@@ -620,18 +620,25 @@ class Tools:
         detail=False → ["name", ...]  
         detail=True  → [{"name","signature","doc"}, ...]
         """
-        import inspect, json, textwrap
+        import inspect, json
 
         tools: list = []
         for name, fn in inspect.getmembers(Tools, predicate=callable):
             if name.startswith("_"):
                 continue
+
             if detail:
                 sig = str(inspect.signature(fn))
-                doc = textwrap.shorten(inspect.getdoc(fn) or "", width=140)
-                tools.append({"name": name, "signature": sig, "doc": doc})
+                # grab the full docstring, or empty string if none
+                doc = inspect.getdoc(fn) or ""
+                tools.append({
+                    "name":      name,
+                    "signature": sig,
+                    "doc":       doc
+                })
             else:
                 tools.append(name)
+
         return json.dumps(tools, indent=2)
 
     # This static method retrieves the source code of a specified tool function by its name. It uses the `inspect` module to get the source code and handles errors gracefully if the tool is not found or if there are issues retrieving the source.
@@ -1694,14 +1701,13 @@ class Tools:
 
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def search_internet(        # ← new canonical name
-        topic: str,
-        num_results: int = 5,
-        wait_sec: int = 1,
-        deep_scrape: bool = True,
-    ) -> list:
+    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
         """
-        Ultra-quick DuckDuckGo search (event-driven, JS injection).
+        Ultra-quick web search search (event-driven, JS injection).
+        Usage:
+        
+        search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
+
         • Opens the first *num_results* links in separate tabs and deep-scrapes each.
         • Returns: title, url, snippet, summary, and full page HTML (`content`).
         • Never blocks more than 5 s on any wait—everything is aggressively polled.
@@ -2394,13 +2400,26 @@ class Tools:
     @staticmethod
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
-        1) Call our search_internet() to open each result in a tab and deep-scrape.
-        2) For each page, feed the full-text snippet into the auxiliary_inference().
-        3) Return a neat bullet-list of 2–3 sentence summaries.
+        Summarize web pages for a search topic.
+
+        1. Call summarize_search(topic: str, top_n: int)
+        - topic (str): the search term, use `topic`
+        - top_n (int): how many results, use `top_n`
+
+        2. For each page returned (dict with "url", "title", "content"):
+        a. Truncate content to 2000 chars, replace newlines.
+        b. Then it calls auxiliary_inference(prompt: str, temperature: float) automatically (you do not have to do this)
+            - prompt: "Here is the content of {url}: ... Please give me a 2–3 sentence summary."
+            - temperature: 0.3
+
+        Returns a numbered list of summaries, or an error/no-results message.
         """
         try:
-            # open tabs and scrape each page’s content
-            pages = Tools.search_internet(topic, num_results=top_n, deep_scrape=True)
+            pages = Tools.search_internet(
+                query=topic,
+                num_results=top_n,
+                deep_scrape=True
+            )
         except Exception as e:
             return f"Error retrieving search pages: {e}"
 
@@ -2408,28 +2427,27 @@ class Tools:
             return "No results found."
 
         summaries = []
-        for idx, p in enumerate(pages, start=1):
-            url     = p.get("url", "")
-            title   = p.get("title", url)
-            content = p.get("content", "")
-            # limit how much we send to the LLM
+        for i, page in enumerate(pages, start=1):
+            url     = page.get("url", "")
+            title   = page.get("title", url)
+            content = page.get("content", "")
             snippet = content[:2000].replace("\n", " ")
 
             prompt = (
                 f"Here is the content of {url}:\n\n"
                 f"{snippet}\n\n"
-                "Please give me a 2-3 sentence summary of the key points."
+                "Please give me a 2–3 sentence summary of the key points."
             )
 
             try:
-                summary = Tools.auxiliary_inference(prompt, temperature=0.3)
+                summary = Tools.auxiliary_inference(prompt, temperature=0.3).strip()
             except Exception as ex:
-                log_message(f"[summarize_search] summarisation failed for {url}: {ex}", "ERROR")
                 summary = "Failed to summarise that page."
 
-            summaries.append(f"{idx}. {title} — {summary.strip()}")
+            summaries.append(f"{i}. {title} — {summary}")
 
         return "\n".join(summaries)
+
 
 
     # This static method scrapes a webpage using BeautifulSoup and requests. It fetches the content of the URL, parses it with BeautifulSoup, and returns the prettified HTML. If an error occurs during scraping, it logs the error and returns an error message.
