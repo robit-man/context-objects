@@ -33,30 +33,30 @@ class ContextObject:
     and self-improvement in an agent pipeline.
     """
 
-    # Schema version
-    schema_version: int = field(init=False, default=1)
-
-    # Identification
-    context_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # ─ Required (no default) ────────────────────────────────────────────────────
     domain: str           # e.g. "segment", "stage", "comparator"
     component: str        # e.g. "instruction", "tool_chain", "and"
     semantic_label: str   # e.g. "select_tools"
+
+    # ─ Defaults & Optionals ─────────────────────────────────────────────────────
+    schema_version: int = field(init=False, default=1)
+    context_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     version: Optional[str] = None
     timestamp: str = field(default_factory=lambda: default_clock().strftime("%Y%m%dT%H%M%SZ"))
 
     # Core references
     segment_ids: List[str] = field(default_factory=list)
-    stage_id:    Optional[str] = None
-    references:  List[str] = field(default_factory=list)
-    children:    List[str] = field(default_factory=list)
+    stage_id: Optional[str] = None
+    references: List[str] = field(default_factory=list)
+    children: List[str] = field(default_factory=list)
 
     # Content & summaries
     summary: Optional[str] = None
-    tags:    List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
 
     # Retrieval & similarity
-    embedding:        Optional[List[float]] = None
-    retrieval_score:  Optional[float] = None
+    embedding: Optional[List[float]] = None
+    retrieval_score: Optional[float] = None
     retrieval_metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Provenance & transformation
@@ -64,51 +64,67 @@ class ContextObject:
 
     # Graph & memory tier
     graph_node_id: Optional[str] = None
-    memory_tier:   Optional[str] = None
+    memory_tier: Optional[str] = None
 
     # Associative memory
-    memory_traces: List[MemoryTrace] = field(default_factory=list)
-    association_strengths: Dict[str, float] = field(default_factory=dict)
-    recall_stats: Dict[str, Any] = field(default_factory=lambda: {"count":0, "last_recalled":None})
-    firing_rate: Optional[float] = None
+    memory_traces: List[MemoryTrace]             = field(default_factory=list)
+    association_strengths: Dict[str, float]      = field(default_factory=dict)
+    recall_stats: Dict[str, Any]                 = field(default_factory=lambda: {"count": 0, "last_recalled": None})
+    firing_rate: Optional[float]                 = None
 
     # Additional metadata & policies
     metadata: Dict[str, Any] = field(default_factory=dict)
-    pinned: bool = False
+    pinned: bool              = False
     last_accessed: Optional[str] = None
-    expires_at: Optional[str] = None
-    acl: Dict[str, Any] = field(default_factory=dict)
-    batch_id: Optional[str] = None
-    dirty: bool = True
-
-    # Internal lock for thread-safe updates
-    _lock: threading.Lock = field(init=False, repr=False, compare=False, default_factory=threading.Lock)
+    expires_at: Optional[str]     = None
+    acl: Dict[str, Any]         = field(default_factory=dict)
+    batch_id: Optional[str]     = None
+    dirty: bool                 = True
 
     def __post_init__(self):
-        # 1) Mandatory fields
+        # create the lock here (not a dataclass field)
+        self._lock = threading.Lock()
+
+        # Validate required fields
         if not all([self.domain, self.component, self.semantic_label]):
             raise ValueError("domain, component and semantic_label are required")
-        # 2) Normalize timestamp
-        try:
-            # if it's a datetime, convert; else assume correct string
-            if isinstance(self.timestamp, datetime):
-                self.timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ")
-        except Exception:
-            pass
-        # 3) Initialize last_accessed
+
+        # Normalize timestamp if needed
+        if isinstance(self.timestamp, datetime):
+            self.timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ")
+
+        # Initialize last_accessed
         if not self.last_accessed:
             self.last_accessed = self.timestamp
-        # 4) Default memory tier by domain
+
+        # Default memory tier by domain
         if not self.memory_tier:
-            self.memory_tier = {"segment":"STM","stage":"LTM"}.get(self.domain, "WM")
-        # 5) Setup logger
+            self.memory_tier = {"segment": "STM", "stage": "LTM"}.get(self.domain, "WM")
+
+        # Setup logger
+        self._logger = logging.getLogger(__name__)
+
+    def __getstate__(self):
+        """
+        Exclude non-picklable items (like threading.Lock) during pickling.
+        """
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        state.pop("_logger", None)
+        return state
+
+    def __setstate__(self, state):
+        """
+        Restore state and recreate lock and logger after unpickling.
+        """
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
 
     def __repr__(self):
         return f"<ContextObject {self.domain}/{self.component}/{self.semantic_label}@{self.timestamp}>"
 
     # ─ Core Helpers ────────────────────────────────────────────────
-
     def touch(self):
         """Mark accessed just now."""
         self.last_accessed = default_clock().strftime("%Y%m%dT%H%M%SZ")
@@ -141,9 +157,11 @@ class ContextObject:
         Thread-safe.
         """
         with self._lock:
-            mt = MemoryTrace(stage_id=stage_id,
-                             coactivated_with=coactivated_with or [],
-                             metadata={"retrieval_score": retrieval_score})
+            mt = MemoryTrace(
+                stage_id=stage_id,
+                coactivated_with=coactivated_with or [],
+                metadata={"retrieval_score": retrieval_score}
+            )
             self.memory_traces.append(mt)
 
             # update recall stats
@@ -152,7 +170,7 @@ class ContextObject:
             stats["last_recalled"] = mt.timestamp
 
             # simplistic firing_rate
-            self.firing_rate = 1.0 / stats["count"]
+            self.firing_rate = 1.0 / stats["count"] if stats["count"] else None
 
             # association strengthening
             for other in mt.coactivated_with:
@@ -162,7 +180,6 @@ class ContextObject:
             self.touch()
 
     # ─ Serialization ──────────────────────────────────────────────
-
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["memory_traces"] = [asdict(mt) for mt in self.memory_traces]
@@ -175,36 +192,37 @@ class ContextObject:
     def from_dict(cls, data: Dict[str, Any]) -> "ContextObject":
         mts = [MemoryTrace(**mt) for mt in data.get("memory_traces", [])]
         obj = cls(
-            context_id=data["context_id"],
             domain=data["domain"],
             component=data["component"],
             semantic_label=data["semantic_label"],
             version=data.get("version"),
-            timestamp=data["timestamp"],
-            segment_ids=data.get("segment_ids", []),
-            stage_id=data.get("stage_id"),
-            references=data.get("references", []),
-            children=data.get("children", []),
-            summary=data.get("summary"),
-            tags=data.get("tags", []),
-            embedding=data.get("embedding"),
-            retrieval_score=data.get("retrieval_score"),
-            retrieval_metadata=data.get("retrieval_metadata", {}),
-            provenance=data.get("provenance", {}),
-            graph_node_id=data.get("graph_node_id"),
-            memory_tier=data.get("memory_tier"),
-            memory_traces=mts,
-            association_strengths=data.get("association_strengths", {}),
-            recall_stats=data.get("recall_stats", {"count":0,"last_recalled":None}),
-            firing_rate=data.get("firing_rate"),
-            metadata=data.get("metadata", {}),
-            pinned=data.get("pinned", False),
-            last_accessed=data.get("last_accessed"),
-            expires_at=data.get("expires_at"),
-            acl=data.get("acl", {}),
-            batch_id=data.get("batch_id"),
-            dirty=data.get("dirty", True)
+            timestamp=data.get("timestamp", default_clock().strftime("%Y%m%dT%H%M%SZ"))
         )
+        # Overwrite defaults with saved values
+        obj.context_id = data.get("context_id", obj.context_id)
+        obj.segment_ids = data.get("segment_ids", [])
+        obj.stage_id = data.get("stage_id")
+        obj.references = data.get("references", [])
+        obj.children = data.get("children", [])
+        obj.summary = data.get("summary")
+        obj.tags = data.get("tags", [])
+        obj.embedding = data.get("embedding")
+        obj.retrieval_score = data.get("retrieval_score")
+        obj.retrieval_metadata = data.get("retrieval_metadata", {})
+        obj.provenance = data.get("provenance", {})
+        obj.graph_node_id = data.get("graph_node_id")
+        obj.memory_tier = data.get("memory_tier", obj.memory_tier)
+        obj.memory_traces = mts
+        obj.association_strengths = data.get("association_strengths", {})
+        obj.recall_stats = data.get("recall_stats", {"count": 0, "last_recalled": None})
+        obj.firing_rate = data.get("firing_rate")
+        obj.metadata = data.get("metadata", {})
+        obj.pinned = data.get("pinned", False)
+        obj.last_accessed = data.get("last_accessed", obj.last_accessed)
+        obj.expires_at = data.get("expires_at")
+        obj.acl = data.get("acl", {})
+        obj.batch_id = data.get("batch_id")
+        obj.dirty = data.get("dirty", True)
         return obj
 
     @staticmethod
@@ -212,7 +230,6 @@ class ContextObject:
         return ContextObject.from_dict(json.loads(s))
 
     # ─ Factory Methods ───────────────────────────────────────────
-
     @classmethod
     def make_segment(
         cls,
@@ -221,14 +238,11 @@ class ContextObject:
         tags: Optional[List[str]] = None,
         **metadata
     ) -> "ContextObject":
-        return cls(
-            domain="segment",
-            component="generic",
-            semantic_label=semantic_label,
-            segment_ids=content_refs,
-            tags=tags or [],
-            metadata=metadata
-        )
+        obj = cls(domain="segment", component="generic", semantic_label=semantic_label)
+        obj.segment_ids = content_refs
+        obj.tags = tags or []
+        obj.metadata.update(metadata)
+        return obj
 
     @classmethod
     def make_stage(
@@ -238,28 +252,12 @@ class ContextObject:
         output: Any,
         **metadata
     ) -> "ContextObject":
-        obj = cls(
-            domain="stage",
-            component=stage_name,
-            semantic_label=stage_name,
-            metadata=metadata
-        )
+        obj = cls(domain="stage", component=stage_name, semantic_label=stage_name)
         obj.references = input_refs
         obj.tags = [stage_name]
+        obj.metadata.update(metadata)
         obj.metadata["output"] = output
         return obj
-
-# ─ Builder ─────────────────────────────────────────────────────────────────────
-class ContextObjectBuilder:
-    def __init__(self, semantic_label: str):
-        self._fields: Dict[str, Any] = {"semantic_label": semantic_label}
-    def domain(self, d: str):   self._fields["domain"] = d; return self
-    def component(self, c: str):self._fields["component"] = c; return self
-    def version(self, v: str):  self._fields["version"] = v; return self
-    def tags(self, t: List[str]): self._fields["tags"] = t; return self
-    def metadata(self, m: Dict[str,Any]): self._fields["metadata"] = m; return self
-    def build(self) -> ContextObject:
-        return ContextObject(**self._fields)
 
 # ─ Repository / DAO Layer ──────────────────────────────────────────────────────
 class ContextRepository:
@@ -320,23 +318,20 @@ class MemoryManager:
         k: int = 5,
         weights: Optional[Dict[str, float]] = None
     ) -> List[ContextObject]:
-        weights = weights or {"assoc":1.0, "recency":1.0}
+        weights = weights or {"assoc": 1.0, "recency": 1.0}
         candidates: Dict[str, float] = {}
         now = default_clock()
 
         for sid in seed_ids:
             seed = self.repo.get(sid)
-            # collect associations
             for other_id, strength in seed.association_strengths.items():
                 score = strength * weights["assoc"]
                 other = self.repo.get(other_id)
-                # apply recency boost
                 last = datetime.strptime(other.last_accessed, "%Y%m%dT%H%M%SZ")
                 age = (now - last).total_seconds()
                 score += weights["recency"] / (1.0 + age)
                 candidates[other_id] = candidates.get(other_id, 0.0) + score
 
-        # return top-k
         sorted_ids = sorted(candidates, key=lambda x: candidates[x], reverse=True)
         return [self.repo.get(cid) for cid in sorted_ids[:k]]
 

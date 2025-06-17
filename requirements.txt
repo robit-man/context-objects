@@ -2,3 +2,6 @@ ollama
 sentence-transformers
 numpy
 torch
+python-dotenv
+whisper
+dotenv
