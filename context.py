@@ -6,11 +6,12 @@ import logging
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 # ─ Utility: default clock ────────────────────────────────────────────────────────
 def default_clock() -> datetime:
     return datetime.utcnow()
+
 
 # ─ MemoryTrace ───────────────────────────────────────────────────────────────────
 @dataclass
@@ -25,18 +26,21 @@ class MemoryTrace:
     coactivated_with: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+
 # ─ ContextObject ────────────────────────────────────────────────────────────────
 @dataclass
 class ContextObject:
     """
     A universal, schema-versioned context object for chaining, retrieval,
     and self-improvement in an agent pipeline.
+    Now domain-agnostic: holds segments, stages, or arbitrary artifacts
+    (tool code, schemas, prompts, policies, plain knowledge).
     """
 
     # ─ Required (no default) ────────────────────────────────────────────────────
-    domain: str           # e.g. "segment", "stage", "comparator"
-    component: str        # e.g. "instruction", "tool_chain", "and"
-    semantic_label: str   # e.g. "select_tools"
+    domain: str           # e.g. "segment", "stage", or "artifact"
+    component: str        # e.g. "tool_code", "schema", "prompt", "policy", "knowledge"
+    semantic_label: str   # e.g. "select_tools", "user_prompt", "db_schema"
 
     # ─ Defaults & Optionals ─────────────────────────────────────────────────────
     schema_version: int = field(init=False, default=1)
@@ -67,10 +71,10 @@ class ContextObject:
     memory_tier: Optional[str] = None
 
     # Associative memory
-    memory_traces: List[MemoryTrace]             = field(default_factory=list)
-    association_strengths: Dict[str, float]      = field(default_factory=dict)
-    recall_stats: Dict[str, Any]                 = field(default_factory=lambda: {"count": 0, "last_recalled": None})
-    firing_rate: Optional[float]                 = None
+    memory_traces: List[MemoryTrace]        = field(default_factory=list)
+    association_strengths: Dict[str, float] = field(default_factory=dict)
+    recall_stats: Dict[str, Any]            = field(default_factory=lambda: {"count": 0, "last_recalled": None})
+    firing_rate: Optional[float]            = None
 
     # Additional metadata & policies
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -85,6 +89,10 @@ class ContextObject:
         # create the lock here (not a dataclass field)
         self._lock = threading.Lock()
 
+        # Normalize domain to one of the allowed buckets
+        if self.domain not in {"segment", "stage", "artifact"}:
+            self.domain = "artifact"
+
         # Validate required fields
         if not all([self.domain, self.component, self.semantic_label]):
             raise ValueError("domain, component and semantic_label are required")
@@ -98,8 +106,8 @@ class ContextObject:
             self.last_accessed = self.timestamp
 
         # Default memory tier by domain
-        if not self.memory_tier:
-            self.memory_tier = {"segment": "STM", "stage": "LTM"}.get(self.domain, "WM")
+        tier_map = {"segment": "STM", "stage": "LTM", "artifact": "WM"}
+        self.memory_tier = tier_map.get(self.domain, "WM")
 
         # Setup logger
         self._logger = logging.getLogger(__name__)
@@ -136,11 +144,23 @@ class ContextObject:
         self.expires_at = exp.strftime("%Y%m%dT%H%M%SZ")
         self.dirty = True
 
-    def compute_embedding(self, embedder: Callable[[str], List[float]]):
-        """Generate embedding from summary via provided embedder."""
-        if self.summary:
-            self.embedding = embedder(self.summary)
-            self.dirty = True
+    def compute_embedding(
+        self,
+        default_embedder: Callable[[str], List[float]],
+        component_embedder: Optional[Dict[str, Callable[[str], List[float]]]] = None
+    ):
+        """
+        Generate embedding from summary via provided embedder(s).
+        If a component_embedder map is given and contains this.component,
+        that function is used; otherwise default_embedder is used.
+        """
+        if not self.summary:
+            return
+        fn = default_embedder
+        if component_embedder and self.component in component_embedder:
+            fn = component_embedder[self.component]
+        self.embedding = fn(self.summary)
+        self.dirty = True
 
     def log_context(self, level=logging.INFO):
         """Emit full context JSON to logs."""
@@ -199,30 +219,30 @@ class ContextObject:
             timestamp=data.get("timestamp", default_clock().strftime("%Y%m%dT%H%M%SZ"))
         )
         # Overwrite defaults with saved values
-        obj.context_id = data.get("context_id", obj.context_id)
-        obj.segment_ids = data.get("segment_ids", [])
-        obj.stage_id = data.get("stage_id")
-        obj.references = data.get("references", [])
-        obj.children = data.get("children", [])
-        obj.summary = data.get("summary")
-        obj.tags = data.get("tags", [])
-        obj.embedding = data.get("embedding")
-        obj.retrieval_score = data.get("retrieval_score")
-        obj.retrieval_metadata = data.get("retrieval_metadata", {})
-        obj.provenance = data.get("provenance", {})
-        obj.graph_node_id = data.get("graph_node_id")
-        obj.memory_tier = data.get("memory_tier", obj.memory_tier)
-        obj.memory_traces = mts
-        obj.association_strengths = data.get("association_strengths", {})
-        obj.recall_stats = data.get("recall_stats", {"count": 0, "last_recalled": None})
-        obj.firing_rate = data.get("firing_rate")
-        obj.metadata = data.get("metadata", {})
-        obj.pinned = data.get("pinned", False)
-        obj.last_accessed = data.get("last_accessed", obj.last_accessed)
-        obj.expires_at = data.get("expires_at")
-        obj.acl = data.get("acl", {})
-        obj.batch_id = data.get("batch_id")
-        obj.dirty = data.get("dirty", True)
+        obj.context_id             = data.get("context_id", obj.context_id)
+        obj.segment_ids            = data.get("segment_ids", [])
+        obj.stage_id               = data.get("stage_id")
+        obj.references             = data.get("references", [])
+        obj.children               = data.get("children", [])
+        obj.summary                = data.get("summary")
+        obj.tags                   = data.get("tags", [])
+        obj.embedding              = data.get("embedding")
+        obj.retrieval_score        = data.get("retrieval_score")
+        obj.retrieval_metadata     = data.get("retrieval_metadata", {})
+        obj.provenance             = data.get("provenance", {})
+        obj.graph_node_id          = data.get("graph_node_id")
+        obj.memory_tier            = data.get("memory_tier", obj.memory_tier)
+        obj.memory_traces          = mts
+        obj.association_strengths  = data.get("association_strengths", {})
+        obj.recall_stats           = data.get("recall_stats", {"count": 0, "last_recalled": None})
+        obj.firing_rate            = data.get("firing_rate")
+        obj.metadata               = data.get("metadata", {})
+        obj.pinned                 = data.get("pinned", False)
+        obj.last_accessed          = data.get("last_accessed", obj.last_accessed)
+        obj.expires_at             = data.get("expires_at")
+        obj.acl                    = data.get("acl", {})
+        obj.batch_id               = data.get("batch_id")
+        obj.dirty                  = data.get("dirty", True)
         return obj
 
     @staticmethod
@@ -238,9 +258,9 @@ class ContextObject:
         tags: Optional[List[str]] = None,
         **metadata
     ) -> "ContextObject":
-        obj = cls(domain="segment", component="generic", semantic_label=semantic_label)
+        obj = cls(domain="segment", component="segment", semantic_label=semantic_label)
         obj.segment_ids = content_refs
-        obj.tags = tags or []
+        obj.tags = tags or ["segment"]
         obj.metadata.update(metadata)
         return obj
 
@@ -258,6 +278,82 @@ class ContextObject:
         obj.metadata.update(metadata)
         obj.metadata["output"] = output
         return obj
+
+    @classmethod
+    def make_tool_code(
+        cls,
+        label: str,
+        code: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        obj = cls(domain="artifact", component="tool_code", semantic_label=label)
+        obj.summary = code[:120] + "…" if len(code) > 120 else code
+        obj.tags = tags or ["code"]
+        obj.metadata.update(metadata)
+        obj.metadata["code"] = code
+        return obj
+
+    @classmethod
+    def make_schema(
+        cls,
+        label: str,
+        schema_def: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        obj = cls(domain="artifact", component="schema", semantic_label=label)
+        obj.summary = schema_def[:120] + "…" if len(schema_def) > 120 else schema_def
+        obj.tags = tags or ["schema"]
+        obj.metadata.update(metadata)
+        obj.metadata["schema"] = schema_def
+        return obj
+
+    @classmethod
+    def make_prompt(
+        cls,
+        label: str,
+        prompt_text: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        obj = cls(domain="artifact", component="prompt", semantic_label=label)
+        obj.summary = prompt_text[:120] + "…" if len(prompt_text) > 120 else prompt_text
+        obj.tags = tags or ["prompt"]
+        obj.metadata.update(metadata)
+        obj.metadata["prompt"] = prompt_text
+        return obj
+
+    @classmethod
+    def make_policy(
+        cls,
+        label: str,
+        policy_text: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        obj = cls(domain="artifact", component="policy", semantic_label=label)
+        obj.summary = policy_text[:120] + "…" if len(policy_text) > 120 else policy_text
+        obj.tags = tags or ["policy"]
+        obj.metadata.update(metadata)
+        obj.metadata["policy"] = policy_text
+        return obj
+
+    @classmethod
+    def make_knowledge(
+        cls,
+        label: str,
+        content: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        obj = cls(domain="artifact", component="knowledge", semantic_label=label)
+        obj.summary = content[:120] + "…" if len(content) > 120 else content
+        obj.tags = tags or ["knowledge"]
+        obj.metadata.update(metadata)
+        obj.metadata["content"] = content
+        return obj
+
 
 # ─ Repository / DAO Layer ──────────────────────────────────────────────────────
 class ContextRepository:
@@ -304,6 +400,7 @@ class ContextRepository:
                     results.append(ctx)
         return results
 
+
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
 class MemoryManager:
     """
@@ -347,6 +444,7 @@ class MemoryManager:
             return la < cutoff and not c.pinned
         for ctx in self.repo.query(stale):
             self.repo.delete(ctx.context_id)
+
 
 # ─ Graph Interface Layer ───────────────────────────────────────────────────────
 class ContextGraph:
