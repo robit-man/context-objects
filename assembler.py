@@ -262,17 +262,17 @@ class Assembler:
 
         # Stage 6: prepare tools & plan summary
         tools_list = self._stage6_prepare_tools()
-        state['plan_ctx'], state['plan_output'] = self._stage6_planning_summary(
+        state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
             state['clar_ctx'], state['know_ctx'], tools_list
         )
 
         # Stage 7: tool chaining → also returns selected_schemas
-        state['tc_ctx'], raw_calls, selected_schemas = self._stage7_tool_chaining(
+        state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
             state['plan_ctx'], state['plan_output'], tools_list
         )
 
         # Stages 8–9: invoke + retries (only on selected_schemas)
-        state['tool_ctxs'] = self._stage8_invoke_with_retries(
+        state['tool_ctxs'] = self._stage9_invoke_with_retries(
             raw_calls, state['plan_output'], selected_schemas
         )
 
@@ -387,7 +387,7 @@ class Assembler:
             for data in [json.loads(c.metadata["schema"])]
         ]
 
-    def _stage6_planning_summary(
+    def _stage7_planning_summary(
         self, clar_ctx: ContextObject, know_ctx: ContextObject, tools_list: List[Dict[str, str]]
     ) -> Tuple[ContextObject, str]:
         tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
@@ -410,7 +410,7 @@ class Assembler:
         ctx.touch(); self.repo.save(ctx)
         return ctx, plan
 
-    def _stage7_tool_chaining(
+    def _stage8_tool_chaining(
         self,
         plan_ctx: ContextObject,
         plan_output: str,
@@ -513,7 +513,7 @@ class Assembler:
         return tc_ctx, raw_calls, selected_schemas
 
 
-    def _stage8_invoke_with_retries(
+    def _stage9_invoke_with_retries(
         self,
         raw_calls: List[str],
         plan_output: str,
