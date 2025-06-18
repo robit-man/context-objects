@@ -228,7 +228,7 @@ class Assembler:
         ctx.touch()
         self.repo.save(ctx)
 
-    # helpers to keep main loop DRY
+    # ── Helpers ────────────────────────────────────────────────────────────
     def _stream_and_capture(self, model, messages, tag=""):
         out = ""
         print(f"{tag} ", end="", flush=True)
@@ -238,21 +238,21 @@ class Assembler:
             out += chunk
         print()
         return out
-
+    
     def run_with_meta_context(self, user_text: str) -> str:
         # ── Stage 1: record user input
         user_ctx = ContextObject.make_segment("user_input", [], tags=["user_input"])
         user_ctx.summary, user_ctx.stage_id = user_text, "user_input"
         user_ctx.touch(); self.repo.save(user_ctx)
 
-        # ── Stage 2: load system prompts
+        # ── Stage 2: system prompts
         sys_ctx = self._load_system_prompts()
 
-        # ── Stage 3: retrieve relevant past context
+        # ── Stage 3: recent + associative retrieval
         now, past = default_clock(), default_clock() - timedelta(minutes=self.lookback)
         tr = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
         history = self._get_history()
-        recent = self.engine.query(
+        recent  = self.engine.query(
             stage_id="recent_retrieval",
             time_range=tr,
             similarity_to=user_text,
@@ -263,8 +263,6 @@ class Assembler:
         for c in assoc:
             c.record_recall(stage_id="recent_retrieval", coactivated_with=[user_ctx.context_id])
             self.repo.save(c)
-
-        # merge without duplicates
         seen = {c.context_id for c in history}
         merged = history + [c for c in recent if c.context_id not in seen]
         seen |= {c.context_id for c in merged}
@@ -282,9 +280,9 @@ class Assembler:
         # ── Stage 4: intent clarification
         clar_block = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in [sys_ctx] + merged)
         clar_msgs = [
-            {"role":"system", "content": self.clarifier_prompt},
-            {"role":"system", "content": f"Context:\n{clar_block}"},
-            {"role":"user",   "content": user_text},
+            {"role":"system","content": self.clarifier_prompt},
+            {"role":"system","content": f"Context:\n{clar_block}"},
+            {"role":"user",  "content": user_text},
         ]
         self._print_stage_context("intent_clarification", {
             "system":  [self.clarifier_prompt],
@@ -322,12 +320,14 @@ class Assembler:
             {"snippets": snippets}
         )
         know_ctx.stage_id = "external_knowledge_retrieval"
-        know_ctx.summary = "\n".join(snippets) if snippets else "(none)"
+        know_ctx.summary = "\n".join(snippets) or "(none)"
         know_ctx.touch(); self.repo.save(know_ctx)
-        self._print_stage_context("external_knowledge_retrieval", {"snippets": [know_ctx.summary]})
+        self._print_stage_context("external_knowledge_retrieval", {
+            "snippets": [know_ctx.summary]
+        })
         stage_refs["external_knowledge_retrieval"] = know_ctx.context_id
-        # ── Stage 6: planning summary (with unpacked tools list) ─────────
-        # 1) pull out all tool_schema contexts
+
+        # ── Stage 6: planning summary (first‐line tool list)
         schema_ctxs = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
@@ -335,15 +335,13 @@ class Assembler:
         for c in schema_ctxs:
             data = json.loads(c.metadata["schema"])
             tools_list.append({
-                "name":        data["name"],
-                # only first line for planning overview
+                "name": data["name"],
                 "description": data.get("description","").split("\n",1)[0]
             })
-
-        # 2) build a plain-text bullet list for planning
-        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}"
-                               for t in tools_list)
-
+        tools_text = "\n".join(
+            f"- **{t['name']}**: {t['description']}"
+            for t in tools_list
+        )
         planning_system = (
             "Available tools:\n"
             f"{tools_text}\n\n"
@@ -357,205 +355,29 @@ class Assembler:
             "input": [plan_input[:200]],
         })
         plan_msgs = [
-            {"role":"system","content":planning_system},
-            {"role":"user",  "content":plan_input},
+            {"role":"system","content": planning_system},
+            {"role":"user",  "content": plan_input},
         ]
         plan_output = self._stream_and_capture(
             self.secondary_model, plan_msgs, tag="[Planner]"
         )
-
         plan_ctx = ContextObject.make_stage(
             "planning_summary",
             know_ctx.references,
             {"plan": plan_output}
         )
-        plan_ctx.stage_id = "planning_summary"
-        plan_ctx.summary  = plan_output
+        plan_ctx.stage_id, plan_ctx.summary = "planning_summary", plan_output
         plan_ctx.touch(); self.repo.save(plan_ctx)
         stage_refs["planning_summary"] = plan_ctx.context_id
 
         # ── Stage 7: initial tool chaining (multi-call JSON) ─────────────
         tc_system = (
-            "Available tools:\n" f"{tools_text}\n\n"
-            "Decide which tools to call (in order). **Reply only** with one‐line JSON:\n"
-            '  {"tool_calls": ["tool1(arg1=...,arg2=...)", "tool2(...)"]}\n'
-            "or\n"
-            '  {"tool_calls": []}'
-        )
-        self._print_stage_context("tool_chaining", {
-            "tools": [tools_text],
-            "plan":  [plan_output[:200]],
-        })
-        tc_msgs = [
-            {"role":"system","content":tc_system},
-            {"role":"user",  "content":plan_output},
-        ]
-        chain_out = self._stream_and_capture(
-            self.secondary_model, tc_msgs, tag="[ToolChain]"
-        )
-
-        # parse the raw tool calls list
-        try:
-            tc_json   = json.loads(chain_out.strip())
-            raw_calls = tc_json.get("tool_calls", [])
-        except json.JSONDecodeError:
-            parsed   = Tools.parse_tool_call(chain_out)
-            if isinstance(parsed, list):
-                raw_calls = parsed
-            elif parsed:
-                raw_calls = [parsed]
-            else:
-                raw_calls = []
-
-        # save chaining stage
-        tc_ctx = ContextObject.make_stage(
-            "tool_chaining",
-            plan_ctx.references,
-            {"tool_calls": raw_calls}
-        )
-        tc_ctx.stage_id = "tool_chaining"
-        tc_ctx.summary  = json.dumps(raw_calls)
-        tc_ctx.touch(); self.repo.save(tc_ctx)
-        stage_refs["tool_chaining"] = tc_ctx.context_id
-
-        # ── Stage 7b: enrich chaining with full docstrings ─────────────
-        if raw_calls:
-            # select only the schemas for the calls
-            sel_names = {call.split("(")[0] for call in raw_calls}
-            selected = [
-                json.loads(c.metadata["schema"])
-                for c in schema_ctxs
-                if json.loads(c.metadata["schema"])["name"] in sel_names
-            ]
-            # build full descriptions
-            details = "\n\n".join(
-                f"**{s['name']}**\n{s.get('description','(no docs)')}"
-                for s in selected
-            )
-            tc_system_full = (
-                "You have chosen these tools and their full docs:\n\n"
-                f"{details}\n\n"
-                "Now confirm your calls or adjust them. **Reply only** with JSON:\n"
-                '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}'
-            )
-            self._print_stage_context("tool_chaining_details", {
-                "selected_tools": details.split("\n"),
-            })
-            tc_msgs2 = [
-                {"role":"system","content":tc_system_full},
-                {"role":"user",  "content": json.dumps({"tool_calls": raw_calls})},
-            ]
-            chain_out = self._stream_and_capture(
-                self.secondary_model, tc_msgs2, tag="[ToolChainDetails]"
-            )
-            # re-parse in case of adjustment
-            try:
-                tc_json2  = json.loads(chain_out.strip())
-                raw_calls = tc_json2.get("tool_calls", raw_calls)
-            except:
-                pass
-
-        # ── Stage 8: invoke each tool in series, capture results/errors ──
-        tool_ctxs, errors = [], []
-        for idx, call_str in enumerate(raw_calls):
-            print(f"[ToolInvocation] Running: {call_str}", flush=True)
-            try:
-                result = Tools.run_tool_once(call_str)
-                exc    = None
-            except Exception as e:
-                result = None
-                exc    = str(e)
-            print(f"[ToolInvocation] Result: {{'output': {result!r}, 'exception': {exc!r}}}",
-                  flush=True)
-
-            # find the schema context for this tool
-            name = call_str.split("(")[0]
-            sch_ctx = next(
-                c for c in schema_ctxs
-                if json.loads(c.metadata["schema"])["name"] == name
-            )
-
-            out_ctx = ContextObject.make_stage(
-                "tool_output",
-                [sch_ctx.context_id],
-                {"call": call_str, "output": result, "exception": exc}
-            )
-            out_ctx.stage_id = f"tool_output_{idx}"
-            out_ctx.summary = (
-                result if isinstance(result, str)
-                else json.dumps(result) if result is not None
-                else f"ERROR: {exc}"
-            )
-            out_ctx.touch(); self.repo.save(out_ctx)
-            tool_ctxs.append(out_ctx)
-
-            if exc:
-                errors.append(f"{call_str} → {exc}")
-
-        stage_refs["tool_invocation"] = [c.context_id for c in tool_ctxs]
-
-        # ── Stage 9: retry chaining if any errors ─────────────────────────
-        if errors:
-            err_block = "\n".join(errors)
-            retry_system = (
-                "The previous tool invocations failed:\n"
-                f"{err_block}\n\n"
-                "Please correct your tool_calls. **Reply only** with JSON:\n"
-                '  {"tool_calls": ["tool1(...)", ...]}'
-            )
-            self._print_stage_context("tool_chaining_retry", {"errors": errors})
-            retry_msgs = [
-                {"role": "system", "content": retry_system},
-                {"role": "user",   "content": plan_output},
-            ]
-            retry_out = self._stream_and_capture(self.secondary_model, retry_msgs, tag="[ToolChainRetry]")
-
-            try:
-                retry_json = json.loads(retry_out.strip())
-                raw_calls  = retry_json.get("tool_calls", [])
-            except:
-                parsed = Tools.parse_tool_call(retry_out)
-                raw_calls = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
-
-            # invoke retry calls same as above
-            for idx, call_str in enumerate(raw_calls):
-                print(f"[ToolInvocationRetry] Running: {call_str}", flush=True)
-                try:
-                    result = Tools.run_tool_once(call_str)
-                    exc = None
-                except Exception as e:
-                    result = None
-                    exc = str(e)
-                print(f"[ToolInvocationRetry] Result: {{'output': {result!r}, 'exception': {exc!r}}}", flush=True)
-
-                name = call_str.split("(")[0]
-                sch_ctx = next(
-                    c for c in schema_ctxs
-                    if json.loads(c.metadata["schema"])["name"] == name
-                )
-                out_ctx = ContextObject.make_stage(
-                    "tool_output",
-                    [sch_ctx.context_id],
-                    {"call": call_str, "output": result, "exception": exc}
-                )
-                out_ctx.stage_id = f"tool_output_retry_{idx}"
-                out_ctx.summary = (
-                    result if isinstance(result, str)
-                    else json.dumps(result) if result is not None
-                    else f"ERROR: {exc}"
-                )
-                out_ctx.touch(); self.repo.save(out_ctx)
-                tool_ctxs.append(out_ctx)
-
-            stage_refs["tool_invocation"] = [c.context_id for c in tool_ctxs]
-        # ── Stage 7: initial tool chaining (multi-call JSON) ────────────
-        tc_system = (
-            "Available tools (name + one-line desc):\n"
+            "Available tools (name + one-line description):\n"
             f"{tools_text}\n\n"
-            "Decide which tools to call (in order). **Reply only** with JSON:\n"
-            '  {"tool_calls": ["tool1(arg1=...,arg2=...)", "tool2(...)"]}\n'
+            "Reply **ONLY** with one-line JSON:\n"
+            '{"tool_calls":["tool1(arg1=...,arg2=...)", "tool2(...)"]}\n'
             "or\n"
-            '  {"tool_calls": []}'
+            '{"tool_calls":[]}'
         )
         self._print_stage_context("tool_chaining", {
             "tools": [tools_text],
@@ -564,206 +386,166 @@ class Assembler:
         chain_out = self._stream_and_capture(
             self.secondary_model,
             [{"role":"system","content":tc_system},
-             {"role":"user","content":plan_output}],
+             {"role":"user",  "content":plan_output}],
             tag="[ToolChain]"
         )
-
         try:
-            tc_json   = json.loads(chain_out.strip())
-            raw_calls = tc_json.get("tool_calls", [])
+            raw_calls = json.loads(chain_out.strip())["tool_calls"]
         except:
-            parsed    = Tools.parse_tool_call(chain_out)
-            raw_calls = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+            parsed = Tools.parse_tool_call(chain_out)
+            raw_calls = parsed if isinstance(parsed,list) else ([parsed] if parsed else [])
 
         tc_ctx = ContextObject.make_stage(
-            "tool_chaining", plan_ctx.references,
-            {"tool_calls": raw_calls}
+            "tool_chaining", plan_ctx.references, {"tool_calls": raw_calls}
         )
-        tc_ctx.stage_id = "tool_chaining"
-        tc_ctx.summary  = json.dumps(raw_calls)
+        tc_ctx.stage_id, tc_ctx.summary = "tool_chaining", json.dumps(raw_calls)
         tc_ctx.touch(); self.repo.save(tc_ctx)
         stage_refs["tool_chaining"] = tc_ctx.context_id
 
-        # ── Stage 7b: enrich with full docstrings ───────────────────────
-        if raw_calls:
-            sel   = {c.split("(")[0] for c in raw_calls}
-            docs  = []
+        # ── Stages 8–9: invoke → validate → intermediate fix-prompt → retry ───
+        def validate(block: Dict[str,Any]) -> Tuple[bool,str]:
+            """
+            Returns (ok, error_message).
+            Only an actual exception should be considered a failure.
+            Treat None output as valid.
+            """
+            exc = block.get("exception")
+            if exc:
+                return False, exc
+            return True, ""
+
+
+        max_retries = 10
+        tool_ctxs = []
+        call_status = {call: None for call in raw_calls}  # None=pending, True=ok, False=error
+        for attempt in range(1, max_retries+1):
+            print(f"\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
+            errors = []
+
+            # execute only pending calls
+            for call_str in raw_calls:
+                if call_status[call_str] is True:
+                    continue  # already succeeded
+
+                print(f"[ToolInvocation] Running: {call_str}", flush=True)
+                try:
+                    result = Tools.run_tool_once(call_str)
+                    block  = {"output": result, "exception": None}
+                except Exception as e:
+                    block  = {"output": None, "exception": str(e)}
+
+                ok, err = validate(block)
+                status = "OK" if ok else f"ERROR: {err}"
+                print(f"[ToolInvocation] {status}", flush=True)
+
+                # persist this tool_output
+                name = call_str.split("(")[0]
+                sch_ctx = next(
+                    c for c in schema_ctxs
+                    if json.loads(c.metadata["schema"])["name"] == name
+                )
+                out_ctx = ContextObject.make_stage(
+                    "tool_output", [sch_ctx.context_id], block
+                )
+                out_ctx.stage_id = f"tool_output_{attempt}"
+                out_ctx.summary = block["output"] if ok else f"ERROR: {err}"
+                out_ctx.touch(); self.repo.save(out_ctx)
+                tool_ctxs.append(out_ctx)
+
+                call_status[call_str] = ok
+                if not ok:
+                    errors.append((call_str, err))
+
+            # if no errors remain, stop retrying
+            if not errors:
+                break
+
+            # prepare retry prompt: only for calls that failed
+            err_lines = [f"{c} → {e}" for c,e in errors]
+            failed_calls = [c for c,_ in errors]
+
+            # gather full docs for failed tools
+            docs = []
             for c in schema_ctxs:
                 schema = json.loads(c.metadata["schema"])
-                if schema["name"] in sel:
+                if schema["name"] in {fc.split("(")[0] for fc in failed_calls}:
                     docs.append(f"**{schema['name']}**\n{schema.get('description','(no docs)')}")
-            full_doc = "\n\n".join(docs)
-            tc_system2 = (
-                "You have chosen these tools with full docs:\n\n"
-                f"{full_doc}\n\n"
-                "Now confirm or adjust your calls. **Reply only** with JSON:\n"
-                '{"tool_calls":["tool1(arg1=...,arg2=...)", ...]}'
-            )
-            self._print_stage_context("tool_chaining_details", {
-                "selected_tools": full_doc.split("\n")
-            })
-            chain_out2 = self._stream_and_capture(
-                self.secondary_model,
-                [{"role":"system","content":tc_system2},
-                 {"role":"user","content":json.dumps({"tool_calls":raw_calls})}],
-                tag="[ToolChainDetails]"
-            )
-            try:
-                tc_json2  = json.loads(chain_out2.strip())
-                raw_calls = tc_json2.get("tool_calls", raw_calls)
-            except:
-                pass
 
-        # ── Stage 8: invoke each tool in series, capture results/errors ──
-        tool_ctxs, results, errors = [], [], []
-        for idx, call_str in enumerate(raw_calls):
-            print(f"[ToolInvocation] Running: {call_str}", flush=True)
-            try:
-                out = Tools.run_tool_once(call_str)
-                exc = None
-            except Exception as e:
-                out, exc = None, str(e)
-            print(f"[ToolInvocation] Result: {{'output':{out!r},'exception':{exc!r}}}", flush=True)
-
-            # record
-            name = call_str.split("(")[0]
-            sch  = next(c for c in schema_ctxs
-                        if json.loads(c.metadata["schema"])["name"]==name)
-            ctx  = ContextObject.make_stage(
-                "tool_output",[sch.context_id],
-                {"call":call_str,"output":out,"exception":exc}
-            )
-            ctx.stage_id = f"tool_output_{idx}"
-            ctx.summary  = (
-                out if isinstance(out,str)
-                else json.dumps(out) if out is not None
-                else f"ERROR: {exc}"
-            )
-            ctx.touch(); self.repo.save(ctx)
-            tool_ctxs.append(ctx)
-
-            results.append((call_str,out))
-            if exc or "malformed node" in (exc or ""):
-                errors.append(f"{call_str} → {exc}")
-
-        stage_refs["tool_invocation"] = [c.context_id for c in tool_ctxs]
-
-        # ── Stage 9: retry if any parsing/AST errors ────────────────────
-        if errors:
-            # Build a rich retry prompt that includes:
-            #  - the error lines
-            #  - the raw successful outputs (so model can interpolate)
-            err_block = "\n".join(errors)
-            res_block = "\n".join(f"{c}: {o}" for c,o in results if o is not None)
-            retry_sys = (
-                "Some calls failed or had parse errors:\n"
-                f"{err_block}\n\n"
-                "Successful outputs so far:\n"
-                f"{res_block}\n\n"
-                "Please correct your tool_calls (e.g. interpolate the location value). **Reply only** with JSON:\n"
-                '{"tool_calls":["tool1(arg1=...,arg2=...)", ...]}'
+            retry_system = (
+                "Some tool calls failed:\n"
+                + "\n".join(err_lines)
+                + "\n\nOriginal plan:\n"
+                + plan_output
+                + "\n\nFull docstrings for the failed tools:\n\n"
+                + "\n\n".join(docs)
+                + "\n\nPlease correct **only** the failing calls. "
+                  "Reply **ONLY** with JSON:\n"
+                '{"tool_calls": ["call1(...)", ...]}'
             )
             self._print_stage_context("tool_chaining_retry", {
-                "errors": errors,
-                "results": results
+                "errors": err_lines,
             })
             retry_out = self._stream_and_capture(
                 self.secondary_model,
-                [{"role":"system","content":retry_sys},
-                 {"role":"user","content":json.dumps({"tool_calls":raw_calls})}],
+                [{"role":"system","content":retry_system},
+                 {"role":"user","content": json.dumps({"tool_calls": failed_calls})}],
                 tag="[ToolChainRetry]"
             )
+
+            # parse the corrected calls
             try:
-                rj        = json.loads(retry_out.strip())
-                raw_calls = rj.get("tool_calls",[])
+                fixed = json.loads(retry_out.strip())["tool_calls"]
             except:
-                parsed   = Tools.parse_tool_call(retry_out)
-                raw_calls = parsed if isinstance(parsed,list) else ([parsed] if parsed else [])
+                parsed = Tools.parse_tool_call(retry_out)
+                fixed = parsed if isinstance(parsed,list) else ([parsed] if parsed else [])
 
-            retry_ctx = ContextObject.make_stage(
-                "tool_chaining_retry", plan_ctx.references,
-                {"tool_calls":raw_calls}
-            )
-            retry_ctx.stage_id, retry_ctx.summary = "tool_chaining_retry", json.dumps(raw_calls)
-            retry_ctx.touch(); self.repo.save(retry_ctx)
-            stage_refs["tool_chaining_retry"] = retry_ctx.context_id
+            # merge back into raw_calls, preserving successes
+            new_raw = []
+            for call in raw_calls:
+                if call in failed_calls:
+                    # take next corrected if available, else keep old to try again
+                    candidate = fixed.pop(0) if fixed else call
+                    new_raw.append(candidate)
+                else:
+                    new_raw.append(call)
+            raw_calls = new_raw
 
-            # Invoke retry calls once more
-            retry_results, retry_errors = [], []
-            for idx, call_str in enumerate(raw_calls):
-                print(f"[Retry_ToolInvocation] Running: {call_str}", flush=True)
-                try:
-                    out = Tools.run_tool_once(call_str)
-                    exc = None
-                except Exception as e:
-                    out, exc = None, str(e)
-                print(f"[Retry_ToolInvocation] Result: {{'output':{out!r},'exception':{exc!r}}}", flush=True)
+        stage_refs["tool_invocation"] = [c.context_id for c in tool_ctxs]
 
-                name = call_str.split("(")[0]
-                sch  = next(c for c in schema_ctxs
-                            if json.loads(c.metadata["schema"])["name"]==name)
-                ctx  = ContextObject.make_stage(
-                    "tool_output",[sch.context_id],
-                    {"call":call_str,"output":out,"exception":exc}
-                )
-                ctx.stage_id = f"tool_output_retry_{idx}"
-                ctx.summary  = (
-                    out if isinstance(out,str)
-                    else json.dumps(out) if out is not None
-                    else f"ERROR: {exc}"
-                )
-                ctx.touch(); self.repo.save(ctx)
-                tool_ctxs.append(ctx)
-
-                retry_results.append((call_str,out))
-                if exc:
-                    retry_errors.append(f"{call_str} → {exc}")
-
-            # if still errors, we give up retrying
-            if retry_errors:
-                self._print_stage_context("tool_chaining_failed", {
-                    "errors": retry_errors
-                })
-
-            stage_refs["tool_invocation"] = [c.context_id for c in tool_ctxs]
-
-        # ── Stage 10: assemble intermediate context ─────────────────────
+        # ── Stage 10: assemble intermediate context ────────────────────────
         refs = [user_ctx.context_id, sys_ctx.context_id] + recent_ids
         for v in stage_refs.values():
             refs += v if isinstance(v,list) else [v]
         refs += [t.context_id for t in tool_ctxs]
-        seen,all_refs = set(),[]
+        seen, all_refs = set(), []
         for r in refs:
             if r not in seen:
                 seen.add(r); all_refs.append(r)
-        ctxs = [self.repo.get(cid) for cid in all_refs]
-        ctxs.sort(key=lambda c:c.timestamp)
-        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
-        # ── Stage 11: final inference ───────────────────────────────────
-        final_system = (
-            "You are a helpful assistant. Use ONLY the provided context below—"
-            "including the user’s original input, the plan, the exact tool calls made, "
-            "and each tool’s outputs—to answer the user’s query. "
-            "Do NOT invent new actions or call any further tools. "
-            "If the context fully answers the question, respond directly. "
-            "If not, admit that you cannot answer without more information."
+        all_ctxs = [self.repo.get(cid) for cid in all_refs]
+        all_ctxs.sort(key=lambda c:c.timestamp)
+        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in all_ctxs)
+
+        # ── Stage 11: final inference (tool-free) ─────────────────────────
+        final_sys = (
+            "Use ONLY the provided context—original query, plan, exact tool calls & their outputs—to answer. "
+            "Do NOT invent new actions. If the context suffices, answer; otherwise admit you cannot."
         )
-        # ── Stage 11: final inference ───────────────────────────────────
-        final_msgs = [
-            {"role": "system",  "content": final_system},
-            {"role":"system","content":self.inference_prompt},
-            {"role":"system","content":interm},
-            {"role":"user",  "content":user_text},
-        ]
-        reply = self._stream_and_capture(self.primary_model, final_msgs, tag="[Assistant]")
+        reply = self._stream_and_capture(
+            self.primary_model,
+            [{"role":"system","content":final_sys},
+             {"role":"system","content":interm},
+             {"role":"user","content":user_text}],
+            tag="[Assistant]"
+        )
 
         resp_ctx = ContextObject.make_stage(
-            "final_inference", [tc_ctx.context_id], {"text":reply}
+            "final_inference",[tc_ctx.context_id],{"text": reply}
         )
         resp_ctx.stage_id, resp_ctx.summary = "final_inference", reply
         resp_ctx.touch(); self.repo.save(resp_ctx)
 
         return reply
+
 
 
 

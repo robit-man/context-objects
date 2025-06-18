@@ -6,6 +6,8 @@ import re
 from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
+import psutil
+import traceback
 
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException, TimeoutException, NoSuchElementException
@@ -1699,15 +1701,17 @@ class Tools:
         Tools._driver.save_screenshot(filename)
         return filename
 
+
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
+    def search_internet(        # ← new canonical name
+        topic: str,
+        num_results: int = 5,
+        wait_sec: int = 1,
+        deep_scrape: bool = True,
+    ) -> list:
         """
-        Ultra-quick web search search (event-driven, JS injection).
-        Usage:
-        
-        search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
-
+        Ultra-quick DuckDuckGo search (event-driven, JS injection).
         • Opens the first *num_results* links in separate tabs and deep-scrapes each.
         • Returns: title, url, snippet, summary, and full page HTML (`content`).
         • Never blocks more than 5 s on any wait—everything is aggressively polled.
@@ -1879,6 +1883,7 @@ class Tools:
 
         log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
         return results
+
 
     # This static method extracts a summary from a webpage using two stages:
     @staticmethod
