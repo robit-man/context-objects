@@ -501,6 +501,7 @@ class Assembler:
 
         return tc_ctx, raw_calls, selected_schemas
 
+
     def _stage8_invoke_with_retries(
         self,
         raw_calls: List[str],
@@ -513,19 +514,15 @@ class Assembler:
 
         max_retries = 10
         tool_ctxs: List[ContextObject] = []
-        # track OK status per original call_str
-        status: Dict[str,bool] = {call: False for call in raw_calls}
+        status = {c: None for c in raw_calls}
 
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, max_retries+1):
             errors: List[Tuple[str,str]] = []
-            print(f"\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
+            print(f"\\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
 
-            # invoke each outstanding call
-            for idx, call_str in enumerate(raw_calls):
-                if status[call_str]:
-                    # already succeeded
+            for call_str in raw_calls:
+                if status[call_str] is True:
                     continue
-
                 print(f"[ToolInvocation] Running: {call_str}", flush=True)
                 try:
                     result = Tools.run_tool_once(call_str)
@@ -534,9 +531,8 @@ class Assembler:
                     block = {"output": None, "exception": str(e)}
 
                 ok, err = validate(block)
-                print(f"[ToolInvocation] {'OK' if ok else 'ERROR: ' + err}", flush=True)
+                print(f"[ToolInvocation] {'OK' if ok else 'ERROR: '+err}", flush=True)
 
-                # persist this invocation
                 name = call_str.split("(")[0]
                 sch = next(
                     s for s in selected_schemas
@@ -545,7 +541,7 @@ class Assembler:
                 out_ctx = ContextObject.make_stage(
                     "tool_output", [sch.context_id], block
                 )
-                out_ctx.stage_id = f"tool_output_{attempt}_{idx}"
+                out_ctx.stage_id = f"tool_output_{attempt}"
                 out_ctx.summary = block["output"] if ok else f"ERROR: {err}"
                 out_ctx.touch(); self.repo.save(out_ctx)
                 tool_ctxs.append(out_ctx)
@@ -554,64 +550,48 @@ class Assembler:
                 if not ok:
                     errors.append((call_str, err))
 
-            # if everything succeeded, break out
             if not errors:
                 break
 
-            # prepare retry prompt for only the failed calls
-            errs   = [f"{c} → {e}" for c,e in errors]
+            errs = [f"{c} → {e}" for c,e in errors]
             failed = [c for c,_ in errors]
-
-            # gather full docs for failed tools
             docs = []
             for sch in selected_schemas:
                 data = json.loads(sch.metadata["schema"])
                 if data["name"] in {f.split("(")[0] for f in failed}:
-                    docs.append(f"**{data['name']}**\n{data.get('description','(no docs)')}")
+                    docs.append(f"**{data['name']}**\\n{data.get('description','(no docs)')}")
 
             retry_sys = (
-                "Some tool calls failed:\n"
-                + "\n".join(errs)
-                + "\n\nOriginal plan:\n"
-                + plan_output
-                + "\n\nFull docs for failing tools:\n\n"
-                + "\n\n".join(docs)
-                + "\n\nPlease correct **only** the failing calls. "
-                  "Reply **ONLY** with JSON:\n"
-                '{"tool_calls":["call1(...)", ...]}'
+                "Some tool calls failed:\\n" + "\\n".join(errs)
+                + "\\n\\nOriginal plan:\\n" + plan_output
+                + "\\n\\nFull docstrings for the failed tools:\\n\\n"
+                + "\\n\\n".join(docs)
+                + "\\n\\nPlease correct **only** the failing calls."
+                " Reply **ONLY** with JSON:\\n"
+                '{"tool_calls": ["call1(...)", ...]}'
             )
-            self._print_stage_context("tool_chaining_retry", {
-                "errors":    errs,
-                "plan":      [plan_output[:200]],
-                "fail_docs": docs
-            })
+            self._print_stage_context("tool_chaining_retry", {"errors": errs})
             retry_msgs = [
-                {"role":"system", "content": retry_sys},
-                {"role":"user",   "content": json.dumps({"tool_calls": failed})}
+                {"role":"system","content":retry_sys},
+                {"role":"user","content":json.dumps({"tool_calls": failed})}
             ]
-            retry_out = self._stream_and_capture(
-                self.secondary_model, retry_msgs, tag="[ToolChainRetry]"
-            )
+            retry_out = self._stream_and_capture(self.secondary_model, retry_msgs, tag="[ToolChainRetry]")
 
-            # parse the fixes
             try:
                 fixed = json.loads(retry_out.strip())["tool_calls"]
             except:
                 parsed = Tools.parse_tool_call(retry_out)
-                fixed = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+                fixed = parsed if isinstance(parsed,list) else ([parsed] if parsed else [])
 
-            # replace only the failed calls in raw_calls with the fixed ones, preserving order
             new_raw = []
-            fix_iter = iter(fixed)
-            for c in raw_calls:
-                if c in failed:
-                    new_raw.append(next(fix_iter, c))
+            for o in raw_calls:
+                if o in failed:
+                    new_raw.append(fixed.pop(0) if fixed else o)
                 else:
-                    new_raw.append(c)
+                    new_raw.append(o)
             raw_calls = new_raw
 
         return tool_ctxs
-
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
         refs = [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids']
