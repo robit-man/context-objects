@@ -416,7 +416,9 @@ class Assembler:
         plan_output: str,
         tools_list: List[Dict[str, str]]
     ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
-        # ── Step A: initial chaining prompt with one-line tool list ──
+        import json, re
+
+        # Step A: initial one-line JSON prompt
         tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
         system_short = (
             "Available tools:\n"
@@ -434,14 +436,26 @@ class Assembler:
         ]
         out_short = self._stream_and_capture(self.secondary_model, msgs_short, tag="[ToolChain]")
 
-        # parse the raw calls
+        # Step B: parse JSON or fallback to regex
         try:
             raw_calls = json.loads(out_short.strip())["tool_calls"]
         except:
             parsed = Tools.parse_tool_call(out_short)
             raw_calls = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
 
-        # save the initial chaining context
+        # Step C: regex-extract any calls embedded in the plan text
+        plan_regex = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\([^)]*\)', plan_output)
+        for call in plan_regex:
+            if call not in raw_calls:
+                raw_calls.append(call)
+
+        # Step D: ensure every tool name mentioned by name in the plan is invoked
+        for t in tools_list:
+            name = t["name"]
+            if name in plan_output and not any(rc.startswith(f"{name}(") for rc in raw_calls):
+                raw_calls.append(f"{name}()")
+
+        # Step E: save the chaining ContextObject
         tc_ctx = ContextObject.make_stage(
             "tool_chaining",
             plan_ctx.references,
@@ -451,24 +465,22 @@ class Assembler:
         tc_ctx.summary  = json.dumps(raw_calls)
         tc_ctx.touch(); self.repo.save(tc_ctx)
 
-        # ── Step B: Narrow down to the selected tools’ full schemas ──
+        # Step F: select only the schemas for the chosen calls
         all_schemas = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
-        sel_names = {call.split("(")[0] for call in raw_calls if isinstance(call, str)}
+        sel_names = {c.split("(")[0] for c in raw_calls if isinstance(c, str)}
         selected_schemas = [
             sch for sch in all_schemas
             if json.loads(sch.metadata["schema"])["name"] in sel_names
         ]
 
-        # ── Step C: present only the chosen tools with their full docs ──
+        # Step G: if any selected, show full docs and reconfirm
         if selected_schemas:
             full_docs = []
             for sch in selected_schemas:
                 data = json.loads(sch.metadata["schema"])
-                full_docs.append(
-                    f"**{data['name']}**\n{data.get('description','(no documentation)')}"
-                )
+                full_docs.append(f"**{data['name']}**\n{data.get('description','(no documentation)')}")
             docs_block = "\n\n".join(full_docs)
 
             system_full = (
@@ -486,18 +498,17 @@ class Assembler:
             ]
             out_full = self._stream_and_capture(self.secondary_model, msgs_full, tag="[ToolChainDetails]")
 
-            # re-parse in case of any adjustments
             try:
-                parsed_full = json.loads(out_full.strip())["tool_calls"]
-                raw_calls = parsed_full
+                confirmed = json.loads(out_full.strip())["tool_calls"]
             except:
                 parsed = Tools.parse_tool_call(out_full)
-                raw_calls = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+                confirmed = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
 
-            # update the chaining context with confirmed calls
-            tc_ctx.summary = json.dumps(raw_calls)
-            tc_ctx.metadata["tool_calls"] = raw_calls
-            tc_ctx.touch(); self.repo.save(tc_ctx)
+            if confirmed:
+                raw_calls = confirmed
+                tc_ctx.summary = json.dumps(raw_calls)
+                tc_ctx.metadata["tool_calls"] = raw_calls
+                tc_ctx.touch(); self.repo.save(tc_ctx)
 
         return tc_ctx, raw_calls, selected_schemas
 
@@ -508,90 +519,134 @@ class Assembler:
         plan_output: str,
         selected_schemas: List[ContextObject]
     ) -> List[ContextObject]:
-        def validate(block: Dict[str, Any]) -> Tuple[bool,str]:
+        """
+        Executes raw_calls with up to 10 retries.
+        On errors, prints the full retry context (errors, docs, prompt)
+        so you can confirm the LLM sees the exception details.
+        """
+        from typing import Tuple, Dict, Any
+
+        def validate(block: Dict[str, Any]) -> Tuple[bool, str]:
             exc = block.get("exception")
             return (exc is None, exc or "")
 
-        max_retries = 10
+        # Normalize any dict-wrapped calls
+        def _norm(calls):
+            out = []
+            for c in calls:
+                if isinstance(c, dict) and "tool_call" in c:
+                    out.append(c["tool_call"])
+                elif isinstance(c, str):
+                    out.append(c)
+            return out
+
+        raw_calls = _norm(raw_calls)
+        call_status = {c: None for c in raw_calls}
         tool_ctxs: List[ContextObject] = []
-        status = {c: None for c in raw_calls}
+        max_retries = 10
 
-        for attempt in range(1, max_retries+1):
-            errors: List[Tuple[str,str]] = []
-            print(f"\\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
+        for attempt in range(1, max_retries + 1):
+            errors: List[Tuple[str, str]] = []
+            print(f"\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
 
-            for call_str in raw_calls:
-                if status[call_str] is True:
+            # invoke pending
+            for call_str in list(raw_calls):
+                if call_status.get(call_str) is True:
                     continue
+
                 print(f"[ToolInvocation] Running: {call_str}", flush=True)
                 try:
-                    result = Tools.run_tool_once(call_str)
-                    block = {"output": result, "exception": None}
+                    raw = Tools.run_tool_once(call_str)
+                    if isinstance(raw, dict) and "exception" in raw:
+                        block = {"output": raw.get("output"), "exception": raw["exception"]}
+                    else:
+                        block = {"output": raw, "exception": None}
                 except Exception as e:
                     block = {"output": None, "exception": str(e)}
 
                 ok, err = validate(block)
-                print(f"[ToolInvocation] {'OK' if ok else 'ERROR: '+err}", flush=True)
+                print(f"[ToolInvocation] {'OK' if ok else 'ERROR: ' + err}", flush=True)
 
+                # persist
                 name = call_str.split("(")[0]
-                sch = next(
+                sch_ctx = next(
                     s for s in selected_schemas
                     if json.loads(s.metadata["schema"])["name"] == name
                 )
                 out_ctx = ContextObject.make_stage(
-                    "tool_output", [sch.context_id], block
+                    "tool_output", [sch_ctx.context_id], block
                 )
                 out_ctx.stage_id = f"tool_output_{attempt}"
-                out_ctx.summary = block["output"] if ok else f"ERROR: {err}"
+                out_ctx.summary  = block["output"] if ok else f"ERROR: {err}"
                 out_ctx.touch(); self.repo.save(out_ctx)
                 tool_ctxs.append(out_ctx)
 
-                status[call_str] = ok
+                call_status[call_str] = ok
                 if not ok:
                     errors.append((call_str, err))
 
             if not errors:
                 break
 
-            errs = [f"{c} → {e}" for c,e in errors]
-            failed = [c for c,_ in errors]
-            docs = []
+            # prepare retry context
+            err_lines    = [f"{c} → {e}" for c, e in errors]
+            failed_calls = [c for c, _ in errors]
+
+            docs: List[str] = []
             for sch in selected_schemas:
                 data = json.loads(sch.metadata["schema"])
-                if data["name"] in {f.split("(")[0] for f in failed}:
-                    docs.append(f"**{data['name']}**\\n{data.get('description','(no docs)')}")
+                if data["name"] in {fc.split("(")[0] for fc in failed_calls}:
+                    docs.append(f"**{data['name']}**: {data.get('description','(no docs)')}")
 
-            retry_sys = (
-                "Some tool calls failed:\\n" + "\\n".join(errs)
-                + "\\n\\nOriginal plan:\\n" + plan_output
-                + "\\n\\nFull docstrings for the failed tools:\\n\\n"
-                + "\\n\\n".join(docs)
-                + "\\n\\nPlease correct **only** the failing calls."
-                " Reply **ONLY** with JSON:\\n"
-                '{"tool_calls": ["call1(...)", ...]}'
+            analysis_system = (
+                "The following tool calls failed with exceptions:\n"
+                + "\n".join(err_lines)
+                + "\n\nOriginal plan:\n" + plan_output
+                + "\n\nDocumentation for failed tools:\n"
+                + "\n".join(docs)
+                + "\n\nPlease analyze these failures (no hard-coded fixes) "
+                  "and propose corrected tool_calls. Reply **ONLY** with JSON: {\"tool_calls\": [...]}"
             )
-            self._print_stage_context("tool_chaining_retry", {"errors": errs})
-            retry_msgs = [
-                {"role":"system","content":retry_sys},
-                {"role":"user","content":json.dumps({"tool_calls": failed})}
-            ]
-            retry_out = self._stream_and_capture(self.secondary_model, retry_msgs, tag="[ToolChainRetry]")
+
+            # **Print full retry window**
+            self._print_stage_context("tool_chaining_retry", {
+                "errors":       err_lines,
+                "failed_docs":  docs,
+                "retry_prompt": [analysis_system],
+            })
+
+            retry_out = self._stream_and_capture(
+                self.secondary_model,
+                [
+                    {"role": "system",  "content": analysis_system},
+                    {"role": "user",    "content": json.dumps({"tool_calls": failed_calls})}
+                ],
+                tag="[ToolChainRetry]"
+            )
 
             try:
                 fixed = json.loads(retry_out.strip())["tool_calls"]
             except:
                 parsed = Tools.parse_tool_call(retry_out)
-                fixed = parsed if isinstance(parsed,list) else ([parsed] if parsed else [])
+                fixed = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
 
+            fixed = _norm(fixed)
+            if not fixed:
+                fixed = [c for c, ok in call_status.items() if ok is not True]
+
+            # merge
             new_raw = []
-            for o in raw_calls:
-                if o in failed:
-                    new_raw.append(fixed.pop(0) if fixed else o)
+            fix_iter = iter(fixed)
+            for orig in raw_calls:
+                if orig in failed_calls:
+                    new_raw.append(next(fix_iter, orig))
                 else:
-                    new_raw.append(o)
-            raw_calls = new_raw
+                    new_raw.append(orig)
+            raw_calls   = new_raw
+            call_status = {c: call_status.get(c) for c in raw_calls}
 
         return tool_ctxs
+
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
         refs = [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids']
