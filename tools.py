@@ -28,6 +28,8 @@ from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 from queue import Queue, Empty
 import uuid
 from pathlib import Path
+from num2words import num2words
+import numpy as np
 
 import networkx as nx
 import sqlite3
@@ -124,6 +126,163 @@ def _create_tool_schema(fn: Callable) -> Dict[str, Any]:
     return schema_obj
 
 
+# Here in this class, we define various utility functions for text processing, embedding, and other operations. We also include methods for removing emojis, converting numbers to words, and calculating cosine similarity.
+class Utils:
+    @staticmethod
+    def remove_emojis(text):
+        emoji_pattern = re.compile(
+            "[" 
+            u"\U0001F600-\U0001F64F"  
+            u"\U0001F300-\U0001F5FF"
+            u"\U0001F680-\U0001F6FF"
+            u"\U0001F1E0-\U0001F1FF"
+            "]+", flags=re.UNICODE)
+        result = emoji_pattern.sub(r'', text)
+        log_message("Emojis removed from text.", "DEBUG")
+        return result
+    
+    @staticmethod
+    def convert_numbers_to_words(text):
+        def replace_num(match):
+            number_str = match.group(0)
+            try:
+                return num2words(int(number_str))
+            except ValueError:
+                return number_str
+        converted = re.sub(r'\b\d+\b', replace_num, text)
+        log_message("Numbers converted to words in text.", "DEBUG")
+        return converted
+    
+    @staticmethod
+    def get_current_time():
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message("Current time retrieved.", "DEBUG")
+        return current_time
+    
+    @staticmethod
+    def cosine_similarity(vec1, vec2):
+        if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
+            log_message("One of the vectors has zero norm in cosine similarity calculation.", "WARNING")
+            return 0.0
+        similarity = float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+        log_message("Cosine similarity computed.", "DEBUG")
+        return similarity
+    
+    @staticmethod
+    def safe_load_json_file(path, default):
+        if not path:
+            return default
+        if not os.path.exists(path):
+            if default == []:
+                with open(path, 'w') as f:
+                    json.dump([], f)
+            return default
+        try:
+            with open(path, 'r') as f:
+                result = json.load(f)
+            log_message(f"JSON file loaded from {path}.", "DEBUG")
+            return result
+        except Exception:
+            log_message(f"Failed to load JSON file from {path}, returning default.", "ERROR")
+            return default
+        
+    def _sanitize_tool_call(code: str) -> str:
+        """
+        Parse the code string as an AST.Call, re-serialize string
+        literals with proper escapes (\n, \') so the final Python is valid.
+        """
+        try:
+            tree = ast.parse(code, mode="eval")
+            call = tree.body
+            if not isinstance(call, ast.Call):
+                return code
+            func = call.func.id
+            parts = []
+            # positional args
+            for arg in call.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    parts.append(repr(arg.value))
+                else:
+                    parts.append(ast.unparse(arg))
+            # keyword args
+            for kw in call.keywords:
+                val = kw.value
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    v = repr(val.value)
+                else:
+                    v = ast.unparse(val)
+                parts.append(f"{kw.arg}={v}")
+            return f"{func}({', '.join(parts)})"
+        except Exception:
+            # if anything goes wrong, just return the original
+            return code
+
+    @staticmethod
+    def load_format_schema(fmt):
+        if not fmt:
+            return None
+        if fmt.lower() == "json":
+            log_message("JSON format schema detected.", "DEBUG")
+            return "json"
+        if os.path.exists(fmt):
+            try:
+                with open(fmt, 'r') as f:
+                    result = json.load(f)
+                log_message("Format schema loaded from file.", "DEBUG")
+                return result
+            except Exception:
+                log_message("Error loading format schema from file.", "ERROR")
+                return None
+        log_message("No valid format schema found.", "WARNING")
+        return None
+    
+    @staticmethod
+    def monitor_script(interval=5):
+        script_path = os.path.abspath(__file__)
+        last_mtime = os.path.getmtime(script_path)
+        log_message("Monitoring script for changes...", "PROCESS")
+        while True:
+            time.sleep(interval)
+            try:
+                new_mtime = os.path.getmtime(script_path)
+                if new_mtime != last_mtime:
+                    log_message("Script change detected. Restarting...", "INFO")
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception:
+                pass
+
+    @staticmethod
+    def embed_text(text):
+        """
+        Embed into a 1-D numpy array of shape (768,).
+        """
+        try:
+            #log_message("Embedding text for context.", "PROCESS")
+            response = embed(model="nomic-embed-text", input=text)
+            vec = np.array(response["embeddings"], dtype=float)
+            # ensure 1-D
+            vec = vec.flatten()
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            #log_message("Text embedding computed and normalized.", "SUCCESS")
+            return vec
+        except Exception as e:
+            log_message("Error during text embedding: " + str(e), "ERROR")
+            return np.zeros(768, dtype=float)
+
+    @staticmethod
+    def speak(text: str):
+        """
+        Legacy wrapper.  Forwards *text* to the global TTS queue if
+        present.  Silently ignores every error.
+        """
+        try:
+            from __main__ import tts_queue
+            tts_queue.put(str(text))
+        except Exception:
+            pass
+        
 # This class delivers various utility functions for managing tools, such as parsing tool calls, adding subtasks, and listing subtasks for use by an LLM instance or other components.
 class Tools:
     _driver = None          # always present, even before first browser launch
@@ -1948,50 +2107,59 @@ class Tools:
             for i, e in enumerate(entries, 1)
         )
 
-    # This static method retrieves the chat history based on various input parameters. It can return messages from a specific timeframe, the last N messages, or messages relevant to a query. It merges on-disk session logs with in-memory history and returns the results in JSON format.
-    # The method handles different input formats and applies semantic similarity search if a query is provided.
-    # It also ensures that the results are formatted consistently and includes timestamps, roles, and content.
-    # The method is designed to be flexible and can handle various use cases for retrieving chat history.
     @staticmethod
-    def get_chat_history(arg1=None, arg2=None) -> str:
+    def get_chat_history(arg1=None, arg2=None, time=None, n=None) -> str:
         """
         get_chat_history("today"/"yesterday"/"last N days") -> all messages in that window
         get_chat_history(n) -> last n messages
         get_chat_history(n, "2 days") -> last n messages from the last 2 days
         get_chat_history("query", n) -> top-n by relevance to 'query'
+        get_chat_history(time="today", n=10) -> top-10 today
 
-        Also merges on-disk chat_sessions/*/session.txt entries with in-memory history,
+        Also merges ContextObject entries from context.jsonl with in-memory history,
         and caps any semantic similarity search to the 100 most recent messages.
         """
+        # normalize keyword args for backwards-compatibility
+        if time is not None:
+            arg1 = time
+        if n is not None:
+            arg2 = n
+
         import os, re, json
         from datetime import datetime, timedelta
 
-        # 1) Load on-disk session logs (one session.txt per dated folder)
-        script_dir   = os.path.dirname(os.path.abspath(__file__))
-        sessions_dir = os.path.join(script_dir, "chat_sessions")
-        disk_entries = []
-        if os.path.isdir(sessions_dir):
-            for sub in os.listdir(sessions_dir):
-                session_file = os.path.join(sessions_dir, sub, "session.txt")
-                if os.path.isfile(session_file):
-                    try:
-                        with open(session_file, "r", encoding="utf-8") as f:
-                            for line in f:
-                                try:
-                                    e = json.loads(line)
-                                    if all(k in e for k in ("timestamp", "role", "content")):
-                                        disk_entries.append(e)
-                                except:
-                                    continue
-                    except:
-                        continue
+        # 1) Load ContextObject entries from context.jsonl
+        from context import ContextObject
+
+        script_dir     = os.path.dirname(os.path.abspath(__file__))
+        context_file   = os.path.join(script_dir, "context.jsonl")
+        context_entries = []
+        if os.path.isfile(context_file):
+            try:
+                with open(context_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            obj = ContextObject.from_json(line)
+                            context_entries.append({
+                                "timestamp":      obj.timestamp,
+                                "role":           obj.metadata.get("role"),
+                                "content":        obj.metadata.get("content", obj.summary or ""),
+                                "context_id":     obj.context_id,
+                                "domain":         obj.domain,
+                                "component":      obj.component,
+                                "semantic_label": obj.semantic_label,
+                            })
+                        except Exception:
+                            continue
+            except Exception:
+                pass
 
         # 2) Grab in-memory entries
         hm = Tools._history_manager
         mem_entries = hm.history if hm else []
 
-        # 3) Merge (disk first so in-memory can override if identical timestamps)
-        all_entries = disk_entries + mem_entries
+        # 3) Merge (context first so in-memory can override if identical timestamps)
+        all_entries = context_entries + mem_entries
 
         # --- 1) TIMEFRAME-ONLY MODE ---
         if isinstance(arg1, str):
@@ -2018,13 +2186,16 @@ class Tools:
                 for e in all_entries:
                     try:
                         ts = datetime.fromisoformat(e["timestamp"])
+                    except ValueError:
+                        from datetime import datetime as _dt
+                        ts = _dt.strptime(e["timestamp"], "%Y%m%dT%H%M%SZ")
                     except:
                         continue
                     if start <= ts < end:
                         results.append({
                             "timestamp": e["timestamp"],
-                            "role":      e["role"],
-                            "content":   e["content"]
+                            "role":      e.get("role"),
+                            "content":   e.get("content")
                         })
                 return json.dumps({"results": results}, indent=2)
 
@@ -2033,7 +2204,6 @@ class Tools:
         since_dt = None
         query    = None
 
-        # If arg1 is a number → last N messages (with optional period arg2)
         if isinstance(arg1, (int, str)) and re.match(r'^\d+$', str(arg1)):
             top_n = int(arg1)
             if arg2:
@@ -2052,10 +2222,15 @@ class Tools:
                 else:
                     try:
                         since_dt = datetime.fromisoformat(arg2)
+                    except ValueError:
+                        try:
+                            from datetime import datetime as _dt
+                            since_dt = _dt.strptime(arg2, "%Y%m%dT%H%M%SZ")
+                        except:
+                            since_dt = None
                     except:
                         since_dt = None
         else:
-            # Otherwise interpret arg1 as a query string
             if arg1 is not None:
                 query = str(arg1)
                 if arg2 and re.match(r'^\d+$', str(arg2)):
@@ -2063,7 +2238,6 @@ class Tools:
             if top_n is None:
                 top_n = 5
 
-        # Default if still unset
         if top_n is None:
             top_n = 5
 
@@ -2072,6 +2246,12 @@ class Tools:
         for e in all_entries:
             try:
                 ts = datetime.fromisoformat(e["timestamp"])
+            except ValueError:
+                from datetime import datetime as _dt
+                try:
+                    ts = _dt.strptime(e["timestamp"], "%Y%m%dT%H%M%SZ")
+                except:
+                    continue
             except:
                 continue
             if since_dt and ts < since_dt:
@@ -2081,7 +2261,6 @@ class Tools:
         # 4) Build results list
         scored = []
         if query:
-            # cap to last 100 for embedding efficiency
             candidates = filtered[-100:]
             q_vec = Utils.embed_text(query)
             for e in candidates:
@@ -2092,7 +2271,6 @@ class Tools:
                 scored.append((score, e))
             scored.sort(key=lambda x: x[0], reverse=True)
         else:
-            # reverse-chronological for no-query
             for e in reversed(filtered):
                 scored.append((0.0, e))
 
@@ -2108,6 +2286,7 @@ class Tools:
             })
 
         return json.dumps({"results": out}, indent=2)
+
 
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
     @staticmethod

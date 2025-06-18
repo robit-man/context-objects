@@ -475,28 +475,41 @@ class Assembler:
             if json.loads(sch.metadata["schema"])["name"] in sel_names
         ]
 
-        # Step G: if any selected, show full docs and reconfirm
+        # Step G: if any selected, show full docs (with real signature & source) and reconfirm
         if selected_schemas:
+            import inspect
             full_docs = []
             for sch in selected_schemas:
-                data = json.loads(sch.metadata["schema"])
-                full_docs.append(f"**{data['name']}**\n{data.get('description','(no documentation)')}")
+                schema = json.loads(sch.metadata["schema"])
+                name = schema["name"]
+                desc = schema.get("description", "(no documentation)")
+                func = getattr(Tools, name, None)
+                sig = inspect.signature(func) if func else "()"
+                try:
+                    src = inspect.getsource(func)
+                except (OSError, TypeError):
+                    src = "# source not available"
+                full_docs.append(
+                    f"**{name}{sig}**\n{desc}\n\n```python\n{src}\n```"
+                )
             docs_block = "\n\n".join(full_docs)
 
             system_full = (
-                "You have chosen these tools and their full documentation:\n\n"
+                "You have chosen these tools. Below is their exact Python signature and source:\n\n"
                 f"{docs_block}\n\n"
-                "Now confirm or adjust your calls. **Reply only** with JSON:\n"
-                '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}'
+                "Stage 1: Read and understand each signature and implementation.\n"
+                "Stage 2: Reply **ONLY** with JSON of corrected calls matching those signatures:\n"
+                '{"tool_calls": ["tool1(arg1=..., arg2=...)", ...]}'
             )
             self._print_stage_context("tool_chaining_details", {
-                "selected_tools": docs_block.split("\n"),
+                "selected_tools_source": docs_block.split("\n"),
             })
             msgs_full = [
                 {"role": "system", "content": system_full},
                 {"role": "user",   "content": json.dumps({"tool_calls": raw_calls})},
             ]
             out_full = self._stream_and_capture(self.secondary_model, msgs_full, tag="[ToolChainDetails]")
+
 
             try:
                 confirmed = json.loads(out_full.strip())["tool_calls"]
@@ -602,11 +615,13 @@ class Assembler:
                 "The following tool calls failed with exceptions:\n"
                 + "\n".join(err_lines)
                 + "\n\nOriginal plan:\n" + plan_output
-                + "\n\nDocumentation for failed tools:\n"
-                + "\n".join(docs)
-                + "\n\nPlease analyze these failures (no hard-coded fixes) "
-                  "and propose corrected tool_calls. Reply **ONLY** with JSON: {\"tool_calls\": [...]}"
+                + "\n\nFor each failed tool, here is its Python signature and source:\n\n"
+                + "\n\n".join(docs)  # docs already built via inspect in stage8
+                + "\n\nStage 1: Review the failures and inspect the code above.\n"
+                + "Stage 2: Reply **ONLY** with JSON of corrected calls matching the real function signatures:\n"
+                + "{\"tool_calls\": [...]}"
             )
+
 
             # **Print full retry window**
             self._print_stage_context("tool_chaining_retry", {
@@ -683,10 +698,6 @@ class Assembler:
         resp_ctx.touch(); self.repo.save(resp_ctx)
 
         return reply
-
-
-
-
 
 if __name__ == "__main__":
     asm = Assembler()
