@@ -1,40 +1,73 @@
-from typing import Callable, Dict, Any, List, Tuple, Union, Optional
+# stage.py
+import json
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+from context import ContextObject
+from ollama import chat
 
-class Stage:
+class Stage(ABC):
     """
-    Encapsulates one pipeline step:
-      - name: comma-separated output keys
-      - model: model name for LLM stages (or None)
-      - func: bound Assembler method implementing the stage
-      - inputs: list of state keys to pull as args
-      - beginning_instruction: optional system prompt injected before context
-      - appended_instruction: optional system prompt injected after context
+    Base class for a single pipeline stage.
+    Subclasses must define:
+      - name: the stage_id / semantic_label
+      - model: which LLM to call (None for non-LLM stages)
+      - assemble(state): List of messages to send, or [] if no LLM
+      - process(raw, state): turn raw LLM or parser output → metadata dict
     """
-    def __init__(
-        self,
-        name: str,
-        model: Optional[str],
-        func: Callable[..., Union[Any, Tuple[Any, ...]]],
-        inputs: List[str],
-        beginning_instruction: Optional[str] = None,
-        appended_instruction: Optional[str] = None
-    ):
-        self.name                  = name
-        self.model                 = model
-        self.func                  = func
-        self.inputs                = inputs
-        self.beginning_instruction = beginning_instruction
-        self.appended_instruction  = appended_instruction
+    name: str
+    model: Optional[str] = None
 
-    def execute(self, state: Dict[str, Any]) -> Union[Any, Tuple[Any, ...]]:
-        args = [state[k] for k in self.inputs]
-        # If an LLM is involved, pass through any system instructions
-        if self.model:
-            return self.func(
-                model=self.model,
-                *args,
-                beginning_instruction=self.beginning_instruction,
-                appended_instruction=self.appended_instruction
-            )
-        # Otherwise, run as before
-        return self.func(*args)
+    def __init__(self, repo, printer, default_model: str):
+        self.repo = repo
+        self.print_context = printer
+        self.default_model = default_model
+
+    @abstractmethod
+    def assemble(self, state: Dict[str, Any]) -> List[Dict[str,Any]]:
+        ...
+
+    @abstractmethod
+    def process(self, raw: Any, state: Dict[str, Any]) -> Dict[str, Any]:
+        ...
+
+    def run(self, state: Dict[str,Any]) -> ContextObject:
+        # 1) assemble messages
+        msgs = self.assemble(state)
+
+        # 2) call LLM if needed
+        if msgs:
+            model = self.model or self.default_model
+            raw = self._stream_and_capture(model, msgs, tag=f"[{self.name}]")
+        else:
+            raw = None
+
+        # 3) process
+        meta = self.process(raw, state)
+
+        # 4) persist as ContextObject
+        ctx = ContextObject.make_stage(
+            self.name,
+            state.get("refs", []),
+            meta
+        )
+        ctx.stage_id = self.name
+        # summary = JSON if dict/list, else str
+        ctx.summary = json.dumps(meta) if isinstance(meta, (dict, list)) else str(meta)
+        ctx.touch()
+        self.repo.save(ctx)
+
+        # 5) record ref for next stages
+        state["refs"].append(ctx.context_id)
+        state[self.name] = ctx
+        state.update(meta)
+        return ctx
+
+    def _stream_and_capture(self, model: str, messages: List[Dict[str,Any]], tag: str="") -> str:
+        out = ""
+        print(f"{tag} ", end="", flush=True)
+        for part in chat(model=model, messages=messages, stream=True):
+            chunk = part["message"]["content"]
+            print(chunk, end="", flush=True)
+            out += chunk
+        print()
+        return out

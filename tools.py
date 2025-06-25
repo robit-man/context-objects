@@ -1699,6 +1699,7 @@ class Tools:
     @staticmethod
     def open_browser(headless: bool = False, force_new: bool = False) -> str:
         """
+        Do not use this tool, use search_internet(topic="string") INSTEAD!!!
         Launch Chrome/Chromium on x86-64 **and** ARM.
         Tries Selenium-Manager → system chromedriver → webdriver-manager.
         """
@@ -1886,14 +1887,14 @@ class Tools:
 
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def search_internet(        # ← new canonical name
-        topic: str,
-        num_results: int = 5,
-        wait_sec: int = 1,
-        deep_scrape: bool = True,
-    ) -> list:
+    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
+
+        1. Call search_internet(topic=str, top_n=int)
+        - topic (str): the search term, use `topic`
+        - top_n (int): how many results, use `top_n`
+
         • Opens the first *num_results* links in separate tabs and deep-scrapes each.
         • Returns: title, url, snippet, summary, and full page HTML (`content`).
         • Never blocks more than 5 s on any wait—everything is aggressively polled.
@@ -2071,6 +2072,8 @@ class Tools:
     @staticmethod
     def selenium_extract_summary(url: str, wait_sec: int = 8) -> str:
         """
+        Do not use this tools, call summarize_search(topic="content") instead!
+
         Fast two-stage page summariser:
 
         1. Try a lightweight `Tools.bs4_scrape()` (no browser).
@@ -2608,18 +2611,51 @@ class Tools:
         return -1
 
     # This static method retrieves the battery voltage from a file named "voltage.txt" located in the user's home directory. It reads the voltage value, logs the action, and returns the voltage as a float. If an error occurs while reading the file, it logs the error and raises a RuntimeError.
-    @staticmethod
     def get_battery_voltage():
+        """
+        1. Try to read ~/voltage.txt and return its float value.
+        2. If that fails (file missing or parse error), fall back to psutil.sensors_battery():
+           - percent: battery.percent
+           - power_plugged: battery.power_plugged
+           - time_left: formatted hh:mm:ss from battery.secsleft
+        Raises RuntimeError on any unexpected failure.
+        """
+        def convert_time(seconds: float) -> str:
+            minutes, seconds = divmod(seconds, 60)
+            hours, minutes = divmod(minutes, 60)
+            return f"{int(hours)}:{int(minutes):02d}:{int(seconds):02d}"
+
         try:
             home_dir = os.path.expanduser("~")
             file_path = os.path.join(home_dir, "voltage.txt")
-            with open(file_path, "r") as f:
-                voltage = float(f.readline().strip())
-            log_message("Battery voltage retrieved.", "SUCCESS")
-            return voltage
+            if os.path.exists(file_path):
+                with open(file_path, "r") as f:
+                    line = f.readline().strip()
+                voltage = float(line)
+                log_message("Battery voltage retrieved from voltage.txt.", "SUCCESS")
+                return voltage
+
+            # Fallback to system battery info
+            battery = psutil.sensors_battery()
+            if battery is None:
+                raise RuntimeError("No system battery information available.")
+            percent      = battery.percent
+            power_plugged = battery.power_plugged
+            secsleft     = battery.secsleft
+            time_left    = convert_time(secsleft)
+
+            log_message("Battery info retrieved via system sensors.", "SUCCESS")
+            return {
+                "percent": percent,
+                "power_plugged": power_plugged,
+                "time_left": time_left
+            }
+
         except Exception as e:
-            log_message("Error reading battery voltage: " + str(e), "ERROR")
-            raise RuntimeError(f"Error reading battery voltage: {e}")
+            msg = f"Error reading battery voltage: {e}"
+            log_message(msg, "ERROR")
+            raise RuntimeError(msg)
+
     
 
     # This static method summarizes a web search by calling the search_internet method to get the top_n results for a given topic. It scrapes each URL for content, asks a secondary agent tool for a summary, and returns a formatted bullet list of the results.
@@ -2628,7 +2664,7 @@ class Tools:
         """
         Summarize web pages for a search topic.
 
-        1. Call summarize_search(topic: str, top_n: int)
+        1. Call summarize_search(topic=str, top_n=int)
         - topic (str): the search term, use `topic`
         - top_n (int): how many results, use `top_n`
 

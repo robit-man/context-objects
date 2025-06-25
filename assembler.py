@@ -197,6 +197,17 @@ class Assembler:
 
         logger.info("Assembler initialized.")
 
+    def _ensure_str(self, x: Any) -> str:
+        """
+        Coerce non-string into JSON/text so strip()/json.loads() never fails.
+        """
+        if isinstance(x, str):
+            return x
+        try:
+            return json.dumps(x)
+        except:
+            return str(x)
+
     def _load_system_prompts(self) -> ContextObject:
         prompts = self.repo.query(
             lambda c: c.domain=="artifact" and c.component in ("prompt","policy")
@@ -220,12 +231,21 @@ class Assembler:
         segs.sort(key=lambda c: c.timestamp)
         return segs[-self.hist_k:]
 
-    def _print_stage_context(self, name: str, sections: Dict[str, List[Any]]):
+    def _print_stage_context(self, name: str, sections: Dict[str, Any]):
         print(f"\n>>> [Stage: {name}] Context window:")
         for title, lines in sections.items():
             print(f"  -- {title}:")
-            for ln in lines:
-                print(f"     {ln}")
+            # if it's a raw string, split on real newlines only
+            if isinstance(lines, str):
+                for ln in lines.splitlines():
+                    print(f"     {ln}")
+            # if it's a list of items, print each
+            elif isinstance(lines, list):
+                for ln in lines:
+                    print(f"     {ln}")
+            # fallback (e.g. single int or dict)
+            else:
+                print(f"     {lines}")
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
@@ -243,6 +263,8 @@ class Assembler:
             out += chunk
         print()
         return out
+
+
 
     def run_with_meta_context(self, user_text: str) -> str:
         state: Dict[str, Any] = {}
@@ -265,24 +287,85 @@ class Assembler:
         # Stage 5: external knowledge
         state['know_ctx'] = self._stage5_external_knowledge(state['clar_ctx'])
 
-        # Stage 6: prepare tools & plan summary
+        # Stage 6: prepare tools & plan
         tools_list = self._stage6_prepare_tools()
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
             state['clar_ctx'], state['know_ctx'], tools_list
         )
 
-        # Stage 7: tool chaining → parse tool_calls
+        # Stage 7b: static plan validation *and* fix
+        state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
+            state['plan_ctx'],
+            state['plan_output'],
+            tools_list
+        )
+        if state['plan_errors']:
+            # instead of bailing out, we could loop or escalate—but for now,
+            # just surface the error
+            raise RuntimeError(f"Plan validation failed: {state['plan_errors']}")
+
+        # Build a single‐string “plan” from the fixed calls
+        plan_cmds = "\n".join(state['fixed_calls'])
+
+        # Stage 7: tool chaining (drive from fixed_calls, not original plan_output)
         state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
-            state['plan_ctx'], state['plan_output'], tools_list
+            state['plan_ctx'],
+            plan_cmds,
+            tools_list
         )
 
-        # Stage 8: invoke with retries
+        # Stage 8.5: (optional) user confirmation
+        state['confirmed_calls'] = self._stage8_5_user_confirmation(
+            raw_calls, user_text
+        )
+
+        # Stage 8: invoke with retries (again, pass plan_cmds)
         state['tool_ctxs'] = self._stage9_invoke_with_retries(
-            raw_calls, state['plan_output'], selected_schemas
+            state['confirmed_calls'],
+            plan_cmds,
+            selected_schemas,
+            user_text,
+            state['clar_ctx'].metadata
         )
 
-        # Stage 9: assemble intermediate & final inference
-        return self._stage10_assemble_and_infer(user_text, state)
+        # Stage 9b: reflection & possible replan (pass plan_cmds)
+        replan = self._stage9b_reflection_and_replan(
+            state['tool_ctxs'],
+            plan_cmds,
+            user_text,
+            state['clar_ctx'].metadata
+        )
+        if replan:
+            # one‐shot replan loop (you can repeat the above pattern)
+            plan_cmds = replan
+            state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
+                state['plan_ctx'], plan_cmds, tools_list
+            )
+            state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
+                state['plan_ctx'], plan_cmds, tools_list
+            )
+            state['confirmed_calls'] = self._stage8_5_user_confirmation(raw_calls, user_text)
+            state['tool_ctxs'] = self._stage9_invoke_with_retries(
+                state['confirmed_calls'],
+                plan_cmds,
+                selected_schemas,
+                user_text,
+                state['clar_ctx'].metadata
+            )
+
+        # Stage 10: assemble draft answer
+        draft = self._stage10_assemble_and_infer(user_text, state)
+
+        # Stage 10b: critique & safety polish
+        final = self._stage10b_response_critique_and_safety(draft, user_text)
+
+        # Stage 11: memory write-back
+        self._stage11_memory_writeback(final, state['tool_ctxs'])
+
+        return final
+
+
+
 
     def _stage1_record_input(self, user_text: str) -> ContextObject:
         # record the new user input
@@ -482,6 +565,152 @@ class Assembler:
         ctx.touch()
         self.repo.save(ctx)
         return ctx, plan
+    
+    def _stage7b_plan_validation(
+        self,
+        plan_ctx: ContextObject,
+        plan_output: str,
+        tools_list: List[Dict[str, str]]
+    ) -> Tuple[List[str], List[Tuple[str,str]], List[str]]:
+        """
+        1) Statically verify each intended call in plan_output against its schema.
+        2) If any are missing required params, loop up to max_attempts:
+           - In all but the last attempt, include only the schema docs.
+           - On the last attempt, also fetch and include the actual tool source code
+             to give the LLM maximum context for filling in missing args.
+        3) If the model hallucinates a non‐existent tool, automatically remap it
+           to the closest real tool name before validating.
+        Returns (valid_calls, errors, fixed_calls)
+        """
+        import json, re, inspect, difflib
+
+        # load all tool schemas
+        all_schs = {
+            json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
+            for c in self.repo.query(
+                lambda c: c.component=="schema" and "tool_schema" in c.tags
+            )
+        }
+
+        # extract the initial calls
+        raw_calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
+        fixed_calls = list(raw_calls)
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            valid: List[str] = []
+            errors: List[Tuple[str,str]] = []
+            missing: Dict[str,List[str]] = {}
+
+            # A) validate (and remap hallucinations) in one pass
+            for idx, call in enumerate(list(fixed_calls)):
+                name, args_str = call.split("(", 1)
+                args_str = args_str.rstrip(")")
+                # 1) if tool name doesn't exist, try to auto‐remap
+                if name not in all_schs:
+                    best = difflib.get_close_matches(name, all_schs.keys(), n=1)
+                    if best:
+                        real = best[0]
+                        new_call = f"{real}({args_str})"
+                        fixed_calls[idx] = new_call
+                        name = real
+                        sch  = all_schs[real]
+                    else:
+                        errors.append((call, "no schema found"))
+                        continue
+                else:
+                    sch = all_schs[name]
+
+                # 2) parse kwargs and find missing
+                kwargs: Dict[str,str] = {}
+                for part in filter(None, args_str.split(",")):
+                    if "=" not in part: continue
+                    k, v = part.split("=", 1)
+                    kwargs[k.strip()] = v.strip()
+
+                req = set(sch.get("parameters", {}).get("required", []))
+                miss = sorted(req - set(kwargs.keys()))
+                if miss:
+                    errors.append((fixed_calls[idx], f"missing required: {miss}"))
+                    missing[fixed_calls[idx]] = miss
+                else:
+                    valid.append(fixed_calls[idx])
+
+            # B) if nothing is missing, we’re done
+            if not missing:
+                break
+
+            # C) build docs for failures (schema, and on last attempt full source)
+            docs_lines: List[str] = []
+            for call, miss in missing.items():
+                tool = call.split("(",1)[0]
+                sch  = all_schs.get(tool, {})
+                desc   = sch.get("description", "(no description)")
+                params = sch.get("parameters", {})
+                docs_lines.append(
+                    f"• **{tool}**: {desc}\n"
+                    f"  Parameters:\n{json.dumps(params, indent=2)}"
+                )
+                if attempt == max_attempts:
+                    try:
+                        src = inspect.getsource(getattr(Tools, tool))
+                    except Exception:
+                        src = "(source unavailable)"
+                    docs_lines.append(f"```python\n{src}\n```")
+
+            # print to your console for debugging
+            self._print_stage_context("plan_validation_docs", {
+                "tool_docs": docs_lines
+            })
+
+            docs_blob  = "\n\n".join(docs_lines)
+            miss_lines = "\n".join(f"{c} → missing {m}" for c, m in missing.items())
+
+            # D) assemble the fix prompt
+            if attempt < max_attempts:
+                prompt = (
+                    "Some tool calls are missing required arguments:\n"
+                    f"{miss_lines}\n\n"
+                    "Here are the schemas for those tools:\n\n"
+                    f"{docs_blob}\n\n"
+                    "**Return only** JSON of the form:\n"
+                    '{"fixed_calls": ["tool1(arg=...)", ...]}'
+                )
+            else:
+                prompt = (
+                    "Final attempt: some calls remain invalid:\n"
+                    f"{miss_lines}\n\n"
+                    "Below are both the schema definitions AND the full source code.\n"
+                    f"{docs_blob}\n\n"
+                    "**Return only** JSON:\n"
+                    '{"fixed_calls": ["tool1(arg=...)", ...]}'
+                )
+
+            out = self._stream_and_capture(
+                self.secondary_model,
+                [{"role": "system", "content": prompt}],
+                tag="[PlanFix]"
+            ).strip()
+
+            # parse LLM’s fixed_calls
+            try:
+                fixed_calls = json.loads(out)["fixed_calls"]
+            except Exception:
+                parsed = Tools.parse_tool_call(out)
+                if isinstance(parsed, list):
+                    fixed_calls = parsed
+                elif parsed:
+                    fixed_calls = [parsed]
+
+        # E) persist final results
+        meta = {"valid": valid, "errors": errors, "fixed_calls": fixed_calls}
+        ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
+        ctx.stage_id = "plan_validation"
+        ctx.summary  = f"Valid: {valid}" if not errors else f"Errors: {errors}"
+        ctx.touch(); self.repo.save(ctx)
+        self._print_stage_context("plan_validation", meta)
+
+        return valid, errors, fixed_calls
 
 
     def _stage8_tool_chaining(
@@ -492,100 +721,172 @@ class Assembler:
     ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
         import json, re
 
-        # --- Fetch only schemas for the tools the plan selected ---
+        # ── A) Extract raw calls from the plan ──────────────────────────────
+        text = plan_output
+        parsed = Tools.parse_tool_call(text)
+        if isinstance(parsed, list):
+            raw = parsed
+        elif parsed:
+            raw = [parsed]
+        else:
+            # fallback to regex
+            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', text)
+
+        # ── B) Dedupe & preserve order ─────────────────────────────────────
+        seen = set()
+        calls: List[str] = []
+        for c in raw:
+            if isinstance(c, str) and c not in seen:
+                seen.add(c)
+                calls.append(c)
+
+        # ── C) Retrieve only the schemas that match these calls ────────────
         all_schemas = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
-        sel_names = {t["name"] for t in tools_list}
         selected_schemas: List[ContextObject] = []
-        docs_lines: List[str] = []
+        full_schemas: List[Dict[str,Any]] = []
+        for sch_obj in all_schemas:
+            schema = json.loads(sch_obj.metadata["schema"])
+            if schema["name"] in {call.split("(")[0] for call in calls}:
+                selected_schemas.append(sch_obj)
+                full_schemas.append(schema)
 
-        for sch in all_schemas:
-            schema = json.loads(sch.metadata["schema"])
-            if schema["name"] in sel_names:
-                selected_schemas.append(sch)
-                desc   = schema.get("description","(no description)")
-                params = json.dumps(schema.get("parameters", {}), indent=2)
-                docs_lines.append(
-                    f"• **{schema['name']}**\n"
-                    f"  description: {desc}\n"
-                    f"  parameters:\n{params}"
-                )
+        # ── D) Build a docs_blob with the full JSON schema for each tool ───
+        docs_blob_parts = []
+        for schema in full_schemas:
+            docs_blob_parts.append(
+                f"**{schema['name']}**\n```json\n"
+                + json.dumps(schema, indent=2)
+                + "\n```"
+            )
+        docs_blob = "\n\n".join(docs_blob_parts)
 
-        # --- System prompt: emphasize sequential execution & output variables ---
-        docs_blob = "\n\n".join(docs_lines)
-        system_short = (
-            "You have these tool definitions (name, description, parameters):\n\n"
-            f"{docs_blob}\n\n"
-            "**Important**:\n"
-            "1. Execute these tools **in the order** you list them.\n"
-            "2. If one tool’s output is needed as input to another, first call the inner tool, "
-            "store its result in `${tool_name}_output`, and then pass that variable into the next.\n"
-            "3. Reply **ONLY** with valid JSON:\n"
-            '{"tool_calls": ["tool1(arg1=..., arg2=...)", ...]}'
+        # ── E) Prompt the LLM, passing only these full schemas ─────────────
+        system = (
+            "You have the following tools (full JSON schemas shown).  "
+            "Please confirm or adjust your tool calls.  Reply **ONLY** with JSON:\n"
+            '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}\n\n'
+            f"{docs_blob}"
         )
-
         self._print_stage_context("tool_chaining", {
-            "tool_docs": docs_lines,
-            "plan":      [plan_output[:200]],
+            "plan":   [plan_output[:200]],
+            "schemas": docs_blob_parts
         })
-
         msgs = [
-            {"role": "system", "content": system_short},
-            {"role": "user",   "content": plan_output},
+            {"role": "system", "content": system},
+            {"role": "user",   "content": json.dumps({"tool_calls": calls})},
         ]
         out = self._stream_and_capture(self.secondary_model, msgs, tag="[ToolChain]")
 
-        # --- Parse the JSON or fallback ---
+        # ── F) Parse the confirmed calls ───────────────────────────────────
         try:
-            raw_calls = json.loads(out.strip())["tool_calls"]
+            parsed2 = json.loads(out.strip())
+            confirmed = parsed2.get("tool_calls", calls)
         except:
-            parsed = Tools.parse_tool_call(out)
-            raw_calls = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+            parsed2 = Tools.parse_tool_call(out)
+            confirmed = (
+                parsed2 if isinstance(parsed2, list)
+                else [parsed2] if parsed2
+                else calls
+            )
 
-        # --- Also catch any bare `tool(...)` in the plan text ---
-        for call in re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\([^)]*\)', plan_output):
-            if call not in raw_calls:
-                raw_calls.append(call)
-
-        # --- Ensure every mentioned tool is invoked at least once ---
-        for t in tools_list:
-            if t["name"] in plan_output and not any(rc.startswith(f"{t['name']}(") for rc in raw_calls):
-                raw_calls.append(f"{t['name']}()")
-
-        # --- Persist the chaining stage ---
+        # ── G) Persist the final chaining stage, including the docs ─────────
         tc_ctx = ContextObject.make_stage(
             "tool_chaining",
-            plan_ctx.references,
-            {"tool_calls": raw_calls}
+            plan_ctx.references + [s.context_id for s in selected_schemas],
+            {
+                "tool_calls": confirmed,
+                "tool_docs": docs_blob
+            }
         )
         tc_ctx.stage_id = "tool_chaining"
-        tc_ctx.summary  = json.dumps(raw_calls)
+        tc_ctx.summary  = json.dumps(confirmed)
         tc_ctx.touch()
         self.repo.save(tc_ctx)
 
-        return tc_ctx, raw_calls, selected_schemas
+        return tc_ctx, confirmed, selected_schemas
+
+
+    def _stage8_5_user_confirmation(
+        self,
+        calls: List[str],
+        user_text: str
+    ) -> List[str]:
+        """
+        (Optional) Surface the to-be-invoked calls for user approval.
+        Here it auto-approves, but hook in your UI/CLI as needed.
+        """
+        self._print_stage_context("user_confirmation", {"calls": calls})
+        confirmed = calls  # replace with real confirmation logic
+        ctx = ContextObject.make_stage(
+            "user_confirmation", [], {"confirmed_calls": confirmed}
+        )
+        ctx.stage_id = "user_confirmation"
+        ctx.summary  = f"Auto-approved: {confirmed}"
+        ctx.touch(); self.repo.save(ctx)
+        return confirmed
+
+
+    def _stage9b_reflection_and_replan(
+        self,
+        tool_ctxs: List[ContextObject],
+        plan_output: str,
+        user_text: str,
+        clar_metadata: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        After tool execution, ask: did outputs meet intent?
+        If not, return a new plan; otherwise return None.
+        """
+        outputs = [f"[{c.stage_id}] {c.summary}" for c in tool_ctxs]
+        prompt = (
+            "We executed these calls:\n"
+            + "\n".join(outputs) + "\n\n"     # ← real newlines here
+            + "\n\nOriginal plan:\n" + plan_output
+            + "\n\nDid these outputs satisfy the original intent?"
+              " If not, provide a corrected plan text only; otherwise reply 'OK'."
+        )
+        self._print_stage_context("reflection_and_replan", {"tool_outputs": outputs})
+        resp = self._stream_and_capture(
+            self.secondary_model,
+            [{"role":"user","content": prompt}],
+            tag="[Reflection]"
+        ).strip()
+        if resp.upper() == "OK":
+            return None
+
+        ctx = ContextObject.make_stage(
+            "reflection_and_replan",
+            [c.context_id for c in tool_ctxs],
+            {"replan": resp}
+        )
+        ctx.stage_id = "reflection_and_replan"
+        ctx.summary  = resp
+        ctx.touch(); self.repo.save(ctx)
+        return resp
 
 
     def _stage9_invoke_with_retries(
         self,
         raw_calls: List[str],
         plan_output: str,
-        selected_schemas: List[ContextObject]
+        selected_schemas: List[ContextObject],
+        user_text: str,
+        clar_metadata: Dict[str, Any]
     ) -> List[ContextObject]:
         """
-        Executes raw_calls sequentially, resolving nested calls by first
-        invoking inner tools and passing their outputs into outer calls.
-        Prints every tool’s raw output or error. On failures, retries up to
-        10 times by presenting the original plan plus **only** the failed
-        tools’ JSON‐schema (description + parameters) for correction.
+        1) Normalize & execute each call in raw_calls in order.
+        2) Run nested inner calls first, capture outputs to ${tool}_output.
+        3) Substitute any ${tool}_output variables.
+        4) Persist each invocation (output/exception) in context.
+        5) On failures, retry up to 10×, prompting only for the failed calls,
+           including original query, clarification notes, plan, extracted vars,
+           and full schemas for the failed tools.
+        Returns list of all tool_output ContextObjects (including nested).
         """
-        from typing import Tuple, Dict, Any
         import json, re
-
-        def validate(res: Dict[str, Any]) -> Tuple[bool, str]:
-            exc = res.get("exception")
-            return (exc is None, exc or "")
+        from typing import Tuple, Any, Dict
 
         def _norm(calls):
             out = []
@@ -596,190 +897,247 @@ class Assembler:
                     out.append(c)
             return out
 
+        def validate(res: Dict[str, Any]) -> Tuple[bool, str]:
+            exc = res.get("exception")
+            return (exc is None, exc or "")
+
+        # ── INITIALIZE ─────────────────────────────────────────────────────────
         raw_calls = _norm(raw_calls)
-        call_status = {c: None for c in raw_calls}
+        call_status: Dict[str, bool] = {c: False for c in raw_calls}
         tool_ctxs: List[ContextObject] = []
         last_results: Dict[str, Any] = {}
         max_retries = 10
 
+        # ── RETRY LOOP ──────────────────────────────────────────────────────────
         for attempt in range(1, max_retries + 1):
-            errors: List[Tuple[str,str]] = []
+            errors: List[Tuple[str, str]] = []
             print(f"\n>>> [Attempt {attempt}/{max_retries}] Executing tool_calls", flush=True)
 
             for original_call in list(raw_calls):
-                if call_status.get(original_call) is True:
+                # skip if already succeeded
+                if call_status[original_call]:
                     continue
 
-                # --- Resolve any nested `${tool}_output` OR inner calls like toolA() inside toolB(...) ---
+                # 1) Substitute any ${tool}_output variables
                 call_str = original_call
-                # 1) substitute previously captured outputs
-                for tname, val in last_results.items():
-                    call_str = call_str.replace(f"${{{tname}_output}}", repr(val))
+                for name, val in last_results.items():
+                    call_str = call_str.replace(f"${{{name}_output}}", repr(val))
 
-                # 2) detect and run any inner tool calls first
-                inner_calls = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\(\s*\)', call_str)
+                # 2) Detect & run any nested inner calls first
+                inner_calls = re.findall(r'\b([A-Za-z_]\w*)\(\)', call_str)
                 for inner in inner_calls:
-                    icall = f"{inner}()"
-                    if icall not in last_results:
-                        print(f"[NestedInvocation] Running inner: {icall}", flush=True)
+                    inner_call = f"{inner}()"
+                    if inner not in last_results:
+                        print(f"[NestedInvocation] Running inner: {inner_call}", flush=True)
                         try:
-                            ires = Tools.run_tool_once(icall)
+                            iout = Tools.run_tool_once(inner_call)
+                            iblock = {"output": iout, "exception": None}
                         except Exception as e:
-                            ires = {"output": None, "exception": str(e)}
-                        ok_i, err_i = validate(ires)
-                        print(f"[NestedInvocation] {'OK' if ok_i else 'ERROR'}", flush=True)
-                        last_results[inner] = ires.get("output")
-                        # record the inner result as its own context
-                        in_sch = next(
+                            iblock = {"output": None, "exception": str(e)}
+                        ok_i, err_i = validate(iblock)
+                        print(f"[NestedInvocation] {'OK' if ok_i else 'ERROR: '+err_i}", flush=True)
+                        last_results[inner] = iblock["output"]
+
+                        # persist nested result
+                        inner_sch = next(
                             sch for sch in selected_schemas
                             if json.loads(sch.metadata["schema"])["name"] == inner
                         )
                         in_ctx = ContextObject.make_stage(
                             "tool_output",
-                            [in_sch.context_id],
-                            ires
+                            [inner_sch.context_id],
+                            iblock
                         )
-                        in_ctx.metadata.update(ires)
-                        in_ctx.stage_id = f"tool_output_{attempt}_inner"
-                        in_ctx.summary  = str(ires.get("output")) if ok_i else f"ERROR: {err_i}"
-                        in_ctx.touch()
-                        self.repo.save(in_ctx)
+                        in_ctx.metadata.update(iblock)
+                        in_ctx.stage_id = f"tool_output_{attempt}_inner_{inner}"
+                        in_ctx.summary  = (
+                            str(iblock["output"])
+                            if ok_i
+                            else f"ERROR: {err_i.splitlines()[-1]}"
+                        )
+                        in_ctx.touch(); self.repo.save(in_ctx)
                         tool_ctxs.append(in_ctx)
 
+                # 3) Execute the primary call
                 print(f"[ToolInvocation] Running: {call_str}", flush=True)
                 try:
-                    result = Tools.run_tool_once(call_str)
+                    out = Tools.run_tool_once(call_str)
+                    block = {"output": out, "exception": None}
                 except Exception as e:
-                    result = {"output": None, "exception": str(e)}
+                    block = {"output": None, "exception": str(e)}
 
-                ok, err = validate(result)
+                ok, err = validate(block)
                 if ok:
-                    print(f"[ToolInvocation] OK, output:\n{result['output']}", flush=True)
+                    print(f"[ToolInvocation] OK → {block['output']!r}", flush=True)
                 else:
-                    print(f"[ToolInvocation] ERROR:\n{result['exception']}", flush=True)
+                    print(f"[ToolInvocation] ERROR → {err.splitlines()[-1]}", flush=True)
 
-                # capture for substitution
-                name = original_call.split("(", 1)[0]
-                last_results[name] = result.get("output")
+                # capture for future substitution
+                tool_name = original_call.split("(", 1)[0]
+                last_results[tool_name] = block["output"]
 
-                # record the call
-                sch_ctx = next(
+                # persist this invocation
+                sch = next(
                     sch for sch in selected_schemas
-                    if json.loads(sch.metadata["schema"])["name"] == name
+                    if json.loads(sch.metadata["schema"])["name"] == tool_name
                 )
                 out_ctx = ContextObject.make_stage(
                     "tool_output",
-                    [sch_ctx.context_id],
-                    result
+                    [sch.context_id],
+                    block
                 )
-                out_ctx.metadata.update(result)
-                out_ctx.stage_id = f"tool_output_{attempt}"
-                out_ctx.summary  = str(result.get("output")) if ok else f"ERROR: {err.splitlines()[-1]}"
-                out_ctx.touch()
-                self.repo.save(out_ctx)
+                out_ctx.metadata.update(block)
+                out_ctx.stage_id = f"tool_output_{attempt}_{tool_name}"
+                out_ctx.summary  = (
+                    str(block["output"])
+                    if ok
+                    else f"ERROR: {err.splitlines()[-1]}"
+                )
+                out_ctx.touch(); self.repo.save(out_ctx)
                 tool_ctxs.append(out_ctx)
 
                 call_status[original_call] = ok
                 if not ok:
                     errors.append((original_call, err))
 
+            # if all succeeded, break
             if not errors:
                 break
 
-            # --- Prepare a focused retry prompt for only the failed tools ---
+            # ── PREPARE RETRY PROMPT ───────────────────────────────────────────────
             err_lines    = [f"{c} → {e.splitlines()[-1]}" for c,e in errors]
             failed_calls = [c for c,_ in errors]
 
-            docs = []
+            # only schemas for the failures
+            docs: List[str] = []
             for sch in selected_schemas:
-                schema = json.loads(sch.metadata["schema"])
-                if schema["name"] in {fc.split("(")[0] for fc in failed_calls}:
-                    params = json.dumps(schema.get("parameters", {}), indent=2)
-                    desc   = schema.get("description","")
+                data = json.loads(sch.metadata["schema"])
+                if data["name"] in {f.split("(")[0] for f in failed_calls}:
+                    params = json.dumps(data.get("parameters", {}), indent=2)
+                    desc   = data.get("description","(no docs)")
                     docs.append(
-                        f"• **{schema['name']}**\n"
-                        f"  description: {desc}\n"
+                        f"• **{data['name']}**\n"
+                        f"  {desc}\n"
                         f"  parameters:\n{params}"
                     )
 
-            analysis_system = (
-                "Some tool calls failed when executed:\n"
-                + "\n".join(err_lines)
-                + "\n\nOriginal plan:\n" + plan_output
-                + "\n\nFailed tool schemas:\n" + "\n\n".join(docs)
-                + "\n\nReply **ONLY** with a JSON object:\n"
-                '{"tool_calls": ["corrected_call1(...)", ...]}'
-            )
+            # extracted-variable block
+            vars_block = "\n".join(f"{n}_output = {v!r}" for n,v in last_results.items())
 
+            retry_sys = (
+                "Some tool calls failed:\n"
+                + "\n".join(err_lines)
+                + "\n\n**Original query:**\n" + user_text
+                + "\n\n**Clarification notes:**\n" + clar_metadata.get("notes","(none)")
+                + "\n\n**Plan:**\n"     + plan_output
+                + (f"\n\n**Available variables:**\n{vars_block}" if vars_block else "")
+                + "\n\n**Schemas for failing tools:**\n"
+                + "\n\n".join(docs)
+                + "\n\nPlease correct **only** the failing calls. "
+                  "Reply **ONLY** with one-line JSON:\n"
+                  '{"tool_calls":["fixed_call1(...)", ...]}'
+            )
             self._print_stage_context("tool_chaining_retry", {
-                "errors": err_lines,
-                "docs":   docs,
-                "prompt": [analysis_system]
+                "errors":    err_lines,
+                "variables": vars_block.split("\n") if vars_block else [],
+                "fail_docs": docs,
             })
 
-            retry_out = self._stream_and_capture(
-                self.secondary_model,
-                [
-                    {"role":"system","content":analysis_system},
-                    {"role":"user",  "content":json.dumps({"tool_calls": failed_calls})}
-                ],
-                tag="[ToolChainRetry]"
-            )
+            retry_msgs = [
+                {"role":"system", "content": retry_sys},
+                {"role":"user",   "content": json.dumps({"tool_calls": failed_calls})}
+            ]
+            retry_out = self._stream_and_capture(self.secondary_model, retry_msgs, tag="[ToolChainRetry]")
 
+            # parse corrected calls
             try:
                 fixed = json.loads(retry_out.strip())["tool_calls"]
             except:
                 parsed = Tools.parse_tool_call(retry_out)
-                fixed = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+                fixed = parsed if isinstance(parsed, list) else ([parsed] if parsed else failed_calls)
 
+            # merge corrections back into raw_calls (preserving order)
             fixed = _norm(fixed)
             if not fixed:
-                fixed = [c for c,ok in call_status.items() if not ok]
+                fixed = failed_calls
 
-            # merge corrected calls
             new_raw = []
             fix_iter = iter(fixed)
-            for orig in raw_calls:
-                if orig in failed_calls:
-                    new_raw.append(next(fix_iter, orig))
+            for c in raw_calls:
+                if c in failed_calls:
+                    new_raw.append(next(fix_iter, c))
                 else:
-                    new_raw.append(orig)
+                    new_raw.append(c)
             raw_calls = new_raw
-            call_status = {c: call_status.get(c) for c in raw_calls}
+            # reset statuses for next attempt
+            call_status = {c: False for c in raw_calls}
 
         return tool_ctxs
 
-
+    def _stage10b_response_critique_and_safety(
+        self,
+        draft: str,
+        user_text: str
+    ) -> str:
+        """
+        Final‐pass LLM check: remove hallucinations, enforce policy,
+        and polish tone/format. Returns the corrected answer.
+        """
+        system = (
+            "You are a final-pass assistant. Given a draft answer and the original user"
+            " question, identify any unsupported statements, correct them, ensure policy"
+            " compliance, and polish the tone. Return only the fixed answer."
+        )
+        self._print_stage_context("response_critique", {"draft": draft})
+        msgs = [
+            {"role":"system","content": system},
+            {"role":"user",  "content": f"Draft:\n{draft}\n\nUser asked: {user_text}"}
+        ]
+        polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]")
+        ctx = ContextObject.make_stage(
+            "response_critique", [], {"text": polished}
+        )
+        ctx.stage_id = "response_critique"
+        ctx.summary  = polished
+        ctx.touch(); self.repo.save(ctx)
+        return polished
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        refs = [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids']
-        refs += [
-            state['clar_ctx'].context_id,
-            state['know_ctx'].context_id,
-            state['plan_ctx'].context_id
-        ]
+        # collect all context IDs, including tool outputs
+        refs = [state['user_ctx'].context_id,
+                state['sys_ctx'].context_id] + state['recent_ids']
+        refs += [state['clar_ctx'].context_id,
+                 state['know_ctx'].context_id,
+                 state['plan_ctx'].context_id]
         refs += [t.context_id for t in state['tool_ctxs']]
+
+        # dedupe & fetch
         seen, allr = set(), []
-        for r in refs:
-            if r not in seen:
-                seen.add(r)
-                allr.append(r)
+        for cid in refs:
+            if cid not in seen:
+                seen.add(cid)
+                allr.append(cid)
         ctxs = [self.repo.get(cid) for cid in allr]
         ctxs.sort(key=lambda c: c.timestamp)
-        interm = "\\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
+
+        # **Use real newlines** so the LLM sees each tool output separately
+        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
 
         final_sys = (
-            "You will receive quite a bit of context, assemble it into a clean and concise relevant answer "
-            "Respond appropriately given the context below"
+            "You will receive quite a bit of context, including tool outputs, "
+            "assemble it into a clean and concise relevant answer. "
+            "Do not hallucinate."
         )
         msgs = [
-            {"role":"system","content": final_sys},
-            {"role":"system","content": self.inference_prompt},
-            {"role":"system","content": interm},
-            {"role":"user","content": user_text},
+            {"role": "system", "content": final_sys},
+            {"role": "system", "content": self.inference_prompt},
+            {"role": "system", "content": interm},
+            {"role": "user",   "content": user_text},
         ]
+
         reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]")
 
+        # persist final
         resp_ctx = ContextObject.make_stage(
             "final_inference", [state['tc_ctx'].context_id], {"text": reply}
         )
@@ -791,6 +1149,31 @@ class Assembler:
         return reply
 
 
+    def _stage11_memory_writeback(
+        self,
+        final_answer: str,
+        tool_ctxs: List[ContextObject]
+    ) -> None:
+        """
+        Persist the final answer into long-term memory as a knowledge artifact.
+        """
+        # Create a new knowledge ContextObject
+        mem = ContextObject.make_knowledge(
+            label="auto_memory",
+            content=final_answer,
+            tags=["memory_writeback"]
+        )
+        mem.touch()
+        self.repo.save(mem)
+
+        # Also record that we co-activated this memory with all tool outputs
+        ctx_ids = [c.context_id for c in tool_ctxs]
+        self.memman.reinforce(mem.context_id, ctx_ids)
+
+        # Log for debugging
+        meta = {"stored_memory_id": mem.context_id, "coactivated_with": ctx_ids}
+        self._print_stage_context("memory_writeback", meta)
+        
 if __name__ == "__main__":
     asm = Assembler(
         context_path="context.jsonl",
