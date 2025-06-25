@@ -2129,65 +2129,100 @@ class Tools:
             f"{i}. {e['title']} — {e['summary'] or '(no summary)'}"
             for i, e in enumerate(entries, 1)
         )
+    
 
     @staticmethod
-    def get_chat_history(arg1=None, arg2=None, time=None, n=None) -> str:
+    def get_chat_history(
+        arg1=None,
+        arg2=None,
+        time=None,
+        n=None,
+        domain: Union[str, List[str]] = None,
+        component: Union[str, List[str]] = None,
+        semantic_label: Union[str, List[str]] = None,
+        keyword: str = None,
+        query: str = None,
+        count: int = None
+    ) -> str:
         """
-        get_chat_history("today"/"yesterday"/"last N days") -> all messages in that window
-        get_chat_history(n) -> last n messages
-        get_chat_history(n, "2 days") -> last n messages from the last 2 days
-        get_chat_history("query", n) -> top-n by relevance to 'query'
-        get_chat_history(time="today", n=10) -> top-10 today
+        Retrieve context objects from `context.jsonl`.
 
-        Also merges ContextObject entries from context.jsonl with in-memory history,
-        and caps any semantic similarity search to the 100 most recent messages.
+        Legacy positional modes:
+          • get_chat_history("today"/"yesterday"/"last N days")
+          • get_chat_history(n) → last n entries
+          • get_chat_history(n, "2 days") → last n entries from the last 2 days
+          • get_chat_history("query", n) → top-n by relevance to 'query'
+
+        New keyword modes:
+          • keyword or query → as first positional arg
+          • count            → as second positional arg
+
+        Optionally filter by:
+          • domain
+          • component
+          • semantic_label
+
+        Returns JSON: {"results": [ {timestamp, role, content, score}, … ] }
         """
-        # normalize keyword args for backwards-compatibility
+        import os, re, json
+        from datetime import datetime, timedelta
+        from context import ContextObject
+
+        # --- Normalize old & new kwargs ---
+        if keyword is not None:
+            arg1 = keyword
+        if query is not None:
+            arg1 = query
+        if count is not None:
+            arg2 = count
         if time is not None:
             arg1 = time
         if n is not None:
             arg2 = n
 
-        import os, re, json
-        from datetime import datetime, timedelta
+        # --- Load on-disk ContextObjects ---
+        ctx_path = os.path.join(os.getcwd(), "context.jsonl")
+        entries = []
+        if os.path.isfile(ctx_path):
+            with open(ctx_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        obj = ContextObject.from_json(line)
+                    except Exception:
+                        continue
+                    entries.append({
+                        "timestamp":      obj.timestamp,
+                        "role":           obj.metadata.get("role"),
+                        "content":        obj.metadata.get("content", obj.summary or ""),
+                        "domain":         obj.domain,
+                        "component":      obj.component,
+                        "semantic_label": obj.semantic_label
+                    })
 
-        # 1) Load ContextObject entries from context.jsonl
-        from context import ContextObject
+        # --- Apply domain/component/semantic_label filters ---
+        def _in(val, flt):
+            if flt is None: return True
+            if isinstance(flt, (list, tuple)): return val in flt
+            return val == flt
 
-        script_dir     = os.path.dirname(os.path.abspath(__file__))
-        context_file   = os.path.join(script_dir, "context.jsonl")
-        context_entries = []
-        if os.path.isfile(context_file):
+        entries = [
+            e for e in entries
+            if _in(e["domain"], domain)
+            and _in(e["component"], component)
+            and _in(e["semantic_label"], semantic_label)
+        ]
+
+        # --- Timestamp parser ---
+        def _parse_ts(s: str) -> datetime:
             try:
-                with open(context_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            obj = ContextObject.from_json(line)
-                            context_entries.append({
-                                "timestamp":      obj.timestamp,
-                                "role":           obj.metadata.get("role"),
-                                "content":        obj.metadata.get("content", obj.summary or ""),
-                                "context_id":     obj.context_id,
-                                "domain":         obj.domain,
-                                "component":      obj.component,
-                                "semantic_label": obj.semantic_label,
-                            })
-                        except Exception:
-                            continue
-            except Exception:
-                pass
+                return datetime.fromisoformat(s)
+            except ValueError:
+                return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
 
-        # 2) Grab in-memory entries
-        hm = Tools._history_manager
-        mem_entries = hm.history if hm else []
-
-        # 3) Merge (context first so in-memory can override if identical timestamps)
-        all_entries = context_entries + mem_entries
-
-        # --- 1) TIMEFRAME-ONLY MODE ---
-        if isinstance(arg1, str):
+        # --- 1) Timeframe-only mode ---
+        if isinstance(arg1, str) and not re.fullmatch(r"\d+", arg1):
             period = arg1.lower().strip()
-            now    = datetime.now()
+            now    = datetime.utcnow()
             today  = now.date()
             start = end = None
 
@@ -2198,117 +2233,101 @@ class Tools:
                 start = datetime.combine(today - timedelta(days=1), datetime.min.time())
                 end   = datetime.combine(today, datetime.min.time())
             else:
-                m = re.match(r'last\s+(\d+)\s+days?', period)
+                m = re.match(r"last\s+(\d+)\s+days?", period)
                 if m:
-                    days = int(m.group(1))
-                    start = datetime.combine(today - timedelta(days=days), datetime.min.time())
+                    d = int(m.group(1))
+                    start = datetime.combine(today - timedelta(days=d), datetime.min.time())
                     end   = datetime.combine(today + timedelta(days=1), datetime.min.time())
 
             if start is not None:
                 results = []
-                for e in all_entries:
+                for e in entries:
                     try:
-                        ts = datetime.fromisoformat(e["timestamp"])
-                    except ValueError:
-                        from datetime import datetime as _dt
-                        ts = _dt.strptime(e["timestamp"], "%Y%m%dT%H%M%SZ")
+                        ts = _parse_ts(e["timestamp"])
                     except:
                         continue
                     if start <= ts < end:
                         results.append({
                             "timestamp": e["timestamp"],
-                            "role":      e.get("role"),
-                            "content":   e.get("content")
+                            "role":      e["role"],
+                            "content":   e["content"]
                         })
                 return json.dumps({"results": results}, indent=2)
 
-        # --- 2) NUMERIC (+ optional relative period) MODE ---
+        # --- 2) Count-based or query mode ---
         top_n    = None
         since_dt = None
-        query    = None
+        qtext    = None
 
-        if isinstance(arg1, (int, str)) and re.match(r'^\d+$', str(arg1)):
+        # If first arg is numeric → count mode
+        if isinstance(arg1, (int, str)) and re.fullmatch(r"\d+", str(arg1)):
             top_n = int(arg1)
+            # optional second arg = period
             if arg2:
-                m = re.match(r'(\d+)\s*(day|hour|minute|week)s?', str(arg2), re.IGNORECASE)
+                m = re.match(r"(\d+)\s*(day|hour|minute|week)s?", str(arg2), re.I)
                 if m:
                     val, unit = int(m.group(1)), m.group(2).lower()
-                    now = datetime.now()
-                    if unit.startswith("day"):
-                        since_dt = now - timedelta(days=val)
-                    elif unit.startswith("hour"):
-                        since_dt = now - timedelta(hours=val)
-                    elif unit.startswith("minute"):
-                        since_dt = now - timedelta(minutes=val)
-                    elif unit.startswith("week"):
-                        since_dt = now - timedelta(weeks=val)
+                    now = datetime.utcnow()
+                    if unit.startswith("day"):    since_dt = now - timedelta(days=val)
+                    elif unit.startswith("hour"): since_dt = now - timedelta(hours=val)
+                    elif unit.startswith("minute"): since_dt = now - timedelta(minutes=val)
+                    elif unit.startswith("week"):  since_dt = now - timedelta(weeks=val)
                 else:
                     try:
-                        since_dt = datetime.fromisoformat(arg2)
-                    except ValueError:
-                        try:
-                            from datetime import datetime as _dt
-                            since_dt = _dt.strptime(arg2, "%Y%m%dT%H%M%SZ")
-                        except:
-                            since_dt = None
+                        since_dt = _parse_ts(arg2)
                     except:
                         since_dt = None
         else:
+            # treat first arg as query text
             if arg1 is not None:
-                query = str(arg1)
-                if arg2 and re.match(r'^\d+$', str(arg2)):
+                qtext = str(arg1)
+                if arg2 and re.fullmatch(r"\d+", str(arg2)):
                     top_n = int(arg2)
             if top_n is None:
                 top_n = 5
 
-        if top_n is None:
-            top_n = 5
-
-        # 3) Filter by since_dt
+        # --- Filter by since_dt ---
         filtered = []
-        for e in all_entries:
+        for e in entries:
             try:
-                ts = datetime.fromisoformat(e["timestamp"])
-            except ValueError:
-                from datetime import datetime as _dt
-                try:
-                    ts = _dt.strptime(e["timestamp"], "%Y%m%dT%H%M%SZ")
-                except:
-                    continue
+                ts = _parse_ts(e["timestamp"])
             except:
                 continue
             if since_dt and ts < since_dt:
                 continue
             filtered.append(e)
 
-        # 4) Build results list
+        # --- Score & rank ---
         scored = []
-        if query:
+        if qtext:
+            from numpy import dot, linalg
+            qv = Utils.embed_text(qtext)
             candidates = filtered[-100:]
-            q_vec = Utils.embed_text(query)
             for e in candidates:
-                text  = e.get("content", "")
-                score = 1.0 if query.lower() in text.lower() else 0.0
-                v     = Utils.embed_text(text)
-                score += Utils.cosine_similarity(q_vec, v)
+                txt   = e["content"]
+                score = 1.0 if qtext.lower() in txt.lower() else 0.0
+                vv    = Utils.embed_text(txt)
+                if linalg.norm(qv) and linalg.norm(vv):
+                    score += float(dot(qv, vv) / (linalg.norm(qv) * linalg.norm(vv)))
                 scored.append((score, e))
             scored.sort(key=lambda x: x[0], reverse=True)
         else:
-            for e in reversed(filtered):
-                scored.append((0.0, e))
+            # pure recency
+            scored = [(0.0, e) for e in reversed(filtered)]
 
-        # 5) Take top_n and format
+        # --- Build output ---
         top = scored[:top_n]
         out = []
         for score, e in top:
             out.append({
-                "timestamp": e.get("timestamp"),
-                "role":      e.get("role"),
-                "content":   e.get("content"),
+                "timestamp": e["timestamp"],
+                "role":      e["role"],
+                "content":   e["content"],
                 "score":     round(score, 3)
             })
 
         return json.dumps({"results": out}, indent=2)
+
 
 
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
