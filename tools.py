@@ -634,30 +634,53 @@ class Tools:
 
     # This static method runs a tool function in-process, parsing the tool call from a string. It executes the function and returns its output or an exception message.
     @staticmethod
-    def run_tool_once(tool_call:str) -> dict:
+    def run_tool_once(tool_call: str) -> dict:
         """
         Convenience: parse `tool_call` (e.g. "hello('world')")
         → execute the referenced *tool function* in-process
         → return { "output":…, "exception": str|None }.
-        Useful for micro-benchmarks when launching a subprocess is overkill.
         """
-        import ast, inspect, traceback
-        m = ast.parse(tool_call.strip(), mode="eval")
-        if not isinstance(m.body, ast.Call):
-            return {"exception": "Not a function call"}
-        name = m.body.func.id
-        fn   = getattr(Tools, name, None)
-        if not callable(fn):
-            return {"exception": f"Unknown tool {name}"}
-        # rebuild positional / kw from the AST
-        args   = [ast.literal_eval(ast.get_source_segment(tool_call,a)) for a in m.body.args]
-        kwargs = {kw.arg: ast.literal_eval(ast.get_source_segment(tool_call,kw.value))
-                  for kw in m.body.keywords}
+        import ast, inspect, traceback, json
+
+        # parse into AST
         try:
-            out = fn(*args, **kwargs)
-            return {"output": out, "exception": None}
-        except Exception as e:
-            return {"output": None, "exception": traceback.format_exc(limit=2)}
+            node = ast.parse(tool_call.strip(), mode="eval")
+        except SyntaxError as e:
+            return {"output": None, "exception": f"SyntaxError: {e}"}
+
+        if not isinstance(node.body, ast.Call):
+            return {"output": None, "exception": "Not a function call"}
+
+        name = node.body.func.id
+        fn = getattr(Tools, name, None)
+        if not callable(fn):
+            return {"output": None, "exception": f"Unknown tool {name}"}
+
+        # rebuild positional / kw args
+        def _eval_arg(a):
+            src = ast.get_source_segment(tool_call, a)
+            return ast.literal_eval(src) if src is not None else None
+
+        args = [_eval_arg(a) for a in node.body.args]
+        kwargs = {
+            kw.arg: _eval_arg(kw.value)
+            for kw in node.body.keywords
+        }
+
+        try:
+            raw_out = fn(*args, **kwargs)
+            # ensure serializable
+            try:
+                json.dumps(raw_out)
+                safe_out = raw_out
+            except (TypeError, ValueError):
+                safe_out = repr(raw_out)
+            return {"output": safe_out, "exception": None}
+
+        except Exception:
+            tb = traceback.format_exc(limit=2)
+            return {"output": None, "exception": tb}
+
 
     # This static method runs a Python script, either in a new terminal window or synchronously capturing its output. It returns a dictionary with the process ID or captured output.
     @staticmethod
