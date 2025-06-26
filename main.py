@@ -189,6 +189,7 @@ if not os.path.exists(SETUP_MARKER):
 CONFIG_FILE = "config.json"
 default_cfg = {
     "primary_model":   "gemma3:4b",
+    "secondary_model":   "gemma3:4b",
     "secondary_model": None
 }
 if not os.path.exists(CONFIG_FILE):
