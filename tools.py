@@ -1995,13 +1995,11 @@ class Tools:
         Tools._driver.save_screenshot(filename)
         return filename
 
-
-    # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
+    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, **kwargs) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
-        THIS RETURNS A RAW MASSIVE EXTRACTED WEBPAGE, call summarize_search(topic="content") instead IF YOU WANT BRIEF SUMAMRIES!
+        THIS RETURNS A RAW MASSIVE EXTRACTED WEBPAGE, call summarize_search(topic="content") instead IF YOU WANT BRIEF SUMMARIES!
 
         1. Call search_internet(topic=str, top_n=int)
         - topic (str): the search term, use `topic`
@@ -2012,7 +2010,19 @@ class Tools:
         • Never blocks more than 5 s on any wait—everything is aggressively polled.
         """
 
-        log_message(f"[search_internet] ▶ {topic!r}", "INFO")
+        # ——— Argument‐alias handling ——————————————
+        # allow users to pass top_n, n, limit, etc.
+        if 'top_n' in kwargs:
+            num_results = kwargs.pop('top_n')
+        if 'n' in kwargs:
+            num_results = kwargs.pop('n')
+        if 'limit' in kwargs:
+            num_results = kwargs.pop('limit')
+        # warn about any other unexpected kwargs
+        if kwargs:
+            log_message(f"[search_internet] Ignoring unexpected args: {list(kwargs.keys())!r}", "WARNING")
+
+        log_message(f"[search_internet] ▶ {topic!r} (num_results={num_results})", "INFO")
 
         # clamp waits to max 5 s
         wait_sec = min(wait_sec, 5)

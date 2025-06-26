@@ -1115,7 +1115,8 @@ class Assembler:
         ctx_s.touch(); self.repo.save(ctx_s)
 
         return ctx, json.dumps(plan_obj)
-    
+
+
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -1184,20 +1185,22 @@ class Assembler:
             errors.clear()
             missing: dict[str, list[str]] = {}
 
-            for idx, call in enumerate(list(fixed_calls)):
+            for call in list(fixed_calls):
                 name, argstr = call.split("(", 1)
                 argstr = argstr.rstrip(")")
                 schema = all_schemas.get(name)
 
-                # ―― Unknown tool?  Accept as-is (no error) ――――――――――――――
+                # ―― Unknown tool?  Accept as-is (no error)
                 if not schema:
                     valid.append(call)
                     continue
 
-                # ―― Parameter check only if schema exists ――――――――――――――
+                # ―― Parameter check only if schema exists
                 required = set(schema.get("parameters", {}).get("required", []))
-                found    = {kv.split("=", 1)[0].strip()
-                            for kv in argstr.split(",") if "=" in kv}
+                found    = {
+                    kv.split("=", 1)[0].strip()
+                    for kv in argstr.split(",") if "=" in kv
+                }
                 miss     = sorted(required - found)
 
                 if miss:
@@ -1207,7 +1210,7 @@ class Assembler:
                     valid.append(call)
 
             if not missing:
-                break  # ✅ nothing left to fix
+                break  # all good
 
             # ---------- ask LLM to fill the gaps ----------
             docs = []
@@ -1219,12 +1222,17 @@ class Assembler:
                     f"{json.dumps(sch.get('parameters', {}), indent=2)}"
                 )
 
+            # **NEW**: include the full original plan (with params)
+            orig_plan = json.dumps(plan_ctx.metadata.get("plan", {}), indent=2)
+
             prompt = (
                 "Some tool calls are missing required arguments.\n"
                 + "\n".join(f"{c} → {m}" for c, m in errors)
+                + "\n\nOriginal plan:\n" + orig_plan
                 + "\n\nSchemas:\n" + "\n\n".join(docs)
                 + "\n\nReturn ONLY JSON: {\"fixed_calls\":[\"tool(arg=...)\", ...]}"
             )
+
             out = self._stream_and_capture(
                 self.secondary_model,
                 [{"role": "system", "content": prompt}],
@@ -1239,22 +1247,16 @@ class Assembler:
                     fixed_calls = fc
 
         # ── D)  Persist validation results ────────────────────────────────
-        meta = {"valid": valid, "errors": errors, "fixed_calls": fixed_calls}
-        pv_ctx = ContextObject.make_stage("plan_validation",
-                                          plan_ctx.references, meta)
+        meta = {"valid": valid or fixed_calls, "errors": errors, "fixed_calls": fixed_calls}
+        pv_ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
         pv_ctx.stage_id = "plan_validation"
-        pv_ctx.summary  = (
-            "OK" if not errors else f"Ignored {len(errors)} call(s) lacking schema"
-        )
+        pv_ctx.summary  = "OK" if not errors else f"Ignored {len(errors)} call(s) lacking schema"
         pv_ctx.touch()
         self.repo.save(pv_ctx)
-
         self._print_stage_context("plan_validation", meta)
 
         # Always return an EMPTY error list so caller never hard-fails
         return valid or fixed_calls, [], fixed_calls
-
-
 
     def _stage8_tool_chaining(
         self,
@@ -1789,7 +1791,7 @@ class Assembler:
         # 3) Build a rich context block that inlines full tool outputs
         interm_parts = []
         for c in ctxs:
-            if c.component.startswith("tool_output"):
+            if c.semantic_label == "tool_output":
                 out = c.metadata.get("output")
                 try:
                     blob = json.dumps(out, indent=2, ensure_ascii=False)
