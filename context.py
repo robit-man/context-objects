@@ -2,6 +2,7 @@
 
 import uuid
 import json
+import math
 import logging
 import threading
 from dataclasses import dataclass, field, asdict
@@ -207,7 +208,67 @@ class ContextObject:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
+    
+    @classmethod
+    def make_narrative(
+        cls,
+        entry: str,
+        tags: Optional[List[str]] = None,
+        **metadata
+    ) -> "ContextObject":
+        """
+        Create *one* narrative row per unique `entry`.
+        If the most-recent narrative row already has an identical summary,
+        reuse it instead of creating a duplicate.
+        """
+        repo: ContextRepository = ContextRepository.instance()  # singleton accessor
 
+        # latest narrative row, if any
+        rows = repo.query(lambda c: c.component == "narrative")
+        rows.sort(key=lambda c: c.timestamp, reverse=True)
+        latest = rows[0] if rows else None
+
+        if latest and latest.summary == entry:
+            # ensure tags/metadata are up-to-date, touch timestamp once
+            if tags:
+                for t in tags:
+                    if t not in latest.tags:
+                        latest.tags.append(t)
+            latest.metadata.update(metadata)
+            latest.touch()
+            repo.save(latest)
+            return latest
+
+        # otherwise insert a fresh row
+        obj = cls(
+            domain="artifact",
+            component="narrative",
+            semantic_label="self_narrative",
+        )
+        obj.summary = entry
+        obj.metadata.update(metadata)
+        obj.tags = tags or ["narrative"]
+        return obj
+
+    
+    @classmethod
+    def make_success(cls, description: str, refs: List[str] = None) -> "ContextObject":
+        """Log that an action or plan succeeded."""
+        obj = cls(domain="stage", component="success", semantic_label="success")
+        obj.summary = description
+        obj.references = refs or []
+        obj.tags = ["success"]
+        return obj
+
+    @classmethod
+    def make_failure(cls, description: str, refs: List[str] = None) -> "ContextObject":
+        """Log that an action or plan failed."""
+        obj = cls(domain="stage", component="failure", semantic_label="failure")
+        obj.summary = description
+        obj.references = refs or []
+        obj.tags = ["failure"]
+        return obj
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ContextObject":
         mts = [MemoryTrace(**mt) for mt in data.get("memory_traces", [])]
@@ -360,10 +421,15 @@ class ContextRepository:
     """
     JSONL-backed repository for ContextObjects.
     """
+    _singleton: "ContextRepository" = None          
+
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
         open(self.path, "a").close()
+
+        ContextRepository._singleton = self
+
 
     def get(self, context_id: str) -> ContextObject:
         with open(self.path, "r") as f:
@@ -374,11 +440,35 @@ class ContextRepository:
         raise KeyError(f"Context {context_id} not found")
 
     def save(self, ctx: ContextObject) -> None:
+        """
+        Append only if this object was modified since the last save.
+        """
+        if not ctx.dirty:
+            return
         with self._lock:
             with open(self.path, "a") as f:
                 f.write(ctx.to_json() + "\n")
             ctx.dirty = False
 
+
+    def exists(self, context_id: str) -> bool:
+        try:
+            self.get(context_id)
+            return True
+        except KeyError:
+            return False
+        
+    @classmethod
+    def instance(cls) -> "ContextRepository":
+        """
+        Return the one live repository registered in __init__.
+        Raises RuntimeError if called before the first repo is created.
+        """
+        if cls._singleton is None:
+            raise RuntimeError("ContextRepository has not been initialised yet")
+        
+        return cls._singleton
+    
     def delete(self, context_id: str) -> None:
         with self._lock:
             objs = []
@@ -431,11 +521,82 @@ class MemoryManager:
 
         sorted_ids = sorted(candidates, key=lambda x: candidates[x], reverse=True)
         return [self.repo.get(cid) for cid in sorted_ids[:k]]
+    
 
+    def decay_and_promote(
+        self,
+        half_life: float = 86_400.0,     # seconds in a day
+        promote_threshold: int = 3
+    ) -> None:
+        import math
+        from datetime import datetime
+
+        now = default_clock()
+
+        # snapshot to avoid mutation-during-iteration
+        for row in list(self.repo.query(lambda c: True)):
+            try:
+                ctx = self.repo.get(row.context_id)
+            except KeyError:
+                continue
+
+            # compute the decayed strengths
+            last_ts = datetime.strptime(ctx.last_accessed, "%Y%m%dT%H%M%SZ")
+            delta = (now - last_ts).total_seconds()
+            new_strengths = {}
+            for oid, strength in ctx.association_strengths.items():
+                try:
+                    self.repo.get(oid)
+                except KeyError:
+                    continue
+                decayed = strength * math.exp(-delta / half_life)
+                if decayed > 1e-6:
+                    new_strengths[oid] = decayed
+
+            # figure out if we need to promote
+            should_promote = ctx.recall_stats.get("count", 0) >= promote_threshold
+            promoted = (ctx.memory_tier != "LTM") and should_promote
+
+            # only update & save if anything really changed
+            if new_strengths != ctx.association_strengths or promoted:
+                ctx.association_strengths = new_strengths
+                if should_promote:
+                    ctx.memory_tier = "LTM"
+                ctx.touch()
+                self.repo.save(ctx)
+
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CURRENT (replace everything in this method)
+    # ──────────────────────────────────────────────────────────────────────────
     def reinforce(self, context_id: str, coactivated: List[str]) -> None:
-        ctx = self.repo.get(context_id)
-        ctx.record_recall(stage_id=None, coactivated_with=coactivated)
+        """
+        Strengthen edges between `context_id` and every ID in `coactivated`
+        while **skipping dangling references safely**.
+        """
+        # ensure the target still exists
+        try:
+            ctx = self.repo.get(context_id)
+        except KeyError:
+            return  # target row was deleted → nothing to do
+
+        # keep only co-activated IDs that still resolve
+        valid_refs: List[str] = []
+        for rid in coactivated:
+            try:
+                self.repo.get(rid)
+                valid_refs.append(rid)
+            except KeyError:
+                continue  # silently drop dangling ref
+
+        if not valid_refs:
+            return  # nothing valid to link
+
+        ctx.record_recall(stage_id=None, coactivated_with=valid_refs)
         self.repo.save(ctx)
+
+
 
     def prune(self, ttl_hours: int) -> None:
         cutoff = default_clock() - timedelta(hours=ttl_hours)

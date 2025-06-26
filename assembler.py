@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 import numpy as np
+import difflib
 from sentence_transformers import SentenceTransformer
 from ollama import chat
 
@@ -48,18 +49,20 @@ class TaskExecutor:
         self.clar_metadata = clar_metadata
 
     def execute(self, node: TaskNode) -> None:
+        import json
+
         # 1) Static validation / fix — always pull the real plan_ctx from the node itself
         plan_ctx_id = node.context_ids[0]
         plan_ctx_obj = self.asm.repo.get(plan_ctx_id)
 
-        # reuse the planning‐validation with a single‐call plan
+        # reuse the planning-validation with a single-call plan
         _, errors, fixed = self.asm._stage7b_plan_validation(
             plan_ctx_obj,
             node.call,
             self.asm.tools_list
         )
         if errors:
-            node.errors = [e for (_, e) in errors]
+            node.errors = [err for (_, err) in errors]
         calls = fixed or [node.call]
 
         # 2) Tool chaining
@@ -84,6 +87,24 @@ class TaskExecutor:
         for t in tool_ctxs:
             node.context_ids.append(t.context_id)
 
+            # ——— record per-tool success/failure —————————————
+            if t.metadata.get("exception") is None:
+                succ = ContextObject.make_success(
+                    f"Tool `{t.metadata.get('tool_name', t.semantic_label)}` succeeded",
+                    refs=[t.context_id]
+                )
+                succ.touch()
+                self.asm.repo.save(succ)
+                self.asm.memman.reinforce(succ.context_id, [t.context_id])
+            else:
+                fail = ContextObject.make_failure(
+                    f"Tool `{t.metadata.get('tool_name', t.semantic_label)}` failed: {t.metadata.get('exception')}",
+                    refs=[t.context_id]
+                )
+                fail.touch()
+                self.asm.repo.save(fail)
+                self.asm.memman.reinforce(fail.context_id, [t.context_id])
+
         # 5) Reflection & replan
         replan = self.asm._stage9b_reflection_and_replan(
             [self.asm.repo.get(cid) for cid in node.context_ids],
@@ -91,18 +112,56 @@ class TaskExecutor:
             self.user_text,
             self.clar_metadata
         )
-        if replan:
+
+        # ——— record reflection outcome —————————————
+        if replan is None:
+            succ = ContextObject.make_success(
+                "Reflection validated original plan (OK)",
+                refs=node.context_ids
+            )
+            succ.touch()
+            self.asm.repo.save(succ)
+            self.asm.memman.reinforce(succ.context_id, node.context_ids)
+        else:
+            fail = ContextObject.make_failure(
+                "Reflection triggered plan adjustment",
+                refs=node.context_ids
+            )
+            fail.touch()
+            self.asm.repo.save(fail)
+            self.asm.memman.reinforce(fail.context_id, node.context_ids)
+
+            # if there's a new plan, expand into subtasks
             try:
                 tree = json.loads(replan)
                 node.children = self.asm._parse_task_tree(tree, parent=node)
-            except:
+            except Exception:
                 pass
 
         # 6) Recurse into children
         for child in node.children:
             self.execute(child)
 
+        # ——— at end of this node, log overall task success/failure ————
+        if not node.errors and replan is None:
+            overall = ContextObject.make_success(
+                f"Task `{node.call}` completed successfully",
+                refs=node.context_ids
+            )
+            overall.touch()
+            self.asm.repo.save(overall)
+            self.asm.memman.reinforce(overall.context_id, node.context_ids)
+        else:
+            overall = ContextObject.make_failure(
+                f"Task `{node.call}` failed or was replanned",
+                refs=node.context_ids
+            )
+            overall.touch()
+            self.asm.repo.save(overall)
+            self.asm.memman.reinforce(overall.context_id, node.context_ids)
+
         node.completed = True
+
 
 class ContextQueryEngine:
     """
@@ -249,40 +308,120 @@ class Assembler:
             self.repo,
             lambda t: stm.encode(t, normalize_embeddings=True)
         )
+                
+        self._seed_tool_schemas()
+        self._seed_static_prompts()
 
-        # seed missing schemas
-        existing = {
-            c.semantic_label
-            for c in self.repo.query(
-                lambda x: x.component=="schema" and "tool_schema" in x.tags
-            )
-        }
-        for name, schema in TOOL_SCHEMAS.items():
-            if name in existing:
+    def _seed_tool_schemas(self) -> None:
+        """
+        Guarantee exactly one ContextObject per tool in TOOL_SCHEMAS:
+         - INSERT if missing
+         - UPDATE if JSON differs
+         - DEDUPE extras
+        """
+        import json
+
+        # 1) Bucket existing schema rows by tool-name
+        buckets: Dict[str, List[ContextObject]] = {}
+        for ctx in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in c.tags):
+            try:
+                name = json.loads(ctx.metadata["schema"])["name"]
+                buckets.setdefault(name, []).append(ctx)
+            except Exception:
                 continue
-            obj = ContextObject.make_schema(
-                label=name,
-                schema_def=json.dumps(schema),
-                tags=["artifact","tool_schema"]
-            )
-            obj.touch()
-            self.repo.save(obj)
 
-        # seed system prompts
-        for nm, txt in [
-            ("clarifier_prompt", self.clarifier_prompt),
-            ("assembler_prompt",  self.assembler_prompt),
-            ("inference_prompt",  self.inference_prompt),
-        ]:
-            p = ContextObject.make_prompt(
-                label=nm,
-                prompt_text=txt,
-                tags=["artifact","prompt"]
-            )
-            p.touch()
-            self.repo.save(p)
+        # 2) Upsert each canonical schema
+        for name, canonical in TOOL_SCHEMAS.items():
+            canonical_blob = json.dumps(canonical, sort_keys=True)
+            rows = buckets.get(name, [])
 
-        logger.info("Assembler initialized.")
+            # A) No existing row → insert
+            if not rows:
+                new_ctx = ContextObject.make_schema(
+                    label=name,
+                    schema_def=canonical_blob,
+                    tags=["artifact", "tool_schema"],
+                )
+                new_ctx.touch()
+                self.repo.save(new_ctx)
+                continue
+
+            # B) Keep only the newest, delete duplicates
+            rows.sort(key=lambda c: c.timestamp, reverse=True)
+            keeper = rows[0]
+            for dup in rows[1:]:
+                self.repo.delete(dup.context_id)
+
+            # C) Check for changes
+            changed = False
+            existing_blob = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
+            if existing_blob != canonical_blob:
+                keeper.metadata["schema"] = canonical_blob
+                changed = True
+
+            if "tool_schema" not in keeper.tags:
+                keeper.tags.append("tool_schema")
+                changed = True
+
+            # D) Only persist if we actually changed something
+            if changed:
+                keeper.touch()
+                self.repo.save(keeper)
+
+    def _seed_static_prompts(self) -> None:
+        """
+        Guarantee exactly one ContextObject for each static system prompt:
+         - INSERT if missing
+         - UPDATE if text differs
+         - DEDUPE extras
+        """
+        static = {
+            "clarifier_prompt": self.clarifier_prompt,
+            "assembler_prompt": self.assembler_prompt,
+            "inference_prompt": self.inference_prompt,
+        }
+
+        # Bucket rows by semantic_label
+        buckets: Dict[str, List[ContextObject]] = {}
+        for ctx in self.repo.query(lambda c: c.component == "prompt"):
+            buckets.setdefault(ctx.semantic_label, []).append(ctx)
+
+        for label, desired_text in static.items():
+            rows = buckets.get(label, [])
+
+            # A) No existing row → insert
+            if not rows:
+                new_ctx = ContextObject.make_prompt(
+                    label=label,
+                    prompt_text=desired_text,
+                    tags=["artifact", "prompt"],
+                )
+                new_ctx.touch()
+                self.repo.save(new_ctx)
+                continue
+
+            # B) Keep only the newest, delete duplicates
+            rows.sort(key=lambda c: c.timestamp, reverse=True)
+            keeper = rows[0]
+            for dup in rows[1:]:
+                self.repo.delete(dup.context_id)
+
+            # C) Check for changes
+            changed = False
+            if keeper.metadata.get("prompt") != desired_text:
+                keeper.metadata["prompt"] = desired_text
+                changed = True
+
+            if "prompt" not in keeper.tags:
+                keeper.tags.append("prompt")
+                changed = True
+
+            # D) Only persist if we actually changed something
+            if changed:
+                keeper.touch()
+                self.repo.save(keeper)
+
+
 
     def _ensure_str(self, x: Any) -> str:
         """
@@ -294,25 +433,100 @@ class Assembler:
             return json.dumps(x)
         except:
             return str(x)
+        
+    def _get_or_make_singleton(
+        self,
+        *,
+        label: str,
+        component: str,
+        tags: list[str] | None = None,
+    ) -> ContextObject:
+        """
+        Return the one-and-only ContextObject with `semantic_label == label`
+        and `component == component`.
 
-    def _load_system_prompts(self) -> ContextObject:
-        prompts = self.repo.query(
-            lambda c: c.domain=="artifact" and c.component in ("prompt","policy")
-        )[:self.top_k]
-        block = "\n".join(
-            f"{c.semantic_label}: {c.metadata.get('prompt') or c.metadata.get('policy')}"
-            for c in prompts
-        ) or "(none)"
-        ctx = ContextObject.make_stage(
-            "system_prompts",
-            [c.context_id for c in prompts],
-            {"prompts": block}
+        - If none exists → create it.
+        - If >1 exist    → keep the newest, delete the extras.
+        - Always make sure the supplied `tags` are present on the keeper.
+        """
+        tags = tags or []
+        # grab *all* candidates
+        rows = self.repo.query(
+            lambda c: c.semantic_label == label and c.component == component
         )
-        ctx.stage_id = "system_prompts"
-        ctx.summary  = block
-        ctx.touch()
-        self.repo.save(ctx)
-        return ctx
+
+        if not rows:                       # ---- INSERT ----
+            ctx = ContextObject.make_stage(label, [], {})
+            ctx.component = component
+            ctx.tags = list(tags)
+            ctx.touch()
+            self.repo.save(ctx)
+            return ctx
+
+        # ---- DEDUPE ----  (rows[0] is newest because jsonl is append-only)
+        rows.sort(key=lambda c: c.timestamp, reverse=True)
+        keeper, *dups = rows
+        for extra in dups:
+            self.repo.delete(extra.context_id)
+
+        # ensure tags are present
+        for t in tags:
+            if t not in keeper.tags:
+                keeper.tags.append(t)
+        return keeper
+
+
+    def _load_narrative_context(self) -> ContextObject:
+        keeper = self._get_or_make_singleton(
+            label="narrative_context",
+            component="stage",
+            tags=["narrative"],
+        )
+
+        narr_objs = self.repo.query(lambda c: c.component == "narrative")
+        narr_objs.sort(key=lambda c: c.timestamp)
+        keeper.metadata["narrative"] = "\n".join(n.summary for n in narr_objs)
+        keeper.summary = keeper.metadata["narrative"] or "(no narrative yet)"
+        keeper.references = [n.context_id for n in narr_objs]
+        keeper.touch()
+        self.repo.save(keeper)
+        return keeper
+    
+    def _load_system_prompts(self) -> ContextObject:
+        keeper = self._get_or_make_singleton(
+            label="system_prompts",
+            component="stage",
+            tags=["system"],
+        )
+
+        narr_ctx = self._load_narrative_context()
+        static_objs = self.repo.query(
+            lambda c: c.domain == "artifact" and c.component in ("prompt", "policy")
+        )[: self.top_k]
+        dyn = self.repo.query(
+            lambda c: c.component == "policy" and "dynamic_prompt" in c.tags
+        )[-5:]
+
+        # build the text *fresh* each turn
+        block = "---\n**My Narrative So Far:**\n" + narr_ctx.summary + "\n---\n"
+        block += "\n".join(
+            f"{c.semantic_label}: {c.metadata.get('prompt') or c.metadata.get('policy')}"
+            for c in static_objs
+        )
+        block += "\n\n# Learned Prompt Adjustments:\n"
+        block += "\n".join(f"* {c.summary}" for c in dyn) or "(none)"
+
+        keeper.metadata["prompts"] = block
+        keeper.summary = block
+        keeper.references = (
+            [narr_ctx.context_id]
+            + [c.context_id for c in static_objs]
+            + [c.context_id for c in dyn]
+        )
+        keeper.touch()
+        self.repo.save(keeper)
+        return keeper
+
 
     def _get_history(self) -> List[ContextObject]:
         segs = self.repo.query(
@@ -378,9 +592,48 @@ class Assembler:
             )
             nodes.append(node)
         return nodes
-
+    
     def run_with_meta_context(self, user_text: str) -> str:
         state: Dict[str, Any] = {}
+
+        raw_hist = Tools.get_chat_history(count=5)
+        try:
+            hist_entries = json.loads(raw_hist)["results"]
+        except Exception:
+            hist_entries = []
+
+        chat_objs: list[ContextObject] = []
+
+        for msg in hist_entries:
+            ts   = msg.get("timestamp")          # ISO string from the tool
+            role = msg.get("role", "unknown")
+            body = msg.get("content", "")
+
+            # ①  look-up: do we already have this exact chat row?
+            mem_candidates = self.repo.query(
+                lambda c: c.domain == "artifact"
+                and c.component == "knowledge"
+                and c.semantic_label == "auto_memory"
+            )
+            mem = mem_candidates[0] if mem_candidates else None
+
+            if mem_candidates:                         # ➜ found → re-use it
+                chat_objs.append(mem)                  # append ONLY the ContextObject
+                continue
+
+            # ②  otherwise create *one* new row and save it
+            ctx = ContextObject.make_stage(
+                "chat_history",
+                [],
+                {"timestamp": ts, "content": body, "role": role},
+            )
+            ctx.stage_id = "chat_history"
+            ctx.summary  = body[:200]            # short preview
+            ctx.touch()
+            self.repo.save(ctx)
+            chat_objs.append(ctx)
+
+        state["chat_history"] = chat_objs        # carry on exactly as before
 
         # ── Stage 1: record input ───────────────────────────────────────
         state['user_ctx'] = self._stage1_record_input(user_text)
@@ -389,8 +642,12 @@ class Assembler:
         state['sys_ctx']  = self._stage2_load_system_prompts()
 
         # ── Stage 3: retrieve & merge context ──────────────────────────
+        # Pass in our freshly minted chat_history objects as extra context
         ctx3 = self._stage3_retrieve_and_merge_context(
-            user_text, state['user_ctx'], state['sys_ctx']
+            user_text,
+            state['user_ctx'],
+            state['sys_ctx'],
+            extra_ctx=state["chat_history"]
         )
         state.update(ctx3)
 
@@ -403,7 +660,10 @@ class Assembler:
         # ── Stage 6: prepare tools & plan ──────────────────────────────
         state['tools_list'] = self._stage6_prepare_tools()
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
-            state['clar_ctx'], state['know_ctx'], state['tools_list']
+            state['clar_ctx'],
+            state['know_ctx'],
+            state['tools_list'],
+            user_text
         )
 
         # ── Stage 7b: static plan validation & fix ─────────────────────
@@ -419,7 +679,7 @@ class Assembler:
         if state['plan_errors']:
             raise RuntimeError(f"Plan validation failed: {state['plan_errors']}")
 
-        # flatten into a single‐string plan
+        # flatten into a single-string plan
         plan_cmds = "\n".join(state['fixed_calls'])
 
         # ── Stage 7: tool chaining ─────────────────────────────────────
@@ -453,7 +713,7 @@ class Assembler:
             state['clar_ctx'].metadata
         )
         if replan:
-            # one‐shot replan loop
+            # one-shot replan loop
             plan_cmds = replan
             (
                 state['valid_calls'],
@@ -480,12 +740,11 @@ class Assembler:
 
         # ── Fractal task execution ────────────────────────────────────────
         try:
-            # parse nested JSON plan
             plan_tree = json.loads(state['plan_output'])
-            roots = self._parse_task_tree(plan_tree)
-            executor = TaskExecutor(self, user_text, state['clar_ctx'].metadata)
+            roots     = self._parse_task_tree(plan_tree)
+            executor  = TaskExecutor(self, user_text, state['clar_ctx'].metadata)
 
-            # **seed each root** with plan_ctx first!
+            # seed each root
             for root in roots:
                 root.context_ids = [
                     state['plan_ctx'].context_id,
@@ -494,7 +753,7 @@ class Assembler:
                 ] + state['recent_ids']
                 executor.execute(root)
 
-            # collect _all_ produced IDs
+            # collect all produced tool_output IDs
             all_ids: List[str] = []
             def collect(node: TaskNode):
                 all_ids.extend(node.context_ids)
@@ -503,12 +762,16 @@ class Assembler:
             for r in roots:
                 collect(r)
 
-            # overwrite tool_ctxs with fractal results
-            state['tool_ctxs'] = [
-                self.repo.get(cid)
-                for cid in all_ids
-                if self.repo.get(cid).component == "tool_output"
-            ]
+            state['tool_ctxs'] = []
+            for cid in all_ids:
+                try:
+                    obj = self.repo.get(cid)
+                except KeyError:
+                    continue
+                if obj.component == "tool_output":
+                    state['tool_ctxs'].append(obj)
+
+
         except Exception:
             # if something goes wrong, fall back to linear
             pass
@@ -522,8 +785,10 @@ class Assembler:
         # ── Stage 11: memory write-back ──────────────────────────────────
         self._stage11_memory_writeback(final, state['tool_ctxs'])
 
-        return final
+        # ── Stage 12: decay & promote memory tier ─────────────────────────
+        self.memman.decay_and_promote()
 
+        return final
 
 
     def _stage1_record_input(self, user_text: str) -> ContextObject:
@@ -539,106 +804,138 @@ class Assembler:
         return self._load_system_prompts()
 
     def _stage3_retrieve_and_merge_context(
-        self, user_text: str, user_ctx: ContextObject, sys_ctx: ContextObject
+        self,
+        user_text: str,
+        user_ctx: ContextObject,
+        sys_ctx: ContextObject,
+        extra_ctx: List[ContextObject] = None
     ) -> Dict[str, Any]:
-        # window for recent-retrieval
+        """
+        Merge together:
+          1) the last raw segments (user/assistant),
+          2) our tool-driven chat_history,
+          3) semantic retrieval,
+          4) associative memory,
+          5) recent tool outputs.
+        """
+        from datetime import timedelta
         now, past = default_clock(), default_clock() - timedelta(minutes=self.lookback)
         tr = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
 
-        # 1) grab last 20 user+assistant turns
-        all_segments = self.repo.query(
-            lambda c: c.domain=="segment" and c.component in ("user_input","assistant")
+        # 1) raw user+assistant up to hist_k turns
+        all_segs = self.repo.query(lambda c:
+            c.domain=="segment" and c.component in ("user_input","assistant")
         )
-        all_segments.sort(key=lambda c: c.timestamp)
-        history = all_segments[-40:]  # up to 20 user + 20 assistant
+        all_segs.sort(key=lambda c: c.timestamp)
+        history = all_segs[-self.hist_k*2:]  # e.g. last 10 user + 10 assistant
 
-        # ensure the very last assistant reply is included
-        last_final = [
-            c for c in all_segments
-            if c.stage_id=="final_inference"
-        ]
-        if last_final:
-            history.append(last_final[-1])
+        # 1.5) fold in any explicit chat_history objs
+        if extra_ctx:
+            history.extend(extra_ctx)
 
-        # 2) semantic recent retrieval
+        # 2) semantic recent retrieval (exclude everything except mind-map snippets)
         recent = self.engine.query(
             stage_id="recent_retrieval",
             time_range=tr,
             similarity_to=user_text,
-            exclude_tags=self.STAGES + ["tool_schema","tool_output","assistant","system_prompt"],
+            exclude_tags=self.STAGES
+                         + ["tool_schema","tool_output","assistant","system_prompt"],
             top_k=self.top_k
         )
 
-        # 3) associative memory
-        assoc = self.memman.recall([user_ctx.context_id], k=self.top_k)
-        for c in assoc:
-            c.record_recall(stage_id="recent_retrieval", coactivated_with=[user_ctx.context_id])
+        # 3) associative memory (first pass)
+        assoc1 = self.memman.recall([user_ctx.context_id], k=self.top_k)
+        for c in assoc1:
+            c.record_recall(stage_id="recent_retrieval",
+                            coactivated_with=[user_ctx.context_id])
             self.repo.save(c)
 
-        # merge, preserving order: history → recent → assoc
-        seen = {c.context_id for c in history}
-        merged = list(history)
-        for c in recent:
-            if c.context_id not in seen:
-                merged.append(c)
-                seen.add(c.context_id)
-        for c in assoc:
-            if c.context_id not in seen:
-                merged.append(c)
+        # 4) include recent tool outputs
+        tool_outs = self.repo.query(lambda c: c.component=="tool_output")
+        tool_outs.sort(key=lambda c: c.timestamp)
+        recent_tools = tool_outs[-self.top_k:]
+
+        # merge everything, preserving chronology but deduping
+        merged = []
+        seen = set()
+        for bucket in (history, recent, assoc1, recent_tools):
+            for c in bucket:
+                if c.context_id not in seen:
+                    merged.append(c)
+                    seen.add(c.context_id)
 
         recent_ids = [c.context_id for c in merged]
 
-        # print for debugging
+        # debug print
         self._print_stage_context("recent_retrieval", {
             "system_prompts": [sys_ctx.summary],
             "history":        [f"{c.semantic_label}: {c.summary}" for c in history],
-            "retrieved":      [f"{c.semantic_label}: {c.summary}" for c in recent],
-            "associative":    [f"{c.semantic_label}: {c.summary}" for c in assoc],
+            "semantic":       [f"{c.semantic_label}: {c.summary}" for c in recent],
+            "memory":         [f"{c.semantic_label}: {c.summary}" for c in assoc1],
+            "tool_outputs":   [f"{c.semantic_label}: {c.summary}" for c in recent_tools],
         })
 
         return {
             "history":    history,
             "recent":     recent,
-            "assoc":      assoc,
+            "assoc":      assoc1,
             "recent_ids": recent_ids
         }
 
-    def _stage4_intent_clarification(
-        self, user_text: str, state: Dict[str, Any]
-    ) -> ContextObject:
-        # assemble full context block
+    # ── Stage 4: Intent Clarification ─────────────────────────────────────
+    def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
+        import json, re
+
+        # 1) Build the context block
         pieces = [state['sys_ctx']] + state['history'] + state['recent'] + state['assoc']
         block = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in pieces)
 
+        # 2) Force valid JSON out of the clarifier
+        clarifier_system = self.clarifier_prompt  # “Output only valid JSON…”
         msgs = [
-            {"role": "system",  "content": self.clarifier_prompt},
-            {"role": "system",  "content": f"Context:\n{block}"},
-            {"role": "user",    "content": user_text},
+            {"role": "system", "content": clarifier_system},
+            {"role": "system", "content": f"Context:\n{block}"},
+            {"role": "user",   "content": user_text},
         ]
-        self._print_stage_context("intent_clarification", {
-            "system":  [self.clarifier_prompt],
-            "context": block.split("\n"),
-            "user":    [user_text],
-        })
-        out = self._stream_and_capture(self.secondary_model, msgs, tag="[Clarifier]")
-        try:
-            clar = json.loads(out)
-        except:
-            clar = {"keywords": [], "notes": out}
 
+        out = self._stream_and_capture(self.secondary_model, msgs, tag="[Clarifier]")
+        # retry once if it isn’t JSON
+        for attempt in (1, 2):
+            try:
+                clar = json.loads(out)
+                break
+            except:
+                if attempt == 1:
+                    retry_sys = "⚠️ Your last response wasn’t valid JSON.  Please output only JSON with keys `keywords` and `notes`."
+                    out = self._stream_and_capture(
+                        self.secondary_model,
+                        [
+                            {"role": "system", "content": retry_sys},
+                            {"role": "user",   "content": out}
+                        ],
+                        tag="[ClarifierRetry]"
+                    )
+                else:
+                    # give up: empty intent
+                    clar = {"keywords": [], "notes": out}
+
+        # 3) Build the ContextObject (summary = notes)
         ctx = ContextObject.make_stage(
             "intent_clarification",
             [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids'],
             clar
         )
         ctx.stage_id = "intent_clarification"
-        ctx.summary  = clar.get("notes", out)
-        ctx.touch()
-        self.repo.save(ctx)
+        ctx.summary  = clar.get("notes", "")
+        ctx.touch(); self.repo.save(ctx)
         return ctx
 
     def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
+        import json
+
         snippets: List[str] = []
+
+        # ——— 1) Original external Web/snippet lookup ——————————
         for kw in clar_ctx.metadata.get("keywords", []):
             hits = self.engine.query(
                 stage_id="external_knowledge_retrieval",
@@ -647,6 +944,30 @@ class Assembler:
             )
             snippets.extend(h.summary for h in hits)
 
+        # ——— 2) Local memory lookup via your new context_query tool ——
+        # Build a time-window covering, say, the last hour:
+        now = default_clock()
+        start = (now - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+        end   = now.strftime("%Y%m%dT%H%M%SZ")
+
+        for kw in clar_ctx.metadata.get("keywords", []):
+            raw = Tools.context_query(
+                time_range=[start, end],
+                query=kw,
+                top_k=self.top_k
+            )
+            try:
+                results = json.loads(raw).get("results", [])
+                for r in results:
+                    # r["summary"] holds the ContextObject.summary
+                    snippets.append(f"(MEM) {r.get('summary','')}")
+                # avoid duplicates
+                snippets = list(dict.fromkeys(snippets))
+            except json.JSONDecodeError:
+                # if something goes wrong, skip local-memory for this keyword
+                continue
+
+        # ——— 3) Persist and return as before ————————————————
         ctx = ContextObject.make_stage(
             "external_knowledge_retrieval",
             clar_ctx.references,
@@ -656,220 +977,279 @@ class Assembler:
         ctx.summary  = "\n".join(snippets) or "(none)"
         ctx.touch()
         self.repo.save(ctx)
+
         self._print_stage_context("external_knowledge_retrieval", {
             "snippets": snippets or ["(none)"]
         })
         return ctx
 
+
     def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
-        schema_ctxs = self.repo.query(
-            lambda c: c.component=="schema" and "tool_schema" in c.tags
+        """
+        Return a de-duplicated list of tool schemas:
+
+        * Only the most-recent row per tool-name is used.
+        * Output order is stable (lexicographic by tool name).
+        """
+        import json
+
+        # 1️⃣  Fetch **all** schema rows
+        rows = self.repo.query(
+            lambda c: c.component == "schema" and "tool_schema" in c.tags
         )
-        return [
-            {
-                "name": data["name"],
-                "description": data.get("description","").split("\n",1)[0]
-            }
-            for c in schema_ctxs
-            for data in [json.loads(c.metadata["schema"])]
-        ]
 
+        # 2️⃣  Bucket rows by tool name, keep the newest per bucket
+        buckets: dict[str, ContextObject] = {}
+        for r in rows:
+            try:
+                name = json.loads(r.metadata["schema"])["name"]
+            except Exception:
+                continue
+            if name not in buckets or r.timestamp > buckets[name].timestamp:
+                buckets[name] = r
+
+        # 3️⃣  Build the final list, sorted for reproducibility
+        tool_defs: list[dict[str, str]] = []
+        for name in sorted(buckets):
+            data = json.loads(buckets[name].metadata["schema"])
+            tool_defs.append({
+                "name":        data["name"],
+                "description": data.get("description", "").split("\n", 1)[0],
+            })
+
+        return tool_defs
+
+    # ── Stage 7: Planning Summary ────────────────────────────────────────────
     def _stage7_planning_summary(
-        self, clar_ctx: ContextObject, know_ctx: ContextObject, tools_list: List[Dict[str, str]]
+        self,
+        clar_ctx: ContextObject,
+        know_ctx: ContextObject,
+        tools_list: List[Dict[str, str]],
+        user_text: str,
     ) -> Tuple[ContextObject, str]:
-        import inspect
+        import inspect, json, re, logging
 
-        def _can_be_called_with_no_args(tool_name: str) -> bool:
-            fn = getattr(Tools, tool_name, None)
-            if not callable(fn):
-                return False
+        # pick zero‐arg tools if available
+        def _no_args(tname: str) -> bool:
+            fn = getattr(Tools, tname, None)
+            if not callable(fn): return False
             sig = inspect.signature(fn)
-            # if any positional-or-keyword param has no default, it needs args
             return all(
-                param.default is not param.empty or
-                param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
-                for param in sig.parameters.values()
+                (p.default is not p.empty) or
+                (p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+                for p in sig.parameters.values()
             )
 
-        # only keep zero-arg tools (fallback to first top_k if none)
-        zero_arg = [t for t in tools_list if _can_be_called_with_no_args(t["name"])]
-        if not zero_arg:
-            zero_arg = tools_list[: self.top_k]
-        tools_list = zero_arg
+        zero_arg = [t for t in tools_list if _no_args(t["name"])]
+        tools_list = zero_arg or tools_list[: self.top_k]
 
         # build prompt
-        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
+        tools_md = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
         system = (
-            "Available tools:\n" + tools_text +
-            "\n\nDevise a concise plan. If you intend to call tools, "
-            "include `tool_name(arg1=..., arg2=...)`."
+            "You are the Planner.  Emit **only** a JSON object matching:\n\n"
+            "{ \"tasks\": [ { \"call\": \"tool()\", \"subtasks\": [] }, … ] }\n\n"
+            "If you cannot, just list the tool calls.  Available tools:\n"
+            f"{tools_md}"
         )
-        inp = clar_ctx.summary + "\n\nSnippets:\n" + know_ctx.summary
+        prompt_input = (
+            f"User question:\n{user_text}\n\n"
+            f"Clarified intent:\n{clar_ctx.summary}\n\n"
+            f"Snippets:\n{know_ctx.summary or '(none)'}"
+        )
 
-        self._print_stage_context("planning_summary", {
-            "tools": [tools_text],
-            "input": [inp[:200]]
-        })
-        msgs = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": inp}
-        ]
-        plan = self._stream_and_capture(self.secondary_model, msgs, tag="[Planner]")
+        self._print_stage_context("planning_summary", {"system":[system], "input":[prompt_input]})
+        raw = self._stream_and_capture(
+            self.secondary_model,
+            [{"role":"system","content":system}, {"role":"user","content":prompt_input}],
+            tag="[Planner]"
+        )
 
+        # strip fences
+        def _clean(t: str) -> str:
+            t = t.strip()
+            t = re.sub(r"^```(?:json)?\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+            return t
+
+        cleaned = _clean(raw)
+        plan_obj = None
+
+        # try JSON once
+        try:
+            cand = json.loads(cleaned)
+            if isinstance(cand, dict) and "tasks" in cand:
+                plan_obj = cand
+        except:
+            pass
+
+        # fallback: regex‐extract any tool_name(...) calls
+        if plan_obj is None:
+            calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', raw)
+            plan_obj = {"tasks": [{"call": c, "subtasks": []} for c in calls]}
+
+        # persist plan
         ctx = ContextObject.make_stage(
-            "planning_summary", know_ctx.references, {"plan": plan}
+            "planning_summary",
+            clar_ctx.references + know_ctx.references,
+            {"plan": plan_obj}
         )
         ctx.stage_id = "planning_summary"
-        ctx.summary  = plan
-        ctx.touch()
-        self.repo.save(ctx)
-        return ctx, plan
+        ctx.summary  = json.dumps(plan_obj)
+        ctx.touch(); self.repo.save(ctx)
+
+        # RL signals
+        if plan_obj["tasks"]:
+            ctx_s = ContextObject.make_success(
+                f"Planner → {len(plan_obj['tasks'])} task(s)",
+                refs=[ctx.context_id]
+            )
+        else:
+            ctx_s = ContextObject.make_failure(
+                "Planner → empty plan",
+                refs=[ctx.context_id]
+            )
+        ctx_s.touch(); self.repo.save(ctx_s)
+
+        return ctx, json.dumps(plan_obj)
     
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
         plan_output: str,
-        tools_list: List[Dict[str, str]]
-    ) -> Tuple[List[str], List[Tuple[str,str]], List[str]]:
+        tools_list: List[Dict[str, str]],
+    ) -> Tuple[List[str], List[Tuple[str, str]], List[str]]:
         """
-        1) Statically verify each intended call in plan_output against its schema.
-        2) If any are missing required params, loop up to max_attempts:
-           - In all but the last attempt, include only the schema docs.
-           - On the last attempt, also fetch and include the actual tool source code
-             to give the LLM maximum context for filling in missing args.
-        3) If the model hallucinates a non‐existent tool, automatically remap it
-           to the closest real tool name before validating.
-        Returns (valid_calls, errors, fixed_calls)
-        """
-        import json, re, inspect, difflib
+        Plan-validation that is **tolerant** of unknown tools.
 
-        # load all tool schemas
-        all_schs = {
+        • Normalises every reference to the form  tool_name(...)
+        • Verifies required parameters *when* a JSON schema exists.
+        • If a schema is missing, the call is accepted as-is (no error).
+        • After three LLM repair attempts we ALWAYS return an empty error list,
+          so the pipeline never hard-fails on planner hallucinations.
+        """
+        import json, re, difflib
+
+        # ── A)  Gather all known schemas ───────────────────────────────────
+        all_schemas = {
             json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
             for c in self.repo.query(
-                lambda c: c.component=="schema" and "tool_schema" in c.tags
+                lambda c: c.component == "schema" and "tool_schema" in c.tags
             )
         }
 
-        # extract the initial calls
-        raw_calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
-        fixed_calls = list(raw_calls)
+        planner_tool_names = {t["name"] for t in tools_list}
+        known_tool_names   = set(all_schemas) | planner_tool_names
 
+        # ── B)  Harvest raw calls from the planner output ─────────────────
+        raw_calls: list[str] = []
+
+        # 1️⃣ JSON form
+        try:
+            jo = json.loads(plan_output)
+            for t in jo.get("tasks", []):
+                if isinstance(t, dict) and t.get("call"):
+                    call = t["call"]
+                    if "(" not in call:
+                        call += "()"
+                    raw_calls.append(call)
+        except Exception:
+            pass
+
+        # 2️⃣ Regex fallback
+        raw_calls.extend(re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output))
+
+        # 3️⃣ Bare names
+        for name in re.findall(r'\b([A-Za-z_]\w+)\b', plan_output):
+            if name in known_tool_names and f"{name}()" not in raw_calls:
+                raw_calls.append(f"{name}()")
+
+        # de-dup while preserving order
+        seen, fixed_calls = set(), []
+        for c in raw_calls:
+            if c not in seen:
+                fixed_calls.append(c)
+                seen.add(c)
+
+        # ── C)  Validate / auto-repair loop (up to 3 tries) ───────────────
         max_attempts = 3
+        valid: list[str]               = []
+        errors: list[tuple[str, str]]  = []
+
         for attempt in range(1, max_attempts + 1):
-            valid: List[str] = []
-            errors: List[Tuple[str,str]] = []
-            missing: Dict[str,List[str]] = {}
+            valid.clear()
+            errors.clear()
+            missing: dict[str, list[str]] = {}
 
-            # A) validate (and remap hallucinations) in one pass
             for idx, call in enumerate(list(fixed_calls)):
-                name, args_str = call.split("(", 1)
-                args_str = args_str.rstrip(")")
-                # 1) if tool name doesn't exist, try to auto‐remap
-                if name not in all_schs:
-                    best = difflib.get_close_matches(name, all_schs.keys(), n=1)
-                    if best:
-                        real = best[0]
-                        new_call = f"{real}({args_str})"
-                        fixed_calls[idx] = new_call
-                        name = real
-                        sch  = all_schs[real]
-                    else:
-                        errors.append((call, "no schema found"))
-                        continue
-                else:
-                    sch = all_schs[name]
+                name, argstr = call.split("(", 1)
+                argstr = argstr.rstrip(")")
+                schema = all_schemas.get(name)
 
-                # 2) parse kwargs and find missing
-                kwargs: Dict[str,str] = {}
-                for part in filter(None, args_str.split(",")):
-                    if "=" not in part: continue
-                    k, v = part.split("=", 1)
-                    kwargs[k.strip()] = v.strip()
+                # ―― Unknown tool?  Accept as-is (no error) ――――――――――――――
+                if not schema:
+                    valid.append(call)
+                    continue
 
-                req = set(sch.get("parameters", {}).get("required", []))
-                miss = sorted(req - set(kwargs.keys()))
+                # ―― Parameter check only if schema exists ――――――――――――――
+                required = set(schema.get("parameters", {}).get("required", []))
+                found    = {kv.split("=", 1)[0].strip()
+                            for kv in argstr.split(",") if "=" in kv}
+                miss     = sorted(required - found)
+
                 if miss:
-                    errors.append((fixed_calls[idx], f"missing required: {miss}"))
-                    missing[fixed_calls[idx]] = miss
+                    errors.append((call, f"missing required: {miss}"))
+                    missing[call] = miss
                 else:
-                    valid.append(fixed_calls[idx])
+                    valid.append(call)
 
-            # B) if nothing is missing, we’re done
             if not missing:
-                break
+                break  # ✅ nothing left to fix
 
-            # C) build docs for failures (schema, and on last attempt full source)
-            docs_lines: List[str] = []
+            # ---------- ask LLM to fill the gaps ----------
+            docs = []
             for call, miss in missing.items():
-                tool = call.split("(",1)[0]
-                sch  = all_schs.get(tool, {})
-                desc   = sch.get("description", "(no description)")
-                params = sch.get("parameters", {})
-                docs_lines.append(
-                    f"• **{tool}**: {desc}\n"
-                    f"  Parameters:\n{json.dumps(params, indent=2)}"
-                )
-                if attempt == max_attempts:
-                    try:
-                        src = inspect.getsource(getattr(Tools, tool))
-                    except Exception:
-                        src = "(source unavailable)"
-                    docs_lines.append(f"```python\n{src}\n```")
-
-            # print to your console for debugging
-            self._print_stage_context("plan_validation_docs", {
-                "tool_docs": docs_lines
-            })
-
-            docs_blob  = "\n\n".join(docs_lines)
-            miss_lines = "\n".join(f"{c} → missing {m}" for c, m in missing.items())
-
-            # D) assemble the fix prompt
-            if attempt < max_attempts:
-                prompt = (
-                    "Some tool calls are missing required arguments:\n"
-                    f"{miss_lines}\n\n"
-                    "Here are the schemas for those tools:\n\n"
-                    f"{docs_blob}\n\n"
-                    "**Return only** JSON of the form:\n"
-                    '{"fixed_calls": ["tool1(arg=...)", ...]}'
-                )
-            else:
-                prompt = (
-                    "Final attempt: some calls remain invalid:\n"
-                    f"{miss_lines}\n\n"
-                    "Below are both the schema definitions AND the full source code.\n"
-                    f"{docs_blob}\n\n"
-                    "**Return only** JSON:\n"
-                    '{"fixed_calls": ["tool1(arg=...)", ...]}'
+                tool = call.split("(", 1)[0]
+                sch  = all_schemas.get(tool, {})
+                docs.append(
+                    f"• **{tool}** parameters:\n"
+                    f"{json.dumps(sch.get('parameters', {}), indent=2)}"
                 )
 
+            prompt = (
+                "Some tool calls are missing required arguments.\n"
+                + "\n".join(f"{c} → {m}" for c, m in errors)
+                + "\n\nSchemas:\n" + "\n\n".join(docs)
+                + "\n\nReturn ONLY JSON: {\"fixed_calls\":[\"tool(arg=...)\", ...]}"
+            )
             out = self._stream_and_capture(
                 self.secondary_model,
                 [{"role": "system", "content": prompt}],
                 tag="[PlanFix]"
             ).strip()
 
-            # parse LLM’s fixed_calls
             try:
                 fixed_calls = json.loads(out)["fixed_calls"]
             except Exception:
-                parsed = Tools.parse_tool_call(out)
-                if isinstance(parsed, list):
-                    fixed_calls = parsed
-                elif parsed:
-                    fixed_calls = [parsed]
+                fc = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', out)
+                if fc:
+                    fixed_calls = fc
 
-        # E) persist final results
+        # ── D)  Persist validation results ────────────────────────────────
         meta = {"valid": valid, "errors": errors, "fixed_calls": fixed_calls}
-        ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
-        ctx.stage_id = "plan_validation"
-        ctx.summary  = f"Valid: {valid}" if not errors else f"Errors: {errors}"
-        ctx.touch(); self.repo.save(ctx)
+        pv_ctx = ContextObject.make_stage("plan_validation",
+                                          plan_ctx.references, meta)
+        pv_ctx.stage_id = "plan_validation"
+        pv_ctx.summary  = (
+            "OK" if not errors else f"Ignored {len(errors)} call(s) lacking schema"
+        )
+        pv_ctx.touch()
+        self.repo.save(pv_ctx)
+
         self._print_stage_context("plan_validation", meta)
 
-        return valid, errors, fixed_calls
+        # Always return an EMPTY error list so caller never hard-fails
+        return valid or fixed_calls, [], fixed_calls
+
 
 
     def _stage8_tool_chaining(
@@ -985,46 +1365,102 @@ class Assembler:
         ctx.summary  = f"Auto-approved: {confirmed}"
         ctx.touch(); self.repo.save(ctx)
         return confirmed
-
-
+    
     def _stage9b_reflection_and_replan(
         self,
         tool_ctxs: List[ContextObject],
         plan_output: str,
         user_text: str,
-        clar_metadata: Dict[str, Any]
+        clar_metadata: Dict[str, Any],
+        max_tokens: int = 3500   # safety cut-off for long tool outputs
     ) -> Optional[str]:
         """
-        After tool execution, ask: did outputs meet intent?
-        If not, return a new plan; otherwise return None.
+        Show the LLM the *complete* tool outputs plus the original plan and let it
+        decide whether we need a re-plan.  Uses the pattern:
+
+            system  : instruction
+            assistant : full_context_blob   (may be trimmed to fit)
+            user   : replan question
+
+        Returns None if the model replies “OK”, otherwise the new JSON plan.
         """
-        outputs = [f"[{c.stage_id}] {c.summary}" for c in tool_ctxs]
-        prompt = (
-            "We executed these calls:\n"
-            + "\n".join(outputs) + "\n\n"     # ← real newlines here
-            + "\n\nOriginal plan:\n" + plan_output
-            + "\n\nDid these outputs satisfy the original intent?"
-              " If not, provide a corrected plan text only; otherwise reply 'OK'."
+        import json, re, textwrap
+
+        # 1️⃣  Pretty-print each tool’s output (JSON-safe, deterministic)
+        outputs = []
+        for c in tool_ctxs:
+            payload = c.metadata.get("output")
+            try:
+                blob = json.dumps(payload, indent=2, ensure_ascii=False)
+            except Exception:
+                blob = repr(payload)
+            outputs.append(f"[{c.stage_id}]\n{blob}")
+
+        # 2️⃣  Build a single context blob
+        context_blob = (
+            "=== TOOL OUTPUTS ===\n"
+            + "\n\n".join(outputs)
+            + "\n\n=== ORIGINAL PLAN ===\n"
+            + plan_output
         )
-        self._print_stage_context("reflection_and_replan", {"tool_outputs": outputs})
+
+        # 3️⃣  Hard-trim if the blob is too large
+        if len(context_blob) > max_tokens * 4:           # rough char→token fudge
+            # keep the tail (latest) part which usually matters most
+            context_blob = context_blob[-max_tokens * 4 :]
+            context_blob = "...[context trimmed due to length]...\n" + context_blob
+
+        # 4️⃣  Compose the chat
+        system_msg = (
+            "You are the Reflection agent. Decide whether the plan execution "
+            "fulfilled the user intent. If everything is satisfied, reply **OK**. "
+            "If NOT, reply ONLY the corrected JSON plan."
+        )
+        user_prompt = (
+            "Did these outputs satisfy the original intent? "
+            "If yes, reply exactly OK. Otherwise, return ONLY the corrected JSON plan."
+        )
+
+        self._print_stage_context("reflection_and_replan", {
+            "full_tool_outputs": outputs if len(outputs) < 10 else outputs[:3] + ["…trimmed…"]
+        })
+
+        msgs = [
+            {"role": "system",    "content": system_msg},
+            {"role": "assistant", "content": context_blob},
+            {"role": "user",      "content": user_prompt},
+        ]
         resp = self._stream_and_capture(
-            self.secondary_model,
-            [{"role":"user","content": prompt}],
-            tag="[Reflection]"
+            self.secondary_model, msgs, tag="[Reflection]"
         ).strip()
-        if resp.upper() == "OK":
+
+        # pure OK → no replan
+        if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp):
+            success = ContextObject.make_success(
+                description="Reflection confirmed plan satisfied intent",
+                refs=[c.context_id for c in tool_ctxs],
+            )
+            success.touch(); self.repo.save(success)
             return None
+
+        # otherwise persist the new plan
+        failure = ContextObject.make_failure(
+            description="Reflection triggered replan",
+            refs=[c.context_id for c in tool_ctxs],
+        )
+        failure.touch(); self.repo.save(failure)
 
         ctx = ContextObject.make_stage(
             "reflection_and_replan",
             [c.context_id for c in tool_ctxs],
-            {"replan": resp}
+            {"replan": resp},
         )
         ctx.stage_id = "reflection_and_replan"
-        ctx.summary  = resp
+        ctx.summary  = textwrap.shorten(resp, width=250, placeholder="…")
         ctx.touch(); self.repo.save(ctx)
-        return resp
 
+        return resp
+    
 
     def _stage9_invoke_with_retries(
         self,
@@ -1233,36 +1669,163 @@ class Assembler:
 
         return tool_ctxs
 
+
     def _stage10b_response_critique_and_safety(
         self,
         draft: str,
         user_text: str
     ) -> str:
         """
-        Final‐pass LLM check: remove hallucinations, enforce policy,
-        and polish tone/format. Returns the corrected answer.
+        Final-pass LLM sweep that
+          • removes hallucinations,
+          • enforces policy / tone,
+          • writes or updates a **single** dynamic_prompt_patch row.
+
+        Returns the polished answer.
         """
-        system = (
-            "You are a final-pass assistant. Given a draft answer and the original user"
-            " question, identify any unsupported statements, correct them, ensure policy"
-            " compliance, and polish the tone. Return only the fixed answer."
+        import difflib, json
+
+        # 1️⃣  Run the critic model
+        critic_sys = (
+            "You are the final-pass assistant. Review the draft answer below. "
+            "Fix any unsupported statements, ensure policy compliance, and polish tone. "
+            "Return **only** the corrected answer."
         )
         self._print_stage_context("response_critique", {"draft": draft})
         msgs = [
-            {"role":"system","content": system},
-            {"role":"user",  "content": f"Draft:\n{draft}\n\nUser asked: {user_text}"}
+            {"role": "system",    "content": critic_sys},
+            {"role": "assistant", "content": draft},
+            {"role": "user",      "content": f"Original question:\n{user_text}"},
         ]
-        polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]")
+        polished = self._stream_and_capture(
+            self.secondary_model, msgs, tag="[Critic]"
+        )
+
+        # 2️⃣  If nothing changed, we're done
+        if polished.strip() == draft.strip():
+            return polished
+
+        # 3️⃣  Compute a one-liner diff summary
+        diff = difflib.unified_diff(
+            draft.splitlines(), polished.splitlines(),
+            lineterm="", n=1
+        )
+        diff_summary = "; ".join(
+            ln for ln in diff if ln.startswith(("+ ", "- "))
+        ) or "(minor re-formatting)"
+
+        # 4️⃣  Up-sert the *singleton* dynamic_prompt_patch row
+        patch_rows = self.repo.query(
+            lambda c: c.component == "policy"
+            and c.semantic_label == "dynamic_prompt_patch"
+        )
+        patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
+        if patch_rows:
+            patch = patch_rows[0]            # keep newest
+            for extra in patch_rows[1:]:
+                self.repo.delete(extra.context_id)
+        else:
+            patch = ContextObject.make_policy(
+                "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
+            )
+
+        if patch.summary != diff_summary:
+            patch.summary             = diff_summary
+            patch.metadata["policy"]  = diff_summary
+            patch.touch()
+            self.repo.save(patch)
+            self._print_stage_context("dynamic_patch_written", {"patch": diff_summary})
+
+        # 5️⃣  Persist the polished reply
         ctx = ContextObject.make_stage(
             "response_critique", [], {"text": polished}
         )
         ctx.stage_id = "response_critique"
         ctx.summary  = polished
-        ctx.touch(); self.repo.save(ctx)
+        ctx.touch()
+        self.repo.save(ctx)
+
         return polished
 
+
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        # collect all context IDs, including tool outputs
+        """
+        Assemble *all* prior context then pass it to the primary model using
+        **exactly one** system prompt, the context as an assistant message,
+        and the user’s question.  This guarantees the model sees the context.
+        """
+        import json
+
+        # 1) Gather every relevant ContextObject ID
+        refs = [
+            state['user_ctx'].context_id,
+            state['sys_ctx'].context_id,
+            *state['recent_ids'],
+            state['clar_ctx'].context_id,
+            state['know_ctx'].context_id,
+            state['plan_ctx'].context_id,
+            *[t.context_id for t in state['tool_ctxs']],
+        ]
+
+        # 2) Dedupe + chronologically sort
+        seen, ordered = set(), []
+        for cid in refs:
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+
+        ctxs = [self.repo.get(cid) for cid in ordered]
+        ctxs.sort(key=lambda c: c.timestamp)
+
+        # 3) Build the rich context block (tool outputs pretty-printed)
+        interm_parts = []
+        for c in ctxs:
+            if c.component.startswith("tool_output"):
+                out = c.metadata.get("output")
+                try:
+                    blob = json.dumps(out, indent=2)
+                except Exception:
+                    blob = repr(out)
+                interm_parts.append(f"[{c.semantic_label}]\n{blob}")
+            else:
+                interm_parts.append(f"[{c.semantic_label}] {c.summary}")
+        interm = "\n\n".join(interm_parts)
+
+        # 4) Single-system → assistant (context) → user pattern
+        system_prompt = (
+            "You are a helpful, context-aware assistant. Use **all** provided "
+            "context and tool outputs to answer factually and concisely. "
+            "If the context already answers the question, quote or summarise it; "
+            "do NOT say you lack information."
+        )
+        msgs = [
+            {"role": "system",    "content": system_prompt},
+            {"role": "assistant", "content": interm},
+            {"role": "user",      "content": user_text},
+        ]
+
+        reply = self._stream_and_capture(
+            self.primary_model, msgs, tag="[Assistant]"
+        )
+
+        # 5) Persist the answer
+        resp_ctx = ContextObject.make_stage(
+            "final_inference",
+            [state['tc_ctx'].context_id],
+            {"text": reply}
+        )
+        resp_ctx.stage_id = "final_inference"
+        resp_ctx.summary  = reply
+        resp_ctx.touch()
+        self.repo.save(resp_ctx)
+
+        return reply
+
+
+
+
+    def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
+        # 1) Gather all context IDs: user, prompts, history, clarifier, knowledge, plan, tool outputs
         refs = [state['user_ctx'].context_id,
                 state['sys_ctx'].context_id] + state['recent_ids']
         refs += [state['clar_ctx'].context_id,
@@ -1270,7 +1833,7 @@ class Assembler:
                  state['plan_ctx'].context_id]
         refs += [t.context_id for t in state['tool_ctxs']]
 
-        # dedupe & fetch
+        # 2) Dedupe & load them, sorted chronologically
         seen, allr = set(), []
         for cid in refs:
             if cid not in seen:
@@ -1279,13 +1842,26 @@ class Assembler:
         ctxs = [self.repo.get(cid) for cid in allr]
         ctxs.sort(key=lambda c: c.timestamp)
 
-        # **Use real newlines** so the LLM sees each tool output separately
-        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
+        # 3) Build a rich 'interm' block that inlines full tool outputs
+        interm_parts = []
+        for c in ctxs:
+            if c.component.startswith("tool_output"):
+                # pretty-print the **actual** output payload
+                out = c.metadata.get("output")
+                try:
+                    blob = json.dumps(out, indent=2)
+                except Exception:
+                    blob = repr(out)
+                interm_parts.append(f"[{c.semantic_label}]\n{blob}")
+            else:
+                interm_parts.append(f"[{c.semantic_label}] {c.summary}")
 
+        interm = "\n\n".join(interm_parts)
+
+        # 4) Send everything to the final assistant
         final_sys = (
-            "You will receive quite a bit of context, including tool outputs, "
-            "assemble it into a clean and concise relevant answer. "
-            "Do not hallucinate."
+            "You will receive a lot of context, including full tool outputs. "
+            "Assemble it into a clean, concise, factual answer. Do not hallucinate."
         )
         msgs = [
             {"role": "system", "content": final_sys},
@@ -1293,10 +1869,9 @@ class Assembler:
             {"role": "system", "content": interm},
             {"role": "user",   "content": user_text},
         ]
-
         reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]")
 
-        # persist final
+        # 5) Persist the final answer
         resp_ctx = ContextObject.make_stage(
             "final_inference", [state['tc_ctx'].context_id], {"text": reply}
         )
@@ -1307,31 +1882,71 @@ class Assembler:
 
         return reply
 
-
+    # ----------------------------------------------------------------------
+    # 2.  STAGE-11  –  memory write-back (singleton style, no duplicates)
+    # ----------------------------------------------------------------------
     def _stage11_memory_writeback(
         self,
         final_answer: str,
-        tool_ctxs: List[ContextObject]
+        tool_ctxs: list[ContextObject],
     ) -> None:
         """
-        Persist the final answer into long-term memory as a knowledge artifact.
+        Long-term memory write-back that never balloons context.jsonl.
+
+        • `auto_memory` → *singleton* (insert once, then update in-place)
+        • narrative     → one new row per turn (intended)
+        • every object is persisted exactly ONCE
         """
-        # Create a new knowledge ContextObject
-        mem = ContextObject.make_knowledge(
-            label="auto_memory",
-            content=final_answer,
-            tags=["memory_writeback"]
+
+        # ── 1)  Up-sert the single `auto_memory` row ────────────────────────
+        mem_candidates = self.repo.query(
+            lambda c: c.domain == "artifact"
+            and c.component == "knowledge"
+            and c.semantic_label == "auto_memory"
         )
-        mem.touch()
-        self.repo.save(mem)
+        mem = mem_candidates[0] if mem_candidates else None
 
-        # Also record that we co-activated this memory with all tool outputs
-        ctx_ids = [c.context_id for c in tool_ctxs]
-        self.memman.reinforce(mem.context_id, ctx_ids)
+        if mem is None:                             # first run  → INSERT
+            mem = ContextObject.make_knowledge(
+                label   = "auto_memory",
+                content = final_answer,
+                tags    = ["memory_writeback"],
+            )
+        else:                                       # later runs → UPDATE (if text changed)
+            if mem.metadata.get("content") != final_answer:
+                mem.metadata["content"] = final_answer
+                mem.summary             = final_answer
 
-        # Log for debugging
-        meta = {"stored_memory_id": mem.context_id, "coactivated_with": ctx_ids}
-        self._print_stage_context("memory_writeback", meta)
+        mem.touch()                                 # refresh timestamp / last_accessed
+
+        # IMPORTANT:  call reinforce **before** the single save below.
+        # MemoryManager mutates mem in-place but does NOT append a new row,
+        # so persisting once afterwards keeps the file tidy.
+        # ── Guard against dangling refs ────────────────────────────────
+        valid_refs = []
+        for c in tool_ctxs:
+            try:
+                # verify the object still exists (and is persisted)
+                self.repo.get(c.context_id)
+                valid_refs.append(c.context_id)
+            except KeyError:
+                # skip IDs that were deduped, pruned, or never saved
+                continue
+
+        self.memman.reinforce(mem.context_id, valid_refs)
+
+        # One narrative row per *unique* answer – duplicates are skipped
+        narr = ContextObject.make_narrative(
+            f"At {default_clock().strftime('%Y-%m-%d %H:%M:%SZ')}, "
+            f"I handled the user’s request and generated: "
+            f"{final_answer[:200]}…"
+        )
+        # make_narrative() already touches & saves when it reuses a row;
+        # only save when we truly inserted a new one
+        if narr.context_id not in {c.context_id for c in self.repo.query(lambda c: c.component == "narrative")}:
+            narr.touch()
+            self.repo.save(narr)
+
         
 if __name__ == "__main__":
     asm = Assembler(

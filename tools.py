@@ -6,6 +6,9 @@ import re
 from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
+from context import ContextRepository, ContextObject, default_clock
+from ollama import chat, embed
+
 import psutil
 import traceback
 
@@ -368,7 +371,115 @@ class Tools:
         logging.debug("Parsed tool call from text: None (AST check failed)")
         return None
 
+    def context_query(
+        time_range: Optional[List[str]]     = None,
+        tags: Optional[List[str]]           = None,
+        exclude_tags: Optional[List[str]]   = None,
+        domain: Optional[List[str]]         = None,
+        component: Optional[List[str]]      = None,
+        semantic_label: Optional[List[str]] = None,
+        summary_regex: Optional[str]        = None,
+        similarity_to: Optional[str]        = None,
+        query: Optional[str]                = None,
+        top_k: int                          = 5,
+    ) -> str:
+        """
+        Query your context.jsonl store.
 
+        Args:
+          time_range:       [start_ts, end_ts] in "YYYYmmddTHHMMSSZ"
+          tags:             include any ContextObjects with ≥1 of these tags
+          exclude_tags:     drop any with ≥1 of these tags
+          domain:           filter by c.domain
+          component:        filter by c.component
+          semantic_label:   filter by c.semantic_label
+          summary_regex:    regex match on c.summary
+          similarity_to:    fuzzy match on summary (higher = more similar)
+          query:            alias for similarity_to
+          top_k:            max results
+
+        Returns:
+          JSON string:
+            {"results":[
+               {
+                 "context_id":…,
+                 "timestamp":…,
+                 "domain":…,
+                 "component":…,
+                 "semantic_label":…,
+                 "summary":…
+               }, … ]}
+        """
+        # alias
+        if query is not None and similarity_to is None:
+            similarity_to = query
+
+        # load everything
+        repo = ContextRepository(os.path.join(os.getcwd(), "context.jsonl"))
+        all_ctx = repo.query(lambda c: True)
+
+        # timestamp parser
+        def _parse_ts(ts: str) -> datetime:
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+
+        # 1) time window
+        if time_range and len(time_range) == 2:
+            start_dt, end_dt = _parse_ts(time_range[0]), _parse_ts(time_range[1])
+            all_ctx = [
+                c for c in all_ctx
+                if start_dt <= _parse_ts(c.timestamp) <= end_dt
+            ]
+
+        # 2) tag filters
+        if tags:
+            all_ctx = [c for c in all_ctx if set(tags) & set(c.tags)]
+        if exclude_tags:
+            all_ctx = [c for c in all_ctx if not (set(exclude_tags) & set(c.tags))]
+
+        # 3) domain / component / semantic_label
+        if domain:
+            all_ctx = [c for c in all_ctx if c.domain in domain]
+        if component:
+            all_ctx = [c for c in all_ctx if c.component in component]
+        if semantic_label:
+            all_ctx = [c for c in all_ctx if c.semantic_label in semantic_label]
+
+        # 4) regex on summary
+        if summary_regex:
+            pat = re.compile(summary_regex, re.IGNORECASE)
+            all_ctx = [c for c in all_ctx if c.summary and pat.search(c.summary)]
+
+        # 5) similarity ranking (fuzzy on text)
+        if similarity_to:
+            key = similarity_to.lower()
+            scored: List[Tuple[float, ContextObject]] = []
+            for c in all_ctx:
+                txt = c.summary or ""
+                ratio = difflib.SequenceMatcher(None, key, txt.lower()).ratio()
+                scored.append((ratio, c))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            selected = [c for _, c in scored[:top_k]]
+        else:
+            # 6) otherwise sort by recency
+            all_ctx.sort(key=lambda c: _parse_ts(c.timestamp), reverse=True)
+            selected = all_ctx[:top_k]
+
+        # 7) format
+        results: List[Dict[str, Any]] = []
+        for c in selected:
+            results.append({
+                "context_id":     c.context_id,
+                "timestamp":      c.timestamp,
+                "domain":         c.domain,
+                "component":      c.component,
+                "semantic_label": c.semantic_label,
+                "summary":        c.summary or ""
+            })
+
+        return json.dumps({"results": results}, indent=2)
     
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
     @staticmethod
