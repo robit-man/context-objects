@@ -132,18 +132,26 @@ class Assembler:
         # system‐and‐stage prompts
         self.clarifier_prompt = self.cfg.get(
             "clarifier_prompt",
-            "You are Clarifier. Expand the user’s intent into a JSON object with "
-            "two keys: 'keywords' (an array of concise keywords) and 'notes' (a brief explanation). "
+            "You are Clarifier.  Expand the user’s intent into a JSON object with three keys:\n"
+            "  • 'keywords': an array of concise keywords\n"
+            "  • 'notes': a brief explanation of the user’s request\n"
+            "  • 'analysis': a 1–4 sentence summary of the user’s goal, "
+            "    taking into account recent chat history and your available tools.\n"
             "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
             "assembler_prompt",
-            "You are Assembler. Distill context into a concise summary."
+            "You are Assembler.  Distill all provided context—including clarified intent, analysis, "
+            "external snippets, and tool outputs—into a concise summary to drive final reasoning."
         )
         self.inference_prompt = self.cfg.get(
             "inference_prompt",
-            "You are a helpful, context-aware assistant. Use all provided snippets and tool outputs."
+            "You are the final‐pass assistant.  Use every piece of context—"
+            "clarified intent, analysis, planning rationale, tool outputs, etc.—"
+            "to generate a factual, policy-compliant, and coherent answer. "
+            "Do not hallucinate or omit relevant details."
         )
+
 
         # persist defaults
         defaults = {
@@ -263,10 +271,9 @@ class Assembler:
             out += chunk
         print()
         return out
-
-
-
     def run_with_meta_context(self, user_text: str) -> str:
+        import json
+
         state: Dict[str, Any] = {}
 
         # Stage 1: record input
@@ -293,6 +300,32 @@ class Assembler:
             state['clar_ctx'], state['know_ctx'], tools_list
         )
 
+        # **NEW**: parse out the structured plan and create tasks/subtasks
+        try:
+            plan_dict = json.loads(state['plan_output'])
+        except json.JSONDecodeError:
+            plan_dict = {}
+        state['plan_dict']    = plan_dict
+        state['task_map']     = {}
+        state['subtask_map']  = {}
+
+        for step in plan_dict.get('plan', []):
+            # spawn a top‐level task
+            tid = Tools.add_task(
+                name=f"Step {step['id']}: {step['description']}",
+                description=step['description']
+            )
+            state['task_map'][step['id']] = tid
+
+            # spawn any subtasks
+            for sub in step.get('subtasks', []):
+                sid = Tools.add_subtask(
+                    task_id=tid,
+                    name=sub['description']
+                )
+                # map (step_id, sub_id) → subtask id
+                state['subtask_map'][(step['id'], sub['id'])] = sid
+
         # Stage 7b: static plan validation *and* fix
         state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
             state['plan_ctx'],
@@ -300,14 +333,12 @@ class Assembler:
             tools_list
         )
         if state['plan_errors']:
-            # instead of bailing out, we could loop or escalate—but for now,
-            # just surface the error
             raise RuntimeError(f"Plan validation failed: {state['plan_errors']}")
 
         # Build a single‐string “plan” from the fixed calls
         plan_cmds = "\n".join(state['fixed_calls'])
 
-        # Stage 7: tool chaining (drive from fixed_calls, not original plan_output)
+        # Stage 7: tool chaining (drive from fixed_calls)
         state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
             state['plan_ctx'],
             plan_cmds,
@@ -319,7 +350,7 @@ class Assembler:
             raw_calls, user_text
         )
 
-        # Stage 8: invoke with retries (again, pass plan_cmds)
+        # Stage 8: invoke with retries
         state['tool_ctxs'] = self._stage9_invoke_with_retries(
             state['confirmed_calls'],
             plan_cmds,
@@ -328,7 +359,7 @@ class Assembler:
             state['clar_ctx'].metadata
         )
 
-        # Stage 9b: reflection & possible replan (pass plan_cmds)
+        # Stage 9b: reflection & possible replan
         replan = self._stage9b_reflection_and_replan(
             state['tool_ctxs'],
             plan_cmds,
@@ -336,7 +367,7 @@ class Assembler:
             state['clar_ctx'].metadata
         )
         if replan:
-            # one‐shot replan loop (you can repeat the above pattern)
+            # one‐shot replan loop
             plan_cmds = replan
             state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
                 state['plan_ctx'], plan_cmds, tools_list
@@ -363,7 +394,6 @@ class Assembler:
         self._stage11_memory_writeback(final, state['tool_ctxs'])
 
         return final
-
 
 
 
@@ -447,17 +477,25 @@ class Assembler:
     def _stage4_intent_clarification(
         self, user_text: str, state: Dict[str, Any]
     ) -> ContextObject:
-        # assemble full context block
+        # 1) assemble the conversation/context block
         pieces = [state['sys_ctx']] + state['history'] + state['recent'] + state['assoc']
         block = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in pieces)
 
+        # 2) build a listing of all available tools
+        tools_list = self._stage6_prepare_tools()   # name + one-line desc
+        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" 
+                               for t in tools_list)
+
+        # 3) call the clarifier, passing both the high-level prompt and the tool list
         msgs = [
             {"role": "system",  "content": self.clarifier_prompt},
+            {"role": "system",  "content": f"Available tools:\n{tools_text}"},
             {"role": "system",  "content": f"Context:\n{block}"},
             {"role": "user",    "content": user_text},
         ]
         self._print_stage_context("intent_clarification", {
             "system":  [self.clarifier_prompt],
+            "tools":   tools_text.split("\n"),
             "context": block.split("\n"),
             "user":    [user_text],
         })
@@ -465,8 +503,9 @@ class Assembler:
         try:
             clar = json.loads(out)
         except:
-            clar = {"keywords": [], "notes": out}
+            clar = {"keywords": [], "notes": out, "analysis": "", "desired_tools": []}
 
+        # 4) persist the clarifier’s output (including analysis & desired_tools)
         ctx = ContextObject.make_stage(
             "intent_clarification",
             [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids'],
@@ -516,56 +555,86 @@ class Assembler:
         ]
 
     def _stage7_planning_summary(
-        self, clar_ctx: ContextObject, know_ctx: ContextObject, tools_list: List[Dict[str, str]]
+        self,
+        clar_ctx: ContextObject,
+        know_ctx: ContextObject,
+        tools_list: List[Dict[str, str]]
     ) -> Tuple[ContextObject, str]:
-        import inspect
+        """
+        Produce a structured plan with steps and subtasks,
+        embedding calls to add_task/add_subtask (and any other tool calls)
+        so downstream stages can execute them automatically.
+        """
+        import json, inspect
 
-        def _can_be_called_with_no_args(tool_name: str) -> bool:
-            fn = getattr(Tools, tool_name, None)
-            if not callable(fn):
-                return False
-            sig = inspect.signature(fn)
-            # if any positional-or-keyword param has no default, it needs args
-            return all(
-                param.default is not param.empty or
-                param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
-                for param in sig.parameters.values()
-            )
+        # Build the brief summary of available tools
+        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}"
+                               for t in tools_list)
 
-        # only keep zero-arg tools (fallback to first top_k if none)
-        zero_arg = [t for t in tools_list if _can_be_called_with_no_args(t["name"])]
-        if not zero_arg:
-            zero_arg = tools_list[: self.top_k]
-        tools_list = zero_arg
-
-        # build prompt
-        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
+        # A very detailed system prompt to force structured JSON output:
         system = (
-            "Available tools:\n" + tools_text +
-            "\n\nDevise a concise plan. If you intend to call tools, "
-            "include `tool_name(arg1=..., arg2=...)`."
+            "You are a Planning Agent.  Given the user’s clarified intent and "
+            "relevant knowledge snippets, generate a step-by-step plan that can "
+            "be executed and tracked.  **Return ONLY valid JSON** matching this schema:\n\n"
+            "```json\n"
+            "{\n"
+            "  \"total_steps\": integer,                // how many top-level steps\n"
+            "  \"pending_steps\": [integer,...],        // steps needing user input\n"
+            "  \"plan\": [\n"
+            "    {\n"
+            "      \"id\": integer,                     // step number 1..total_steps\n"
+            "      \"description\": string,             // natural-language description\n"
+            "      \"tool_call\": {                     // if this step invokes a tool\n"
+            "        \"name\": string,                  // e.g. \"add_task\"\n"
+            "        \"arguments\": { ... }             // kwargs for that tool\n"
+            "      },\n"
+            "      \"subtasks\": [                      // optional list of subtasks\n"
+            "        { \"id\": string,                  // use placeholder until created\n"
+            "          \"description\": string,\n"
+            "          \"tool_call\": { ... }\n"
+            "        },\n"
+            "        ...\n"
+            "      ]\n"
+            "    },\n"
+            "    ...\n"
+            "  ]\n"
+            "}\n"
+            "```  \n"
+            "Use the following tools when creating tasks:\n"
+            "- `add_task(name: str, description: str)` to register each top-level step.\n"
+            "- `add_subtask(task_id: str, name: str)` to register any sub-step.\n\n"
+            "Here are your available tools:\n\n"
+            f"{tools_text}\n\n"
+            "Now devise the plan.  If you need more information for a step, "
+            "leave its `tool_call.arguments` with placeholders (e.g. \"<ENTITY_NAME>\") "
+            "and list that step id in `pending_steps`."
         )
-        inp = clar_ctx.summary + "\n\nSnippets:\n" + know_ctx.summary
+
+        # Concatenate clarifier notes + context snippets
+        user_block = clar_ctx.summary
+        knowledge_block = know_ctx.summary
+        prompt_input = f"{user_block}\n\nRelevant info:\n{knowledge_block}"
 
         self._print_stage_context("planning_summary", {
-            "tools": [tools_text],
-            "input": [inp[:200]]
+            "system": [system],
+            "input":  [prompt_input]
         })
+
         msgs = [
             {"role": "system", "content": system},
-            {"role": "user",   "content": inp}
+            {"role": "user",   "content": prompt_input}
         ]
-        plan = self._stream_and_capture(self.secondary_model, msgs, tag="[Planner]")
+        plan_json = self._stream_and_capture(self.secondary_model, msgs, tag="[Planner]")
 
+        # Make a ContextObject of the raw JSON for audit
         ctx = ContextObject.make_stage(
-            "planning_summary", know_ctx.references, {"plan": plan}
+            "planning_summary", know_ctx.references, {"plan": plan_json}
         )
         ctx.stage_id = "planning_summary"
-        ctx.summary  = plan
-        ctx.touch()
-        self.repo.save(ctx)
-        return ctx, plan
-    
+        ctx.summary  = plan_json
+        ctx.touch(); self.repo.save(ctx)
+
+        return ctx, plan_json
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -580,11 +649,17 @@ class Assembler:
              to give the LLM maximum context for filling in missing args.
         3) If the model hallucinates a non‐existent tool, automatically remap it
            to the closest real tool name before validating.
+        Records each pass in self.state['progress'] and persists intermediate ContextObjects.
         Returns (valid_calls, errors, fixed_calls)
         """
         import json, re, inspect, difflib
 
-        # load all tool schemas
+        # ensure we can track progress
+        if not hasattr(self, "state"):
+            self.state = {}
+        self.state.setdefault("progress", [])
+
+        # load all tool schemas from context store
         all_schs = {
             json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
             for c in self.repo.query(
@@ -592,42 +667,41 @@ class Assembler:
             )
         }
 
-        # extract the initial calls
+        # extract initial raw calls from the plan text
         raw_calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
         fixed_calls = list(raw_calls)
 
         max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            valid: List[str] = []
-            errors: List[Tuple[str,str]] = []
-            missing: Dict[str,List[str]] = {}
+        final_valid, final_errors = [], []
 
-            # A) validate (and remap hallucinations) in one pass
+        for attempt in range(1, max_attempts + 1):
+            valid, errors, missing = [], [], {}
+
+            # A) Validate & auto-remap hallucinated names
             for idx, call in enumerate(list(fixed_calls)):
                 name, args_str = call.split("(", 1)
                 args_str = args_str.rstrip(")")
-                # 1) if tool name doesn't exist, try to auto‐remap
+                # if tool doesn't exist, try fuzzy match
                 if name not in all_schs:
-                    best = difflib.get_close_matches(name, all_schs.keys(), n=1)
-                    if best:
-                        real = best[0]
-                        new_call = f"{real}({args_str})"
-                        fixed_calls[idx] = new_call
+                    match = difflib.get_close_matches(name, all_schs.keys(), n=1)
+                    if match:
+                        real = match[0]
+                        fixed_calls[idx] = f"{real}({args_str})"
                         name = real
-                        sch  = all_schs[real]
                     else:
                         errors.append((call, "no schema found"))
                         continue
-                else:
-                    sch = all_schs[name]
+                sch = all_schs[name]
 
-                # 2) parse kwargs and find missing
-                kwargs: Dict[str,str] = {}
+                # parse provided kwargs
+                kwargs = {}
                 for part in filter(None, args_str.split(",")):
-                    if "=" not in part: continue
+                    if "=" not in part:
+                        continue
                     k, v = part.split("=", 1)
                     kwargs[k.strip()] = v.strip()
 
+                # check required parameters
                 req = set(sch.get("parameters", {}).get("required", []))
                 miss = sorted(req - set(kwargs.keys()))
                 if miss:
@@ -636,51 +710,53 @@ class Assembler:
                 else:
                     valid.append(fixed_calls[idx])
 
-            # B) if nothing is missing, we’re done
+            final_valid, final_errors = valid, errors
+
+            # B) if no missing args, we're done
             if not missing:
                 break
 
-            # C) build docs for failures (schema, and on last attempt full source)
-            docs_lines: List[str] = []
+            # C) build doc‐blobs for failing tools
+            docs_lines = []
             for call, miss in missing.items():
-                tool = call.split("(",1)[0]
+                tool = call.split("(", 1)[0]
                 sch  = all_schs.get(tool, {})
                 desc   = sch.get("description", "(no description)")
                 params = sch.get("parameters", {})
+                # always include schema
                 docs_lines.append(
                     f"• **{tool}**: {desc}\n"
                     f"  Parameters:\n{json.dumps(params, indent=2)}"
                 )
+                # on final attempt, also include source
                 if attempt == max_attempts:
                     try:
                         src = inspect.getsource(getattr(Tools, tool))
                     except Exception:
-                        src = "(source unavailable)"
+                        src = "# source unavailable"
                     docs_lines.append(f"```python\n{src}\n```")
 
-            # print to your console for debugging
-            self._print_stage_context("plan_validation_docs", {
-                "tool_docs": docs_lines
-            })
+            # log for debugging
+            self._print_stage_context("plan_validation_docs", {"tool_docs": docs_lines})
 
             docs_blob  = "\n\n".join(docs_lines)
             miss_lines = "\n".join(f"{c} → missing {m}" for c, m in missing.items())
 
-            # D) assemble the fix prompt
+            # D) assemble self-fix prompt
             if attempt < max_attempts:
                 prompt = (
                     "Some tool calls are missing required arguments:\n"
                     f"{miss_lines}\n\n"
                     "Here are the schemas for those tools:\n\n"
                     f"{docs_blob}\n\n"
-                    "**Return only** JSON of the form:\n"
+                    "**Return only** JSON:\n"
                     '{"fixed_calls": ["tool1(arg=...)", ...]}'
                 )
             else:
                 prompt = (
-                    "Final attempt: some calls remain invalid:\n"
+                    "FINAL ATTEMPT: Some calls remain invalid:\n"
                     f"{miss_lines}\n\n"
-                    "Below are both the schema definitions AND the full source code.\n"
+                    "Below are both the schema definitions AND the full source code.\n\n"
                     f"{docs_blob}\n\n"
                     "**Return only** JSON:\n"
                     '{"fixed_calls": ["tool1(arg=...)", ...]}'
@@ -692,7 +768,7 @@ class Assembler:
                 tag="[PlanFix]"
             ).strip()
 
-            # parse LLM’s fixed_calls
+            # parse the LLM's JSON or fallback with parser
             try:
                 fixed_calls = json.loads(out)["fixed_calls"]
             except Exception:
@@ -702,15 +778,41 @@ class Assembler:
                 elif parsed:
                     fixed_calls = [parsed]
 
-        # E) persist final results
-        meta = {"valid": valid, "errors": errors, "fixed_calls": fixed_calls}
-        ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
-        ctx.stage_id = "plan_validation"
-        ctx.summary  = f"Valid: {valid}" if not errors else f"Errors: {errors}"
-        ctx.touch(); self.repo.save(ctx)
-        self._print_stage_context("plan_validation", meta)
+            # E) persist intermediate result
+            inter_meta = {
+                "attempt": attempt,
+                "raw_calls": fixed_calls,
+                "errors": errors
+            }
+            inter_ctx = ContextObject.make_stage(
+                "plan_refinement", plan_ctx.references, inter_meta
+            )
+            inter_ctx.stage_id = "plan_refinement"
+            inter_ctx.summary  = f"Pass {attempt}: calls={fixed_calls}, errors={errors}"
+            inter_ctx.touch(); self.repo.save(inter_ctx)
 
-        return valid, errors, fixed_calls
+            # record in our in-memory progress tracker
+            self.state["progress"].append(inter_meta)
+
+        # F) final persist of plan_validation
+        final_meta = {
+            "valid": final_valid,
+            "errors": final_errors,
+            "fixed_calls": fixed_calls
+        }
+        final_ctx = ContextObject.make_stage(
+            "plan_validation", plan_ctx.references, final_meta
+        )
+        final_ctx.stage_id = "plan_validation"
+        final_ctx.summary  = (
+            f"Valid: {final_valid}"
+            if not final_errors
+            else f"Errors: {final_errors}"
+        )
+        final_ctx.touch(); self.repo.save(final_ctx)
+        self._print_stage_context("plan_validation", final_meta)
+
+        return final_valid, final_errors, fixed_calls
 
 
     def _stage8_tool_chaining(
@@ -721,48 +823,40 @@ class Assembler:
     ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
         import json, re
 
-        # ── A) Extract raw calls from the plan ──────────────────────────────
-        text = plan_output
-        parsed = Tools.parse_tool_call(text)
+        # A) Extract raw calls via parser or regex
+        parsed = Tools.parse_tool_call(plan_output)
         if isinstance(parsed, list):
             raw = parsed
         elif parsed:
             raw = [parsed]
         else:
-            # fallback to regex
-            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', text)
+            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
 
-        # ── B) Dedupe & preserve order ─────────────────────────────────────
-        seen = set()
-        calls: List[str] = []
+        # B) Dedupe & preserve order
+        seen, calls = set(), []
         for c in raw:
             if isinstance(c, str) and c not in seen:
                 seen.add(c)
                 calls.append(c)
 
-        # ── C) Retrieve only the schemas that match these calls ────────────
-        all_schemas = self.repo.query(
+        # C) Find matching schema ContextObjects
+        all_schs = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
-        selected_schemas: List[ContextObject] = []
-        full_schemas: List[Dict[str,Any]] = []
-        for sch_obj in all_schemas:
-            schema = json.loads(sch_obj.metadata["schema"])
-            if schema["name"] in {call.split("(")[0] for call in calls}:
-                selected_schemas.append(sch_obj)
-                full_schemas.append(schema)
+        selected_schemas = [
+            sch for sch in all_schs
+            if json.loads(sch.metadata["schema"])["name"] in {c.split("(")[0] for c in calls}
+        ]
 
-        # ── D) Build a docs_blob with the full JSON schema for each tool ───
-        docs_blob_parts = []
-        for schema in full_schemas:
-            docs_blob_parts.append(
-                f"**{schema['name']}**\n```json\n"
-                + json.dumps(schema, indent=2)
-                + "\n```"
-            )
-        docs_blob = "\n\n".join(docs_blob_parts)
+        # D) Build a full‐schema docs blob
+        full_schs = [json.loads(sch.metadata["schema"]) for sch in selected_schemas]
+        docs_parts = [
+            f"**{s['name']}**\n```json\n{json.dumps(s, indent=2)}\n```"
+            for s in full_schs
+        ]
+        docs_blob = "\n\n".join(docs_parts)
 
-        # ── E) Prompt the LLM, passing only these full schemas ─────────────
+        # E) Ask the LLM to confirm/adjust these calls given only these schemas
         system = (
             "You have the following tools (full JSON schemas shown).  "
             "Please confirm or adjust your tool calls.  Reply **ONLY** with JSON:\n"
@@ -770,8 +864,8 @@ class Assembler:
             f"{docs_blob}"
         )
         self._print_stage_context("tool_chaining", {
-            "plan":   [plan_output[:200]],
-            "schemas": docs_blob_parts
+            "plan":    [plan_output],
+            "schemas": docs_parts
         })
         msgs = [
             {"role": "system", "content": system},
@@ -779,31 +873,28 @@ class Assembler:
         ]
         out = self._stream_and_capture(self.secondary_model, msgs, tag="[ToolChain]")
 
-        # ── F) Parse the confirmed calls ───────────────────────────────────
+        # F) Parse confirmed calls JSON or fallback
         try:
-            parsed2 = json.loads(out.strip())
-            confirmed = parsed2.get("tool_calls", calls)
-        except:
+            confirmed = json.loads(out.strip()).get("tool_calls", calls)
+        except Exception:
             parsed2 = Tools.parse_tool_call(out)
-            confirmed = (
-                parsed2 if isinstance(parsed2, list)
-                else [parsed2] if parsed2
-                else calls
-            )
+            if isinstance(parsed2, list):
+                confirmed = parsed2
+            elif parsed2:
+                confirmed = [parsed2]
+            else:
+                confirmed = calls
 
-        # ── G) Persist the final chaining stage, including the docs ─────────
+        # G) Persist chaining decision (including the docs used)
+        tc_meta = {"tool_calls": confirmed, "tool_docs": docs_blob}
         tc_ctx = ContextObject.make_stage(
             "tool_chaining",
             plan_ctx.references + [s.context_id for s in selected_schemas],
-            {
-                "tool_calls": confirmed,
-                "tool_docs": docs_blob
-            }
+            tc_meta
         )
         tc_ctx.stage_id = "tool_chaining"
         tc_ctx.summary  = json.dumps(confirmed)
-        tc_ctx.touch()
-        self.repo.save(tc_ctx)
+        tc_ctx.touch(); self.repo.save(tc_ctx)
 
         return tc_ctx, confirmed, selected_schemas
 
@@ -1103,43 +1194,67 @@ class Assembler:
         return polished
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        # collect all context IDs, including tool outputs
-        refs = [state['user_ctx'].context_id,
-                state['sys_ctx'].context_id] + state['recent_ids']
-        refs += [state['clar_ctx'].context_id,
-                 state['know_ctx'].context_id,
-                 state['plan_ctx'].context_id]
-        refs += [t.context_id for t in state['tool_ctxs']]
+        # 1) Gather all relevant context IDs
+        refs = [
+            state['user_ctx'].context_id,
+            state['sys_ctx'].context_id
+        ]
+        # conversation history & retrievals
+        refs += state['recent_ids']
+        # clarification, external knowledge, planning
+        refs += [
+            state['clar_ctx'].context_id,
+            state['know_ctx'].context_id,
+            state['plan_ctx'].context_id
+        ]
+        # the tool‐chaining decision plus each tool_output
+        refs.append(state['tc_ctx'].context_id)
+        refs += [ctx.context_id for ctx in state['tool_ctxs']]
 
-        # dedupe & fetch
-        seen, allr = set(), []
+        # 2) Dedupe while preserving chronological order
+        seen, ordered = set(), []
         for cid in refs:
             if cid not in seen:
                 seen.add(cid)
-                allr.append(cid)
-        ctxs = [self.repo.get(cid) for cid in allr]
-        ctxs.sort(key=lambda c: c.timestamp)
+                ordered.append(cid)
 
-        # **Use real newlines** so the LLM sees each tool output separately
-        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
+        # 3) Fetch and sort by timestamp
+        ctx_objs = [self.repo.get(cid) for cid in ordered]
+        ctx_objs.sort(key=lambda c: c.timestamp)
 
+        # 4) Build a line-by-line context block
+        pieces = []
+        for c in ctx_objs:
+            # every snippet appears as “[label] summary”
+            pieces.append(f"[{c.semantic_label}] {c.summary}")
+            # if this stage recorded full tool docs, include them
+            if c.stage_id == "tool_chaining" and "tool_docs" in c.metadata:
+                pieces.append("Tool Docs:\n" + c.metadata["tool_docs"])
+
+        interm = "\n".join(pieces)
+
+        # 5) Final‐assembly prompt
         final_sys = (
-            "You will receive quite a bit of context, including tool outputs, "
-            "assemble it into a clean and concise relevant answer. "
-            "Do not hallucinate."
+            "You will receive a sequence of context snippets—some from earlier conversation, "
+            "some the results of tools you invoked, and documentation for those tools. "
+            "Assemble everything into a clean, concise answer. "
+            "Do NOT hallucinate or invent anything not present in the context."
         )
         msgs = [
-            {"role": "system", "content": final_sys},
-            {"role": "system", "content": self.inference_prompt},
-            {"role": "system", "content": interm},
-            {"role": "user",   "content": user_text},
+            {"role": "system",  "content": final_sys},
+            {"role": "system",  "content": self.inference_prompt},
+            {"role": "system",  "content": interm},
+            {"role": "user",    "content": user_text},
         ]
 
+        # 6) Stream the model’s reply
         reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]")
 
-        # persist final
+        # 7) Persist the final answer in memory
         resp_ctx = ContextObject.make_stage(
-            "final_inference", [state['tc_ctx'].context_id], {"text": reply}
+            "final_inference",
+            [state['tc_ctx'].context_id],
+            {"text": reply}
         )
         resp_ctx.stage_id = "final_inference"
         resp_ctx.summary  = reply
@@ -1147,6 +1262,7 @@ class Assembler:
         self.repo.save(resp_ctx)
 
         return reply
+
 
 
     def _stage11_memory_writeback(

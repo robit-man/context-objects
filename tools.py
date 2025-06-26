@@ -1890,6 +1890,7 @@ class Tools:
     def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, ) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
+        THIS RETURNS A RAW MASSIVE EXTRACTED WEBPAGE, call summarize_search(topic="content") instead IF YOU WANT BRIEF SUMAMRIES!
 
         1. Call search_internet(topic=str, top_n=int)
         - topic (str): the search term, use `topic`
