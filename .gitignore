@@ -8,3 +8,5 @@ glados_piper_medium.onnx.json
 piper_linux_x86_64.tar.gz
 piper
 workspace
+tts_output
+session.log
