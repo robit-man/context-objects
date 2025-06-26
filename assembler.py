@@ -3,13 +3,12 @@
 assembler.py — Stage-driven pipeline with full observability and
 dynamic, chronological context windows per stage.
 """
-
 import json
 import logging
 import re
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
-
+from dataclasses import dataclass, field
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from ollama import chat
@@ -17,12 +16,93 @@ from ollama import chat
 from context import ContextObject, ContextRepository, MemoryManager, default_clock
 from tools import TOOL_SCHEMAS, Tools
 
+logger = logging.getLogger("assembler")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] assembler: %(message)s",
 )
-logger = logging.getLogger("assembler")
 
+@dataclass
+class TaskNode:
+    call: str
+    parent: Optional["TaskNode"] = None
+    children: List["TaskNode"] = field(default_factory=list)
+    context_ids: List[str] = field(default_factory=list)
+    completed: bool = False
+    errors: List[str] = field(default_factory=list)
+
+class TaskExecutor:
+    """
+    Executes a TaskNode tree in DFS order:
+      1) Validate the node.call via Assembler._stage7b_plan_validation
+      2) Chain & confirm tool calls (stages 8 & 8.5)
+      3) Invoke with retries (stage 9)
+      4) Reflect & possibly replan (stage 9b)
+      5) Recurse into children
+      6) Mark node completed
+    Accumulates all resulting ContextObject IDs into each node's context_ids.
+    """
+    def __init__(self, asm: "Assembler", user_text: str, clar_metadata: Dict[str,Any]):
+        self.asm = asm
+        self.user_text = user_text
+        self.clar_metadata = clar_metadata
+
+    def execute(self, node: TaskNode) -> None:
+        # 1) Static validation / fix — always pull the real plan_ctx from the node itself
+        plan_ctx_id = node.context_ids[0]
+        plan_ctx_obj = self.asm.repo.get(plan_ctx_id)
+
+        # reuse the planning‐validation with a single‐call plan
+        _, errors, fixed = self.asm._stage7b_plan_validation(
+            plan_ctx_obj,
+            node.call,
+            self.asm.tools_list
+        )
+        if errors:
+            node.errors = [e for (_, e) in errors]
+        calls = fixed or [node.call]
+
+        # 2) Tool chaining
+        tc_ctx, raw_calls, schemas = self.asm._stage8_tool_chaining(
+            plan_ctx_obj,
+            "\n".join(calls),
+            self.asm.tools_list
+        )
+        node.context_ids.append(tc_ctx.context_id)
+
+        # 3) User confirmation
+        confirmed = self.asm._stage8_5_user_confirmation(raw_calls, self.user_text)
+
+        # 4) Invoke with retries
+        tool_ctxs = self.asm._stage9_invoke_with_retries(
+            confirmed,
+            "\n".join(calls),
+            schemas,
+            self.user_text,
+            self.clar_metadata
+        )
+        for t in tool_ctxs:
+            node.context_ids.append(t.context_id)
+
+        # 5) Reflection & replan
+        replan = self.asm._stage9b_reflection_and_replan(
+            [self.asm.repo.get(cid) for cid in node.context_ids],
+            "\n".join(calls),
+            self.user_text,
+            self.clar_metadata
+        )
+        if replan:
+            try:
+                tree = json.loads(replan)
+                node.children = self.asm._parse_task_tree(tree, parent=node)
+            except:
+                pass
+
+        # 6) Recurse into children
+        for child in node.children:
+            self.execute(child)
+
+        node.completed = True
 
 class ContextQueryEngine:
     """
@@ -98,7 +178,6 @@ class ContextQueryEngine:
             self.repo.save(c)
         return out
 
-
 class Assembler:
     STAGES = [
         "recent_retrieval",
@@ -110,6 +189,9 @@ class Assembler:
         "final_inference",
     ]
 
+    """
+    Fractal Assembler with recursive TaskExecutor.
+    """
     def __init__(
         self,
         context_path:     str = "context.jsonl",
@@ -123,6 +205,7 @@ class Assembler:
         except FileNotFoundError:
             self.cfg = {}
 
+        # models & lookback
         self.primary_model   = self.cfg.get("primary_model",   "gemma3:4b")
         self.secondary_model = self.cfg.get("secondary_model", self.primary_model)
         self.lookback        = self.cfg.get("lookback_minutes", lookback_minutes)
@@ -132,26 +215,18 @@ class Assembler:
         # system‐and‐stage prompts
         self.clarifier_prompt = self.cfg.get(
             "clarifier_prompt",
-            "You are Clarifier.  Expand the user’s intent into a JSON object with three keys:\n"
-            "  • 'keywords': an array of concise keywords\n"
-            "  • 'notes': a brief explanation of the user’s request\n"
-            "  • 'analysis': a 1–4 sentence summary of the user’s goal, "
-            "    taking into account recent chat history and your available tools.\n"
-            "Output only valid JSON."
+            "You are Clarifier. Expand the user’s intent into a JSON object with "
+            "two keys: 'keywords' (an array of concise keywords) and 'notes' "
+            "(a brief explanation). Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
             "assembler_prompt",
-            "You are Assembler.  Distill all provided context—including clarified intent, analysis, "
-            "external snippets, and tool outputs—into a concise summary to drive final reasoning."
+            "You are Assembler. Distill context into a concise summary."
         )
         self.inference_prompt = self.cfg.get(
             "inference_prompt",
-            "You are the final‐pass assistant.  Use every piece of context—"
-            "clarified intent, analysis, planning rationale, tool outputs, etc.—"
-            "to generate a factual, policy-compliant, and coherent answer. "
-            "Do not hallucinate or omit relevant details."
+            "You are a helpful, context-aware assistant. Use all provided snippets and tool outputs."
         )
-
 
         # persist defaults
         defaults = {
@@ -183,7 +258,8 @@ class Assembler:
             )
         }
         for name, schema in TOOL_SCHEMAS.items():
-            if name in existing: continue
+            if name in existing:
+                continue
             obj = ContextObject.make_schema(
                 label=name,
                 schema_def=json.dumps(schema),
@@ -195,11 +271,14 @@ class Assembler:
         # seed system prompts
         for nm, txt in [
             ("clarifier_prompt", self.clarifier_prompt),
-            ("assembler_prompt", self.assembler_prompt),
-            ("inference_prompt", self.inference_prompt),
+            ("assembler_prompt",  self.assembler_prompt),
+            ("inference_prompt",  self.inference_prompt),
         ]:
-            p = ContextObject.make_prompt(label=nm, prompt_text=txt,
-                                          tags=["artifact","prompt"])
+            p = ContextObject.make_prompt(
+                label=nm,
+                prompt_text=txt,
+                tags=["artifact","prompt"]
+            )
             p.touch()
             self.repo.save(p)
 
@@ -224,9 +303,11 @@ class Assembler:
             f"{c.semantic_label}: {c.metadata.get('prompt') or c.metadata.get('policy')}"
             for c in prompts
         ) or "(none)"
-        ctx = ContextObject.make_stage("system_prompts",
-                                       [c.context_id for c in prompts],
-                                       {"prompts": block})
+        ctx = ContextObject.make_stage(
+            "system_prompts",
+            [c.context_id for c in prompts],
+            {"prompts": block}
+        )
         ctx.stage_id = "system_prompts"
         ctx.summary  = block
         ctx.touch()
@@ -234,8 +315,10 @@ class Assembler:
         return ctx
 
     def _get_history(self) -> List[ContextObject]:
-        segs = self.repo.query(lambda c: c.domain=="segment"
-                               and c.component in ("user_input","assistant"))
+        segs = self.repo.query(
+            lambda c: c.domain=="segment"
+            and c.component in ("user_input","assistant")
+        )
         segs.sort(key=lambda c: c.timestamp)
         return segs[-self.hist_k:]
 
@@ -243,26 +326,31 @@ class Assembler:
         print(f"\n>>> [Stage: {name}] Context window:")
         for title, lines in sections.items():
             print(f"  -- {title}:")
-            # if it's a raw string, split on real newlines only
             if isinstance(lines, str):
                 for ln in lines.splitlines():
                     print(f"     {ln}")
-            # if it's a list of items, print each
             elif isinstance(lines, list):
                 for ln in lines:
                     print(f"     {ln}")
-            # fallback (e.g. single int or dict)
             else:
                 print(f"     {lines}")
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
-        ctx.summary = (ctx.references and
-                       (ctx.metadata.get("plan") or ctx.metadata.get("tool_call"))) or ctx.summary
+        ctx.summary = (
+            (ctx.references and
+             (ctx.metadata.get("plan") or ctx.metadata.get("tool_call")))
+            or ctx.summary
+        )
         ctx.touch()
         self.repo.save(ctx)
 
-    def _stream_and_capture(self, model: str, messages: List[Dict[str,Any]], tag: str="") -> str:
+    def _stream_and_capture(
+        self,
+        model: str,
+        messages: List[Dict[str,Any]],
+        tag: str = ""
+    ) -> str:
         out = ""
         print(f"{tag} ", end="", flush=True)
         for part in chat(model=model, messages=messages, stream=True):
@@ -271,86 +359,84 @@ class Assembler:
             out += chunk
         print()
         return out
-    def run_with_meta_context(self, user_text: str) -> str:
-        import json
 
+    def _parse_task_tree(
+        self,
+        tree: Dict[str,Any],
+        parent: Optional[TaskNode] = None
+    ) -> List[TaskNode]:
+        """
+        Given JSON of shape {"tasks":[{"call":str,"subtasks":[...]}...]},
+        return a list of TaskNode with proper parent links.
+        """
+        nodes: List[TaskNode] = []
+        for t in tree.get("tasks", []):
+            node = TaskNode(call=t["call"], parent=parent)
+            node.children = self._parse_task_tree(
+                {"tasks": t.get("subtasks", [])},
+                parent=node
+            )
+            nodes.append(node)
+        return nodes
+
+    def run_with_meta_context(self, user_text: str) -> str:
         state: Dict[str, Any] = {}
 
-        # Stage 1: record input
+        # ── Stage 1: record input ───────────────────────────────────────
         state['user_ctx'] = self._stage1_record_input(user_text)
 
-        # Stage 2: load system prompts
+        # ── Stage 2: load system prompts ────────────────────────────────
         state['sys_ctx']  = self._stage2_load_system_prompts()
 
-        # Stage 3: retrieve & merge context
+        # ── Stage 3: retrieve & merge context ──────────────────────────
         ctx3 = self._stage3_retrieve_and_merge_context(
             user_text, state['user_ctx'], state['sys_ctx']
         )
         state.update(ctx3)
 
-        # Stage 4: clarify intent
+        # ── Stage 4: clarify intent ────────────────────────────────────
         state['clar_ctx'] = self._stage4_intent_clarification(user_text, state)
 
-        # Stage 5: external knowledge
+        # ── Stage 5: external knowledge ────────────────────────────────
         state['know_ctx'] = self._stage5_external_knowledge(state['clar_ctx'])
 
-        # Stage 6: prepare tools & plan
-        tools_list = self._stage6_prepare_tools()
+        # ── Stage 6: prepare tools & plan ──────────────────────────────
+        state['tools_list'] = self._stage6_prepare_tools()
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
-            state['clar_ctx'], state['know_ctx'], tools_list
+            state['clar_ctx'], state['know_ctx'], state['tools_list']
         )
 
-        # **NEW**: parse out the structured plan and create tasks/subtasks
-        try:
-            plan_dict = json.loads(state['plan_output'])
-        except json.JSONDecodeError:
-            plan_dict = {}
-        state['plan_dict']    = plan_dict
-        state['task_map']     = {}
-        state['subtask_map']  = {}
-
-        for step in plan_dict.get('plan', []):
-            # spawn a top‐level task
-            tid = Tools.add_task(
-                name=f"Step {step['id']}: {step['description']}",
-                description=step['description']
-            )
-            state['task_map'][step['id']] = tid
-
-            # spawn any subtasks
-            for sub in step.get('subtasks', []):
-                sid = Tools.add_subtask(
-                    task_id=tid,
-                    name=sub['description']
-                )
-                # map (step_id, sub_id) → subtask id
-                state['subtask_map'][(step['id'], sub['id'])] = sid
-
-        # Stage 7b: static plan validation *and* fix
-        state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
+        # ── Stage 7b: static plan validation & fix ─────────────────────
+        (
+            state['valid_calls'],
+            state['plan_errors'],
+            state['fixed_calls']
+        ) = self._stage7b_plan_validation(
             state['plan_ctx'],
             state['plan_output'],
-            tools_list
+            state['tools_list']
         )
         if state['plan_errors']:
             raise RuntimeError(f"Plan validation failed: {state['plan_errors']}")
 
-        # Build a single‐string “plan” from the fixed calls
+        # flatten into a single‐string plan
         plan_cmds = "\n".join(state['fixed_calls'])
 
-        # Stage 7: tool chaining (drive from fixed_calls)
-        state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
-            state['plan_ctx'],
-            plan_cmds,
-            tools_list
+        # ── Stage 7: tool chaining ─────────────────────────────────────
+        (
+            state['tc_ctx'],
+            raw_calls,
+            selected_schemas
+        ) = self._stage8_tool_chaining(
+            state['plan_ctx'], plan_cmds, state['tools_list']
         )
 
-        # Stage 8.5: (optional) user confirmation
+        # ── Stage 8.5: user confirmation ───────────────────────────────
         state['confirmed_calls'] = self._stage8_5_user_confirmation(
             raw_calls, user_text
         )
 
-        # Stage 8: invoke with retries
+        # ── Stage 8: invoke with retries ───────────────────────────────
         state['tool_ctxs'] = self._stage9_invoke_with_retries(
             state['confirmed_calls'],
             plan_cmds,
@@ -359,7 +445,7 @@ class Assembler:
             state['clar_ctx'].metadata
         )
 
-        # Stage 9b: reflection & possible replan
+        # ── Stage 9b: reflection & possible replan ─────────────────────
         replan = self._stage9b_reflection_and_replan(
             state['tool_ctxs'],
             plan_cmds,
@@ -369,11 +455,19 @@ class Assembler:
         if replan:
             # one‐shot replan loop
             plan_cmds = replan
-            state['valid_calls'], state['plan_errors'], state['fixed_calls'] = self._stage7b_plan_validation(
-                state['plan_ctx'], plan_cmds, tools_list
+            (
+                state['valid_calls'],
+                state['plan_errors'],
+                state['fixed_calls']
+            ) = self._stage7b_plan_validation(
+                state['plan_ctx'], plan_cmds, state['tools_list']
             )
-            state['tc_ctx'], raw_calls, selected_schemas = self._stage8_tool_chaining(
-                state['plan_ctx'], plan_cmds, tools_list
+            (
+                state['tc_ctx'],
+                raw_calls,
+                selected_schemas
+            ) = self._stage8_tool_chaining(
+                state['plan_ctx'], plan_cmds, state['tools_list']
             )
             state['confirmed_calls'] = self._stage8_5_user_confirmation(raw_calls, user_text)
             state['tool_ctxs'] = self._stage9_invoke_with_retries(
@@ -384,13 +478,48 @@ class Assembler:
                 state['clar_ctx'].metadata
             )
 
-        # Stage 10: assemble draft answer
+        # ── Fractal task execution ────────────────────────────────────────
+        try:
+            # parse nested JSON plan
+            plan_tree = json.loads(state['plan_output'])
+            roots = self._parse_task_tree(plan_tree)
+            executor = TaskExecutor(self, user_text, state['clar_ctx'].metadata)
+
+            # **seed each root** with plan_ctx first!
+            for root in roots:
+                root.context_ids = [
+                    state['plan_ctx'].context_id,
+                    state['user_ctx'].context_id,
+                    state['sys_ctx'].context_id
+                ] + state['recent_ids']
+                executor.execute(root)
+
+            # collect _all_ produced IDs
+            all_ids: List[str] = []
+            def collect(node: TaskNode):
+                all_ids.extend(node.context_ids)
+                for c in node.children:
+                    collect(c)
+            for r in roots:
+                collect(r)
+
+            # overwrite tool_ctxs with fractal results
+            state['tool_ctxs'] = [
+                self.repo.get(cid)
+                for cid in all_ids
+                if self.repo.get(cid).component == "tool_output"
+            ]
+        except Exception:
+            # if something goes wrong, fall back to linear
+            pass
+
+        # ── Stage 10: assemble draft answer ──────────────────────────────
         draft = self._stage10_assemble_and_infer(user_text, state)
 
-        # Stage 10b: critique & safety polish
+        # ── Stage 10b: critique & safety polish ─────────────────────────
         final = self._stage10b_response_critique_and_safety(draft, user_text)
 
-        # Stage 11: memory write-back
+        # ── Stage 11: memory write-back ──────────────────────────────────
         self._stage11_memory_writeback(final, state['tool_ctxs'])
 
         return final
@@ -477,25 +606,17 @@ class Assembler:
     def _stage4_intent_clarification(
         self, user_text: str, state: Dict[str, Any]
     ) -> ContextObject:
-        # 1) assemble the conversation/context block
+        # assemble full context block
         pieces = [state['sys_ctx']] + state['history'] + state['recent'] + state['assoc']
         block = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in pieces)
 
-        # 2) build a listing of all available tools
-        tools_list = self._stage6_prepare_tools()   # name + one-line desc
-        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" 
-                               for t in tools_list)
-
-        # 3) call the clarifier, passing both the high-level prompt and the tool list
         msgs = [
             {"role": "system",  "content": self.clarifier_prompt},
-            {"role": "system",  "content": f"Available tools:\n{tools_text}"},
             {"role": "system",  "content": f"Context:\n{block}"},
             {"role": "user",    "content": user_text},
         ]
         self._print_stage_context("intent_clarification", {
             "system":  [self.clarifier_prompt],
-            "tools":   tools_text.split("\n"),
             "context": block.split("\n"),
             "user":    [user_text],
         })
@@ -503,9 +624,8 @@ class Assembler:
         try:
             clar = json.loads(out)
         except:
-            clar = {"keywords": [], "notes": out, "analysis": "", "desired_tools": []}
+            clar = {"keywords": [], "notes": out}
 
-        # 4) persist the clarifier’s output (including analysis & desired_tools)
         ctx = ContextObject.make_stage(
             "intent_clarification",
             [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids'],
@@ -555,86 +675,56 @@ class Assembler:
         ]
 
     def _stage7_planning_summary(
-        self,
-        clar_ctx: ContextObject,
-        know_ctx: ContextObject,
-        tools_list: List[Dict[str, str]]
+        self, clar_ctx: ContextObject, know_ctx: ContextObject, tools_list: List[Dict[str, str]]
     ) -> Tuple[ContextObject, str]:
-        """
-        Produce a structured plan with steps and subtasks,
-        embedding calls to add_task/add_subtask (and any other tool calls)
-        so downstream stages can execute them automatically.
-        """
-        import json, inspect
+        import inspect
 
-        # Build the brief summary of available tools
-        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}"
-                               for t in tools_list)
+        def _can_be_called_with_no_args(tool_name: str) -> bool:
+            fn = getattr(Tools, tool_name, None)
+            if not callable(fn):
+                return False
+            sig = inspect.signature(fn)
+            # if any positional-or-keyword param has no default, it needs args
+            return all(
+                param.default is not param.empty or
+                param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+                for param in sig.parameters.values()
+            )
 
-        # A very detailed system prompt to force structured JSON output:
+        # only keep zero-arg tools (fallback to first top_k if none)
+        zero_arg = [t for t in tools_list if _can_be_called_with_no_args(t["name"])]
+        if not zero_arg:
+            zero_arg = tools_list[: self.top_k]
+        tools_list = zero_arg
+
+        # build prompt
+        tools_text = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
         system = (
-            "You are a Planning Agent.  Given the user’s clarified intent and "
-            "relevant knowledge snippets, generate a step-by-step plan that can "
-            "be executed and tracked.  **Return ONLY valid JSON** matching this schema:\n\n"
-            "```json\n"
-            "{\n"
-            "  \"total_steps\": integer,                // how many top-level steps\n"
-            "  \"pending_steps\": [integer,...],        // steps needing user input\n"
-            "  \"plan\": [\n"
-            "    {\n"
-            "      \"id\": integer,                     // step number 1..total_steps\n"
-            "      \"description\": string,             // natural-language description\n"
-            "      \"tool_call\": {                     // if this step invokes a tool\n"
-            "        \"name\": string,                  // e.g. \"add_task\"\n"
-            "        \"arguments\": { ... }             // kwargs for that tool\n"
-            "      },\n"
-            "      \"subtasks\": [                      // optional list of subtasks\n"
-            "        { \"id\": string,                  // use placeholder until created\n"
-            "          \"description\": string,\n"
-            "          \"tool_call\": { ... }\n"
-            "        },\n"
-            "        ...\n"
-            "      ]\n"
-            "    },\n"
-            "    ...\n"
-            "  ]\n"
-            "}\n"
-            "```  \n"
-            "Use the following tools when creating tasks:\n"
-            "- `add_task(name: str, description: str)` to register each top-level step.\n"
-            "- `add_subtask(task_id: str, name: str)` to register any sub-step.\n\n"
-            "Here are your available tools:\n\n"
-            f"{tools_text}\n\n"
-            "Now devise the plan.  If you need more information for a step, "
-            "leave its `tool_call.arguments` with placeholders (e.g. \"<ENTITY_NAME>\") "
-            "and list that step id in `pending_steps`."
+            "Available tools:\n" + tools_text +
+            "\n\nDevise a concise plan. If you intend to call tools, "
+            "include `tool_name(arg1=..., arg2=...)`."
         )
-
-        # Concatenate clarifier notes + context snippets
-        user_block = clar_ctx.summary
-        knowledge_block = know_ctx.summary
-        prompt_input = f"{user_block}\n\nRelevant info:\n{knowledge_block}"
+        inp = clar_ctx.summary + "\n\nSnippets:\n" + know_ctx.summary
 
         self._print_stage_context("planning_summary", {
-            "system": [system],
-            "input":  [prompt_input]
+            "tools": [tools_text],
+            "input": [inp[:200]]
         })
-
         msgs = [
             {"role": "system", "content": system},
-            {"role": "user",   "content": prompt_input}
+            {"role": "user",   "content": inp}
         ]
-        plan_json = self._stream_and_capture(self.secondary_model, msgs, tag="[Planner]")
+        plan = self._stream_and_capture(self.secondary_model, msgs, tag="[Planner]")
 
-        # Make a ContextObject of the raw JSON for audit
         ctx = ContextObject.make_stage(
-            "planning_summary", know_ctx.references, {"plan": plan_json}
+            "planning_summary", know_ctx.references, {"plan": plan}
         )
         ctx.stage_id = "planning_summary"
-        ctx.summary  = plan_json
-        ctx.touch(); self.repo.save(ctx)
-
-        return ctx, plan_json
+        ctx.summary  = plan
+        ctx.touch()
+        self.repo.save(ctx)
+        return ctx, plan
+    
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -649,17 +739,11 @@ class Assembler:
              to give the LLM maximum context for filling in missing args.
         3) If the model hallucinates a non‐existent tool, automatically remap it
            to the closest real tool name before validating.
-        Records each pass in self.state['progress'] and persists intermediate ContextObjects.
         Returns (valid_calls, errors, fixed_calls)
         """
         import json, re, inspect, difflib
 
-        # ensure we can track progress
-        if not hasattr(self, "state"):
-            self.state = {}
-        self.state.setdefault("progress", [])
-
-        # load all tool schemas from context store
+        # load all tool schemas
         all_schs = {
             json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
             for c in self.repo.query(
@@ -667,41 +751,42 @@ class Assembler:
             )
         }
 
-        # extract initial raw calls from the plan text
+        # extract the initial calls
         raw_calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
         fixed_calls = list(raw_calls)
 
         max_attempts = 3
-        final_valid, final_errors = [], []
-
         for attempt in range(1, max_attempts + 1):
-            valid, errors, missing = [], [], {}
+            valid: List[str] = []
+            errors: List[Tuple[str,str]] = []
+            missing: Dict[str,List[str]] = {}
 
-            # A) Validate & auto-remap hallucinated names
+            # A) validate (and remap hallucinations) in one pass
             for idx, call in enumerate(list(fixed_calls)):
                 name, args_str = call.split("(", 1)
                 args_str = args_str.rstrip(")")
-                # if tool doesn't exist, try fuzzy match
+                # 1) if tool name doesn't exist, try to auto‐remap
                 if name not in all_schs:
-                    match = difflib.get_close_matches(name, all_schs.keys(), n=1)
-                    if match:
-                        real = match[0]
-                        fixed_calls[idx] = f"{real}({args_str})"
+                    best = difflib.get_close_matches(name, all_schs.keys(), n=1)
+                    if best:
+                        real = best[0]
+                        new_call = f"{real}({args_str})"
+                        fixed_calls[idx] = new_call
                         name = real
+                        sch  = all_schs[real]
                     else:
                         errors.append((call, "no schema found"))
                         continue
-                sch = all_schs[name]
+                else:
+                    sch = all_schs[name]
 
-                # parse provided kwargs
-                kwargs = {}
+                # 2) parse kwargs and find missing
+                kwargs: Dict[str,str] = {}
                 for part in filter(None, args_str.split(",")):
-                    if "=" not in part:
-                        continue
+                    if "=" not in part: continue
                     k, v = part.split("=", 1)
                     kwargs[k.strip()] = v.strip()
 
-                # check required parameters
                 req = set(sch.get("parameters", {}).get("required", []))
                 miss = sorted(req - set(kwargs.keys()))
                 if miss:
@@ -710,53 +795,51 @@ class Assembler:
                 else:
                     valid.append(fixed_calls[idx])
 
-            final_valid, final_errors = valid, errors
-
-            # B) if no missing args, we're done
+            # B) if nothing is missing, we’re done
             if not missing:
                 break
 
-            # C) build doc‐blobs for failing tools
-            docs_lines = []
+            # C) build docs for failures (schema, and on last attempt full source)
+            docs_lines: List[str] = []
             for call, miss in missing.items():
-                tool = call.split("(", 1)[0]
+                tool = call.split("(",1)[0]
                 sch  = all_schs.get(tool, {})
                 desc   = sch.get("description", "(no description)")
                 params = sch.get("parameters", {})
-                # always include schema
                 docs_lines.append(
                     f"• **{tool}**: {desc}\n"
                     f"  Parameters:\n{json.dumps(params, indent=2)}"
                 )
-                # on final attempt, also include source
                 if attempt == max_attempts:
                     try:
                         src = inspect.getsource(getattr(Tools, tool))
                     except Exception:
-                        src = "# source unavailable"
+                        src = "(source unavailable)"
                     docs_lines.append(f"```python\n{src}\n```")
 
-            # log for debugging
-            self._print_stage_context("plan_validation_docs", {"tool_docs": docs_lines})
+            # print to your console for debugging
+            self._print_stage_context("plan_validation_docs", {
+                "tool_docs": docs_lines
+            })
 
             docs_blob  = "\n\n".join(docs_lines)
             miss_lines = "\n".join(f"{c} → missing {m}" for c, m in missing.items())
 
-            # D) assemble self-fix prompt
+            # D) assemble the fix prompt
             if attempt < max_attempts:
                 prompt = (
                     "Some tool calls are missing required arguments:\n"
                     f"{miss_lines}\n\n"
                     "Here are the schemas for those tools:\n\n"
                     f"{docs_blob}\n\n"
-                    "**Return only** JSON:\n"
+                    "**Return only** JSON of the form:\n"
                     '{"fixed_calls": ["tool1(arg=...)", ...]}'
                 )
             else:
                 prompt = (
-                    "FINAL ATTEMPT: Some calls remain invalid:\n"
+                    "Final attempt: some calls remain invalid:\n"
                     f"{miss_lines}\n\n"
-                    "Below are both the schema definitions AND the full source code.\n\n"
+                    "Below are both the schema definitions AND the full source code.\n"
                     f"{docs_blob}\n\n"
                     "**Return only** JSON:\n"
                     '{"fixed_calls": ["tool1(arg=...)", ...]}'
@@ -768,7 +851,7 @@ class Assembler:
                 tag="[PlanFix]"
             ).strip()
 
-            # parse the LLM's JSON or fallback with parser
+            # parse LLM’s fixed_calls
             try:
                 fixed_calls = json.loads(out)["fixed_calls"]
             except Exception:
@@ -778,41 +861,15 @@ class Assembler:
                 elif parsed:
                     fixed_calls = [parsed]
 
-            # E) persist intermediate result
-            inter_meta = {
-                "attempt": attempt,
-                "raw_calls": fixed_calls,
-                "errors": errors
-            }
-            inter_ctx = ContextObject.make_stage(
-                "plan_refinement", plan_ctx.references, inter_meta
-            )
-            inter_ctx.stage_id = "plan_refinement"
-            inter_ctx.summary  = f"Pass {attempt}: calls={fixed_calls}, errors={errors}"
-            inter_ctx.touch(); self.repo.save(inter_ctx)
+        # E) persist final results
+        meta = {"valid": valid, "errors": errors, "fixed_calls": fixed_calls}
+        ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
+        ctx.stage_id = "plan_validation"
+        ctx.summary  = f"Valid: {valid}" if not errors else f"Errors: {errors}"
+        ctx.touch(); self.repo.save(ctx)
+        self._print_stage_context("plan_validation", meta)
 
-            # record in our in-memory progress tracker
-            self.state["progress"].append(inter_meta)
-
-        # F) final persist of plan_validation
-        final_meta = {
-            "valid": final_valid,
-            "errors": final_errors,
-            "fixed_calls": fixed_calls
-        }
-        final_ctx = ContextObject.make_stage(
-            "plan_validation", plan_ctx.references, final_meta
-        )
-        final_ctx.stage_id = "plan_validation"
-        final_ctx.summary  = (
-            f"Valid: {final_valid}"
-            if not final_errors
-            else f"Errors: {final_errors}"
-        )
-        final_ctx.touch(); self.repo.save(final_ctx)
-        self._print_stage_context("plan_validation", final_meta)
-
-        return final_valid, final_errors, fixed_calls
+        return valid, errors, fixed_calls
 
 
     def _stage8_tool_chaining(
@@ -823,40 +880,48 @@ class Assembler:
     ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
         import json, re
 
-        # A) Extract raw calls via parser or regex
-        parsed = Tools.parse_tool_call(plan_output)
+        # ── A) Extract raw calls from the plan ──────────────────────────────
+        text = plan_output
+        parsed = Tools.parse_tool_call(text)
         if isinstance(parsed, list):
             raw = parsed
         elif parsed:
             raw = [parsed]
         else:
-            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
+            # fallback to regex
+            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', text)
 
-        # B) Dedupe & preserve order
-        seen, calls = set(), []
+        # ── B) Dedupe & preserve order ─────────────────────────────────────
+        seen = set()
+        calls: List[str] = []
         for c in raw:
             if isinstance(c, str) and c not in seen:
                 seen.add(c)
                 calls.append(c)
 
-        # C) Find matching schema ContextObjects
-        all_schs = self.repo.query(
+        # ── C) Retrieve only the schemas that match these calls ────────────
+        all_schemas = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
-        selected_schemas = [
-            sch for sch in all_schs
-            if json.loads(sch.metadata["schema"])["name"] in {c.split("(")[0] for c in calls}
-        ]
+        selected_schemas: List[ContextObject] = []
+        full_schemas: List[Dict[str,Any]] = []
+        for sch_obj in all_schemas:
+            schema = json.loads(sch_obj.metadata["schema"])
+            if schema["name"] in {call.split("(")[0] for call in calls}:
+                selected_schemas.append(sch_obj)
+                full_schemas.append(schema)
 
-        # D) Build a full‐schema docs blob
-        full_schs = [json.loads(sch.metadata["schema"]) for sch in selected_schemas]
-        docs_parts = [
-            f"**{s['name']}**\n```json\n{json.dumps(s, indent=2)}\n```"
-            for s in full_schs
-        ]
-        docs_blob = "\n\n".join(docs_parts)
+        # ── D) Build a docs_blob with the full JSON schema for each tool ───
+        docs_blob_parts = []
+        for schema in full_schemas:
+            docs_blob_parts.append(
+                f"**{schema['name']}**\n```json\n"
+                + json.dumps(schema, indent=2)
+                + "\n```"
+            )
+        docs_blob = "\n\n".join(docs_blob_parts)
 
-        # E) Ask the LLM to confirm/adjust these calls given only these schemas
+        # ── E) Prompt the LLM, passing only these full schemas ─────────────
         system = (
             "You have the following tools (full JSON schemas shown).  "
             "Please confirm or adjust your tool calls.  Reply **ONLY** with JSON:\n"
@@ -864,8 +929,8 @@ class Assembler:
             f"{docs_blob}"
         )
         self._print_stage_context("tool_chaining", {
-            "plan":    [plan_output],
-            "schemas": docs_parts
+            "plan":   [plan_output[:200]],
+            "schemas": docs_blob_parts
         })
         msgs = [
             {"role": "system", "content": system},
@@ -873,28 +938,31 @@ class Assembler:
         ]
         out = self._stream_and_capture(self.secondary_model, msgs, tag="[ToolChain]")
 
-        # F) Parse confirmed calls JSON or fallback
+        # ── F) Parse the confirmed calls ───────────────────────────────────
         try:
-            confirmed = json.loads(out.strip()).get("tool_calls", calls)
-        except Exception:
+            parsed2 = json.loads(out.strip())
+            confirmed = parsed2.get("tool_calls", calls)
+        except:
             parsed2 = Tools.parse_tool_call(out)
-            if isinstance(parsed2, list):
-                confirmed = parsed2
-            elif parsed2:
-                confirmed = [parsed2]
-            else:
-                confirmed = calls
+            confirmed = (
+                parsed2 if isinstance(parsed2, list)
+                else [parsed2] if parsed2
+                else calls
+            )
 
-        # G) Persist chaining decision (including the docs used)
-        tc_meta = {"tool_calls": confirmed, "tool_docs": docs_blob}
+        # ── G) Persist the final chaining stage, including the docs ─────────
         tc_ctx = ContextObject.make_stage(
             "tool_chaining",
             plan_ctx.references + [s.context_id for s in selected_schemas],
-            tc_meta
+            {
+                "tool_calls": confirmed,
+                "tool_docs": docs_blob
+            }
         )
         tc_ctx.stage_id = "tool_chaining"
         tc_ctx.summary  = json.dumps(confirmed)
-        tc_ctx.touch(); self.repo.save(tc_ctx)
+        tc_ctx.touch()
+        self.repo.save(tc_ctx)
 
         return tc_ctx, confirmed, selected_schemas
 
@@ -1194,67 +1262,43 @@ class Assembler:
         return polished
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        # 1) Gather all relevant context IDs
-        refs = [
-            state['user_ctx'].context_id,
-            state['sys_ctx'].context_id
-        ]
-        # conversation history & retrievals
-        refs += state['recent_ids']
-        # clarification, external knowledge, planning
-        refs += [
-            state['clar_ctx'].context_id,
-            state['know_ctx'].context_id,
-            state['plan_ctx'].context_id
-        ]
-        # the tool‐chaining decision plus each tool_output
-        refs.append(state['tc_ctx'].context_id)
-        refs += [ctx.context_id for ctx in state['tool_ctxs']]
+        # collect all context IDs, including tool outputs
+        refs = [state['user_ctx'].context_id,
+                state['sys_ctx'].context_id] + state['recent_ids']
+        refs += [state['clar_ctx'].context_id,
+                 state['know_ctx'].context_id,
+                 state['plan_ctx'].context_id]
+        refs += [t.context_id for t in state['tool_ctxs']]
 
-        # 2) Dedupe while preserving chronological order
-        seen, ordered = set(), []
+        # dedupe & fetch
+        seen, allr = set(), []
         for cid in refs:
             if cid not in seen:
                 seen.add(cid)
-                ordered.append(cid)
+                allr.append(cid)
+        ctxs = [self.repo.get(cid) for cid in allr]
+        ctxs.sort(key=lambda c: c.timestamp)
 
-        # 3) Fetch and sort by timestamp
-        ctx_objs = [self.repo.get(cid) for cid in ordered]
-        ctx_objs.sort(key=lambda c: c.timestamp)
+        # **Use real newlines** so the LLM sees each tool output separately
+        interm = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in ctxs)
 
-        # 4) Build a line-by-line context block
-        pieces = []
-        for c in ctx_objs:
-            # every snippet appears as “[label] summary”
-            pieces.append(f"[{c.semantic_label}] {c.summary}")
-            # if this stage recorded full tool docs, include them
-            if c.stage_id == "tool_chaining" and "tool_docs" in c.metadata:
-                pieces.append("Tool Docs:\n" + c.metadata["tool_docs"])
-
-        interm = "\n".join(pieces)
-
-        # 5) Final‐assembly prompt
         final_sys = (
-            "You will receive a sequence of context snippets—some from earlier conversation, "
-            "some the results of tools you invoked, and documentation for those tools. "
-            "Assemble everything into a clean, concise answer. "
-            "Do NOT hallucinate or invent anything not present in the context."
+            "You will receive quite a bit of context, including tool outputs, "
+            "assemble it into a clean and concise relevant answer. "
+            "Do not hallucinate."
         )
         msgs = [
-            {"role": "system",  "content": final_sys},
-            {"role": "system",  "content": self.inference_prompt},
-            {"role": "system",  "content": interm},
-            {"role": "user",    "content": user_text},
+            {"role": "system", "content": final_sys},
+            {"role": "system", "content": self.inference_prompt},
+            {"role": "system", "content": interm},
+            {"role": "user",   "content": user_text},
         ]
 
-        # 6) Stream the model’s reply
         reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]")
 
-        # 7) Persist the final answer in memory
+        # persist final
         resp_ctx = ContextObject.make_stage(
-            "final_inference",
-            [state['tc_ctx'].context_id],
-            {"text": reply}
+            "final_inference", [state['tc_ctx'].context_id], {"text": reply}
         )
         resp_ctx.stage_id = "final_inference"
         resp_ctx.summary  = reply
@@ -1262,7 +1306,6 @@ class Assembler:
         self.repo.save(resp_ctx)
 
         return reply
-
 
 
     def _stage11_memory_writeback(
