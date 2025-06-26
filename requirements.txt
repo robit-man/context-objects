@@ -1,5 +1,0 @@
-ollama
-sentence-transformers
-numpy
-torch
-python-dateutil

@@ -176,7 +176,8 @@ if not os.path.exists(SETUP_MARKER):
         "tiktoken",         # For tokenization
         "python-telegram-bot", # For Telegram bot API
         "asyncio",          # For asynchronous operations
-        "nest-asyncio"      # For asyncio compat
+        "nest-asyncio",      # For asyncio compat
+        "sentence-transformers"
     ])
 
     with open(SETUP_MARKER, "w") as f:
