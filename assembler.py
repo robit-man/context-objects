@@ -780,7 +780,11 @@ class Assembler:
         draft = self._stage10_assemble_and_infer(user_text, state)
 
         # ── Stage 10b: critique & safety polish ─────────────────────────
-        final = self._stage10b_response_critique_and_safety(draft, user_text)
+        final = self._stage10b_response_critique_and_safety(
+            draft,
+            user_text,
+            state['tool_ctxs']
+        )
 
         # ── Stage 11: memory write-back ──────────────────────────────────
         self._stage11_memory_writeback(final, state['tool_ctxs'])
@@ -1365,99 +1369,95 @@ class Assembler:
         ctx.summary  = f"Auto-approved: {confirmed}"
         ctx.touch(); self.repo.save(ctx)
         return confirmed
-    
+
     def _stage9b_reflection_and_replan(
         self,
         tool_ctxs: List[ContextObject],
         plan_output: str,
         user_text: str,
         clar_metadata: Dict[str, Any],
-        max_tokens: int = 3500   # safety cut-off for long tool outputs
+        max_tokens: int = 3500   # no longer used for trimming
     ) -> Optional[str]:
         """
-        Show the LLM the *complete* tool outputs plus the original plan and let it
-        decide whether we need a re-plan.  Uses the pattern:
-
-            system  : instruction
-            assistant : full_context_blob   (may be trimmed to fit)
-            user   : replan question
-
-        Returns None if the model replies “OK”, otherwise the new JSON plan.
+        Reflect on the full context (user question, clarifier notes/keywords,
+        **all** tool outputs, original plan).  If everything satisfied the intent,
+        return None; otherwise return only the corrected JSON plan.
         """
-        import json, re, textwrap
+        import json, re
 
-        # 1️⃣  Pretty-print each tool’s output (JSON-safe, deterministic)
-        outputs = []
+        # 1) Gather clarifier info
+        clar_notes = clar_metadata.get("notes", "")
+        clar_keywords = clar_metadata.get("keywords", [])
+
+        # 2) Build the full context blob
+        parts = [
+            f"=== USER QUESTION ===\n{user_text}",
+            f"=== CLARIFIER NOTES ===\n{clar_notes}"
+        ]
+        if clar_keywords:
+            parts.append(f"=== CLARIFIER KEYWORDS ===\n{', '.join(clar_keywords)}")
+
+        # 3) Append every single tool output, unfiltered
         for c in tool_ctxs:
             payload = c.metadata.get("output")
             try:
                 blob = json.dumps(payload, indent=2, ensure_ascii=False)
             except Exception:
                 blob = repr(payload)
-            outputs.append(f"[{c.stage_id}]\n{blob}")
+            parts.append(f"=== TOOL OUTPUT [{c.stage_id}] ===\n{blob}")
 
-        # 2️⃣  Build a single context blob
-        context_blob = (
-            "=== TOOL OUTPUTS ===\n"
-            + "\n\n".join(outputs)
-            + "\n\n=== ORIGINAL PLAN ===\n"
-            + plan_output
-        )
+        # 4) Finally, the original plan
+        parts.append(f"=== ORIGINAL PLAN ===\n{plan_output}")
 
-        # 3️⃣  Hard-trim if the blob is too large
-        if len(context_blob) > max_tokens * 4:           # rough char→token fudge
-            # keep the tail (latest) part which usually matters most
-            context_blob = context_blob[-max_tokens * 4 :]
-            context_blob = "...[context trimmed due to length]...\n" + context_blob
+        context_blob = "\n\n".join(parts)
 
-        # 4️⃣  Compose the chat
+        # 5) Reflection prompt
         system_msg = (
-            "You are the Reflection agent. Decide whether the plan execution "
-            "fulfilled the user intent. If everything is satisfied, reply **OK**. "
-            "If NOT, reply ONLY the corrected JSON plan."
+            "You are the Reflection agent.  Please review **all** of the following "
+            "context, including the user question, clarifier notes, every tool output, "
+            "and the original plan.  Decide whether the plan execution satisfied the user's intent.  "
+            "If yes, reply exactly `OK`.  Otherwise, reply **only** with the corrected JSON plan."
         )
-        user_prompt = (
-            "Did these outputs satisfy the original intent? "
-            "If yes, reply exactly OK. Otherwise, return ONLY the corrected JSON plan."
+        user_payload = (
+            context_blob
+            + "\n\n"
+            + "Did these tool outputs satisfy the original intent? "
+              "If yes, reply OK.  If not, return only the corrected JSON plan."
         )
-
-        self._print_stage_context("reflection_and_replan", {
-            "full_tool_outputs": outputs if len(outputs) < 10 else outputs[:3] + ["…trimmed…"]
-        })
 
         msgs = [
-            {"role": "system",    "content": system_msg},
-            {"role": "assistant", "content": context_blob},
-            {"role": "user",      "content": user_prompt},
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_payload},
         ]
-        resp = self._stream_and_capture(
-            self.secondary_model, msgs, tag="[Reflection]"
-        ).strip()
+        resp = self._stream_and_capture(self.secondary_model, msgs, tag="[Reflection]").strip()
 
-        # pure OK → no replan
+        # 6) If it’s literally “OK”, we keep the original outputs
         if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp):
-            success = ContextObject.make_success(
+            ok_ctx = ContextObject.make_success(
                 description="Reflection confirmed plan satisfied intent",
-                refs=[c.context_id for c in tool_ctxs],
+                refs=[c.context_id for c in tool_ctxs]
             )
-            success.touch(); self.repo.save(success)
+            ok_ctx.touch()
+            self.repo.save(ok_ctx)
             return None
 
-        # otherwise persist the new plan
-        failure = ContextObject.make_failure(
+        # 7) Otherwise record the new plan
+        fail_ctx = ContextObject.make_failure(
             description="Reflection triggered replan",
-            refs=[c.context_id for c in tool_ctxs],
+            refs=[c.context_id for c in tool_ctxs]
         )
-        failure.touch(); self.repo.save(failure)
+        fail_ctx.touch()
+        self.repo.save(fail_ctx)
 
-        ctx = ContextObject.make_stage(
+        repl = ContextObject.make_stage(
             "reflection_and_replan",
             [c.context_id for c in tool_ctxs],
-            {"replan": resp},
+            {"replan": resp}
         )
-        ctx.stage_id = "reflection_and_replan"
-        ctx.summary  = textwrap.shorten(resp, width=250, placeholder="…")
-        ctx.touch(); self.repo.save(ctx)
+        repl.stage_id = "reflection_and_replan"
+        repl.summary  = resp  # full JSON plan
+        repl.touch()
+        self.repo.save(repl)
 
         return resp
     
@@ -1673,7 +1673,8 @@ class Assembler:
     def _stage10b_response_critique_and_safety(
         self,
         draft: str,
-        user_text: str
+        user_text: str,
+        tool_ctxs: List[ContextObject]
     ) -> str:
         """
         Final-pass LLM sweep that
@@ -1683,29 +1684,42 @@ class Assembler:
 
         Returns the polished answer.
         """
-        import difflib, json
+        import difflib
+        import json
 
-        # 1️⃣  Run the critic model
+        # 1️⃣ Gather and pretty-print the tool outputs for the critic
+        outputs = []
+        for c in tool_ctxs:
+            out = c.metadata.get("output")
+            try:
+                blob = json.dumps(out, indent=2, ensure_ascii=False)
+            except Exception:
+                blob = repr(out)
+            outputs.append(f"[{c.stage_id}]\n{blob}")
+
+        # 2️⃣ Run the critic model with both the draft and the tool outputs
         critic_sys = (
-            "You are the final-pass assistant. Review the draft answer below. "
-            "Fix any unsupported statements, ensure policy compliance, and polish tone. "
-            "Return **only** the corrected answer."
+            "You are the final-pass assistant. Review the draft answer below "
+            "in light of the full tool outputs. Fix any unsupported statements, "
+            "ensure policy compliance, and polish tone. Return **only** the corrected answer."
         )
-        self._print_stage_context("response_critique", {"draft": draft})
+        self._print_stage_context("response_critique", {
+            "tool_outputs": outputs,
+            "draft": [draft]
+        })
         msgs = [
             {"role": "system",    "content": critic_sys},
+            {"role": "system",    "content": "Tool outputs:\n\n" + "\n\n".join(outputs)},
             {"role": "assistant", "content": draft},
             {"role": "user",      "content": f"Original question:\n{user_text}"},
         ]
-        polished = self._stream_and_capture(
-            self.secondary_model, msgs, tag="[Critic]"
-        )
+        polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]")
 
-        # 2️⃣  If nothing changed, we're done
+        # 3️⃣ If nothing changed, we're done
         if polished.strip() == draft.strip():
             return polished
 
-        # 3️⃣  Compute a one-liner diff summary
+        # 4️⃣ Compute a one-liner diff summary
         diff = difflib.unified_diff(
             draft.splitlines(), polished.splitlines(),
             lineterm="", n=1
@@ -1714,14 +1728,14 @@ class Assembler:
             ln for ln in diff if ln.startswith(("+ ", "- "))
         ) or "(minor re-formatting)"
 
-        # 4️⃣  Up-sert the *singleton* dynamic_prompt_patch row
+        # 5️⃣ Upsert the *singleton* dynamic_prompt_patch row
         patch_rows = self.repo.query(
             lambda c: c.component == "policy"
-            and c.semantic_label == "dynamic_prompt_patch"
+                      and c.semantic_label == "dynamic_prompt_patch"
         )
         patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
         if patch_rows:
-            patch = patch_rows[0]            # keep newest
+            patch = patch_rows[0]
             for extra in patch_rows[1:]:
                 self.repo.delete(extra.context_id)
         else:
@@ -1730,15 +1744,17 @@ class Assembler:
             )
 
         if patch.summary != diff_summary:
-            patch.summary             = diff_summary
-            patch.metadata["policy"]  = diff_summary
+            patch.summary            = diff_summary
+            patch.metadata["policy"] = diff_summary
             patch.touch()
             self.repo.save(patch)
             self._print_stage_context("dynamic_patch_written", {"patch": diff_summary})
 
-        # 5️⃣  Persist the polished reply
+        # 6️⃣ Persist the polished reply
         ctx = ContextObject.make_stage(
-            "response_critique", [], {"text": polished}
+            "response_critique",
+            [],  # no extra refs needed here
+            {"text": polished}
         )
         ctx.stage_id = "response_critique"
         ctx.summary  = polished
@@ -1747,16 +1763,10 @@ class Assembler:
 
         return polished
 
-
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        """
-        Assemble *all* prior context then pass it to the primary model using
-        **exactly one** system prompt, the context as an assistant message,
-        and the user’s question.  This guarantees the model sees the context.
-        """
         import json
 
-        # 1) Gather every relevant ContextObject ID
+        # 1) Gather all context IDs including tool outputs
         refs = [
             state['user_ctx'].context_id,
             state['sys_ctx'].context_id,
@@ -1767,95 +1777,27 @@ class Assembler:
             *[t.context_id for t in state['tool_ctxs']],
         ]
 
-        # 2) Dedupe + chronologically sort
+        # 2) Dedupe & load them, sorted chronologically
         seen, ordered = set(), []
         for cid in refs:
             if cid not in seen:
                 seen.add(cid)
                 ordered.append(cid)
-
         ctxs = [self.repo.get(cid) for cid in ordered]
         ctxs.sort(key=lambda c: c.timestamp)
 
-        # 3) Build the rich context block (tool outputs pretty-printed)
+        # 3) Build a rich context block that inlines full tool outputs
         interm_parts = []
         for c in ctxs:
             if c.component.startswith("tool_output"):
                 out = c.metadata.get("output")
                 try:
-                    blob = json.dumps(out, indent=2)
+                    blob = json.dumps(out, indent=2, ensure_ascii=False)
                 except Exception:
                     blob = repr(out)
                 interm_parts.append(f"[{c.semantic_label}]\n{blob}")
             else:
                 interm_parts.append(f"[{c.semantic_label}] {c.summary}")
-        interm = "\n\n".join(interm_parts)
-
-        # 4) Single-system → assistant (context) → user pattern
-        system_prompt = (
-            "You are a helpful, context-aware assistant. Use **all** provided "
-            "context and tool outputs to answer factually and concisely. "
-            "If the context already answers the question, quote or summarise it; "
-            "do NOT say you lack information."
-        )
-        msgs = [
-            {"role": "system",    "content": system_prompt},
-            {"role": "assistant", "content": interm},
-            {"role": "user",      "content": user_text},
-        ]
-
-        reply = self._stream_and_capture(
-            self.primary_model, msgs, tag="[Assistant]"
-        )
-
-        # 5) Persist the answer
-        resp_ctx = ContextObject.make_stage(
-            "final_inference",
-            [state['tc_ctx'].context_id],
-            {"text": reply}
-        )
-        resp_ctx.stage_id = "final_inference"
-        resp_ctx.summary  = reply
-        resp_ctx.touch()
-        self.repo.save(resp_ctx)
-
-        return reply
-
-
-
-
-    def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-        # 1) Gather all context IDs: user, prompts, history, clarifier, knowledge, plan, tool outputs
-        refs = [state['user_ctx'].context_id,
-                state['sys_ctx'].context_id] + state['recent_ids']
-        refs += [state['clar_ctx'].context_id,
-                 state['know_ctx'].context_id,
-                 state['plan_ctx'].context_id]
-        refs += [t.context_id for t in state['tool_ctxs']]
-
-        # 2) Dedupe & load them, sorted chronologically
-        seen, allr = set(), []
-        for cid in refs:
-            if cid not in seen:
-                seen.add(cid)
-                allr.append(cid)
-        ctxs = [self.repo.get(cid) for cid in allr]
-        ctxs.sort(key=lambda c: c.timestamp)
-
-        # 3) Build a rich 'interm' block that inlines full tool outputs
-        interm_parts = []
-        for c in ctxs:
-            if c.component.startswith("tool_output"):
-                # pretty-print the **actual** output payload
-                out = c.metadata.get("output")
-                try:
-                    blob = json.dumps(out, indent=2)
-                except Exception:
-                    blob = repr(out)
-                interm_parts.append(f"[{c.semantic_label}]\n{blob}")
-            else:
-                interm_parts.append(f"[{c.semantic_label}] {c.summary}")
-
         interm = "\n\n".join(interm_parts)
 
         # 4) Send everything to the final assistant
@@ -1871,9 +1813,11 @@ class Assembler:
         ]
         reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]")
 
-        # 5) Persist the final answer
+        # 5) Persist the final answer, referencing all tool outputs
         resp_ctx = ContextObject.make_stage(
-            "final_inference", [state['tc_ctx'].context_id], {"text": reply}
+            "final_inference",
+            [state['tc_ctx'].context_id] + [t.context_id for t in state['tool_ctxs']],
+            {"text": reply}
         )
         resp_ctx.stage_id = "final_inference"
         resp_ctx.summary  = reply
