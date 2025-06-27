@@ -222,37 +222,58 @@ def handle_input(user_text: str):
     #if not getattr(asm, "_awaiting_confirmation", False):
         #tts.enqueue(resp)
 
-# ──────────── START AUDIO SERVICE ────────────────────────────────────────────
+# ──────────── START AUDIO SERVICE (threaded) ────────────────────────────
 audio_svc = AudioService(
-    sample_rate         = config.get("sample_rate",        16000),
-    rms_threshold       = config.get("rms_threshold",      0.01),
-    silence_duration    = config.get("silence_duration",   2.0),
-    consensus_threshold = config.get("consensus_threshold",0.5),
+    sample_rate         = config.get("sample_rate", 16000),
+    rms_threshold       = config.get("rms_threshold", 0.01),
+    silence_duration    = config.get("silence_duration", 2.0),
+    consensus_threshold = config.get("consensus_threshold", 0.5),
     enable_denoise      = config.get("enable_noise_reduction", False),
     on_transcription    = handle_input,
     logger              = log_message,
     cfg                 = config,
 )
-audio_svc.start()
+audio_thread = threading.Thread(target=audio_svc.start, daemon=True)
+audio_thread.start()
 
-threading.Thread(target=telegram_input, args=(asm,), daemon=True).start()
 # now that the mic is running, give it to TTS so it can suspend/resume
 tts.audio_service = audio_svc
 
-# ──────────── TEXT REPL OVERRIDE ─────────────────────────────────────────────
-print(f"Using context store: {CTX_PATH}")
-print(f"Primary model: {config['primary_model']}")
-print("Ready: type or speak; Ctrl-C to exit.")
-while True:
-    try:
-        line = input(">> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        break
-    if line:
-        handle_input(line)
+# ──────────── START TELEGRAM BOT (threaded) ─────────────────────────────
+tel_thread = threading.Thread(target=telegram_input, args=(asm,), daemon=True)
+tel_thread.start()
 
-# ──────────── CLEANUP ────────────────────────────────────────────────────────
-audio_svc.stop()
-tts.stop()
-session_log.close()
-print("Goodbye.")
+# ──────────── TEXT REPL (in its own thread) ─────────────────────────────────────────────
+def cli_loop():
+    print(f"Using context store: {CTX_PATH}")
+    print(f"Primary model: {config['primary_model']}")
+    print("Ready (CLI): type your message, Ctrl-C to exit.")
+    try:
+        while True:
+            line = input(">> ").strip()
+            if line:
+                handle_input(line)
+    except (EOFError, KeyboardInterrupt):
+        # When the user explicitly stops the CLI, we simply return—
+        # letting the main thread handle full cleanup.
+        return
+
+cli_thread = threading.Thread(target=cli_loop, daemon=True)
+cli_thread.start()
+
+# ──────────── WAIT FOREVER (until SIGINT) ─────────────────────────────────────────────
+# The main thread will block here; CTRL-C will trigger our SIGINT handler.
+threading.Event().wait()
+
+# ──────────── CLEANUP (runs on SIGINT) ────────────────────────────────────────────────
+# You already have a SIGINT handler calling sys.exit(0),
+# so put your cleanup in an atexit hook:
+
+import atexit
+def _cleanup():
+    print("\nShutting down services…")
+    audio_svc.stop()
+    tts.stop()
+    session_log.close()
+    print("Goodbye.")
+atexit.register(_cleanup)
