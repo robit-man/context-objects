@@ -45,38 +45,56 @@ def telegram_input(asm):
         sent   = await context.bot.send_message(chat_id=chat_id, text="🛠️ Processing…")
         msg_id = sent.message_id
 
+# inside telegram_input.py, replace your runner() with:
+
         async def runner():
             try:
-                # ── 0) Clear any stale .ogg paths from previous runs
+                # ── 0) Flush any leftover file‐TTS texts and OGG paths ───────
+                try:
+                    while True:
+                        asm.tts._file_q.get_nowait()
+                except queue.Empty:
+                    pass
                 try:
                     while True:
                         asm.tts._ogg_q.get_nowait()
                 except queue.Empty:
                     pass
 
-                # ── 1) Switch TTS into file-output mode
+                # ── 1) Switch TTS into file‐output mode ─────────────────────
                 asm.tts.set_mode("file")
 
-                # ── 2) Run the entire assembler pipeline in a thread
+                # ── 2) Run the assembler pipeline synchronously ────────────
                 final = await asyncio.to_thread(asm.run_with_meta_context, user_text)
 
-                # ── 3) Update the message with the final text
+                # ── 3) Edit the “Processing…” message to show the final text ──
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
                     text=final or "(no response)"
                 )
 
-                # ── 4) Wait until the file-TTS queue has been fully processed
-                asm.tts._file_q.join()
+                # ── 4) Now *only* generate the one OGG for that final answer ──
 
-                # ── 5) Now retrieve exactly one .ogg path (the most recent)
+                # Clear out any accidental enqueues during the run
                 try:
-                    ogg_path = asm.tts.wait_for_latest_ogg(timeout=5.0)
+                    while True:
+                        asm.tts._file_q.get_nowait()
                 except queue.Empty:
-                    return
+                    pass
+                try:
+                    while True:
+                        asm.tts._ogg_q.get_nowait()
+                except queue.Empty:
+                    pass
 
-                # ── 6) Send that single OGG back
+                # Enqueue only the final text
+                asm.tts.enqueue(final or "")
+
+                # Wait for exactly one OGG
+                ogg_path = asm.tts.wait_for_latest_ogg(timeout=10.0)
+
+                # Send it back
                 with open(ogg_path, "rb") as vf:
                     await context.bot.send_voice(
                         chat_id=chat_id,
@@ -85,7 +103,7 @@ def telegram_input(asm):
                     )
 
             except asyncio.CancelledError:
-                # If a new request preempted this one
+                # If a new request preempted this one…
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -96,7 +114,7 @@ def telegram_input(asm):
                     pass
 
             except Exception as e:
-                # On any other error, report it
+                # Any other error…
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"❌ Error: {e}"
@@ -104,6 +122,7 @@ def telegram_input(asm):
 
             finally:
                 running_tasks.pop(chat_id, None)
+
 
         # Launch the runner as a background task
         task = loop.create_task(runner())
