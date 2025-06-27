@@ -595,14 +595,13 @@ class Assembler:
             )
             nodes.append(node)
         return nodes
-        
+            
     def run_with_meta_context(self, user_text: str) -> str:
         import re, json
 
-        # ——— 0) If we're waiting on yes/no, handle it first ——————————
+        # ——— Stage 0: handle pending yes/no confirmation ——————————
         if getattr(self, "_awaiting_confirmation", False):
-            ans = user_text.strip()
-
+            ans = user_text.strip().lower()
             # YES branch
             if re.search(r"\b(yes|y|sure|please do)\b", ans, re.I):
                 # Summarize next steps for TTS
@@ -619,11 +618,11 @@ class Assembler:
                 self.tts.enqueue(summary)
 
                 # Restore saved state
-                state       = self._pending_state
+                state = self._pending_state
                 fixed_calls = self._pending_fixed_calls
                 del self._awaiting_confirmation
 
-                # ——— Resume: tool chaining → user confirmation (auto) → invoke → reflection ——
+                # ——— Stages 8–9: tool chaining, confirmation, invocation, reflection ——
                 tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                     state['plan_ctx'],
                     "\n".join(fixed_calls),
@@ -643,10 +642,11 @@ class Assembler:
                     user_text,
                     state['clar_ctx'].metadata
                 )
+
+                # optional replan loop
                 if replan:
-                    plan_obj    = json.loads(replan)
-                    new_calls   = [t["call"] for t in plan_obj.get("tasks", [])]
-                    fixed_calls = new_calls
+                    plan_obj = json.loads(replan)
+                    fixed_calls = [t["call"] for t in plan_obj.get("tasks", [])]
                     tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                         state['plan_ctx'],
                         "\n".join(fixed_calls),
@@ -662,10 +662,10 @@ class Assembler:
                     )
 
                 # inject into state for Stage 10+
-                state['tc_ctx']    = tc_ctx
+                state['tc_ctx'] = tc_ctx
                 state['tool_ctxs'] = tool_ctxs
 
-                # ——— 1️⃣0️⃣+: assemble, critique, memory, decay —————————
+                # ——— Stage 10+: assemble, critique, memory, decay —————————
                 draft = self._stage10_assemble_and_infer(user_text, state)
                 final = self._stage10b_response_critique_and_safety(
                     draft, user_text, state['tool_ctxs']
@@ -676,8 +676,8 @@ class Assembler:
                 self.tts.enqueue("Done. " + final[:200])
                 return final
 
-            # NO branch → ask a refine question
-            elif re.search(r"\b(no|n)\b", ans, re.I):
+            # NO branch: ask refine question
+            if re.search(r"\b(no|n)\b", ans, re.I):
                 refine_prompt = (
                     "You are an assistant. The user declined the plan:\n"
                     f"{self._pending_plan}\n\n"
@@ -691,28 +691,29 @@ class Assembler:
                 self.tts.enqueue(question)
                 return question
 
-            # UNCLEAR → ask again (directly, no LLM)
-            else:
-                clarify_prompt = "I didn’t catch that. Please answer yes or no."
-                self.tts.enqueue(clarify_prompt)
-                return clarify_prompt
+            # UNCLEAR: ask again
+            clarify_prompt = "I didn’t catch that. Please answer yes or no."
+            self.tts.enqueue(clarify_prompt)
+            return clarify_prompt
 
-        # ——— Normal turn start — record input ——————————————
+        # ——— Stage 1: record input ——————————————
         state: Dict[str, Any] = {}
         state['user_ctx'] = self._stage1_record_input(user_text)
 
-        # ── Stages 2–6 ─────────────────────────────────────────────────
+        # ——— Stages 2–6: system prompts, context retrieval, intent, knowledge, tools ——
         state['sys_ctx']   = self._stage2_load_system_prompts()
         ctx3 = self._stage3_retrieve_and_merge_context(
             user_text,
             state['user_ctx'],
             state['sys_ctx'],
-            extra_ctx=state.get("chat_history", []),
+            extra_ctx=state.get("chat_history", [])
         )
         state.update(ctx3)
-        state['clar_ctx']  = self._stage4_intent_clarification(user_text, state)
-        state['know_ctx']  = self._stage5_external_knowledge(state['clar_ctx'])
-        state['tools_list']= self._stage6_prepare_tools()
+        state['clar_ctx']   = self._stage4_intent_clarification(user_text, state)
+        state['know_ctx']   = self._stage5_external_knowledge(state['clar_ctx'])
+        state['tools_list'] = self._stage6_prepare_tools()
+
+        # ——— Stage 7: planning summary ——————————————
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
             state['clar_ctx'],
             state['know_ctx'],
@@ -720,7 +721,7 @@ class Assembler:
             user_text
         )
 
-        # ── Stage 7b: validate & fix ────────────────────────────────────
+        # ——— Stage 7b: plan validation ——————————————
         valid, errors, fixed_calls = self._stage7b_plan_validation(
             state['plan_ctx'],
             state['plan_output'],
@@ -729,15 +730,15 @@ class Assembler:
         if errors:
             raise RuntimeError(f"Plan validation failed: {errors}")
 
-        # flatten into a single plan string
         plan_str = "\n".join(fixed_calls)
 
-        # ── If there are tool calls, ask user to confirm via LLM question ──
+        # ——— Confirmation or direct execution ——————————
         if fixed_calls:
             ask_confirm = (
                 "You are an assistant. Here is the plan I intend to run:\n"
                 f"{plan_str}\n\n"
                 "Formulate a single yes/no question to ask the user to confirm before proceeding."
+                "extremely brief and specific!"
             )
             question = self._stream_and_capture(
                 self.primary_model,
@@ -747,81 +748,84 @@ class Assembler:
             self.tts.enqueue(question)
 
             # stash for resume
-            self._awaiting_confirmation    = True
-            self._pending_state            = state
-            self._pending_plan             = plan_str
-            self._pending_fixed_calls      = fixed_calls
-            self._pending_schemas          = None
-
+            self._awaiting_confirmation = True
+            self._pending_state = state
+            self._pending_plan = plan_str
+            self._pending_fixed_calls = fixed_calls
             return question
 
-        # ── Otherwise (no tools), just execute straight through ───────────
+        # ——— No tools: immediate tool chaining & invocation —————————
         tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-            state['plan_ctx'], plan_str, state['tools_list']
+            state['plan_ctx'],
+            plan_str,
+            state['tools_list']
         )
         confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
         tool_ctxs = self._stage9_invoke_with_retries(
-            confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
+            confirmed,
+            plan_str,
+            schemas,
+            user_text,
+            state['clar_ctx'].metadata
         )
         replan = self._stage9b_reflection_and_replan(
-            tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
+            tool_ctxs,
+            plan_str,
+            user_text,
+            state['clar_ctx'].metadata
         )
+
         if replan:
-            plan_obj   = json.loads(replan)
-            new_calls  = [t["call"] for t in plan_obj.get("tasks", [])]
-            plan_str   = "\n".join(new_calls)
+            plan_obj  = json.loads(replan)
+            new_calls = [t["call"] for t in plan_obj.get("tasks", [])]
+            plan_str  = "\n".join(new_calls)
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                state['plan_ctx'], plan_str, state['tools_list']
+                state['plan_ctx'],
+                plan_str,
+                state['tools_list']
             )
             confirmed  = self._stage8_5_user_confirmation(raw_calls, user_text)
             tool_ctxs  = self._stage9_invoke_with_retries(
-                confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
+                confirmed,
+                plan_str,
+                schemas,
+                user_text,
+                state['clar_ctx'].metadata
             )
 
-        # ── Fractal task execution ────────────────────────────────────────
-        try:
-            tree    = json.loads(state['plan_output'])
-            roots   = self._parse_task_tree(tree)
-            executor= TaskExecutor(self, user_text, state['clar_ctx'].metadata)
-            for r in roots:
-                r.context_ids = [
-                    state['plan_ctx'].context_id,
-                    state['user_ctx'].context_id,
-                    state['sys_ctx'].context_id
-                ] + state['recent_ids']
-                executor.execute(r)
+        # ——— Optional fractal executor fallback ——————————————
+        if not fixed_calls and state.get('plan_output'):
+            try:
+                tree    = json.loads(state['plan_output'])
+                roots   = self._parse_task_tree(tree)
+                executor = TaskExecutor(self, user_text, state['clar_ctx'].metadata)
+                for r in roots:
+                    r.context_ids = (
+                        [state['plan_ctx'].context_id,
+                        state['user_ctx'].context_id,
+                        state['sys_ctx'].context_id]
+                        + state.get('recent_ids', [])
+                    )
+                    executor.execute(r)
+                # collect tool_output contexts
+                tool_ctxs = [
+                    obj for obj in (self.repo.get(cid) for cid in set().union(*[r.context_ids for r in roots]))
+                    if obj.component == "tool_output"
+                ]
+            except Exception:
+                tool_ctxs = []
 
-            # collect tool_output ContextObjects
-            all_ids = []
-            def collect(n):
-                all_ids.extend(n.context_ids)
-                for c in n.children:
-                    collect(c)
-            for r in roots: collect(r)
-
-            tool_ctxs = []
-            for cid in all_ids:
-                try:
-                    obj = self.repo.get(cid)
-                except KeyError:
-                    continue
-                if obj.component == "tool_output":
-                    tool_ctxs.append(obj)
-        except:
-            tool_ctxs = []
-
-        # ── Stage 10+: assemble, critique, memory, decay ──────────────────
+        # ——— Stage 10+: assemble, critique, memory, decay —————————
         state['tc_ctx']    = tc_ctx
         state['tool_ctxs'] = tool_ctxs
         draft = self._stage10_assemble_and_infer(user_text, state)
-        final = self._stage10b_response_critique_and_safety(
-            draft, user_text, tool_ctxs
-        )
+        final = self._stage10b_response_critique_and_safety(draft, user_text, tool_ctxs)
         self._stage11_memory_writeback(final, tool_ctxs)
         self.memman.decay_and_promote()
 
         self.tts.enqueue(final)
         return final
+
 
 
 
@@ -1725,16 +1729,15 @@ class Assembler:
     ) -> str:
         """
         Final-pass LLM sweep that
-          • removes hallucinations,
-          • enforces policy / tone,
-          • writes or updates a **single** dynamic_prompt_patch row.
+        • removes hallucinations,
+        • enforces policy / tone,
+        • writes or updates a **single** dynamic_prompt_patch row.
 
         Returns the polished answer.
         """
-        import difflib
-        import json
+        import json, difflib
 
-        # 1️⃣ Gather and pretty-print the tool outputs for the critic
+        # 1) Gather all tool outputs
         outputs = []
         for c in tool_ctxs:
             out = c.metadata.get("output")
@@ -1744,29 +1747,36 @@ class Assembler:
                 blob = repr(out)
             outputs.append(f"[{c.stage_id}]\n{blob}")
 
-        # 2️⃣ Run the critic model with both the draft and the tool outputs
+        # 2) Build critic prompt (single system + user)
         critic_sys = (
             "You are the final-pass assistant. Review the draft answer and all tool outputs. "
             "Remove any unsupported claims, then deliver a concise, accurate, conversational response. "
             "Polish the tone and return only the final answer."
         )
-        self._print_stage_context("response_critique", {
-            "tool_outputs": outputs,
-            "draft": [draft]
-        })
-        msgs = [
-            {"role": "system",    "content": critic_sys},
-            {"role": "system",    "content": "Tool outputs:\n\n" + "\n\n".join(outputs)},
-            {"role": "assistant", "content": draft},
-            {"role": "user",      "content": f"Original question:\n{user_text}"},
-        ]
-        polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]")
+        prompt_user = (
+            f"Draft answer:\n{draft}\n\n"
+            f"Tool outputs:\n" + "\n\n".join(outputs) + "\n\n"
+            f"Original question:\n{user_text}"
+        )
 
-        # 3️⃣ If nothing changed, we're done
-        if polished.strip() == draft.strip():
+        # Debug: print the combined context
+        self._print_stage_context("response_critique", {
+            "draft": [draft],
+            "tool_outputs": outputs,
+        })
+
+        # 3) Invoke LLM
+        msgs = [
+            {"role": "system",  "content": critic_sys},
+            {"role": "user",    "content": prompt_user},
+        ]
+        polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]").strip()
+
+        # 4) If unchanged, return draft
+        if polished == draft.strip():
             return polished
 
-        # 4️⃣ Compute a one-liner diff summary
+        # 5) Compute one-line diff summary
         diff = difflib.unified_diff(
             draft.splitlines(), polished.splitlines(),
             lineterm="", n=1
@@ -1775,10 +1785,9 @@ class Assembler:
             ln for ln in diff if ln.startswith(("+ ", "- "))
         ) or "(minor re-formatting)"
 
-        # 5️⃣ Upsert the *singleton* dynamic_prompt_patch row
+        # 6) Upsert dynamic_prompt_patch
         patch_rows = self.repo.query(
-            lambda c: c.component == "policy"
-                      and c.semantic_label == "dynamic_prompt_patch"
+            lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
         )
         patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
         if patch_rows:
@@ -1789,26 +1798,26 @@ class Assembler:
             patch = ContextObject.make_policy(
                 "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
             )
-
         if patch.summary != diff_summary:
-            patch.summary            = diff_summary
+            patch.summary = diff_summary
             patch.metadata["policy"] = diff_summary
             patch.touch()
             self.repo.save(patch)
             self._print_stage_context("dynamic_patch_written", {"patch": diff_summary})
 
-        # 6️⃣ Persist the polished reply
+        # 7) Persist polished reply
         ctx = ContextObject.make_stage(
             "response_critique",
-            [],  # no extra refs needed here
+            [],  # no extra refs here
             {"text": polished}
         )
         ctx.stage_id = "response_critique"
-        ctx.summary  = polished
+        ctx.summary = polished
         ctx.touch()
         self.repo.save(ctx)
 
         return polished
+
 
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
         import json
