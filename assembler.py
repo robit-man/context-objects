@@ -599,38 +599,95 @@ class Assembler:
     def run_with_meta_context(self, user_text: str) -> str:
         import re, json
 
-        # ——— 0) If we’re waiting for yes/no, handle it first ——————————
+        # ——— 0) Handle an outstanding yes/no confirmation —————————
         if getattr(self, "_awaiting_confirmation", False):
             ans = user_text.strip()
+
             # YES branch
             if re.search(r"\b(yes|y|sure|please do)\b", ans, re.I):
-                # 0a) Summarize next steps via LLM
+                # Summarize next steps
                 confirm_prompt = (
-                    "You are an assistant.  The user agreed to proceed with this plan:\n"
+                    "You are an assistant. The user agreed to proceed with this plan:\n"
                     f"{self._pending_plan}\n\n"
                     "Summarize the next steps in one or two sentences."
                 )
                 summary = self._stream_and_capture(
                     self.primary_model,
-                    [{"role": "system", "content": confirm_prompt}],
+                    [{"role":"system","content":confirm_prompt}],
                     tag="[Confirm]"
                 )
                 self.tts.enqueue(summary)
 
-                # 0b) Clear the flag and pull in the saved state
+                # load the saved pre-confirmation state
                 state         = self._pending_state
                 fixed_calls   = self._pending_fixed_calls
-                schemas       = self._pending_schemas or None
+                schemas       = self._pending_schemas or []  # if you want to reuse schemas
+
+                # clear flag
                 del self._awaiting_confirmation
-                # fall through to resume below
+
+                # ——— resume at Tool-Chaining & Invocation —————————
+                tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                    state['plan_ctx'],
+                    "\n".join(fixed_calls),
+                    state['tools_list']
+                )
+                confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
+                tool_ctxs = self._stage9_invoke_with_retries(
+                    confirmed,
+                    "\n".join(fixed_calls),
+                    schemas,
+                    user_text,
+                    state['clar_ctx'].metadata
+                )
+                # reflection & possible replan
+                replan = self._stage9b_reflection_and_replan(
+                    tool_ctxs,
+                    "\n".join(fixed_calls),
+                    user_text,
+                    state['clar_ctx'].metadata
+                )
+                if replan:
+                    # simple one-shot replan
+                    plan_obj = json.loads(replan)
+                    new_calls = [t["call"] for t in plan_obj.get("tasks", [])]
+                    fixed_calls = new_calls
+                    tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                        state['plan_ctx'],
+                        "\n".join(fixed_calls),
+                        state['tools_list']
+                    )
+                    confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
+                    tool_ctxs = self._stage9_invoke_with_retries(
+                        confirmed,
+                        "\n".join(fixed_calls),
+                        schemas,
+                        user_text,
+                        state['clar_ctx'].metadata
+                    )
+
+                # inject into state
+                state['tool_ctxs'] = tool_ctxs
+                state['tc_ctx']    = tc_ctx
+
+                # ——— Stage 10+: Final assembly, critique, memory, decay ————
+                draft = self._stage10_assemble_and_infer(user_text, state)
+                final = self._stage10b_response_critique_and_safety(
+                    draft, user_text, state['tool_ctxs']
+                )
+                self._stage11_memory_writeback(final, state['tool_ctxs'])
+                self.memman.decay_and_promote()
+
+                # speak the completion
+                self.tts.enqueue("Done. " + final[:200])
+                return final
 
             # NO branch
             elif re.search(r"\b(no|n)\b", ans, re.I):
-                # ask a single, clear follow‐up question
                 refine_prompt = (
-                    "You are an assistant.  The user declined the plan:\n"
+                    "You are an assistant. The user declined the plan:\n"
                     f"{self._pending_plan}\n\n"
-                    "Ask exactly one clear yes/no question to refine this plan."
+                    "Ask a single, clear follow-up question to help me refine this plan."
                 )
                 question = self._stream_and_capture(
                     self.primary_model,
@@ -638,9 +695,10 @@ class Assembler:
                     tag="[Refine]"
                 )
                 self.tts.enqueue(question)
+                # still awaiting a yes/no to new question
                 return question
 
-            # UNCLEAR
+            # UNCLEAR → ask again
             else:
                 clarify_prompt = "I didn’t catch that. Please answer yes or no."
                 question = self._stream_and_capture(
@@ -651,89 +709,44 @@ class Assembler:
                 self.tts.enqueue(question)
                 return question
 
-            # ——— 0c) Resume at stage 8 with our saved plan ——————————
-            plan_str = "\n".join(fixed_calls)
-            # 8) tool chaining
-            tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                state['plan_ctx'], plan_str, state['tools_list']
-            )
-            # 8.5) user confirmation (auto)
-            confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
-            # 9) invoke with retries
-            tool_ctxs = self._stage9_invoke_with_retries(
-                confirmed, plan_str, schemas,
-                user_text, state['clar_ctx'].metadata
-            )
-            # 9b) reflection & possible replan
-            replan = self._stage9b_reflection_and_replan(
-                tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
-            )
-            if replan:
-                # single automatic replan pass
-                plan_str = replan
-                valid, _, fixed_calls = self._stage7b_plan_validation(
-                    state['plan_ctx'], plan_str, state['tools_list']
-                )
-                tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                    state['plan_ctx'], plan_str, state['tools_list']
-                )
-                confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
-                tool_ctxs = self._stage9_invoke_with_retries(
-                    confirmed, plan_str, schemas,
-                    user_text, state['clar_ctx'].metadata
-                )
-
-            # 10 & 10b: assemble + critique
-            draft = self._stage10_assemble_and_infer(user_text, state)
-            final = self._stage10b_response_critique_and_safety(
-                draft, user_text, tool_ctxs
-            )
-            # 11) memory write-back, 12) decay/promote
-            self._stage11_memory_writeback(final, tool_ctxs)
-            self.memman.decay_and_promote()
-
-            # speak a closing summary
-            self.tts.enqueue("Done. " + final[:200])
-            return final
-
-        # ——— 1) Normal turn: record user input ——————————————
+        # ——— 1) Normal turn start — record user input ——————————————
         state: Dict[str, Any] = {}
         state['user_ctx'] = self._stage1_record_input(user_text)
 
-        # ——— 2–6) as before —────────────────────────────────────────
+        # ── Stages 2–6 as before ─────────────────────────────────────────
         state['sys_ctx']   = self._stage2_load_system_prompts()
-        ctx3 = self._stage3_retrieve_and_merge_context(
-            user_text,
-            state['user_ctx'],
-            state['sys_ctx'],
-            extra_ctx=state.get("chat_history", []),
-        )
+        ctx3               = self._stage3_retrieve_and_merge_context(
+                                user_text,
+                                state['user_ctx'],
+                                state['sys_ctx'],
+                                extra_ctx=state.get("chat_history", []),
+                             )
         state.update(ctx3)
         state['clar_ctx']  = self._stage4_intent_clarification(user_text, state)
         state['know_ctx']  = self._stage5_external_knowledge(state['clar_ctx'])
         state['tools_list']= self._stage6_prepare_tools()
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
-            state['clar_ctx'],
-            state['know_ctx'],
-            state['tools_list'],
-            user_text
-        )
+                                         state['clar_ctx'],
+                                         state['know_ctx'],
+                                         state['tools_list'],
+                                         user_text
+                                     )
 
-        # ——— 7b) validate & fix plan —────────────────────────────────────
-        valid_calls, errors, fixed_calls = self._stage7b_plan_validation(
-            state['plan_ctx'],
-            state['plan_output'],
-            state['tools_list']
-        )
+        # ——— 2) Validate & fix plan ————————————————————————————————
+        valid, errors, fixed_calls = self._stage7b_plan_validation(
+                                       state['plan_ctx'],
+                                       state['plan_output'],
+                                       state['tools_list']
+                                    )
         if errors:
             raise RuntimeError(f"Plan validation failed: {errors}")
 
-        # ——— 7c) ask user to confirm via LLM question —──────────────────
+        # ——— 3) Ask the user to confirm via LLM-generated question ————
         plan_str = "\n".join(fixed_calls)
         ask_confirm = (
-            "You are an assistant.  Here is the plan I intend to run:\n"
+            "You are an assistant. Here is the plan I intend to run:\n"
             f"{plan_str}\n\n"
-            "Formulate exactly one yes/no question asking the user to confirm."
+            "Formulate a single yes/no question to ask the user to confirm before proceeding."
         )
         question = self._stream_and_capture(
             self.primary_model,
@@ -742,14 +755,14 @@ class Assembler:
         )
         self.tts.enqueue(question)
 
-        # — store everything and pause until reply —──────────────────────
-        self._awaiting_confirmation    = True
-        self._pending_state            = state
-        self._pending_plan             = plan_str
-        self._pending_fixed_calls      = fixed_calls
-        self._pending_schemas          = None  # recompute on resume
-        return question
+        # stash everything for the resume above
+        self._awaiting_confirmation   = True
+        self._pending_state           = state
+        self._pending_plan            = plan_str
+        self._pending_fixed_calls     = fixed_calls
+        self._pending_schemas         = None
 
+        return question
 
 
 
