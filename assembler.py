@@ -17,7 +17,7 @@ from tts_service import TTSManager
 from audio_service import AudioService
 from context import ContextObject, ContextRepository, MemoryManager, default_clock
 from tools import TOOL_SCHEMAS, Tools
-
+import inspect
 logger = logging.getLogger("assembler")
 logging.basicConfig(
     level=logging.INFO,
@@ -595,13 +595,14 @@ class Assembler:
             )
             nodes.append(node)
         return nodes
-    
+        
     def run_with_meta_context(self, user_text: str) -> str:
         import re, json
 
         # ——— 0) If we're waiting on yes/no, handle it first ——————————
         if getattr(self, "_awaiting_confirmation", False):
             ans = user_text.strip()
+
             # YES branch
             if re.search(r"\b(yes|y|sure|please do)\b", ans, re.I):
                 # Summarize next steps for TTS
@@ -614,7 +615,7 @@ class Assembler:
                     self.primary_model,
                     [{"role": "system", "content": confirm_prompt}],
                     tag="[Confirm]"
-                )
+                ).strip()
                 self.tts.enqueue(summary)
 
                 # Restore saved state
@@ -643,9 +644,8 @@ class Assembler:
                     state['clar_ctx'].metadata
                 )
                 if replan:
-                    # one‐shot auto replan
-                    plan_obj   = json.loads(replan)
-                    new_calls  = [t["call"] for t in plan_obj.get("tasks", [])]
+                    plan_obj    = json.loads(replan)
+                    new_calls   = [t["call"] for t in plan_obj.get("tasks", [])]
                     fixed_calls = new_calls
                     tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                         state['plan_ctx'],
@@ -687,22 +687,17 @@ class Assembler:
                     self.primary_model,
                     [{"role": "system", "content": refine_prompt}],
                     tag="[Refine]"
-                )
+                ).strip()
                 self.tts.enqueue(question)
                 return question
 
-            # UNCLEAR → ask again
+            # UNCLEAR → ask again (directly, no LLM)
             else:
                 clarify_prompt = "I didn’t catch that. Please answer yes or no."
-                question = self._stream_and_capture(
-                    self.primary_model,
-                    [{"role": "system", "content": clarify_prompt}],
-                    tag="[Clarify]"
-                )
-                self.tts.enqueue(question)
-                return question
+                self.tts.enqueue(clarify_prompt)
+                return clarify_prompt
 
-        # ——— Normal turn start — record input, etc. ——————————————
+        # ——— Normal turn start — record input ——————————————
         state: Dict[str, Any] = {}
         state['user_ctx'] = self._stage1_record_input(user_text)
 
@@ -748,7 +743,7 @@ class Assembler:
                 self.primary_model,
                 [{"role": "system", "content": ask_confirm}],
                 tag="[AskConfirm]"
-            )
+            ).strip()
             self.tts.enqueue(question)
 
             # stash for resume
@@ -761,7 +756,6 @@ class Assembler:
             return question
 
         # ── Otherwise (no tools), just execute straight through ───────────
-        # tool chaining → auto-confirm → invoke → reflection
         tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
             state['plan_ctx'], plan_str, state['tools_list']
         )
@@ -784,7 +778,7 @@ class Assembler:
                 confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
             )
 
-        # ── Fractal task execution (Stage 9 → 9b done above) ─────────────
+        # ── Fractal task execution ────────────────────────────────────────
         try:
             tree    = json.loads(state['plan_output'])
             roots   = self._parse_task_tree(tree)
@@ -797,7 +791,7 @@ class Assembler:
                 ] + state['recent_ids']
                 executor.execute(r)
 
-            # collect all tool_output ContextObjects
+            # collect tool_output ContextObjects
             all_ids = []
             def collect(n):
                 all_ids.extend(n.context_ids)
@@ -820,7 +814,7 @@ class Assembler:
         state['tc_ctx']    = tc_ctx
         state['tool_ctxs'] = tool_ctxs
         draft = self._stage10_assemble_and_infer(user_text, state)
-        final= self._stage10b_response_critique_and_safety(
+        final = self._stage10b_response_critique_and_safety(
             draft, user_text, tool_ctxs
         )
         self._stage11_memory_writeback(final, tool_ctxs)
@@ -828,7 +822,6 @@ class Assembler:
 
         self.tts.enqueue(final)
         return final
-
 
 
 
@@ -1068,7 +1061,6 @@ class Assembler:
         tools_list: List[Dict[str, str]],
         user_text: str,
     ) -> Tuple[ContextObject, str]:
-        import inspect, json, re, logging
 
         # pick zero‐arg tools if available
         def _no_args(tname: str) -> bool:
@@ -1088,7 +1080,8 @@ class Assembler:
         tools_md = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tools_list)
         system = (
             "You are the Planner.  Emit **only** a JSON object matching:\n\n"
-            "{ \"tasks\": [ { \"call\": \"tool()\", \"subtasks\": [] }, … ] }\n\n"
+            "{ \"tasks\": [ { \"call\": \"tool_name\", "
+            "\"tool_input\": { /* any named parameters */ }, \"subtasks\": [] }, … ] }\n\n"
             "If you cannot, just list the tool calls.  Available tools:\n"
             f"{tools_md}"
         )
@@ -1105,17 +1098,14 @@ class Assembler:
             tag="[Planner]"
         )
 
-        # strip fences
+        # strip fences and parse JSON
         def _clean(t: str) -> str:
             t = t.strip()
             t = re.sub(r"^```(?:json)?\s*", "", t)
             t = re.sub(r"\s*```$", "", t).strip()
             return t
-
         cleaned = _clean(raw)
         plan_obj = None
-
-        # try JSON once
         try:
             cand = json.loads(cleaned)
             if isinstance(cand, dict) and "tasks" in cand:
@@ -1123,25 +1113,39 @@ class Assembler:
         except:
             pass
 
-        # fallback: regex‐extract any tool_name(...) calls
+        # fallback: if no JSON, extract bare calls (we'll handle params later)
         if plan_obj is None:
             calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', raw)
-            plan_obj = {"tasks": [{"call": c, "subtasks": []} for c in calls]}
+            plan_obj = {"tasks":[{"call":c,"tool_input":{},"subtasks":[]} for c in calls]}
 
-        # persist plan
+        # Now *build the actual call strings* including real tool_input params
+        call_strings = []
+        for t in plan_obj["tasks"]:
+            name = t["call"]
+            params = t.get("tool_input", {}) or t.get("params", {})
+            if params:
+                # JSON‐encode each param value
+                arg_list = []
+                for k,v in params.items():
+                    arg_list.append(f"{k}={json.dumps(v)}")
+                call_strings.append(f"{name}({','.join(arg_list)})")
+            else:
+                call_strings.append(f"{name}()")
+
+        # persist plan (we still store the raw plan_obj for reflection, but summary = JSON of call_strings)
         ctx = ContextObject.make_stage(
             "planning_summary",
             clar_ctx.references + know_ctx.references,
             {"plan": plan_obj}
         )
         ctx.stage_id = "planning_summary"
-        ctx.summary  = json.dumps(plan_obj)
+        ctx.summary  = json.dumps({"tasks": [{"call":s, "subtasks":[]} for s in call_strings]})
         ctx.touch(); self.repo.save(ctx)
 
         # RL signals
-        if plan_obj["tasks"]:
+        if call_strings:
             ctx_s = ContextObject.make_success(
-                f"Planner → {len(plan_obj['tasks'])} task(s)",
+                f"Planner → {len(call_strings)} task(s)",
                 refs=[ctx.context_id]
             )
         else:
@@ -1151,7 +1155,7 @@ class Assembler:
             )
         ctx_s.touch(); self.repo.save(ctx_s)
 
-        return ctx, json.dumps(plan_obj)
+        return ctx, json.dumps({"tasks":[{"call":s,"subtasks":[]} for s in call_strings]})
 
 
     def _stage7b_plan_validation(
@@ -1252,33 +1256,37 @@ class Assembler:
             # ---------- ask LLM to fill the gaps ----------
             docs = []
             for call, miss in missing.items():
-                tool = call.split("(", 1)[0]
-                sch  = all_schemas.get(tool, {})
-                docs.append(
-                    f"• **{tool}** parameters:\n"
-                    f"{json.dumps(sch.get('parameters', {}), indent=2)}"
-                )
-
-            # **NEW**: include the full original plan (with params)
+                name = call.split("(",1)[0]
+                params_blob = json.dumps(all_schemas[name]["parameters"], indent=2)
+                docs.append(f"• **{name}** parameters:\n{params_blob}")
             orig_plan = json.dumps(plan_ctx.metadata.get("plan", {}), indent=2)
 
+            # build an *example* using the real tool name + missing keys placeholder
+            fixes = []
+            for call, miss in missing.items():
+                name = call.split("(",1)[0]
+                ex_args = ",".join(f"{k}=..." for k in miss)
+                fixes.append(f"{name}({ex_args})")
+            example = fixes[0] if fixes else f"{list(all_schemas)[0]}(...)"
+
             prompt = (
-                "Some tool calls are missing required arguments.\n"
-                + "\n".join(f"{c} → {m}" for c, m in errors)
+                "Some tool calls are missing required arguments:\n"
+                + "\n".join(f"{c} → missing {ms}" for c,ms in missing.items())
                 + "\n\nOriginal plan:\n" + orig_plan
                 + "\n\nSchemas:\n" + "\n\n".join(docs)
-                + "\n\nReturn ONLY JSON: {\"fixed_calls\":[\"tool(arg=...)\", ...]}"
+                + f"\n\nReturn ONLY JSON: {{\"fixed_calls\":[\"{example}\", …]}}"
             )
 
             out = self._stream_and_capture(
                 self.secondary_model,
-                [{"role": "system", "content": prompt}],
+                [{"role":"system","content":prompt}],
                 tag="[PlanFix]"
             ).strip()
 
             try:
                 fixed_calls = json.loads(out)["fixed_calls"]
-            except Exception:
+            except:
+                # fallback regex
                 fc = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', out)
                 if fc:
                     fixed_calls = fc
@@ -1738,9 +1746,9 @@ class Assembler:
 
         # 2️⃣ Run the critic model with both the draft and the tool outputs
         critic_sys = (
-            "You are the final-pass assistant. Review the draft answer below "
-            "in light of the full tool outputs. Fix any unsupported statements, "
-            "ensure policy compliance, and polish tone. Return **only** the corrected answer."
+            "You are the final-pass assistant. Review the draft answer and all tool outputs. "
+            "Remove any unsupported claims, then deliver a concise, accurate, conversational response. "
+            "Polish the tone and return only the final answer."
         )
         self._print_stage_context("response_critique", {
             "tool_outputs": outputs,

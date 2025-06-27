@@ -218,15 +218,15 @@ def handle_input(user_text: str):
     print(resp)
 
     # only enqueue when we're NOT asking the user to confirm
-    if not getattr(asm, "_awaiting_confirmation", False):
-        tts.enqueue(resp)
+    #if not getattr(asm, "_awaiting_confirmation", False):
+        #tts.enqueue(resp)
 
 # ──────────── START AUDIO SERVICE ────────────────────────────────────────────
 audio_svc = AudioService(
     sample_rate         = config.get("sample_rate",        16000),
     rms_threshold       = config.get("rms_threshold",      0.01),
     silence_duration    = config.get("silence_duration",   2.0),
-    consensus_threshold = config.get("consensus_threshold",0.8),
+    consensus_threshold = config.get("consensus_threshold",0.5),
     enable_denoise      = config.get("enable_noise_reduction", False),
     on_transcription    = handle_input,
     logger              = log_message,

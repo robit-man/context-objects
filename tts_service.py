@@ -31,15 +31,25 @@ class TTSManager:
             raise ValueError("TTSManager only supports live mode")
         self.log(f"TTS mode → {mode}", "INFO")
         while not self._live_q.empty():
-            try: self._live_q.get_nowait()
-            except queue.Empty: break
+            try:
+                self._live_q.get_nowait()
+            except queue.Empty:
+                break
 
     def enqueue(self, text: str):
+        # strip leading/trailing whitespace
         text = text.strip()
         if not text:
             return
-        self.log(f"Enqueue live TTS: {text!r}", "DEBUG")
-        self._live_q.put(text)
+
+        # remove all asterisks so Piper doesn't speak "asterisk"
+        cleaned = text.replace('*', '')
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return
+
+        self.log(f"Enqueue live TTS: {cleaned!r}", "DEBUG")
+        self._live_q.put(cleaned)
 
     def stop(self):
         self._running = False
@@ -68,8 +78,14 @@ class TTSManager:
             volume     = self.volume
             script_dir = os.path.dirname(__file__)
             piper_exe  = os.path.join(script_dir, "piper", "piper")
-            onnx_json  = os.path.join(script_dir, self.config.get("onnx_json", "glados_piper_medium.onnx.json"))
-            onnx_model = os.path.join(script_dir, self.config.get("onnx_model",  "glados_piper_medium.onnx"))
+            onnx_json  = os.path.join(
+                script_dir,
+                self.config.get("onnx_json", "glados_piper_medium.onnx.json")
+            )
+            onnx_model = os.path.join(
+                script_dir,
+                self.config.get("onnx_model",  "glados_piper_medium.onnx")
+            )
 
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
