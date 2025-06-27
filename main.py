@@ -172,108 +172,108 @@ with open(CONFIG_FILE) as f:
     config = json.load(f)
 
 
-# ──────────── IMPORT HELPERS & SERVICES ──────────────────────────────────────
+# ─── IMPORT THE CORE CLASSES ──────────────────────────────────────────────
 from assembler     import Assembler
 from audio_service import AudioService
 from tts_service   import TTSManager
 from telegram_input import telegram_input
 
-# ──────────── INIT TTS MANAGER & ASSEMBLER ──────────────────────────────────
 CTX_PATH = "context.jsonl"
 
-# 1️⃣  Instantiate TTS (we'll hook up the mic afterward)
-tts = TTSManager(
-    logger         = log_message,
-    cfg            = config,
-    audio_service  = None,       # will assign below
-)
-tts.set_mode("live")
-
-# 2️⃣  Instantiate Assembler, passing in our TTSManager
-asm = Assembler(
-    context_path     = CTX_PATH,
-    config_path      = CONFIG_FILE,
-    lookback_minutes = 60,
-    top_k            = 5,
-    tts_manager      = tts,
-)
-
-# 3️⃣  Open session log for transcripts
-session_log = open("session.log", "a")
-
-def handle_input(user_text: str):
-    """Called for both typed and spoken inputs."""
-    print(f">> {user_text}")
-    session_log.write(json.dumps({
-        "role":      "user",
-        "content":   user_text,
-        "timestamp": datetime.now().isoformat()
-    }) + "\n")
-    session_log.flush()
-
-    # clear any queued TTS so we start fresh
-    tts.set_mode("live")
-
-    # run through assembler → LLM (this may already enqueue a question)
-    resp = asm.run_with_meta_context(user_text)
-    print(resp)
-
-    # only enqueue when we're NOT asking the user to confirm
-    #if not getattr(asm, "_awaiting_confirmation", False):
-        #tts.enqueue(resp)
-
-# ──────────── START AUDIO SERVICE (threaded) ────────────────────────────
+# ─── 1) AUDIO PIPELINE ────────────────────────────────────────────────────
 audio_svc = AudioService(
-    sample_rate         = config.get("sample_rate", 16000),
-    rms_threshold       = config.get("rms_threshold", 0.01),
-    silence_duration    = config.get("silence_duration", 2.0),
-    consensus_threshold = config.get("consensus_threshold", 0.5),
+    sample_rate         = config.get("sample_rate",        16000),
+    rms_threshold       = config.get("rms_threshold",      0.01),
+    silence_duration    = config.get("silence_duration",   2.0),
+    consensus_threshold = config.get("consensus_threshold",0.5),
     enable_denoise      = config.get("enable_noise_reduction", False),
-    on_transcription    = handle_input,
+    on_transcription    = None,      # set below
     logger              = log_message,
     cfg                 = config,
 )
-audio_thread = threading.Thread(target=audio_svc.start, daemon=True)
-audio_thread.start()
+tts_audio = TTSManager(
+    logger        = log_message,
+    cfg           = config,
+    audio_service = audio_svc,     # live‐playback on speaker
+)
+tts_audio.set_mode("live")
+asm_audio = Assembler(
+    context_path     = CTX_PATH,
+    config_path      = "config.json",
+    lookback_minutes = 60,
+    top_k            = 5,
+    tts_manager      = tts_audio,
+)
+# wire up the mic callback to asm_audio
+def _audio_input_cb(text: str):
+    asm_audio.run_with_meta_context(text)
+audio_svc.on_transcription = _audio_input_cb
 
-# now that the mic is running, give it to TTS so it can suspend/resume
-tts.audio_service = audio_svc
+# start audio in its own thread
+threading.Thread(target=audio_svc.start, daemon=True).start()
 
-# ──────────── START TELEGRAM BOT (threaded) ─────────────────────────────
-tel_thread = threading.Thread(target=telegram_input, args=(asm,), daemon=True)
-tel_thread.start()
-
-# ──────────── TEXT REPL (in its own thread) ─────────────────────────────────────────────
+# ─── 2) CLI PIPELINE ──────────────────────────────────────────────────────
 def cli_loop():
-    print(f"Using context store: {CTX_PATH}")
-    print(f"Primary model: {config['primary_model']}")
+    tts_cli = TTSManager(
+        logger        = log_message,
+        cfg           = config,
+        audio_service = audio_svc   # also speak on speaker
+    )
+    tts_cli.set_mode("live")
+    asm_cli = Assembler(
+        context_path     = CTX_PATH,
+        config_path      = "config.json",
+        lookback_minutes = 60,
+        top_k            = 5,
+        tts_manager      = tts_cli,
+    )
+
     print("Ready (CLI): type your message, Ctrl-C to exit.")
-    try:
-        while True:
+    while True:
+        try:
             line = input(">> ").strip()
-            if line:
-                handle_input(line)
-    except (EOFError, KeyboardInterrupt):
-        # When the user explicitly stops the CLI, we simply return—
-        # letting the main thread handle full cleanup.
-        return
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            continue
+        # run and speak
+        answer = asm_cli.run_with_meta_context(line)
+        # live TTS will speak automatically
+    print("CLI loop exiting…")
 
-cli_thread = threading.Thread(target=cli_loop, daemon=True)
-cli_thread.start()
+threading.Thread(target=cli_loop, daemon=True).start()
 
-# ──────────── WAIT FOREVER (until SIGINT) ─────────────────────────────────────────────
-# The main thread will block here; CTRL-C will trigger our SIGINT handler.
-threading.Event().wait()
+# ─── 3) TELEGRAM PIPELINE ────────────────────────────────────────────────
+# file‐mode TTS
 
-# ──────────── CLEANUP (runs on SIGINT) ────────────────────────────────────────────────
-# You already have a SIGINT handler calling sys.exit(0),
-# so put your cleanup in an atexit hook:
+tts_tele = TTSManager(
+    logger        = log_message,
+    cfg           = config,
+    audio_service = None      # no speaker output
+)
+tts_tele.set_mode("file")
+asm_tele = Assembler(
+    context_path     = CTX_PATH,
+    config_path      = "config.json",
+    lookback_minutes = 60,
+    top_k            = 5,
+    tts_manager      = tts_tele,
+)
 
+threading.Thread(
+    target=telegram_input,
+    args=(asm_tele,),
+    daemon=True
+).start()
+
+# ─── WAIT FOR CTRL-C ──────────────────────────────────────────────────────
 import atexit
 def _cleanup():
-    print("\nShutting down services…")
+    log_message("Shutting down services…", "INFO")
     audio_svc.stop()
-    tts.stop()
-    session_log.close()
-    print("Goodbye.")
+    tts_audio.stop()
+    # tts_cli and tts_tele threads will exit automatically
+    log_message("Goodbye.", "INFO")
 atexit.register(_cleanup)
+
+threading.Event().wait()
