@@ -154,7 +154,7 @@ if not os.path.exists(SETUP_MARKER):
         "noisereduce","denoiser","pillow","opencv-python",
         "mss","networkx","pandas","selenium","webdriver-manager",
         "flask_cors","flask","tiktoken","python-telegram-bot",
-        "asyncio","nest-asyncio","sentence-transformers", "telegram"
+        "asyncio","nest-asyncio","sentence-transformers", "telegram", "num2words"
     ])
     with open(SETUP_MARKER,"w") as f:
         f.write("done")
