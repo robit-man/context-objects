@@ -154,7 +154,7 @@ if not os.path.exists(SETUP_MARKER):
         "noisereduce","denoiser","pillow","opencv-python",
         "mss","networkx","pandas","selenium","webdriver-manager",
         "flask_cors","flask","tiktoken","python-telegram-bot",
-        "asyncio","nest-asyncio","sentence-transformers"
+        "asyncio","nest-asyncio","sentence-transformers", "telegram"
     ])
     with open(SETUP_MARKER,"w") as f:
         f.write("done")
@@ -176,6 +176,7 @@ with open(CONFIG_FILE) as f:
 from assembler     import Assembler
 from audio_service import AudioService
 from tts_service   import TTSManager
+from telegram_input import telegram_input
 
 # ──────────── INIT TTS MANAGER & ASSEMBLER ──────────────────────────────────
 CTX_PATH = "context.jsonl"
@@ -234,6 +235,7 @@ audio_svc = AudioService(
 )
 audio_svc.start()
 
+threading.Thread(target=telegram_input, args=(asm,), daemon=True).start()
 # now that the mic is running, give it to TTS so it can suspend/resume
 tts.audio_service = audio_svc
 

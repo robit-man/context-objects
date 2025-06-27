@@ -1,4 +1,5 @@
 .venv
+.env
 config.json
 __pycache__
 context.jsonl
@@ -9,4 +10,5 @@ piper_linux_x86_64.tar.gz
 piper
 workspace
 tts_output
+tts_ogg
 session.log

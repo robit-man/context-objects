@@ -39,7 +39,7 @@ class AudioService:
 
         self.log("AudioService: loading Whisper models…", "INFO")
         self.model_base   = whisper.load_model("base")
-        self.model_medium = whisper.load_model("medium")
+        self.model_medium = whisper.load_model("small")
         self.log("AudioService: Whisper models loaded.", "SUCCESS")
 
         self._audio_q   = queue.Queue()
