@@ -171,25 +171,33 @@ if not os.path.exists(CONFIG_FILE):
 with open(CONFIG_FILE) as f:
     config = json.load(f)
 
-# ──────────── IMPORT YOUR HELPERS ────────────────────────────────────────────
-from assembler      import Assembler
-from audio_service  import AudioService
-from tts_service    import TTSManager
 
-# ──────────── INIT Assembler, TTS & Audio ────────────────────────────────────
+# ──────────── IMPORT HELPERS & SERVICES ──────────────────────────────────────
+from assembler     import Assembler
+from audio_service import AudioService
+from tts_service   import TTSManager
+
+# ──────────── INIT TTS MANAGER & ASSEMBLER ──────────────────────────────────
 CTX_PATH = "context.jsonl"
+
+# 1️⃣  Instantiate TTS (we'll hook up the mic afterward)
+tts = TTSManager(
+    logger         = log_message,
+    cfg            = config,
+    audio_service  = None,       # will assign below
+)
+tts.set_mode("live")
+
+# 2️⃣  Instantiate Assembler, passing in our TTSManager
 asm = Assembler(
     context_path     = CTX_PATH,
     config_path      = CONFIG_FILE,
     lookback_minutes = 60,
-    top_k            = 5
+    top_k            = 5,
+    tts_manager      = tts,
 )
 
-# Instantiate our live‐only TTS manager
-tts = TTSManager(logger=log_message, cfg=config)
-tts.set_mode("live")
-
-# Open session log for transcripts
+# 3️⃣  Open session log for transcripts
 session_log = open("session.log", "a")
 
 def handle_input(user_text: str):
@@ -202,28 +210,32 @@ def handle_input(user_text: str):
     }) + "\n")
     session_log.flush()
 
-    # clear any queued TTS (we just re-set mode to flush)
+    # clear any queued TTS so we start fresh
     tts.set_mode("live")
 
-    # run through assembler → LLM
+    # run through assembler → LLM (this may already enqueue a question)
     resp = asm.run_with_meta_context(user_text)
     print(resp)
 
-    # enqueue for live playback
-    tts.enqueue(resp)
+    # only enqueue when we're NOT asking the user to confirm
+    if not getattr(asm, "_awaiting_confirmation", False):
+        tts.enqueue(resp)
 
-# ──────────── start AudioService ─────────────────────────────────────────────
+# ──────────── START AUDIO SERVICE ────────────────────────────────────────────
 audio_svc = AudioService(
-    sample_rate        = config.get("sample_rate", 16000),
-    rms_threshold      = config.get("rms_threshold", 0.01),
-    silence_duration   = config.get("silence_duration", 1.0),
-    consensus_threshold= config.get("consensus_threshold", 0.5),
-    enable_denoise     = config.get("enable_noise_reduction", False),
-    on_transcription   = handle_input,
-    logger             = log_message,
-    cfg                = config
+    sample_rate         = config.get("sample_rate",        16000),
+    rms_threshold       = config.get("rms_threshold",      0.01),
+    silence_duration    = config.get("silence_duration",   2.0),
+    consensus_threshold = config.get("consensus_threshold",0.8),
+    enable_denoise      = config.get("enable_noise_reduction", False),
+    on_transcription    = handle_input,
+    logger              = log_message,
+    cfg                 = config,
 )
 audio_svc.start()
+
+# now that the mic is running, give it to TTS so it can suspend/resume
+tts.audio_service = audio_svc
 
 # ──────────── TEXT REPL OVERRIDE ─────────────────────────────────────────────
 print(f"Using context store: {CTX_PATH}")

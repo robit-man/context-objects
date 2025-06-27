@@ -27,25 +27,26 @@ class AudioService:
         cfg: dict,
         denoise_fn: callable = None,
     ):
-        self.sample_rate      = sample_rate
-        self.rms_threshold    = rms_threshold
-        self.silence_duration = silence_duration
-        self.consensus_thresh = consensus_threshold
-        self.enable_denoise   = enable_denoise
-        self.on_transcription = on_transcription
-        self.log              = logger
-        self.config           = cfg
-        self._denoise_fn      = denoise_fn
+        self.sample_rate       = sample_rate
+        self.rms_threshold     = rms_threshold
+        self.silence_duration  = silence_duration
+        self.consensus_thresh  = consensus_threshold
+        self.enable_denoise    = enable_denoise
+        self.on_transcription  = on_transcription
+        self.log               = logger
+        self.config            = cfg
+        self._denoise_fn       = denoise_fn
 
         self.log("AudioService: loading Whisper models…", "INFO")
         self.model_base   = whisper.load_model("base")
         self.model_medium = whisper.load_model("medium")
         self.log("AudioService: Whisper models loaded.", "SUCCESS")
 
-        self._audio_q  = queue.Queue()
-        self._stop_evt = threading.Event()
-        self._stream   = None
-        self._worker   = threading.Thread(target=self._listen_loop, daemon=True)
+        self._audio_q   = queue.Queue()
+        self._stop_evt  = threading.Event()
+        self._stream    = None
+        self._worker    = threading.Thread(target=self._listen_loop, daemon=True)
+        self._suspended = False
 
     def start(self):
         """Begin capturing audio and running transcription loop."""
@@ -69,9 +70,19 @@ class AudioService:
             self._stream.close()
         self._worker.join()
 
+    def suspend(self):
+        """Pause feeding audio into the transcription queue."""
+        self._suspended = True
+
+    def resume(self):
+        """Resume feeding audio into the transcription queue."""
+        self._suspended = False
+
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
             self.log(f"AudioService: status {status}", "WARNING")
+        if self._suspended:
+            return
         # flatten to 1-D
         self._audio_q.put(indata[:, 0].copy())
 
@@ -81,7 +92,7 @@ class AudioService:
             buffers = []
             silence_start = None
 
-            # accumulate until silence_duration of RMS< threshold
+            # accumulate until enough silence
             while not self._stop_evt.is_set():
                 buf = self._audio_q.get()
                 rms = float(np.sqrt(np.mean(buf**2)))
