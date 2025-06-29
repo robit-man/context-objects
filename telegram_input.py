@@ -48,10 +48,15 @@ def telegram_input(asm):
 # inside telegram_input.py, replace your runner() with:
 
         async def runner():
-            import os, tempfile, subprocess, uuid, queue
+            import os
+            import tempfile
+            import subprocess
+            import uuid
+            import queue
+            import asyncio
 
             try:
-                # ── 0) Flush any leftover file‐TTS texts and OGG paths ───────
+                # ── 0) Flush any leftover file‐TTS texts and OGG paths
                 try:
                     while True:
                         asm.tts._file_q.get_nowait()
@@ -63,20 +68,20 @@ def telegram_input(asm):
                 except queue.Empty:
                     pass
 
-                # ── 1) Switch TTS into file‐output mode ─────────────────────
-                asm.tts.set_mode("file")
-
-                # ── 2) Run the assembler pipeline synchronously ────────────
+                # ── 1) Run the assembler pipeline synchronously (still in live mode)
                 final = await asyncio.to_thread(asm.run_with_meta_context, user_text)
 
-                # ── 3) Show the final text in place of “Processing…” ───────
+                # ── 2) Edit the “Processing…” message to show the final text
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
                     text=final or "(no response)"
                 )
 
-                # ── 4) Clear any stray queues again ─────────────────────────
+                # ── 3) Now switch TTS into file‐output mode
+                asm.tts.set_mode("file")
+
+                # ── 4) Clear any stray file‐mode queues again
                 try:
                     while True:
                         asm.tts._file_q.get_nowait()
@@ -88,10 +93,10 @@ def telegram_input(asm):
                 except queue.Empty:
                     pass
 
-                # ── 5) Enqueue only the final large text ────────────────────
+                # ── 5) Enqueue only the final text for file‐mode TTS
                 asm.tts.enqueue(final or "")
 
-                # ── 6) Collect all OGG chunks (1 s timeout each) ────────────
+                # ── 6) Collect all OGG chunks (1s timeout each)
                 ogg_paths = []
                 while True:
                     try:
@@ -103,7 +108,7 @@ def telegram_input(asm):
                 if not ogg_paths:
                     return  # nothing to send
 
-                # ── 7) If only one chunk, send it directly ─────────────────
+                # ── 7) If only one chunk, send it directly
                 if len(ogg_paths) == 1:
                     with open(ogg_paths[0], "rb") as vf:
                         await context.bot.send_voice(
@@ -113,7 +118,7 @@ def telegram_input(asm):
                         )
                     return
 
-                # ── 8) Try fast concat-demuxer method ──────────────────────
+                # ── 8) Concatenate multiple OGGs into one file
                 combined_path = os.path.join(
                     tempfile.gettempdir(),
                     f"combined_{uuid.uuid4().hex}.ogg"
@@ -125,34 +130,37 @@ def telegram_input(asm):
                     list_file.flush()
                     list_file.close()
 
-                    cmd1 = [
+                    # try concat demuxer
+                    subprocess.run([
                         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                         "-i", list_file.name,
                         "-c", "copy",
                         combined_path
-                    ]
-                    subprocess.run(cmd1, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 except subprocess.CalledProcessError:
-                    # ── 9) Fallback: filter_complex concat (re-encode/join) ───
+                    # fallback: re-encode concat
                     inputs = []
                     for p in ogg_paths:
                         inputs += ["-i", p]
                     filter_expr = f"concat=n={len(ogg_paths)}:v=0:a=1[out]"
-                    cmd2 = ["ffmpeg", "-y"] + inputs + [
-                        "-filter_complex", filter_expr,
-                        "-map", "[out]",
-                        combined_path
-                    ]
-                    subprocess.run(cmd2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+                    subprocess.run(
+                        ["ffmpeg", "-y"] + inputs + [
+                            "-filter_complex", filter_expr,
+                            "-map", "[out]",
+                            combined_path
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
                 finally:
                     try:
                         os.unlink(list_file.name)
-                    except:
+                    except OSError:
                         pass
 
-                # ── 10) Send the single, seamless OGG ───────────────────────
+                # ── 9) Send the combined OGG
                 with open(combined_path, "rb") as vf:
                     await context.bot.send_voice(
                         chat_id=chat_id,
