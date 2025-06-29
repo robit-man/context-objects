@@ -8,6 +8,8 @@ import sys, os, subprocess, platform, re, json, time, threading, queue, datetime
 from datetime import datetime, timezone
 from context import ContextRepository, ContextObject, default_clock
 from ollama import chat, embed
+import cv2
+import mss
 
 import psutil
 import traceback
@@ -70,6 +72,25 @@ def log_message(message, category="INFO"):
          color = COLOR_RESET
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{color}[{timestamp}] {category.upper()}: {message}{COLOR_RESET}")
+
+
+
+# This function loads the configuration from config.json, creating it with default values if it doesn't exist.
+def load_config():
+    """
+    Load configuration from config.json (in the script directory). If not present, create it with default values.
+    New keys include settings for primary/secondary models, temperatures, RMS threshold, debug audio playback,
+    noise reduction, consensus threshold, and now image support.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "config.json")
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    log_message("Configuration loaded from config.json", "INFO")
+    return config
+
+config = load_config()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # tool‐schema generation & registry
@@ -2482,10 +2503,13 @@ class Tools:
         """
 
         # 1) Build output path
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        screen_capture_dir = os.path.join(os.path.dirname(__file__), "captures")
+        os.makedirs(screen_capture_dir, exist_ok=True)
+
         ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename   = f"screen_{ts}.png"
-        path       = os.path.join(script_dir, filename)
+        path       = os.path.join(screen_capture_dir, filename)
 
         # 2) Capture with mss
         try:
@@ -2506,16 +2530,16 @@ class Tools:
 
     # This static method captures one frame from the default webcam using OpenCV, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the image.
     @staticmethod
-    def capture_webcam_and_annotate():
+    def capture_webcam_and_annotate(query: str=None):
         """
-        Capture one frame from the default webcam using OpenCV,
+        Capture the webcam camera using cv2, save it with a timestamp, and then annotate what you see,
         save it with a timestamp, and return a JSON string containing:
           - 'file': the saved file path
           - 'prompt': an instruction for the model to describe the image.
 
         Usage:
             ```tool_code
-            capture_webcam_and_annotate()
+            capture_webcam_and_annotate(query="question about image")
             ```
         """
 
@@ -2533,10 +2557,13 @@ class Tools:
             return json.dumps({"error": "Failed to capture frame."})
 
         # 3) Build output path
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        image_capture_dir = os.path.join(os.path.dirname(__file__), "captures")
+        os.makedirs(image_capture_dir, exist_ok=True)
+
         ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename   = f"webcam_{ts}.png"
-        path       = os.path.join(script_dir, filename)
+        path       = os.path.join(image_capture_dir, filename)
 
         # 4) Save as PNG
         try:
@@ -2547,10 +2574,21 @@ class Tools:
             return json.dumps({"error": str(e)})
 
         # 5) Return the file path plus a prompt
-        return json.dumps({
+        json.dumps({
             "file":   path,
             "prompt": f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'."
         })
+
+        if query != None:
+            prompt = (f"{query}', apply those questions to the following image and respond with your analysis of its visual contents '{path}', ")
+        else:
+            prompt = (f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'.")
+
+    
+        final = Tools.auxiliary_inference(prompt, temperature=0.5)
+
+        return final
+    
 
     # This static method converts a user query into a more precise information query related to the content of an image. It uses a secondary agent tool to process the query and image context, returning the refined query.
     @staticmethod
@@ -2924,7 +2962,7 @@ class Tools:
             )
             ```
         """
-        secondary_model = config.get("secondary_model")
+        model_selected = config.get("primary_model")
         # build message list in the required order
         messages: list[dict[str, str]] = []
         if system is not None:
@@ -2936,7 +2974,7 @@ class Tools:
         messages.append({"role": "user", "content": prompt})
 
         payload = {
-            "model": secondary_model,
+            "model": model_selected,
             "temperature": temperature,
             "messages": messages,
             "stream": True
@@ -2952,7 +2990,7 @@ class Tools:
             content = ""
             print("⟳ Secondary Agent Tool Stream:", end="", flush=True)
             for part in chat(
-                model=secondary_model,
+                model=model_selected,
                 messages=messages,
                 stream=True
             ):

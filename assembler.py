@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import difflib
 from sentence_transformers import SentenceTransformer
-from ollama import chat
+from ollama import chat, embed
 from tts_service import TTSManager
 from audio_service import AudioService
 from context import ContextObject, ContextRepository, MemoryManager, default_clock
@@ -257,7 +257,7 @@ class Assembler:
         context_path:     str = "context.jsonl",
         config_path:      str = "config.json",
         lookback_minutes: int = 60,
-        top_k:            int = 5,
+        top_k:            int = 10,
         tts_manager:      TTSManager | None = None,
     ):
         # load or init config
@@ -278,6 +278,8 @@ class Assembler:
             "clarifier_prompt",
             "You are Clarifier. Expand the user’s intent into a JSON object with "
             "two keys: 'keywords' (an array of concise keywords) and 'notes' "
+            "You must stay away from security or privacy relatec concerns, as those are handled downstream, "
+            "and remain extremely objective in your choices, as the result of your analysis aids in calling of available tools."
             "(a brief explanation). Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
@@ -304,12 +306,32 @@ class Assembler:
         self.repo   = ContextRepository(context_path)
         self.memman = MemoryManager(self.repo)
 
-        # embedding engine
-        stm = SentenceTransformer("all-MiniLM-L6-v2")
+        @staticmethod
+        def embed_text(text):
+            """
+            Embed into a 1-D numpy array of shape (768,).
+            """
+            try:
+                #log_message("Embedding text for context.", "PROCESS")
+                response = embed(model="nomic-embed-text", input=text)
+                vec = np.array(response["embeddings"], dtype=float)
+                # ensure 1-D
+                vec = vec.flatten()
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                #log_message("Text embedding computed and normalized.", "SUCCESS")
+                return vec
+            except Exception as e:
+                #log_message("Error during text embedding: " + str(e), "ERROR")
+                return np.zeros(768, dtype=float)
+
+
         self.engine = ContextQueryEngine(
-            self.repo,
-            lambda t: stm.encode(t, normalize_embeddings=True)
+           self.repo,
+           lambda t: embed_text(t)  # Use your custom embedding function
         )
+
                 
         self._seed_tool_schemas()
         self._seed_static_prompts()
@@ -595,16 +617,65 @@ class Assembler:
             )
             nodes.append(node)
         return nodes
+    
+    def _generate_system_prompt(self, purpose, schema=None, variables={}):
+        system_meta = (
+            "Generate a clear and concise instruction set for an agent to perform a task.\n"
+            "First, review the purpose of the system prompt:\n"
+            f"{purpose}\n\n"
+        )
+        
+        if schema is not None:
+            system_meta += (
+                "Now, based on the purpose, we have a schema which will be used to perform regex and capture outputs. Creatively inform the system prompt you are about to generate based on the expected model outputs:\n"
+                f"{schema}\n\n"
+            )
+        
+        # Inject additional variables
+        for var_name, var_value in variables.items():
+            system_meta += (
+                f"Additionally, consider the following variable: {var_name}.\n"
+                f"The value of {var_name} is: {var_value}\n\n"
+            )
+        
+        system_meta += (
+            "Generate a clear instruction set based on the above, with no additional introduction or explanation. Output only the exact system message and nothing more."
+        )
+        
+        system = self._stream_and_capture(
+            self.primary_model,
+            [{"role": "system", "content": system_meta}],
+            tag="[Refine]"
+        ).strip()
+        
+        return system
+
+
             
     def run_with_meta_context(self, user_text: str) -> str:
-        import re, json
 
         # ——— Stage 0: handle pending yes/no confirmation ——————————
         if getattr(self, "_awaiting_confirmation", False):
             ans = user_text.strip().lower()
 
-            # YES branch: resume from saved tool-chain instead of re-chaining
-            if re.search(r"\b(yes|y|sure|please do)\b", ans, re.I):
+            refine_prompt = (
+                    "you must determine if the user, in reply to the pending plan, is requesting a revision or confirming it as adequate.\n"
+                    "First, you must review the plan:\n"
+                    f"{self._pending_plan}\n\n"
+                    "Now here is the users reply to that plan:\n"
+                    f"{ans}\n\n"
+                    "Based on the users reply, if they are requesting a reconsideration, or denial of the plan, you must only output [replan], or [no] as the sole word you reply with and NOTHING MORE."
+                    "If the users response is favorable and appears to desire to run the plan, respond ONLY with [yes], or [sure] as the sole word you reply with and NOTHING MORE."
+                )
+            
+            analysis = self._stream_and_capture(
+                self.primary_model,
+                [{"role": "system", "content": refine_prompt}],
+                tag="[Refine]"
+            ).strip()
+            
+            # YES branch: resume from saved plan by re-chaining tools
+            if re.search(r"\b(yes|y|sure|please do)\b", analysis, re.I):
                 # Summarize next steps for TTS
                 confirm_prompt = (
                     "You are an assistant. The user agreed to proceed with this plan:\n"
@@ -618,41 +689,41 @@ class Assembler:
                 ).strip()
                 self.tts.enqueue(summary)
 
-                # Restore saved state & tool-chain
-                state = self._pending_state
+                # Restore saved state
+                state    = self._pending_state
                 plan_str = self._pending_plan
-                fixed_calls = self._pending_fixed_calls
-                tc_ctx, raw_calls, schemas = self._pending_tool_chain
-                # clear the pending flag
-                del self._awaiting_confirmation
-                del self._pending_tool_chain
 
-                # Stage 8.5 → Stage 9 → Stage 9b
-                confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
-                tool_ctxs = self._stage9_invoke_with_retries(
-                    confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
+                # Clear pending attributes
+                for attr in (
+                    "_awaiting_confirmation",
+                    "_pending_state",
+                    "_pending_plan",
+                    "_pending_fixed_calls",
+                    "_pending_tool_chain"
+                ):
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+
+                # Re-generate the tool chain from the confirmed plan to grab the real arguments
+                tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                    state['plan_ctx'],
+                    plan_str,
+                    state['tools_list']
                 )
+
+                # Invoke tools with the up-to-date calls
+                tool_ctxs = self._stage9_invoke_with_retries(
+                    raw_calls,
+                    plan_str,
+                    schemas,
+                    user_text,
+                    state['clar_ctx'].metadata
+                )
+
+                # Continue with reflection, assemble, critique, etc.
                 replan = self._stage9b_reflection_and_replan(
                     tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
                 )
-
-                # optional replan loop
-                if replan and replan.strip().startswith("{"):
-                    try:
-                        plan_obj = json.loads(replan)
-                        fixed_calls = [t["call"] for t in plan_obj.get("tasks", [])]
-                        plan_str = "\n".join(fixed_calls)
-                    except json.JSONDecodeError:
-                        pass
-
-                    # re-chain only the new calls
-                    tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                        state['plan_ctx'], plan_str, state['tools_list']
-                    )
-                    confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
-                    tool_ctxs = self._stage9_invoke_with_retries(
-                        confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
-                    )
 
                 # inject into state for Stage 10+
                 state['tc_ctx'] = tc_ctx
@@ -666,28 +737,55 @@ class Assembler:
                 self._stage11_memory_writeback(final, tool_ctxs)
                 self.memman.decay_and_promote()
 
-                self.tts.enqueue("Done. " + final[:200])
+                self.tts.enqueue(final[:200])
                 return final
 
             # NO branch: ask a refine question
-            if re.search(r"\b(no|n)\b", ans, re.I):
-                refine_prompt = (
-                    "You are an assistant. The user declined the plan:\n"
+
+            else:
+
+                refine_plan_prompt = (
+                    "Based on the user's response, refine the current plan to address their concerns.\n"
+                    "First, here is the old plan:\n"
                     f"{self._pending_plan}\n\n"
-                    "Ask a single, clear follow-up question to refine this plan."
+                    "Now here is the user's feedback:\n"
+                    f"{ans}\n\n"
+                    "Propose a new plan as JSON with the same schema."
+                )
+                new_plan = self._stream_and_capture(
+                    self.primary_model,
+                    [{"role": "system", "content": refine_plan_prompt}],
+                    tag="[RefinePlan]"
+                ).strip()
+
+                # Update the pending plan string
+                self._pending_plan = new_plan
+
+                # **Re-chain** tools immediately so we preserve context for the next confirm question
+                saved = self._pending_state
+                tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                    saved['plan_ctx'],
+                    self._pending_plan,
+                    saved['tools_list']
+                )
+
+                # Update the pending tool chain so the YES path will see it
+                self._pending_tool_chain = (tc_ctx, raw_calls, schemas)
+
+                # Ask the user again
+                ask_confirm = (
+                    "I've updated the plan based on your feedback. Here it is:\n"
+                    f"{self._pending_plan}\n\n"
+                    "Does this look good to run? (yes/no)"
                 )
                 question = self._stream_and_capture(
                     self.primary_model,
-                    [{"role": "system", "content": refine_prompt}],
-                    tag="[Refine]"
+                    [{"role": "system", "content": ask_confirm}],
+                    tag="[AskConfirm]"
                 ).strip()
                 self.tts.enqueue(question)
                 return question
 
-            # UNCLEAR: ask again
-            clarify_prompt = "I didn’t catch that. Please answer yes or no."
-            self.tts.enqueue(clarify_prompt)
-            return clarify_prompt
 
         # ——— Stage 1: record input ——————————————
         state: Dict[str, Any] = {}
@@ -702,6 +800,7 @@ class Assembler:
         state['clar_ctx'] = self._stage4_intent_clarification(user_text, state)
         state['know_ctx'] = self._stage5_external_knowledge(state['clar_ctx'])
         state['tools_list'] = self._stage6_prepare_tools()
+        print(state['tools_list'])
 
         # ——— Stage 7: planning summary ——————————————
         state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
@@ -716,6 +815,9 @@ class Assembler:
             raise RuntimeError(f"Plan validation failed: {errors}")
 
         plan_str = "\n".join(fixed_calls)
+
+        print("FIXED CALLS")
+        print(fixed_calls)
 
         # ——— If there are tool calls, chain them *once* now and stash for resume —————
         if fixed_calls:
@@ -747,9 +849,16 @@ class Assembler:
         tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
             state['plan_ctx'], plan_str, state['tools_list']
         )
-        confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
+        print("[RAW CALLS]")
+        print(raw_calls)
+        print("[TC CONTEXT]")
+        print( tc_ctx)
+        print("[SCHEMAS]")
+        print(schemas)
+
+        #confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
         tool_ctxs = self._stage9_invoke_with_retries(
-            confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
+            raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
         )
         replan = self._stage9b_reflection_and_replan(
             tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
@@ -766,10 +875,13 @@ class Assembler:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state['plan_ctx'], plan_str, state['tools_list']
             )
-            confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
+            #confirmed = self._stage8_5_user_confirmation(raw_calls, user_text)
             tool_ctxs = self._stage9_invoke_with_retries(
-                confirmed, plan_str, schemas, user_text, state['clar_ctx'].metadata
+                raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
             )
+            print("[RAW CALLS]" + raw_calls)
+            print("[TC CONTEXT]" + tc_ctx)
+            print("[SCHEMAS]" + schemas)
 
         # ——— Stage 10+: assemble, critique, memory, decay —————————
         state['tc_ctx'] = tc_ctx
@@ -781,8 +893,6 @@ class Assembler:
 
         self.tts.enqueue(final)
         return final
-
-
 
 
 
@@ -977,8 +1087,7 @@ class Assembler:
             "snippets": snippets or ["(none)"]
         })
         return ctx
-
-
+    
     def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
         """
         Return a de-duplicated list of tool schemas:
@@ -1014,6 +1123,7 @@ class Assembler:
 
         return tool_defs
 
+
     # ── Stage 7: Planning Summary ────────────────────────────────────────────
     def _stage7_planning_summary(
         self,
@@ -1034,7 +1144,7 @@ class Assembler:
                 for p in sig.parameters.values()
             )
 
-        zero_arg = [t for t in tools_list if _no_args(t["name"])]
+        zero_arg = [t for t in tools_list]
         tools_list = zero_arg or tools_list[: self.top_k]
 
         # build prompt
@@ -1275,6 +1385,9 @@ class Assembler:
         # ── A) Extract raw calls from the plan ──────────────────────────────
         text = plan_output
         parsed = Tools.parse_tool_call(text)
+
+        print("PARSED TOOL CALL")
+        print(parsed)
         if isinstance(parsed, list):
             raw = parsed
         elif parsed:
@@ -1384,7 +1497,7 @@ class Assembler:
         plan_output: str,
         user_text: str,
         clar_metadata: Dict[str, Any],
-        max_tokens: int = 3500   # no longer used for trimming
+        max_tokens: int = 128000   # no longer used for trimming
     ) -> Optional[str]:
         """
         Reflect on the full context (user question, clarifier notes/keywords,
@@ -1510,6 +1623,11 @@ class Assembler:
         tool_ctxs: List[ContextObject] = []
         last_results: Dict[str, Any] = {}
         max_retries = 10
+
+        print("RAW CALLS")
+        print(raw_calls)
+        print("TOOL CONTEXTS")
+        print(tool_ctxs)
 
         # ── RETRY LOOP ──────────────────────────────────────────────────────────
         for attempt in range(1, max_retries + 1):

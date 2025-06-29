@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 import numpy as np
+import re
 
 # lock to prevent Piper/process races
 tts_lock = threading.Lock()
@@ -14,16 +15,18 @@ tts_lock = threading.Lock()
 class TTSManager:
     """
     Piper → live‐playback or file‐output TTS manager.
-    Modes:
-      • "live":   stream to speaker via `aplay`
-      • "file":   write .ogg files and queue their paths
+    Automatically splits long text into manageable chunks.
     """
+
     def __init__(self, logger: callable, cfg: dict, audio_service=None):
         self.log            = logger
         self.config         = cfg
         self.audio_service  = audio_service
         self.volume         = cfg.get("tts_volume", 0.2)
         self.debug          = cfg.get("tts_debug", False)
+
+        # chunk size in characters (adjust as needed)
+        self.max_chunk_size = cfg.get("tts_max_chunk_size", 500)
 
         # Queues for live vs file modes
         self._live_q = queue.Queue()
@@ -52,16 +55,43 @@ class TTSManager:
                 try: self._live_q.get_nowait()
                 except queue.Empty: break
 
+    def _split_text(self, text: str) -> list[str]:
+        """
+        Split on sentence boundaries but ensure each chunk ≤ max_chunk_size.
+        Falls back to character-based splits if a sentence is too long.
+        """
+        sentences = re.split(r'(?<=[\.\?\!])\s+', text)
+        chunks: list[str] = []
+        current = ""
+        for s in sentences:
+            if len(current) + len(s) + 1 <= self.max_chunk_size:
+                current = f"{current} {s}".strip()
+            else:
+                if current:
+                    chunks.append(current)
+                # if single sentence too long, break it up
+                if len(s) > self.max_chunk_size:
+                    for i in range(0, len(s), self.max_chunk_size):
+                        chunks.append(s[i:i+self.max_chunk_size])
+                    current = ""
+                else:
+                    current = s
+        if current:
+            chunks.append(current)
+        return chunks
+
     def enqueue(self, text: str):
         text = text.strip().replace("*","")  # strip asterisks
         if not text:
             return
-        if self._mode == "live":
-            self.log(f"Enqueue live TTS: {text!r}", "DEBUG")
-            self._live_q.put(text)
-        else:
-            self.log(f"Enqueue file TTS: {text!r}", "DEBUG")
-            self._file_q.put(text)
+        # split into manageable chunks
+        for chunk in self._split_text(text):
+            if self._mode == "live":
+                self.log(f"Enqueue live TTS chunk: {chunk!r}", "DEBUG")
+                self._live_q.put(chunk)
+            else:
+                self.log(f"Enqueue file TTS chunk: {chunk!r}", "DEBUG")
+                self._file_q.put(chunk)
 
     def wait_for_latest_ogg(self, timeout: float):
         """

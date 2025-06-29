@@ -17,6 +17,7 @@ import platform
 import shutil
 import json
 import signal
+import time
 import threading
 from datetime import datetime
 
@@ -240,31 +241,67 @@ def cli_loop():
         answer = asm_cli.run_with_meta_context(line)
         # live TTS will speak automatically
     print("CLI loop exiting…")
+   
 
 threading.Thread(target=cli_loop, daemon=True).start()
 
+def _monitor_files(interval=1):
+    paths = [
+        os.path.abspath(__file__),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assembler.py")
+    ]
+    last_mtimes = {p: os.path.getmtime(p) for p in paths if os.path.exists(p)}
+    while True:
+        time.sleep(interval)
+        for p in paths:
+            try:
+                m = os.path.getmtime(p)
+                if last_mtimes.get(p) != m:
+                    log_message(f"File change detected for '{os.path.basename(p)}', restarting...", "INFO")
+                    # ── SHUT DOWN FLASK SERVER ───────────────────────────
+                    srv = globals().get("_flask_server")
+                    if srv:
+                        log_message("Shutting down existing Flask server...", "INFO")
+                        try:
+                            srv.shutdown()
+                        except Exception as e:
+                            log_message(f"Error shutting down Flask server: {e}", "WARNING")
+                    # ── RE-EXEC THE PROCESS ───────────────────────────────
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception:
+                continue
+threading.Thread(target=_monitor_files, daemon=True).start()
+
 # ─── 3) TELEGRAM PIPELINE ────────────────────────────────────────────────
-# file‐mode TTS
+try:
+    tts_tele = TTSManager(
+        logger        = log_message,
+        cfg           = config,
+        audio_service = None     # no speaker output
+    )
+    tts_tele.set_mode("file")
+    asm_tele = Assembler(
+        context_path     = CTX_PATH,
+        config_path      = "config.json",
+        lookback_minutes = 60,
+        top_k            = 5,
+        tts_manager      = tts_tele,
+    )
 
-tts_tele = TTSManager(
-    logger        = log_message,
-    cfg           = config,
-    audio_service = None      # no speaker output
-)
-tts_tele.set_mode("file")
-asm_tele = Assembler(
-    context_path     = CTX_PATH,
-    config_path      = "config.json",
-    lookback_minutes = 60,
-    top_k            = 5,
-    tts_manager      = tts_tele,
-)
+    def _run_telegram():
+        try:
+            telegram_input(asm_tele)
+        except Exception as e:
+            print(f"Telegram thread error: {e}")
 
-threading.Thread(
-    target=telegram_input,
-    args=(asm_tele,),
-    daemon=True
-).start()
+    threading.Thread(
+        target=_run_telegram,
+        daemon=True,
+        name="TelegramThread"
+    ).start()
+
+except Exception as e:
+    print(f"Error setting up Telegram thread: {e}")
 
 # ─── WAIT FOR CTRL-C ──────────────────────────────────────────────────────
 import atexit
