@@ -763,55 +763,93 @@ class Tools:
             except OSError:
                 pass
 
-
-    # This static method runs a tool function in-process, parsing the tool call from a string. It executes the function and returns its output or an exception message.
     @staticmethod
     def run_tool_once(tool_call: str) -> dict:
         """
-        Convenience: parse `tool_call` (e.g. "hello('world')")
-        → execute the referenced *tool function* in-process
-        → return { "output":…, "exception": str|None }.
+        Parse `tool_call` (e.g. "foo(1, bar='x')" or "Tools.foo(1)"), execute
+        the corresponding Tools.foo function, and return a dict with keys:
+          - "output": the function’s return value (or its repr if unserializable)
+          - "exception": None on success or a clear error/traceback string on failure
         """
-        import ast, inspect, traceback, json
+        import ast
+        import inspect
+        import traceback
+        import json
 
-        # parse into AST
+        # 1) Parse into AST
         try:
-            node = ast.parse(tool_call.strip(), mode="eval")
+            expr = ast.parse(tool_call.strip(), mode="eval")
         except SyntaxError as e:
             return {"output": None, "exception": f"SyntaxError: {e}"}
 
-        if not isinstance(node.body, ast.Call):
-            return {"output": None, "exception": "Not a function call"}
+        # Must be a function call
+        call = expr.body
+        if not isinstance(call, ast.Call):
+            return {"output": None, "exception": "Invalid call: not a function invocation"}
 
-        name = node.body.func.id
-        fn = getattr(Tools, name, None)
+        # 2) Resolve function name
+        #    Accept either foo(...) or Tools.foo(...)
+        fn_name = None
+        if isinstance(call.func, ast.Name):
+            fn_name = call.func.id
+        elif isinstance(call.func, ast.Attribute):
+            # e.g. Tools.foo
+            if (isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == Tools.__name__):
+                fn_name = call.func.attr
+        if not fn_name:
+            return {"output": None, "exception": "Unsupported function reference"}
+
+        # 3) Lookup the function
+        fn = getattr(Tools, fn_name, None)
         if not callable(fn):
-            return {"output": None, "exception": f"Unknown tool {name}"}
+            return {"output": None, "exception": f"Unknown tool: {fn_name}"}
 
-        # rebuild positional / kw args
-        def _eval_arg(a):
-            src = ast.get_source_segment(tool_call, a)
-            return ast.literal_eval(src) if src is not None else None
-
-        args = [_eval_arg(a) for a in node.body.args]
-        kwargs = {
-            kw.arg: _eval_arg(kw.value)
-            for kw in node.body.keywords
-        }
-
-        try:
-            raw_out = fn(*args, **kwargs)
-            # ensure serializable
+        # 4) Safely evaluate each arg via literal_eval
+        def _safe_eval(node):
             try:
-                json.dumps(raw_out)
-                safe_out = raw_out
-            except (TypeError, ValueError):
-                safe_out = repr(raw_out)
-            return {"output": safe_out, "exception": None}
+                return ast.literal_eval(node)
+            except Exception as e:
+                raise ValueError(f"Could not parse argument: {e}")
 
+        args = []
+        for i, a in enumerate(call.args):
+            try:
+                args.append(_safe_eval(a))
+            except ValueError as e:
+                return {"output": None, "exception": f"Positional arg #{i}: {e}"}
+
+        kwargs = {}
+        for kw in call.keywords:
+            if kw.arg is None:
+                return {"output": None, "exception": "Kwargs unpacking (`**`) not supported"}
+            try:
+                kwargs[kw.arg] = _safe_eval(kw.value)
+            except ValueError as e:
+                return {"output": None, "exception": f"Keyword arg '{kw.arg}': {e}"}
+
+        # 5) Bind to signature to catch missing/extra args
+        sig = inspect.signature(fn)
+        try:
+            sig.bind_partial(*args, **kwargs)
+        except TypeError as e:
+            return {"output": None, "exception": f"Signature error: {e}"}
+
+        # 6) Call the function, catching any exception
+        try:
+            raw = fn(*args, **kwargs)
         except Exception:
-            tb = traceback.format_exc(limit=2)
+            tb = traceback.format_exc()
             return {"output": None, "exception": tb}
+
+        # 7) Ensure JSON‐serializable
+        try:
+            json.dumps(raw)
+            safe_out = raw
+        except Exception:
+            safe_out = repr(raw)
+
+        return {"output": safe_out, "exception": None}
 
 
     # This static method runs a Python script, either in a new terminal window or synchronously capturing its output. It returns a dictionary with the process ID or captured output.

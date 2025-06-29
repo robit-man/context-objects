@@ -57,40 +57,62 @@ class TTSManager:
 
     def _split_text(self, text: str) -> list[str]:
         """
-        Split on sentence boundaries but ensure each chunk ≤ max_chunk_size.
-        Falls back to character-based splits if a sentence is too long.
+        1) Split on blank lines (paragraphs)
+        2) Within each paragraph, split on sentence boundaries or any newline
+        3) Pack sentences into chunks ≤ max_chunk_size
+        4) If still too large, hard-slice into max_chunk_size windows
         """
-        sentences = re.split(r'(?<=[\.\?\!])\s+', text)
+        # normalize line endings
+        import re
+
+        # 1) Break into paragraphs
+        paras = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
         chunks: list[str] = []
-        current = ""
-        for s in sentences:
-            if len(current) + len(s) + 1 <= self.max_chunk_size:
-                current = f"{current} {s}".strip()
-            else:
-                if current:
-                    chunks.append(current)
-                # if single sentence too long, break it up
-                if len(s) > self.max_chunk_size:
-                    for i in range(0, len(s), self.max_chunk_size):
-                        chunks.append(s[i:i+self.max_chunk_size])
-                    current = ""
+
+        for para in paras:
+            # 2) Split on sentence punctuation OR on any newline/bullet
+            parts = re.split(r'(?<=[\.\?\!])\s+|\n+|(?<=\u2022)\s*', para)
+            # you can also include r'(?<=^[-\*\u2022]\s*)' if you want bullets
+            buffer = ""
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+
+                # if adding this part would overflow, flush buffer first
+                if buffer and len(buffer) + 1 + len(part) > self.max_chunk_size:
+                    chunks.append(buffer)
+                    buffer = ""
+
+                # if the single part alone fits, accumulate it
+                if len(part) <= self.max_chunk_size:
+                    buffer = f"{buffer} {part}".strip() if buffer else part
                 else:
-                    current = s
-        if current:
-            chunks.append(current)
+                    # 3) part itself is too big—even on its own—so hard-slice
+                    if buffer:
+                        chunks.append(buffer)
+                        buffer = ""
+                    for i in range(0, len(part), self.max_chunk_size):
+                        slice_ = part[i : i + self.max_chunk_size].strip()
+                        if slice_:
+                            chunks.append(slice_)
+            # at paragraph end, flush any remaining buffer
+            if buffer:
+                chunks.append(buffer)
+
         return chunks
 
     def enqueue(self, text: str):
-        text = text.strip().replace("*","")  # strip asterisks
+        text = text.strip().replace("*", "")
         if not text:
             return
-        # split into manageable chunks
-        for chunk in self._split_text(text):
+        # ALWAYS chunk the entire text
+        for idx, chunk in enumerate(self._split_text(text), start=1):
             if self._mode == "live":
-                self.log(f"Enqueue live TTS chunk: {chunk!r}", "DEBUG")
+                self.log(f"Enqueue live TTS chunk {idx}/{len(text)}: {chunk!r}", "DEBUG")
                 self._live_q.put(chunk)
             else:
-                self.log(f"Enqueue file TTS chunk: {chunk!r}", "DEBUG")
+                self.log(f"Enqueue file TTS chunk {idx}/{len(text)}: {chunk!r}", "DEBUG")
                 self._file_q.put(chunk)
 
     def wait_for_latest_ogg(self, timeout: float):
@@ -129,8 +151,14 @@ class TTSManager:
             # build Piper + aplay commands
             script_dir = os.path.dirname(__file__)
             piper_exe  = os.path.join(script_dir, "piper", "piper")
-            onnx_json  = os.path.join(script_dir, self.config.get("onnx_json", "glados_piper_medium.onnx.json"))
-            onnx_model = os.path.join(script_dir, self.config.get("onnx_model",  "glados_piper_medium.onnx"))
+            onnx_json  = os.path.join(
+                script_dir,
+                self.config.get("onnx_json", "glados_piper_medium.onnx.json")
+            )
+            onnx_model = os.path.join(
+                script_dir,
+                self.config.get("onnx_model",  "glados_piper_medium.onnx")
+            )
 
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
@@ -146,27 +174,39 @@ class TTSManager:
             self.log(f"[TTS live] Speaking: {text!r}", "INFO")
 
             with tts_lock:
-                p1 = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=(subprocess.PIPE if self.debug else subprocess.DEVNULL))
+                p1 = subprocess.Popen(
+                    cmd_piper,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=(subprocess.PIPE if self.debug else subprocess.DEVNULL)
+                )
                 p2 = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
 
+            # send text to Piper
             p1.stdin.write(payload)
             p1.stdin.close()
 
+            # stream Piper’s PCM into aplay
             def _stream_audio():
                 while True:
                     chunk = p1.stdout.read(4096)
                     if not chunk:
                         break
                     if self.volume != 1.0:
-                        arr   = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) * self.volume
+                        arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) * self.volume
                         chunk = np.clip(arr, -32768,32767).astype(np.int16).tobytes()
                     p2.stdin.write(chunk)
                 p2.stdin.close()
 
             streamer = threading.Thread(target=_stream_audio, daemon=True)
             streamer.start()
-            p1.wait(); streamer.join()
+
+            # wait for Piper to finish generating audio
+            p1.wait()
+            # wait for the streaming thread to drain Piper’s output into aplay
+            streamer.join()
+            # wait for aplay to finish playback
+            p2.wait()
 
             if self.debug:
                 err = p1.stderr.read().decode(errors="ignore").strip()

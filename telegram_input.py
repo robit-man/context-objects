@@ -48,6 +48,8 @@ def telegram_input(asm):
 # inside telegram_input.py, replace your runner() with:
 
         async def runner():
+            import os, tempfile, subprocess, uuid, queue
+
             try:
                 # ── 0) Flush any leftover file‐TTS texts and OGG paths ───────
                 try:
@@ -67,16 +69,14 @@ def telegram_input(asm):
                 # ── 2) Run the assembler pipeline synchronously ────────────
                 final = await asyncio.to_thread(asm.run_with_meta_context, user_text)
 
-                # ── 3) Edit the “Processing…” message to show the final text ──
+                # ── 3) Show the final text in place of “Processing…” ───────
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
                     text=final or "(no response)"
                 )
 
-                # ── 4) Now *only* generate the one OGG for that final answer ──
-
-                # Clear out any accidental enqueues during the run
+                # ── 4) Clear any stray queues again ─────────────────────────
                 try:
                     while True:
                         asm.tts._file_q.get_nowait()
@@ -88,14 +88,72 @@ def telegram_input(asm):
                 except queue.Empty:
                     pass
 
-                # Enqueue only the final text
+                # ── 5) Enqueue only the final large text ────────────────────
                 asm.tts.enqueue(final or "")
 
-                # Wait for exactly one OGG
-                ogg_path = asm.tts.wait_for_latest_ogg(timeout=10.0)
+                # ── 6) Collect all OGG chunks (1 s timeout each) ────────────
+                ogg_paths = []
+                while True:
+                    try:
+                        path = await asyncio.to_thread(asm.tts.wait_for_latest_ogg, 1.0)
+                        ogg_paths.append(path)
+                    except queue.Empty:
+                        break
 
-                # Send it back
-                with open(ogg_path, "rb") as vf:
+                if not ogg_paths:
+                    return  # nothing to send
+
+                # ── 7) If only one chunk, send it directly ─────────────────
+                if len(ogg_paths) == 1:
+                    with open(ogg_paths[0], "rb") as vf:
+                        await context.bot.send_voice(
+                            chat_id=chat_id,
+                            voice=vf,
+                            reply_to_message_id=msg_id
+                        )
+                    return
+
+                # ── 8) Try fast concat-demuxer method ──────────────────────
+                combined_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"combined_{uuid.uuid4().hex}.ogg"
+                )
+                list_file = tempfile.NamedTemporaryFile("w+", delete=False)
+                try:
+                    for p in ogg_paths:
+                        list_file.write(f"file '{p}'\n")
+                    list_file.flush()
+                    list_file.close()
+
+                    cmd1 = [
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", list_file.name,
+                        "-c", "copy",
+                        combined_path
+                    ]
+                    subprocess.run(cmd1, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                except subprocess.CalledProcessError:
+                    # ── 9) Fallback: filter_complex concat (re-encode/join) ───
+                    inputs = []
+                    for p in ogg_paths:
+                        inputs += ["-i", p]
+                    filter_expr = f"concat=n={len(ogg_paths)}:v=0:a=1[out]"
+                    cmd2 = ["ffmpeg", "-y"] + inputs + [
+                        "-filter_complex", filter_expr,
+                        "-map", "[out]",
+                        combined_path
+                    ]
+                    subprocess.run(cmd2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                finally:
+                    try:
+                        os.unlink(list_file.name)
+                    except:
+                        pass
+
+                # ── 10) Send the single, seamless OGG ───────────────────────
+                with open(combined_path, "rb") as vf:
                     await context.bot.send_voice(
                         chat_id=chat_id,
                         voice=vf,
@@ -103,7 +161,7 @@ def telegram_input(asm):
                     )
 
             except asyncio.CancelledError:
-                # If a new request preempted this one…
+                # A newer request preempted this one
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -114,7 +172,7 @@ def telegram_input(asm):
                     pass
 
             except Exception as e:
-                # Any other error…
+                # Any other error
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"❌ Error: {e}"
@@ -122,6 +180,7 @@ def telegram_input(asm):
 
             finally:
                 running_tasks.pop(chat_id, None)
+
 
 
         # Launch the runner as a background task
