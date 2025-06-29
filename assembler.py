@@ -1286,6 +1286,16 @@ class Assembler:
                 "planning_summary:gave_up_replanning", {"final_plan": plan_obj}
             )
 
+        # ── FIXUP PARAMETER NAMES FOR REAL TOOL SIGNATURES ────────────────
+        for task in plan_obj["tasks"]:
+            name = task.get("call")
+            ti   = task.setdefault("tool_input", {})
+            if name == "search_internet" and "query" in ti:
+                ti["topic"] = ti.pop("query")
+            if name == "parse_tool_call" and "tool_call" in ti:
+                ti["text"]  = ti.pop("tool_call")
+        # ───────────────────────────────────────────────────────────────────
+
         # —— build the final call strings —— 
         call_strings: List[str] = []
         for task in plan_obj["tasks"]:
@@ -1333,6 +1343,7 @@ class Assembler:
         })
 
 
+
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -1362,6 +1373,16 @@ class Assembler:
             # fallback to regex-only if the planner wasn’t JSON
             calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
             return calls, [], calls
+
+        # ── FIXUP PARAMETER NAMES FOR REAL TOOL SIGNATURES ────────────────
+        for task in tasks:
+            name = task.get("call")
+            ti   = task.setdefault("tool_input", {})
+            if name == "search_internet" and "query" in ti:
+                ti["topic"] = ti.pop("query")
+            if name == "parse_tool_call" and "tool_call" in ti:
+                ti["text"]  = ti.pop("tool_call")
+        # ───────────────────────────────────────────────────────────────────
 
         # C) Up to 3 repair passes: fill any missing required params
         for _ in range(3):
@@ -1401,6 +1422,14 @@ class Assembler:
             try:
                 plan_obj = json.loads(repair)
                 tasks    = plan_obj.get("tasks", [])
+                # after repair, re-apply the fixup:
+                for task in tasks:
+                    name = task.get("call")
+                    ti   = task.setdefault("tool_input", {})
+                    if name == "search_internet" and "query" in ti:
+                        ti["topic"] = ti.pop("query")
+                    if name == "parse_tool_call" and "tool_call" in ti:
+                        ti["text"]  = ti.pop("tool_call")
             except:
                 break
 
@@ -1409,7 +1438,10 @@ class Assembler:
         for task in tasks:
             name = task["call"]
             ti   = task.get("tool_input", {}) or {}
-            args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k,v in ti.items())
+            args = ",".join(
+                f'{k}={json.dumps(v, ensure_ascii=False)}'
+                for k, v in ti.items()
+            )
             fixed_calls.append(f"{name}({args})")
 
         # E) Persist the validation step
@@ -1425,6 +1457,7 @@ class Assembler:
         self._print_stage_context("plan_validation", meta)
 
         return fixed_calls, [], fixed_calls
+
 
     
     def _stage8_tool_chaining(
