@@ -166,47 +166,87 @@ def telegram_input(asm):
 
     # ───────────── Telegram update handler ─────────────────────────────
     async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat_id = update.effective_chat.id
+        chat_id    = update.effective_chat.id
+        chat_type  = update.effective_chat.type               # "private", "group", …
+        bot_name   = context.bot.username.lower()
+        msg        = update.message
 
-        # 1) ── TEXT directly from message
-        user_text = (update.message.text or "").strip() if update.message else ""
+        if not msg:                                           # nothing to inspect
+            return
 
-        # 2) ── VOICE → download & Whisper
-        if not user_text and update.message and update.message.voice:
+        # ------------------------------------------------------------------
+        # 0) Decide whether the bot is being addressed
+        # ------------------------------------------------------------------
+        addressed = (chat_type == "private")                  # DMs ⇒ always true
+
+        # --- voice messages ALWAYS trigger, no matter what ---
+        if msg.voice:
+            addressed = True
+
+        cleaned_text = ""                                     # will hold final text
+
+        # A) explicit @mention in text
+        if msg.text and msg.entities:
+            for ent in msg.entities:
+                if ent.type == "mention":
+                    mention = msg.text[ent.offset : ent.offset + ent.length]
+                    if mention.lstrip("@").lower() == bot_name:
+                        addressed     = True
+                        cleaned_text  = (msg.text[:ent.offset] +
+                                         msg.text[ent.offset + ent.length:]).strip()
+                        break
+
+        # B) reply directly to a bot message
+        if not addressed and msg.reply_to_message:
+            replied_user = msg.reply_to_message.from_user
+            if replied_user and replied_user.id == context.bot.id:
+                addressed = True
+
+        if not addressed:
+            return                                            # ignore unrelated chatter
+
+        # ------------------------------------------------------------------
+        # 1) Plain text (maybe already stripped above)
+        # ------------------------------------------------------------------
+        if not cleaned_text and msg.text:
+            cleaned_text = msg.text.strip()
+
+        # ------------------------------------------------------------------
+        # 2) Voice note → Whisper transcription (runs even in groups)
+        # ------------------------------------------------------------------
+        if msg.voice:
             try:
-                # download opus-in-OGG to temp (keep *path*, not file-handle)
-                raw_ogg_path = tempfile.mktemp(suffix=".oga")
-                voice_file   = await context.bot.get_file(update.message.voice.file_id)
-                await voice_file.download_to_drive(raw_ogg_path)
+                raw_ogg = tempfile.mktemp(suffix=".oga")
+                voice_f = await context.bot.get_file(msg.voice.file_id)
+                await voice_f.download_to_drive(raw_ogg)
 
-                # convert to 16 kHz mono WAV
-                wav_path = raw_ogg_path + ".wav"
+                wav_path = raw_ogg + ".wav"
                 subprocess.run(
                     ["ffmpeg", "-loglevel", "error", "-y",
-                     "-i", raw_ogg_path, "-ac", "1", "-ar", "16000", wav_path],
+                     "-i", raw_ogg, "-ac", "1", "-ar", "16000", wav_path],
                     check=True
                 )
-
-                # Whisper transcription
-                result    = _WHISPER.transcribe(wav_path, language="en")
-                user_text = result.get("text", "").strip()
+                result       = _WHISPER.transcribe(wav_path, language="en")
+                transcribed  = result.get("text", "").strip()
+                cleaned_text = transcribed or cleaned_text   # prefer transcript
 
             except Exception as ex:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Voice note error: {ex}"
-                )
+                await context.bot.send_message(chat_id, text=f"❌ Voice note error: {ex}")
             finally:
-                # clean up temp files
-                for p in (locals().get("raw_ogg_path"), locals().get("wav_path")):
-                    if p and isinstance(p, str) and os.path.exists(p):
-                        try:
-                            os.unlink(p)
-                        except Exception:
-                            pass
+                for p in (locals().get("raw_ogg"), locals().get("wav_path")):
+                    if p and os.path.exists(p):
+                        try: os.unlink(p)
+                        except Exception: pass
 
-        if not user_text:
-            return                                    # nothing to process
+        if not cleaned_text:
+            return                                            # still nothing to do
+
+        # ------------------------------------------------------------------
+        # 3) Prefix with sender’s username for context
+        # ------------------------------------------------------------------
+        sender = update.effective_user
+        sender_name = sender.username or f"{sender.first_name} {sender.last_name or ''}".strip()
+        user_text = f"{sender_name}: {cleaned_text}"
 
         # 3) ── per-chat Assembler
         chat_asm = assemblers.get(chat_id)
