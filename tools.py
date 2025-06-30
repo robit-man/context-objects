@@ -313,6 +313,11 @@ class Tools:
     _poll   = 0.05                     
     _short  = 3
     
+
+    # Here we set up the Flask app and CORS for cross-origin requests.
+    WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
@@ -501,7 +506,12 @@ class Tools:
             })
 
         return json.dumps({"results": results}, indent=2)
-    
+
+    @staticmethod
+    def skip_tools():
+        """For simple replies, just skip tools altogether! Please bias towards this for basic greetings or ongoing conversation where no action beyond contextual replies is needed!"""
+        return
+
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
     @staticmethod
     def add_subtask(parent_id: int, text: str) -> dict:
@@ -1439,12 +1449,19 @@ class Tools:
 
         # keep the public manifest in sync for other agents
         Tools.discover_agent_stack()
-
-    # This static method creates, appends, or deletes files in the workspace directory. It provides methods to create a new file, append content to an existing file, delete a file, list workspace entries, find files matching a pattern, and read/write files.
     @staticmethod
     def create_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Create or overwrite a file under base_dir.
+        Create or overwrite a file under the specified base directory.
+
+        This will automatically create any missing directories in the path.
+
+        :param filename: Name (or relative path) of the file to create.
+        :param content:  Text to write into the new file. Use an empty string to create an empty file.
+        :param base_dir: Directory under which to create the file. Defaults to the workspace root.
+
+        :returns: A confirmation message including the full path of the created file,
+                  or an error message if creation failed.
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1456,11 +1473,19 @@ class Tools:
         except Exception as e:
             return f"Error creating file {path!r}: {e}"
 
-    # This static method appends content to an existing file or creates it if it does not exist. It ensures the directory structure is created and handles any exceptions that may occur during the file operation.
     @staticmethod
     def append_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Append to or create a file under base_dir.
+        Append content to a file under the specified base directory.
+
+        If the file does not exist, it will be created along with any necessary directories.
+
+        :param filename: Name (or relative path) of the file to append to.
+        :param content:  Text to append at the end of the file.
+        :param base_dir: Directory under which to append the file. Defaults to the workspace root.
+
+        :returns: A confirmation message including the full path of the file,
+                  or an error message if the operation failed.
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1472,11 +1497,17 @@ class Tools:
         except Exception as e:
             return f"Error appending to file {path!r}: {e}"
 
-    # This static method deletes a specified file from the workspace directory. It handles exceptions for file not found and other errors, returning appropriate messages.
     @staticmethod
     def delete_file(filename: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Delete a file under base_dir.
+        Delete a file under the specified base directory.
+
+        :param filename: Name (or relative path) of the file to delete.
+        :param base_dir: Directory under which the file resides. Defaults to the workspace root.
+
+        :returns: A confirmation message if deletion succeeded,
+                  "File not found" if the file was missing,
+                  or an error message for other failures.
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1488,11 +1519,14 @@ class Tools:
         except Exception as e:
             return f"Error deleting file {path!r}: {e}"
 
-    # This static method lists all entries (files and directories) under the specified base directory. It returns a JSON string of the entries or an error message if the operation fails.
     @staticmethod
     def list_workspace(base_dir: str = WORKSPACE_DIR) -> str:
         """
-        List entries under base_dir.
+        List all entries (files and subdirectories) under the specified directory.
+
+        :param base_dir: Directory whose contents to list. Defaults to the workspace root.
+
+        :returns: A JSON‐encoded list of entry names, or a JSON object with an "error" key on failure.
         """
         import os, json
         try:
@@ -1501,11 +1535,19 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    # This static method finds files matching a specified pattern under the workspace directory. It recursively searches through subdirectories and returns a JSON string of matching files and their directories.
     @staticmethod
     def find_files(pattern: str, path: str = WORKSPACE_DIR) -> str:
         """
-        Recursively glob under path for files matching pattern.
+        Recursively search for files matching a glob pattern under the given path.
+
+        :param pattern:  Unix‐style glob pattern (e.g. "*.txt").
+        :param path:     Root directory in which to search. Defaults to the workspace root.
+
+        :returns: A JSON‐encoded list of objects, each containing:
+                  {
+                    "file": "<filename>",
+                    "dir":  "<directory path containing the file>"
+                  }
         """
         import os, fnmatch, json
         matches = []
@@ -1515,11 +1557,14 @@ class Tools:
                     matches.append({"file": fname, "dir": root})
         return json.dumps(matches)
 
-    # This static method lists the contents of a directory, returning a JSON string of the entries. It handles exceptions and returns an error message if the operation fails.
     @staticmethod
     def list_dir(path: str = WORKSPACE_DIR) -> str:
         """
-        JSON list of entries at path.
+        List the contents of a single directory (non‐recursive).
+
+        :param path: Directory whose entries to list. Defaults to the workspace root.
+
+        :returns: A JSON‐encoded list of entry names, or a JSON object with an "error" key on failure.
         """
         import os, json
         try:
@@ -1527,28 +1572,43 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    # Here we define a static method that serves as an alias for `find_files`, allowing users to list files in the workspace directory using a specified pattern. It returns a list of matching files.
     @staticmethod
     def list_files(path: str = WORKSPACE_DIR, pattern: str = "*") -> list:
-        """Alias for find_files(pattern, path)."""
-        return Tools.find_files(pattern, path)
+        """
+        Alias for `find_files(pattern, path)`, returning a Python list of matches.
 
-    # This static method reads multiple files from a specified path and returns their contents as a dictionary. Each key in the dictionary is the filename, and the value is the content of that file.
+        :param path:     Directory in which to search. Defaults to the workspace root.
+        :param pattern:  Unix‐style glob pattern. Defaults to "*" (everything).
+
+        :returns: A Python list of filename/dir dictionaries matching the pattern.
+        """
+        import json
+        return json.loads(Tools.find_files(pattern, path))
+
     @staticmethod
     def read_files(path: str, *filenames: str) -> dict:
         """
-        Read multiple files under `path` and return a dict { filename: content }.
+        Read the contents of multiple files under a given directory.
+
+        :param path:      Directory in which the files reside.
+        :param filenames: One or more filenames (relative to `path`) to read.
+
+        :returns: A dict mapping each filename to its text content, or an error string.
         """
         out = {}
         for fn in filenames:
             out[fn] = Tools.read_file(fn, path)
         return out
 
-    # We define a static method to read the contents of a single file. It constructs the full path, attempts to read the file, and returns its contents or an error message if reading fails.
     @staticmethod
     def read_file(filepath: str, base_dir: str | None = None) -> str:
         """
-        Read and return the file’s contents.
+        Read and return the contents of a single file.
+
+        :param filepath:  Path to the file to read. If `base_dir` is provided, `filepath` is relative.
+        :param base_dir:  Optional base directory to prefix to `filepath`.
+
+        :returns: The file’s text content, or an error message if reading fails.
         """
         import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
@@ -1558,11 +1618,16 @@ class Tools:
         except Exception as e:
             return f"Error reading {path!r}: {e}"
 
-    # This static method writes content to a specified file path, creating any necessary directories. It handles exceptions and returns a message indicating success or failure.
     @staticmethod
     def write_file(filepath: str, content: str, base_dir: str | None = None) -> str:
         """
-        Write content to filepath.
+        Write text content to a file, creating any missing directories.
+
+        :param filepath:  Path (relative or absolute) of the file to write.
+        :param content:   Text to write into the file.
+        :param base_dir:  Optional base directory to prefix to `filepath`.
+
+        :returns: A summary "<n> chars written to <path>", or an error message on failure.
         """
         import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
@@ -1574,11 +1639,19 @@ class Tools:
         except Exception as e:
             return f"Error writing {path!r}: {e}"
 
-    # This static method renames a file from an old name to a new name under the specified base directory. It ensures that the paths are safe and handles exceptions, returning a message indicating success or failure.
     @staticmethod
     def rename_file(old: str, new: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Rename old→new under base_dir.
+        Rename a file from `old` to `new`, under the specified base directory.
+
+        Prevents directory‐traversal attacks by normalizing paths.
+
+        :param old:      Original filename or relative path.
+        :param new:      Desired new filename or relative path.
+        :param base_dir: Directory under which both paths reside. Defaults to the workspace root.
+
+        :returns: A confirmation message "Renamed old → new",
+                  or an error message if the operation fails or paths are invalid.
         """
         import os
         safe_old = os.path.normpath(old)
@@ -1594,11 +1667,19 @@ class Tools:
         except Exception as e:
             return f"Error renaming file: {e}"
 
-    # This static method copies a file from a source path to a destination path under the specified base directory. It ensures that the paths are safe, creates necessary directories, and handles exceptions, returning a message indicating success or failure.
     @staticmethod
     def copy_file(src: str, dst: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Copy src→dst under base_dir.
+        Copy a file from `src` to `dst` under the specified base directory.
+
+        Prevents directory‐traversal attacks by normalizing paths.
+
+        :param src:      Source filename or relative path.
+        :param dst:      Destination filename or relative path.
+        :param base_dir: Directory under which both paths reside. Defaults to the workspace root.
+
+        :returns: A confirmation message "Copied src → dst",
+                  or an error message if the operation fails or paths are invalid.
         """
         import os, shutil
         safe_src = os.path.normpath(src)
@@ -1614,11 +1695,17 @@ class Tools:
         except Exception as e:
             return f"Error copying file: {e}"
 
-    # This static method checks if a file exists under the specified base directory. It normalizes the path to prevent directory traversal attacks and returns a boolean indicating whether the file exists.
     @staticmethod
     def file_exists(filename: str, base_dir: str = WORKSPACE_DIR) -> bool:
         """
-        Check if filename exists under base_dir.
+        Check whether a file exists under the specified base directory.
+
+        Prevents directory‐traversal attacks by normalizing the path.
+
+        :param filename: Name or relative path of the file.
+        :param base_dir: Directory in which to look. Defaults to the workspace root.
+
+        :returns: True if the file exists, False otherwise (or if the path is invalid).
         """
         import os
         safe = os.path.normpath(filename)
@@ -1626,11 +1713,20 @@ class Tools:
             return False
         return os.path.exists(os.path.join(base_dir, safe))
 
-    # This static method retrieves metadata for a specified file, including its size and last modified time. It normalizes the path to prevent directory traversal attacks and handles exceptions, returning a dictionary with the file's metadata or an error message.
     @staticmethod
     def file_info(filename: str, base_dir: str = WORKSPACE_DIR) -> dict:
         """
-        Return metadata for filename.
+        Return size and last-modified timestamp for a file under the specified base directory.
+
+        Prevents directory‐traversal attacks by normalizing the path.
+
+        :param filename: Name or relative path of the file.
+        :param base_dir: Directory in which to stat. Defaults to the workspace root.
+
+        :returns: A dict with keys:
+                  - "size":     file size in bytes,
+                  - "modified": last-modified time as a UNIX timestamp,
+                  or {"error": "..."} on failure.
         """
         import os
         safe = os.path.normpath(filename)
@@ -1643,23 +1739,25 @@ class Tools:
         except Exception as e:
             return {"error": str(e)}
 
-    # This static method returns the absolute path of the workspace directory, which is defined as a constant at the top of the module. It can be used to get the base directory for file operations.
     @staticmethod
     def get_workspace_dir() -> str:
         """
-        Absolute path of the workspace.
-        """
-        return WORKSPACE_DIR
+        Return the absolute path of the workspace directory.
 
-    # This static method returns the current working directory of the process. It uses the `os` module to get the current directory and returns it as a string.
+        :returns: The constant WORKSPACE_DIR used as the base for all file operations.
+        """
+        return Tools.WORKSPACE_DIR
+
     @staticmethod
     def get_cwd() -> str:
         """
-        Return current working directory.
+        Return the current working directory of this process.
+
+        :returns: The output of os.getcwd().
         """
         import os
         return os.getcwd()
-
+    
     # We define a static method to introspect the available tools and agents, writing the results to a JSON file named `agent_stack.json`. This method collects tool and agent names, default stages, and the last updated timestamp.
     @staticmethod
     def discover_agent_stack() -> str:
@@ -2023,6 +2121,9 @@ class Tools:
     # This static method inputs text into a specified element in the currently open browser using a CSS selector. It waits for the element to be clickable, scrolls it into view, clears any existing text, and sends the specified text followed by a RETURN key. It logs the action and returns a message indicating success or failure.
     @staticmethod
     def input(selector: str, text: str, timeout: int = 8) -> str:
+        """
+        This static method inputs text into a specified element in the currently open browser using a CSS selector. Do not use for replying
+        """
         if not Tools._driver:
             return "Error: browser not open"
         try:
@@ -2617,12 +2718,7 @@ class Tools:
             "prompt": f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'."
         })
 
-        if query != None:
-            prompt = (f"{query}', apply those questions to the following image and respond with your analysis of its visual contents '{path}', ")
-        else:
-            prompt = (f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'.")
-
-    
+        prompt = (f"{query}', apply those questions to the following image and respond with your analysis of its visual contents '{path}', ")
         final = Tools.auxiliary_inference(prompt, temperature=0.5)
 
         return final

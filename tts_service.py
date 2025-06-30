@@ -106,14 +106,19 @@ class TTSManager:
         text = text.strip().replace("*", "")
         if not text:
             return
-        # ALWAYS chunk the entire text
-        for idx, chunk in enumerate(self._split_text(text), start=1):
+
+        # split once to know total
+        parts = self._split_text(text)
+        total = len(parts)
+
+        for idx, chunk in enumerate(parts, start=1):
             if self._mode == "live":
-                self.log(f"Enqueue live TTS chunk {idx}/{len(text)}: {chunk!r}", "DEBUG")
+                self.log(f"Enqueue live TTS chunk {idx}/{total}: {chunk!r}", "DEBUG")
                 self._live_q.put(chunk)
             else:
-                self.log(f"Enqueue file TTS chunk {idx}/{len(text)}: {chunk!r}", "DEBUG")
+                self.log(f"Enqueue file TTS chunk {idx}/{total}: {chunk!r}", "DEBUG")
                 self._file_q.put(chunk)
+
 
     def wait_for_latest_ogg(self, timeout: float):
         """

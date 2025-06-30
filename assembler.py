@@ -25,6 +25,37 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] assembler: %(message)s",
 )
+import ast, json, re
+from functools import lru_cache
+from typing import Any, Dict, List, Tuple
+
+# ──────────────────────────────────────────────────────────────────────────────
+def _canon(call: str) -> str:
+    """Return a canonical signature for a tool call (idempotent)."""
+    name, _ = call.split("(", 1)
+    tree = ast.parse(call.strip())
+    node = tree.body[0].value                     # type: ignore[arg-type]
+    pos = [ast.get_source_segment(call, a).strip() for a in node.args]
+    kw  = {k.arg: ast.get_source_segment(call, k.value).strip()
+           for k in node.keywords
+           if ast.get_source_segment(call, k.value).strip() not in ("''", '""', 'None')}
+    sig = name.strip() + "("
+    sig += ",".join(pos)
+    if kw:
+        sig += "," if pos else ""
+        sig += ",".join(f"{k}={v}" for k, v in sorted(kw.items()))
+    sig += ")"
+    return sig
+
+@lru_cache(maxsize=None)
+def _done_calls(repo) -> set[str]:
+    """Any *successful* canonical signatures stored in the context log."""
+    done: set[str] = set()
+    for obj in repo.query(lambda c: c.component == "tool_output"):
+        # success is recorded via metadata["ok"] we add below
+        if obj.metadata.get("ok"):
+            done.add(obj.metadata["tool_call"])
+    return done
 
 class RLController:
     """
@@ -1243,7 +1274,8 @@ class Assembler:
                     input_refs=[state["user_ctx"].context_id],
                     output={"stage": stage, "duration": dur, "error": not ran_ok}
                 )
-                perf.touch(); self.repo.save(perf)
+                perf.touch(); 
+                #self.repo.save(perf)
                 self.memman.reinforce(perf.context_id, state.get("recent_ids", []))
                 try:
                     status_cb(stage, summary)
@@ -1965,18 +1997,22 @@ class Assembler:
         self.repo.save(repl)
 
         return resp
+        
     
+
     def _stage9_invoke_with_retries(
         self,
         raw_calls: List[str],
         plan_output: str,
-        selected_schemas: List[ContextObject],
+        selected_schemas: List["ContextObject"],
         user_text: str,
-        clar_metadata: Dict[str, Any]
-    ) -> List[ContextObject]:
-        import json, re
-        from typing import Tuple, Any, Dict
+        clar_metadata: Dict[str, Any],
+    ) -> List["ContextObject"]:
+        """
+        Execute tool calls with retry / reflection, *and* keep track of plan progress.
+        """
 
+        # ── helpers ────────────────────────────────────────────────────────────
         def _norm(calls):
             out = []
             for c in calls:
@@ -1990,175 +2026,143 @@ class Assembler:
             exc = res.get("exception")
             return (exc is None, exc or "")
 
-        # ── INITIALIZE ─────────────────────────────────────────────────────────
-        raw_calls = _norm(raw_calls)
+        def normalize_key(k: str) -> str:
+            return re.sub(r"\W+", "", k).lower()
+
+        # ── INITIAL SET-UP ─────────────────────────────────────────────────────
+        raw_calls      = _norm(raw_calls)
+        total_calls    = len(raw_calls)
+        completed_ok   = 0
+        seen_success   = set(_done_calls(self.repo))         # persisted successes
         call_status: Dict[str, bool] = {c: False for c in raw_calls}
-        tool_ctxs: List[ContextObject] = []
-        last_results: Dict[str, Any] = {}
-        max_retries = 10
+        tool_ctxs:     List["ContextObject"] = []
+        last_results:  Dict[str, Any] = {}
+        max_retries    = 10
 
         print("\n--- Stage 9: invoke_with_retries ---")
         print("Initial raw_calls:", raw_calls)
         print("Plan output:\n", plan_output)
+        print("Already-completed signatures:", seen_success)
 
-        # Helper for matching [PLACEHOLDER]
-        def normalize_key(k: str) -> str:
-            return re.sub(r'\W+', '', k).lower()
+        # prune anything that succeeded in the past
+        raw_calls = [c for c in raw_calls if _canon(c) not in seen_success]
+        if not raw_calls:
+            print("Nothing to run – plan already completed.")
+            return []
 
-        # ── RETRY LOOP ──────────────────────────────────────────────────────────
+        # ── RETRY LOOP ─────────────────────────────────────────────────────────
         for attempt in range(1, max_retries + 1):
-            errors: List[Tuple[str, str]] = []
             print(f"\n>>> Attempt {attempt}/{max_retries}")
+            errors: List[Tuple[str, str]] = []
 
             for original_call in list(raw_calls):
                 if call_status[original_call]:
-                    continue
+                    continue                                # this call already OK in this pass
 
-                # — Step A: placeholder substitution [Foo] → last_results["Foo"]
+                # (A) placeholder substitution  ────────────────────────────────
                 call_str = original_call
-                for ph in re.findall(r'\[([^\]]+)\]', call_str):
+                for ph in re.findall(r"\[([^\]]+)\]", call_str):
                     norm = normalize_key(ph)
-                    match = next(
-                        (k for k in last_results if normalize_key(k).find(norm) != -1),
-                        None
-                    )
+                    match = next((k for k in last_results if normalize_key(k).find(norm) != -1), None)
                     if match:
                         val = last_results[match]
-                        print(f" Substituting [{ph}] with {val!r} from '{match}'")
                         call_str = call_str.replace(f"[{ph}]", repr(val))
                     else:
-                        print(f" ⚠️ No upstream value for placeholder [{ph}]")
+                        print(f" ⚠️  No upstream value for placeholder [{ph}]")
 
-                # — Step B: nested inner calls and ${tool}_output
-                # 1) substitute ${tool}_output
+                # (B) ${tool}_output substitution & nested calls  ──────────────
                 for name, val in last_results.items():
                     call_str = call_str.replace(f"${{{name}_output}}", repr(val))
 
-                # 2) detect bare nested calls foo() inside our call_str
-                for inner in re.findall(r'\b([A-Za-z_]\w*)\(\)', call_str):
+                for inner in re.findall(r"\b([A-Za-z_]\w*)\(\)", call_str):
                     if inner not in last_results:
                         inner_call = f"{inner}()"
-                        print(f"[NestedInvocation] Running inner: {inner_call}")
-                        res_i = Tools.run_tool_once(inner_call)
-                        ok_i, err_i = _validate(res_i)
-                        last_results[inner] = res_i["output"]
-                        print(f"[NestedInvocation] {'OK' if ok_i else 'ERROR:' + err_i}")
+                        print(f"[Nested] {inner_call}")
+                        r_i = Tools.run_tool_once(inner_call)
+                        ok_i, err_i = _validate(r_i)
+                        last_results[inner] = r_i["output"]
+                        print(f"[Nested] {'OK' if ok_i else 'ERR: ' + err_i}")
 
-                        # persist nested result
-                        sch_i = next(
-                            sch for sch in selected_schemas
-                            if json.loads(sch.metadata["schema"])["name"] == inner
-                        )
-                        in_ctx = ContextObject.make_stage(
-                            "tool_output",
-                            [sch_i.context_id],
-                            res_i
-                        )
-                        in_ctx.stage_id = f"tool_output_{attempt}_inner_{inner}"
-                        in_ctx.summary  = (
-                            str(res_i["output"])
-                            if ok_i else f"ERROR: {err_i}"
-                        )
-                        in_ctx.metadata.update(res_i)
-                        in_ctx.touch(); self.repo.save(in_ctx)
-                        tool_ctxs.append(in_ctx)
+                # (C) invoke primary tool call  ────────────────────────────────
+                sig = _canon(call_str)
+                if sig in seen_success:
+                    call_status[original_call] = True
+                    completed_ok += 1
+                    continue                              # already done in *previous* run
 
-                # — Step C: primary call
-                print(f"[ToolInvocation] Running: {call_str}")
+                print(f"[ToolInvocation] {call_str}")
                 res = Tools.run_tool_once(call_str)
                 ok, err = _validate(res)
-                status = "OK" if ok else f"ERROR: {err.splitlines()[-1]}"
-                print(f"[ToolInvocation] {status}")
+                res["tool_call"] = sig
+                res["ok"] = ok
 
-                # capture for future substitution
-                tool_name = original_call.split("(", 1)[0]
-                last_results[tool_name] = res["output"]
+                # ── progress printout ────────────────────────────────────────
+                if ok:
+                    completed_ok += 1
+                pct = (completed_ok / total_calls) * 100
+                print(f"[ToolInvocation] {'OK' if ok else 'ERROR'} "
+                    f"– PLAN-PROGRESS {pct:5.2f}% ({completed_ok}/{total_calls})")
 
-                # persist this invocation
-                sch = next(
-                    sch for sch in selected_schemas
-                    if json.loads(sch.metadata["schema"])["name"] == tool_name
-                )
-                out_ctx = ContextObject.make_stage(
-                    "tool_output",
-                    [sch.context_id],
-                    res
-                )
-                out_ctx.stage_id = f"tool_output_{attempt}_{tool_name}"
-                out_ctx.summary  = (
-                    str(res["output"]) if ok else f"ERROR: {err.splitlines()[-1]}"
-                )
-                out_ctx.metadata.update(res)
-                out_ctx.touch(); self.repo.save(out_ctx)
-                tool_ctxs.append(out_ctx)
+                # future substitutions
+                last_results[original_call.split("(", 1)[0]] = res["output"]
+
+                # persist context
+                schema_name = original_call.split("(", 1)[0]
+                sch = next(s for s in selected_schemas
+                        if json.loads(s.metadata["schema"])["name"] == schema_name)
+                ctx = ContextObject.make_stage("tool_output", [sch.context_id], res)
+                ctx.stage_id = f"tool_output_{attempt}_{schema_name}"
+                ctx.summary  = str(res["output"]) if ok else f"ERROR: {err}"
+                ctx.metadata.update(res)
+                ctx.touch(); self.repo.save(ctx)
+                tool_ctxs.append(ctx)
 
                 call_status[original_call] = ok
-                if not ok:
+                if ok:
+                    seen_success.add(sig)
+                else:
                     errors.append((original_call, err))
 
+            # ── loop-break conditions ─────────────────────────────────────────
             if not errors:
-                print("All calls succeeded.")
+                print("All remaining calls succeeded.")
                 break
 
-            # ── PREPARE RETRY LLM PROMPT ─────────────────────────────────────────
-            err_lines   = [f"{c} → {e.splitlines()[-1]}" for c,e in errors]
-            failed_calls = [c for c,_ in errors]
+            # if we still have failures, ask LLM to repair the failing calls …
+            err_lines = [f"{c} → {e.splitlines()[-1]}" for c, e in errors]
+            failed_calls = [c for c, _ in errors]
             print("Failures:", err_lines)
 
-            # collect schemas for the failures
-            docs = []
-            for sch in selected_schemas:
-                data = json.loads(sch.metadata["schema"])
-                if data["name"] in {c.split("(")[0] for c in failed_calls}:
-                    docs.append(f"• **{data['name']}** parameters:\n"
-                                + json.dumps(data.get("parameters", {}), indent=2))
-
-            # available variables block
-            vars_block = "\n".join(f"{k}_output = {v!r}" for k,v in last_results.items())
-
+            vars_block = "\n".join(f"{k}_output = {v!r}" for k, v in last_results.items())
             retry_sys = (
-                "Some tool calls failed:\n"
-                + "\n".join(err_lines)
-                + "\n\n**Original query:**\n"    + user_text
-                + "\n\n**Clarification notes:**\n" + clar_metadata.get("notes","(none)")
-                + "\n\n**Plan:**\n"              + plan_output
-                + (f"\n\n**Available variables:**\n{vars_block}" if vars_block else "")
-                + "\n\n**Schemas for failing tools:**\n"
-                + "\n\n".join(docs)
-                + "\n\nPlease return ONLY JSON: {\"tool_calls\":[\"fixed_call1(...)\", …]}"
+                "Some tool calls failed:\n" + "\n".join(err_lines) +
+                "\n\n**Original query:**\n" + user_text +
+                "\n\n**Plan:**\n" + plan_output +
+                ("\n\n**Variables:**\n" + vars_block if vars_block else "") +
+                "\n\nReturn JSON {\"tool_calls\":[\"fixed_call1(...)\", ...]}"
             )
-            self._print_stage_context("tool_chaining_retry", {
-                "errors":    err_lines,
-                "variables": vars_block.split("\n") if vars_block else [],
-                "fail_docs": docs,
-            })
-
             retry_msgs = [
-                {"role":"system",  "content": retry_sys},
-                {"role":"user",    "content": json.dumps({"tool_calls": failed_calls})}
+                {"role": "system", "content": retry_sys},
+                {"role": "user",   "content": json.dumps({"tool_calls": failed_calls})}
             ]
-            retry_out = self._stream_and_capture(
-                self.secondary_model, retry_msgs, tag="[ToolChainRetry]"
-            ).strip()
+            retry_out = self._stream_and_capture(self.secondary_model, retry_msgs,
+                                                tag="[ToolChainRetry]").strip()
 
-            # parse corrected calls
             try:
                 fixed = json.loads(retry_out)["tool_calls"]
-            except:
+            except Exception:
                 parsed = Tools.parse_tool_call(retry_out)
-                fixed = parsed if isinstance(parsed, list) else ([parsed] if parsed else failed_calls)
+                fixed = parsed if isinstance(parsed, list) else \
+                        ([parsed] if parsed else failed_calls)
 
             fixed = _norm(fixed) or failed_calls
 
-            # merge corrections back
+            # replace the failing calls with fixes
             new_raw = []
             fix_iter = iter(fixed)
             for c in raw_calls:
-                if c in failed_calls:
-                    new_raw.append(next(fix_iter, c))
-                else:
-                    new_raw.append(c)
-            raw_calls = new_raw
+                new_raw.append(next(fix_iter, c) if c in failed_calls else c)
+            raw_calls   = new_raw
             call_status = {c: False for c in raw_calls}
 
         return tool_ctxs

@@ -12,6 +12,7 @@
     "click",
     "close_browser",
     "connect_network",
+    "context_query",
     "convert_query_for_image",
     "copy_file",
     "create_file",
@@ -99,5 +100,5 @@
     "chain_of_thought",
     "notification_audit"
   ],
-  "updated": "2025-06-24T22:49:41.912007"
+  "updated": "2025-06-30T02:32:38.121798"
 }

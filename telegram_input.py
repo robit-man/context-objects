@@ -12,7 +12,7 @@ Features
 
 from __future__ import annotations
 
-import asyncio, os, queue, tempfile, subprocess, uuid
+import shlex, asyncio, os, queue, tempfile, subprocess, uuid
 from typing import Any, Callable, List
 
 from dotenv import load_dotenv
@@ -86,35 +86,67 @@ def _make_status_cb(
     chat_id: int,
     msg_id: int,
     *,
-    max_lines: int = 6,
-) -> Callable[[str, Any], None]:
+    max_lines: int = 20,
+    min_interval: float = 5,
+):
     """
-    Return a thread-safe `status_cb(stage, output)` that updates a rolling
-    history inside the original “🛠 Processing…” message.
+    Returns
+        status_cb(stage, output)   – pass to the assembler
+        stop_cb()                  – call once when work is finished
+    `stop_cb` cancels any pending edit and disables further updates,
+    preventing the final message from being overwritten.
     """
     history: List[str] = []
+    last_edit_at: float = 0.0
+    pending_handle: asyncio.TimerHandle | None = None
+    disabled: bool = False                      # set True by stop_cb()
 
-    async def _do_edit(text: str) -> None:
+    async def _do_edit() -> None:
+        nonlocal last_edit_at, pending_handle
+        if disabled:
+            return
+        text = "🛠️ Processing…\n" + "\n".join(history[-max_lines:])
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
+            await bot.edit_message_text(chat_id=chat_id,
+                                        message_id=msg_id,
+                                        text=text)
+        except Exception:
+            pass  # message deleted / race condition – ignore
+        finally:
+            last_edit_at = loop.time()
+            pending_handle = None
+
+    def _schedule_edit() -> None:
+        nonlocal pending_handle
+        if disabled or pending_handle is not None:
+            return
+        delay = max(min_interval - (loop.time() - last_edit_at), 0.0)
+        if delay == 0:
+            asyncio.run_coroutine_threadsafe(_do_edit(), loop)
+        else:
+            pending_handle = loop.call_later(
+                delay,
+                lambda: asyncio.run_coroutine_threadsafe(_do_edit(), loop)
             )
-        except Exception:  # message deleted or race condition – ignore
-            pass
 
     def status_cb(stage: str, output: Any) -> None:
+        if disabled:
+            return
         snippet = str(output).replace("\n", " ")
-        if len(snippet) > 400:
-            snippet = snippet[:397] + "…"
+        if len(snippet) > 2000:
+            snippet = snippet[:1997] + "…"
         history.append(f"• {stage}: {snippet}")
-        text = "🛠️ Processing…\n" + "\n".join(history[-max_lines:])
+        _schedule_edit()
 
-        # schedule safely from ANY thread
-        asyncio.run_coroutine_threadsafe(_do_edit(text), loop)
+    def stop_cb() -> None:
+        """Disable further edits and cancel any scheduled one."""
+        nonlocal disabled, pending_handle
+        disabled = True
+        if pending_handle is not None and not pending_handle.cancelled():
+            pending_handle.cancel()
+            pending_handle = None
 
-    return status_cb
+    return status_cb, stop_cb
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -160,7 +192,7 @@ def telegram_input(asm):
         msg_id = placeholder.message_id
 
         # Build per-stage callback
-        status_cb = _make_status_cb(loop, context.bot, chat_id, msg_id)
+        status_cb, stop_status = _make_status_cb(loop, context.bot, chat_id, msg_id)
 
         # ───────────── background pipeline runner ──────────────────────
         async def runner() -> None:
@@ -185,6 +217,8 @@ def telegram_input(asm):
                     msg_id,
                 )
 
+                stop_status()
+
                 # ── Replace the placeholder with the answer ────────────
                 if final and len(final) < 4000:
                     # short enough → single edit
@@ -205,59 +239,60 @@ def telegram_input(asm):
 
                 # ── ONE voice reply (.ogg) ────────────────────────────
                 asm.tts.enqueue(final or "")
+
+                # wait for every chunk to finish rendering
+                await asyncio.to_thread(asm.tts._file_q.join)
+
+                # drain finished .ogg paths
                 ogg_paths: List[str] = []
                 while True:
                     try:
-                        path = await asyncio.to_thread(
-                            asm.tts.wait_for_latest_ogg, 1.0
-                        )
-                        ogg_paths.append(path)
+                        p = asm.tts._ogg_q.get_nowait()
+                        if os.path.getsize(p) > 0:
+                            ogg_paths.append(p)
                     except queue.Empty:
                         break
 
                 if not ogg_paths:
-                    return
+                    return  # nothing to send
 
                 if len(ogg_paths) == 1:
                     with open(ogg_paths[0], "rb") as vf:
                         await context.bot.send_voice(chat_id=chat_id, voice=vf)
-                else:
-                    # Concatenate multiple .ogg files
-                    combined = os.path.join(
-                        tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg"
-                    )
-                    listfile = tempfile.NamedTemporaryFile("w+", delete=False)
-                    for p in ogg_paths:
-                        listfile.write(f"file '{p}'\n")
-                    listfile.flush(), listfile.close()
+                    return  # done
 
-                    try:
-                        subprocess.run(
-                            [
-                                "ffmpeg",
-                                "-y",
-                                "-f",
-                                "concat",
-                                "-safe",
-                                "0",
-                                "-i",
-                                listfile.name,
-                                "-c",
-                                "copy",
-                                combined,
-                            ],
-                            check=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                    finally:
-                        try:
-                            os.unlink(listfile.name)
-                        except FileNotFoundError:
-                            pass
+                # ── concatenate via filter_complex ───────────────────
+                combined = os.path.join(
+                    tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg"
+                )
 
-                    with open(combined, "rb") as vf:
-                        await context.bot.send_voice(chat_id=chat_id, voice=vf)
+                # build ffmpeg arg list:  -i file1 -i file2 ...
+                ff_in_args: list[str] = []
+                for p in ogg_paths:
+                    ff_in_args += ["-i", p]
+
+                # e.g. "[0:a][1:a][2:a]concat=n=3:v=0:a=1,aresample=48000"
+                streams = "".join(f"[{i}:a]" for i in range(len(ogg_paths)))
+                concat_filter = f"{streams}concat=n={len(ogg_paths)}:v=0:a=1,aresample=48000"
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    *ff_in_args,
+                    "-filter_complex", concat_filter,
+                    "-loglevel", "error",
+                    "-c:a", "libopus", "-b:a", "48k",
+                    combined,
+                ]
+
+                try:
+                    subprocess.run(cmd, check=True)
+                except subprocess.CalledProcessError as e:
+                    # bubble up full stderr so we see the real problem if it ever fails
+                    raise RuntimeError(f"ffmpeg concat failed (exit {e.returncode}):\n{e.stderr}") from e
+
+                with open(combined, "rb") as vf:
+                    await context.bot.send_voice(chat_id=chat_id, voice=vf)
+
 
             except asyncio.CancelledError:
                 # superseded by a newer request
