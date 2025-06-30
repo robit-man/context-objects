@@ -6,6 +6,7 @@ dynamic, chronological context windows per stage.
 import json
 import logging
 import re
+import os, json, random, math
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass, field
@@ -23,6 +24,53 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] assembler: %(message)s",
 )
 
+
+class RLController:
+    """
+    Very lightweight bandit: each optional stage has a weight;
+    inclusion chance = sigmoid(weight).  After each turn we
+    update weights of the stages *we actually ran* toward the
+    observed reward, and persist to disk.
+    """
+    def __init__(self, stages: List[str], alpha: float = 0.05, path: str = "weights.rl"):
+        self.alpha = alpha
+        self.path  = path
+
+        # load existing weights if present, else start at 0.0
+        if os.path.exists(self.path):
+            try:
+                data = json.load(open(self.path, "r"))
+            except Exception:
+                data = {}
+        else:
+            data = {}
+
+        # ensure every stage has a weight entry
+        self.weights = {s: float(data.get(s, 0.0)) for s in stages}
+        # in case file had extras, ignore them
+
+    def probability(self, stage: str) -> float:
+        w = self.weights.get(stage, 0.0)
+        return 1.0 / (1.0 + math.exp(-w))
+
+    def should_run(self, stage: str) -> bool:
+        return random.random() < self.probability(stage)
+
+    def update(self, included: List[str], reward: float):
+        # nudge each included stage’s weight toward the observed reward
+        for s in included:
+            if s in self.weights:
+                # simple gradient towards reward
+                self.weights[s] += self.alpha * (reward - self.weights[s])
+        self.save()
+
+    def save(self):
+        """Persist current weights to disk."""
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.weights, f, indent=2)
+        os.replace(tmp, self.path)
+
 @dataclass
 class TaskNode:
     call: str
@@ -31,6 +79,7 @@ class TaskNode:
     context_ids: List[str] = field(default_factory=list)
     completed: bool = False
     errors: List[str] = field(default_factory=list)
+
 
 class TaskExecutor:
     """
@@ -236,7 +285,7 @@ class ContextQueryEngine:
             c.record_recall(stage_id=stage_id, coactivated_with=[])
             self.repo.save(c)
         return out
-
+    
 class Assembler:
     STAGES = [
         "recent_retrieval",
@@ -249,7 +298,8 @@ class Assembler:
     ]
 
     """
-    Fractal Assembler with recursive TaskExecutor.
+    Fractal Assembler with recursive TaskExecutor and on-disk RL for stage selection
+    plus an RL-driven “curiosity” probe system for gap‐closing questions.
     """
     def __init__(
         self,
@@ -259,27 +309,25 @@ class Assembler:
         top_k:            int = 10,
         tts_manager:      TTSManager | None = None,
     ):
-        # load or init config
+        # — load or init config —
         try:
             self.cfg = json.load(open(config_path))
         except FileNotFoundError:
             self.cfg = {}
 
-        # models & lookback
+        # — models & lookback settings —
         self.primary_model   = self.cfg.get("primary_model",   "gemma3:4b")
         self.secondary_model = self.cfg.get("secondary_model", self.primary_model)
         self.lookback        = self.cfg.get("lookback_minutes", lookback_minutes)
         self.top_k           = self.cfg.get("top_k",            top_k)
         self.hist_k          = self.cfg.get("history_turns",    5)
 
-        # system‐and‐stage prompts
+        # — system & stage prompts —
         self.clarifier_prompt = self.cfg.get(
             "clarifier_prompt",
             "You are Clarifier. Expand the user’s intent into a JSON object with "
-            "two keys: 'keywords' (an array of concise keywords) and 'notes' "
-            "You must stay away from security or privacy relatec concerns, as those are handled downstream, "
-            "and remain extremely objective in your choices, as the result of your analysis aids in calling of available tools."
-            "(a brief explanation). Output only valid JSON."
+            "two keys: 'keywords' (an array of concise keywords) and 'notes'. "
+            "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
             "assembler_prompt",
@@ -290,7 +338,7 @@ class Assembler:
             "You are a helpful, context-aware assistant. Use all provided snippets and tool outputs."
         )
 
-        # persist defaults
+        # — persist defaults back to config file if they changed —
         defaults = {
             "primary_model":    self.primary_model,
             "secondary_model":  self.secondary_model,
@@ -301,9 +349,71 @@ class Assembler:
         if defaults != self.cfg:
             json.dump(defaults, open(config_path, "w"), indent=2)
 
-        # init context store + memory
+        # — init context store & memory manager —
         self.repo   = ContextRepository(context_path)
         self.memman = MemoryManager(self.repo)
+
+        # — setup embedding engine —
+        @staticmethod
+        def embed_text(text: str) -> np.ndarray:
+            try:
+                resp = embed(model="nomic-embed-text", input=text)
+                vec  = np.array(resp["embeddings"], dtype=float).flatten()
+                norm = np.linalg.norm(vec)
+                return vec / norm if norm > 0 else vec
+            except:
+                return np.zeros(768, dtype=float)
+
+        self.engine = ContextQueryEngine(self.repo, lambda t: embed_text(t))
+
+        # — seed all schemas & static prompts —
+        self._seed_tool_schemas()
+        self._seed_static_prompts()
+
+        # — text-to-speech manager —
+        self.tts = tts_manager
+
+        # — RLController for optional stages —
+        self._optional_stages = [
+            "external_knowledge",
+            "uncertainty_check",
+            "user_confirmation",
+            "reflection_and_replan",
+        ]
+        self.rl = RLController(
+            stages=self._optional_stages,
+            alpha=self.cfg.get("rl_alpha", 0.05),
+            path=self.cfg.get("rl_weights_path", "weights.rl")
+        )
+
+        # — seed & load “curiosity” templates from the repo —
+        self.curiosity_templates = self.repo.query(
+            lambda c: c.component=="policy"
+                      and c.semantic_label.startswith("curiosity_template")
+        )
+        if not self.curiosity_templates:
+            # insert two example probe templates if none exist
+            defaults = {
+                "curiosity_template_missing_notes":
+                  "I’m not quite sure what you meant by: «{snippet}». Can you clarify?",
+                "curiosity_template_missing_date":
+                  "You mentioned a date but didn’t specify which one—what date are you thinking of?"
+            }
+            for label, text in defaults.items():
+                tmpl = ContextObject.make_policy(
+                    label=label,
+                    policy_text=text,
+                    tags=["dynamic_prompt","curiosity_template"]
+                )
+                tmpl.touch(); self.repo.save(tmpl)
+                self.curiosity_templates.append(tmpl)
+
+        # — RLController for curiosity‐template selection —
+        self.curiosity_rl = RLController(
+            stages=[t.semantic_label for t in self.curiosity_templates],
+            alpha=self.cfg.get("curiosity_alpha", 0.1),
+            path=self.cfg.get("curiosity_weights_path", "curiosity_weights.rl")
+        )
 
         @staticmethod
         def embed_text(text):
@@ -335,7 +445,50 @@ class Assembler:
         self._seed_tool_schemas()
         self._seed_static_prompts()
         self.tts = tts_manager
-        
+            
+    def _stage_curiosity_probe(self, state: Dict[str,Any]) -> List[str]:
+        probes = []
+        clar = state["clar_ctx"]
+        # find “gaps” you care about
+        gaps = []
+        if not clar.metadata.get("notes"):
+            gaps.append(("missing_notes", clar.summary[:50]))
+        if "date(" in state.get("plan_output","") and not any(
+            kw.lower().startswith("date") for kw in clar.metadata.get("keywords",[])
+        ):
+            gaps.append(("missing_date", "plan mentions a date"))
+
+        # for each gap, pick the best template by RL
+        for gap_name, snippet in gaps:
+            # sample among all templates whose label contains our gap
+            choices = [t for t in self.curiosity_templates if gap_name in t.semantic_label]
+            if not choices:
+                continue
+            # pick one by its sigmoid(weight)
+            picked = max(choices,
+                        key=lambda t: self.curiosity_rl.probability(t.semantic_label)
+            )
+            prompt = picked.metadata["policy"].format(snippet=snippet)
+            probes.append(prompt)
+
+            # record that we “ran” this template
+            state.setdefault("curiosity_used", []).append(picked.semantic_label)
+
+            # save the question as a ContextObject so we can slot in the answer later
+            ctx = ContextObject.make_stage(
+                "curiosity",
+                [clar.context_id],
+                {"question": prompt},
+                session_id=self.session_id
+            )
+            ctx.component = "curiosity"
+            ctx.semantic_label = "question"
+            ctx.tags.append("curiosity")
+            ctx.touch(); self.repo.save(ctx)
+
+        return probes
+
+
     def _seed_tool_schemas(self) -> None:
         """
         Guarantee exactly one ContextObject per tool in TOOL_SCHEMAS:
@@ -650,301 +803,267 @@ class Assembler:
         return system
 
 
-            
-    def run_with_meta_context(self, user_text: str) -> str:
+    def _should_ask_confirmation(self, state: Dict[str, Any]) -> bool:
+        """
+        Ask the LLM if we need to show the plan to the user before running.
+        Returns True if it replies 'yes', False otherwise.
+        """
         import re, json
 
-        print("\n=== run_with_meta_context ===")
-        print("User input:", repr(user_text))
+        calls = state.get("fixed_calls", [])
+        # build a one-line summary of the recent context
+        ctx_summ = " | ".join(
+            f"{c.stage_id or c.semantic_label}: {c.summary[:40].replace(chr(10), ' ')}"
+            for c in [
+                state.get("user_ctx"),
+                state.get("clar_ctx"),
+                state.get("know_ctx"),
+            ]
+            if c
+        )
+        prompt = {
+            "plan": calls,
+            "context_summary": ctx_summ
+        }
+        system = (
+            "You are a meta‐reasoner.  Given the plan (list of tool calls) "
+            "and a brief context summary, decide whether you need explicit user "
+            "confirmation before running the plan.  Answer only 'yes' or 'no'."
+        )
+        out = self._stream_and_capture(
+            self.primary_model,
+            [
+                {"role":"system",  "content": system},
+                {"role":"user",    "content": json.dumps(prompt)}
+            ],
+            tag="[ConfirmCheck]"
+        ).strip()
+        return bool(re.search(r"\byes\b", out, re.I))
+   
 
-        # ——— Stage 0: handle pending yes/no confirmation ——————————
-        print("\n--- Stage 0: Pending Confirmation Check ---")
+    # helper: resume after user says yes/no
+    def _handle_confirmation(self, reply: str) -> str:
+        import re
+        ans = reply.strip().lower()
+        # YES
+        if re.search(r"\b(yes|y|sure|go ahead)\b", ans):
+            st = self._pending_state
+            queue = self._pending_queue
+            # clear flags
+            del self._awaiting_confirmation
+            del self._pending_state
+            del self._pending_queue
+            # continue where we left off
+            return self.run_with_meta_context(st["user_text"])
+        # NO → abort or replan
+        else:
+            # clear flags
+            del self._awaiting_confirmation
+            st = self._pending_state
+            queue = self._pending_queue
+            # for simplicity, force replanning
+            return self.run_with_meta_context(st["user_text"])
+        
+        
+    def run_with_meta_context(self, user_text: str) -> str:
+        import json, re
+        from collections import deque
+
+        # 0) If we're in the middle of a yes/no confirmation, handle that first
         if getattr(self, "_awaiting_confirmation", False):
-            print("⚠️  _awaiting_confirmation is True")
-            print("Pending plan:", repr(self._pending_plan))
-            ans = user_text.strip().lower()
-            print("Normalized answer:", repr(ans))
+            return self._handle_confirmation(user_text)
 
-            refine_prompt = (
-                "you must determine if the user, in reply to the pending plan, is requesting a revision or confirming it as adequate.\n"
-                "First, you must review the plan:\n"
-                f"{self._pending_plan}\n\n"
-                "Now here is the users reply to that plan:\n"
-                f"{ans}\n\n"
-                "Based on the users reply, if they are requesting a reconsideration, or denial of the plan, you must only output [replan], or [no] as the sole word you reply with and NOTHING MORE."
-                "If the users response is favorable and appears to desire to run the plan, respond ONLY with [yes], or [sure] as the sole word you reply with and NOTHING MORE."
-            )
-            print("Refine prompt >>>\n", refine_prompt)
-            analysis = self._stream_and_capture(
-                self.primary_model,
-                [{"role": "system", "content": refine_prompt}],
-                tag="[Refine]"
-            ).strip()
-            print("Refine analysis result:", repr(analysis))
+        # 1) Build initial stage‐queue
+        queue = deque([
+            "record_input",
+            "load_system_prompts",
+            "retrieve_and_merge_context",
+            "intent_clarification",
+            "external_knowledge",
+            "prepare_tools",
+            "planning_summary",
+            "plan_validation",
+        ])
+        state: Dict[str, Any] = {
+            "user_text":     user_text,
+            "errors":        [],      # collect (stage, error) tuples
+            "curiosity_used": []      # track which probes fired
+        }
+        result: Optional[str] = None
 
-            # YES branch
-            if re.search(r"\b(yes|y|sure|please do)\b", analysis, re.I):
-                print("✅  Stage 0 → YES branch")
-                confirm_prompt = (
-                    "You are an assistant. The user agreed to proceed with this plan:\n"
-                    f"{self._pending_plan}\n\n"
-                    "Summarize the next steps in one or two sentences."
-                )
-                print("Confirm prompt >>>\n", confirm_prompt)
-                summary = self._stream_and_capture(
-                    self.primary_model,
-                    [{"role": "system", "content": confirm_prompt}],
-                    tag="[Confirm]"
-                ).strip()
-                print("Confirm summary:", summary)
-                self.tts.enqueue(summary)
-
-                # restore saved state & tool-chain
-                state         = self._pending_state
-                plan_str      = self._pending_plan
-                fixed_calls   = self._pending_fixed_calls
-                tc_ctx, raw_calls, schemas = self._pending_tool_chain
-                print("Restored state keys:", list(state.keys()))
-                print("Restored fixed_calls:", fixed_calls)
-                print("Restored raw_calls    :", raw_calls)
-                print("Restored schemas      :", [s.context_id for s in schemas])
-
-                # clear pending flags
-                for attr in ("_awaiting_confirmation","_pending_state","_pending_plan","_pending_fixed_calls","_pending_tool_chain"):
-                    if hasattr(self, attr):
-                        delattr(self, attr)
-                print("Cleared all _pending_* attributes")
-
-                # ——— Stage 9: invoke with retries ——————————————
-                print("\n--- Stage 9: Invoke Tools with Retries ---")
-                print("Invoking:", raw_calls)
-                tool_ctxs = self._stage9_invoke_with_retries(
-                    raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
-                )
-                print("→ tool_ctxs IDs:", [t.context_id for t in tool_ctxs])
-
-                # ——— Stage 9b: reflection & replan ——————————————
-                print("\n--- Stage 9b: Reflection & Replan ---")
-                replan = self._stage9b_reflection_and_replan(
-                    tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
-                )
-                print("Reflection outcome:", repr(replan))
-
-                # optional internal replan loop
-                if replan and replan.strip().startswith("{"):
-                    print("↻  Replanning based on reflection")
-                    try:
-                        plan_obj = json.loads(replan)
-                        fixed_calls = [t["call"] for t in plan_obj.get("tasks", [])]
-                        plan_str    = "\n".join(fixed_calls)
-                    except json.JSONDecodeError:
-                        pass
-
-                    print("New plan_str:", plan_str)
-                    tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                        state['plan_ctx'], plan_str, state['tools_list']
-                    )
-                    print("Re-chained raw_calls:", raw_calls)
-                    tool_ctxs = self._stage9_invoke_with_retries(
-                        raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
-                    )
-                    print("Re-invoked tool_ctxs:", [t.context_id for t in tool_ctxs])
-
-                # bundle into state for assembly
-                state['tc_ctx']    = tc_ctx
-                state['tool_ctxs'] = tool_ctxs
-
-                # ——— Stage 10: assemble & infer ——————————————
-                print("\n--- Stage 10: Assemble & Infer ---")
-                print("State keys:", list(state.keys()))
-                draft = self._stage10_assemble_and_infer(user_text, state)
-                print("Draft answer:", draft)
-
-                # ——— Stage 10b: critique & safety ——————————————
-                print("\n--- Stage 10b: Critique & Safety ---")
-                final = self._stage10b_response_critique_and_safety(draft, user_text, tool_ctxs)
-                print("Final answer:", final)
-
-                # ——— Stage 11: memory writeback & decay ——————————————
-                print("\n--- Stage 11: Memory Writeback & Decay ---")
-                self._stage11_memory_writeback(final, tool_ctxs)
-                self.memman.decay_and_promote()
-                self.tts.enqueue(final[:200])
-                return final
-
-            # NO branch
-            else:
-                print("❌  Stage 0 → NO branch")
-                refine_plan_prompt = (
-                    "Based on the user's response, refine the current plan to address their concerns.\n"
-                    "Old plan:\n" f"{self._pending_plan}\n\n"
-                    "User feedback:\n" f"{ans}\n"
-                )
-                print("RefinePlan prompt >>>\n", refine_plan_prompt)
-                new_plan = self._stream_and_capture(
-                    self.primary_model,
-                    [{"role": "system", "content": refine_plan_prompt}],
-                    tag="[RefinePlan]"
-                ).strip()
-                print("New pending plan:", new_plan)
-                self._pending_plan = new_plan
-                self.tts.enqueue("I've adjusted the plan based on your feedback.  Here's the new approach:")
-                
-                # ask for confirmation on refined plan
-                ask_confirm = (
-                    "Here is the refined plan:\n"
-                    f"{new_plan}\n\n"
-                    "Does this look good to run? (yes/no)"
-                )
-                print("AskConfirm prompt >>>\n", ask_confirm)
-                question = self._stream_and_capture(
-                    self.primary_model,
-                    [{"role": "system", "content": ask_confirm}],
-                    tag="[AskConfirm]"
-                ).strip()
-                print("Confirmation question:", question)
-                self.tts.enqueue(question)
-                return question
-
-        # ——— Stage 1: record input ——————————————
-        print("\n--- Stage 1: Record Input ---")
-        print("User text:", user_text)
-        state: Dict[str, Any] = {}
-        state['user_ctx'] = self._stage1_record_input(user_text)
-        print("user_ctx.summary:", state['user_ctx'].summary)
-
-        # ——— Stages 2–6: prompts, merge, clarify, knowledge, tools ——
-        print("\n--- Stage 2: Load System Prompts ---")
-        state['sys_ctx'] = self._stage2_load_system_prompts()
-        print("sys_ctx.summary[:200]:", state['sys_ctx'].summary[:200], "…")
-
-        print("\n--- Stage 3: Retrieve & Merge Context ---")
-        ctx3 = self._stage3_retrieve_and_merge_context(
-            user_text, state['user_ctx'], state['sys_ctx'], extra_ctx=state.get("chat_history", [])
-        )
-        state.update(ctx3)
-        print("ctx3 keys:", list(ctx3.keys()))
-        print("recent_ids:", ctx3.get("recent_ids"))
-
-        print("\n--- Stage 4: Intent Clarification ---")
-        state['clar_ctx'] = self._stage4_intent_clarification(user_text, state)
-        print("clar_ctx.summary:", state['clar_ctx'].summary)
-
-        print("\n--- Stage 5: External Knowledge Retrieval ---")
-        state['know_ctx'] = self._stage5_external_knowledge(state['clar_ctx'])
-        print("know_ctx.summary[:200]:", state['know_ctx'].summary[:200], "…")
-
-        print("\n--- Stage 6: Prepare Tools ---")
-        state['tools_list'] = self._stage6_prepare_tools()
-        print("tools_list:", state['tools_list'])
-
-        # ——— Stage 7: planning summary ——————————————
-        print("\n--- Stage 7: Planning Summary ---")
-        state['plan_ctx'], state['plan_output'] = self._stage7_planning_summary(
-            state['clar_ctx'], state['know_ctx'], state['tools_list'], user_text
-        )
-        print("plan_output:", state['plan_output'])
-
-        # ——— Stage 7b: plan validation ——————————————
-        print("\n--- Stage 7b: Plan Validation ---")
-        valid, errors, fixed_calls = self._stage7b_plan_validation(
-            state['plan_ctx'], state['plan_output'], state['tools_list']
-        )
-        print("valid:", valid, "errors:", errors, "fixed_calls:", fixed_calls)
-        if errors:
-            raise RuntimeError(f"Plan validation failed: {errors}")
-
-        plan_str = "\n".join(fixed_calls)
-        print("plan_str:", repr(plan_str))
-
-        # ——— Stage 8 & 8.5: chain & stash for confirmation —————————
-        if fixed_calls:
-            print("\n--- Stage 8: Tool Chaining ---")
-            tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                state['plan_ctx'], plan_str, state['tools_list']
-            )
-            print("Chained raw_calls:", raw_calls)
-            print("Chained schemas IDs:", [s.context_id for s in schemas])
-
-            ask_confirm = (
-                "You are an assistant. Here is the plan I intend to run:\n"
-                f"{plan_str}\n\n"
-                "Ask the user if they think the plan is ready to go, and explain the plan briefly so they understand the steps that will take place. Very brief and concise! Make sure you correctly label the tools and their order by exact name in the plan."
-            )
-            print("AskConfirm prompt >>>\n", ask_confirm)
-            question = self._stream_and_capture(
-                self.primary_model,
-                [{"role": "system", "content": ask_confirm}],
-                tag="[AskConfirm]"
-            ).strip()
-            print("Confirmation question:", question)
-            self.tts.enqueue(question)
-
-            self._awaiting_confirmation   = True
-            self._pending_state            = state
-            self._pending_plan             = plan_str
-            self._pending_fixed_calls      = fixed_calls
-            self._pending_tool_chain       = (tc_ctx, raw_calls, schemas)
-            return question
-
-        # ——— Stage 8–9–9b & straight-through execution ——————————————
-        print("\n--- No tools to confirm: straight-through execution ---")
-        print("Re-entering Stage 8:")
-        tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-            state['plan_ctx'], plan_str, state['tools_list']
-        )
-        print("RAW CALLS:", raw_calls)
-        print("TC CONTEXT:", tc_ctx.context_id)
-        print("SCHEMAS:", [s.context_id for s in schemas])
-
-        print("\n--- Stage 9: Invoke Tools with Retries ---")
-        tool_ctxs = self._stage9_invoke_with_retries(
-            raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
-        )
-        print("tool_ctxs IDs:", [t.context_id for t in tool_ctxs])
-
-        print("\n--- Stage 9b: Reflection & Replan ---")
-        replan = self._stage9b_reflection_and_replan(
-            tool_ctxs, plan_str, user_text, state['clar_ctx'].metadata
-        )
-        print("Reflection result:", repr(replan))
-
-        if replan and replan.strip().startswith("{"):
-            print("↻  Replan detected, repeating Stages 8 & 9")
+        # 2) Orchestrate
+        while queue:
+            stage = queue.popleft()
             try:
-                plan_obj   = json.loads(replan)
-                fixed_calls= [t["call"] for t in plan_obj.get("tasks",[])]
-                plan_str   = "\n".join(fixed_calls)
-            except json.JSONDecodeError:
-                pass
-            tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                state['plan_ctx'], plan_str, state['tools_list']
-            )
-            print("Re-chained raw_calls:", raw_calls)
-            tool_ctxs = self._stage9_invoke_with_retries(
-                raw_calls, plan_str, schemas, user_text, state['clar_ctx'].metadata
-            )
-            print("Re-invoked tool_ctxs:", [t.context_id for t in tool_ctxs])
+                if stage == "record_input":
+                    state["user_ctx"] = self._stage1_record_input(state["user_text"])
 
-        # ——— Stage 10+: assemble, critique, memory, decay ——————————————
-        state['tc_ctx']    = tc_ctx
-        state['tool_ctxs'] = tool_ctxs
+                elif stage == "load_system_prompts":
+                    state["sys_ctx"] = self._stage2_load_system_prompts()
 
-        print("\n--- Stage 10: Assemble & Infer ---")
-        draft = self._stage10_assemble_and_infer(user_text, state)
-        print("Draft answer:", draft)
+                elif stage == "retrieve_and_merge_context":
+                    recent_segs = self._get_history()
+                    out = self._stage3_retrieve_and_merge_context(
+                        state["user_text"],
+                        state["user_ctx"],
+                        state["sys_ctx"],
+                        extra_ctx=recent_segs,
+                    )
+                    state.update(out)
 
-        print("\n--- Stage 10b: Critique & Safety ---")
-        final = self._stage10b_response_critique_and_safety(draft, user_text, tool_ctxs)
-        print("Final answer:", final)
+                elif stage == "intent_clarification":
+                    state["clar_ctx"] = self._stage4_intent_clarification(
+                        state["user_text"], state
+                    )
+                    # immediately follow with a curiosity probe
+                    queue.appendleft("curiosity_probe")
 
-        print("\n--- Stage 11: Memory Writeback & Decay ---")
-        self._stage11_memory_writeback(final, tool_ctxs)
-        self.memman.decay_and_promote()
+                elif stage == "curiosity_probe":
+                    notes = state["clar_ctx"].metadata.get("notes", "")
+                    # only probe if notes are too brief or ambiguous
+                    if len(notes.strip()) < 20:
+                        for tmpl in self.curiosity_templates:
+                            label = tmpl.semantic_label
+                            if self.curiosity_rl.should_run(label):
+                                # format the question
+                                template = tmpl.metadata.get("policy", tmpl.summary)
+                                question = template.replace(
+                                    "{snippet}",
+                                    notes or state["clar_ctx"].summary
+                                )
+                                # ask LLM to expand the clarifier notes
+                                followup = self._stream_and_capture(
+                                    self.primary_model,
+                                    [{"role":"system","content":question}],
+                                    tag="[Curiosity]"
+                                ).strip()
+                                # append new details back into clarifier
+                                updated = notes + "\n" + followup
+                                state["clar_ctx"].metadata["notes"] = updated
+                                state["clar_ctx"].summary = updated
+                                state["clar_ctx"].touch()
+                                self.repo.save(state["clar_ctx"])
+                                state["curiosity_used"].append(label)
+                                break
+                    # continue without reinserting anything
 
-        self.tts.enqueue(final)
-        return final
+                elif stage == "external_knowledge":
+                    state["know_ctx"] = self._stage5_external_knowledge(state["clar_ctx"])
 
+                elif stage == "prepare_tools":
+                    state["tools_list"] = self._stage6_prepare_tools()
+
+                elif stage == "planning_summary":
+                    ctx, plan_str = self._stage7_planning_summary(
+                        state["clar_ctx"],
+                        state["know_ctx"],
+                        state["tools_list"],
+                        state["user_text"],
+                    )
+                    state["plan_ctx"], state["plan_output"] = ctx, plan_str
+
+                elif stage == "plan_validation":
+                    valid, errors, fixed_calls = self._stage7b_plan_validation(
+                        state["plan_ctx"],
+                        state["plan_output"],
+                        state["tools_list"],
+                    )
+                    if errors:
+                        raise RuntimeError(f"Plan validation failed: {errors}")
+                    state["fixed_calls"] = fixed_calls
+                    # now plan the execution phases
+                    queue.clear()
+                    queue.append("tool_chaining")
+                    queue.append("uncertainty_check")
+                    queue.extend([
+                        "invoke_with_retries",
+                        "reflection_and_replan",
+                        "assemble_and_infer",
+                        "response_critique",
+                        "memory_writeback",
+                    ])
+
+                elif stage == "tool_chaining":
+                    tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                        state["plan_ctx"],
+                        "\n".join(state.get("fixed_calls", [])),
+                        state["tools_list"],
+                    )
+                    state.update(tc_ctx=tc_ctx, raw_calls=raw_calls, schemas=schemas)
+
+                elif stage == "uncertainty_check":
+                    if self._should_ask_confirmation(state):
+                        queue.appendleft("user_confirmation")
+
+                elif stage == "user_confirmation":
+                    calls_str = "\n".join(state.get("fixed_calls", []))
+                    ask = (
+                        "I plan to run these steps:\n"
+                        f"{calls_str}\n\n"
+                        "Does that look good? (yes/no)"
+                    )
+                    question = self._stream_and_capture(
+                        self.primary_model,
+                        [{"role": "system", "content": ask}],
+                        tag="[AskConfirm]",
+                    ).strip()
+                    self.tts.enqueue(question)
+                    # stash for follow-up
+                    self._awaiting_confirmation = True
+                    self._pending_state         = state.copy()
+                    self._pending_queue         = list(queue)
+                    return question
+
+                elif stage == "invoke_with_retries":
+                    state["tool_ctxs"] = self._stage9_invoke_with_retries(
+                        state["raw_calls"],
+                        state["plan_output"],
+                        state["schemas"],
+                        state["user_text"],
+                        state["clar_ctx"].metadata,
+                    )
+
+                elif stage == "reflection_and_replan":
+                    replan = self._stage9b_reflection_and_replan(
+                        state["tool_ctxs"],
+                        state["plan_output"],
+                        state["user_text"],
+                        state["clar_ctx"].metadata,
+                        state["plan_ctx"],
+                    )
+                    if replan:
+                        queue.clear()
+                        queue.extend(["planning_summary", "plan_validation"])
+
+                elif stage == "assemble_and_infer":
+                    state["draft"] = self._stage10_assemble_and_infer(
+                        state["user_text"], state
+                    )
+
+                elif stage == "response_critique":
+                    state["final"] = self._stage10b_response_critique_and_safety(
+                        state["draft"],
+                        state["user_text"],
+                        state.get("tool_ctxs", []),
+                    )
+
+                elif stage == "memory_writeback":
+                    self._stage11_memory_writeback(
+                        state.get("final", ""), state.get("tool_ctxs", [])
+                    )
+                    self.memman.decay_and_promote()
+                    result = state.get("final")
+                    # learn which curiosity probes were helpful
+                    if state["curiosity_used"]:
+                        reward = 1.0 if not state["errors"] else 0.0
+                        self.curiosity_rl.update(state["curiosity_used"], reward)
+
+            except Exception as e:
+                state["errors"].append((stage, str(e)))
+                logger.warning(f"Stage `{stage}` failed: {e}")
+                continue
+
+        return result
 
 
 
@@ -1286,16 +1405,6 @@ class Assembler:
                 "planning_summary:gave_up_replanning", {"final_plan": plan_obj}
             )
 
-        # ── FIXUP PARAMETER NAMES FOR REAL TOOL SIGNATURES ────────────────
-        for task in plan_obj["tasks"]:
-            name = task.get("call")
-            ti   = task.setdefault("tool_input", {})
-            if name == "search_internet" and "query" in ti:
-                ti["topic"] = ti.pop("query")
-            if name == "parse_tool_call" and "tool_call" in ti:
-                ti["text"]  = ti.pop("tool_call")
-        # ───────────────────────────────────────────────────────────────────
-
         # —— build the final call strings —— 
         call_strings: List[str] = []
         for task in plan_obj["tasks"]:
@@ -1343,7 +1452,6 @@ class Assembler:
         })
 
 
-
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -1371,18 +1479,9 @@ class Assembler:
             tasks    = plan_obj.get("tasks", [])
         except Exception:
             # fallback to regex-only if the planner wasn’t JSON
-            calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
-            return calls, [], calls
-
-        # ── FIXUP PARAMETER NAMES FOR REAL TOOL SIGNATURES ────────────────
-        for task in tasks:
-            name = task.get("call")
-            ti   = task.setdefault("tool_input", {})
-            if name == "search_internet" and "query" in ti:
-                ti["topic"] = ti.pop("query")
-            if name == "parse_tool_call" and "tool_call" in ti:
-                ti["text"]  = ti.pop("tool_call")
-        # ───────────────────────────────────────────────────────────────────
+            #calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
+            #return calls, [], calls
+            raise RuntimeError("Planner output was not valid JSON; cannot validate tool_input parameters")
 
         # C) Up to 3 repair passes: fill any missing required params
         for _ in range(3):
@@ -1422,14 +1521,6 @@ class Assembler:
             try:
                 plan_obj = json.loads(repair)
                 tasks    = plan_obj.get("tasks", [])
-                # after repair, re-apply the fixup:
-                for task in tasks:
-                    name = task.get("call")
-                    ti   = task.setdefault("tool_input", {})
-                    if name == "search_internet" and "query" in ti:
-                        ti["topic"] = ti.pop("query")
-                    if name == "parse_tool_call" and "tool_call" in ti:
-                        ti["text"]  = ti.pop("tool_call")
             except:
                 break
 
@@ -1438,10 +1529,7 @@ class Assembler:
         for task in tasks:
             name = task["call"]
             ti   = task.get("tool_input", {}) or {}
-            args = ",".join(
-                f'{k}={json.dumps(v, ensure_ascii=False)}'
-                for k, v in ti.items()
-            )
+            args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k,v in ti.items())
             fixed_calls.append(f"{name}({args})")
 
         # E) Persist the validation step
@@ -1458,8 +1546,7 @@ class Assembler:
 
         return fixed_calls, [], fixed_calls
 
-
-    
+        
     def _stage8_tool_chaining(
         self,
         plan_ctx: ContextObject,
@@ -1471,15 +1558,11 @@ class Assembler:
         # ── A) Extract raw calls from the plan ──────────────────────────────
         text = plan_output
         parsed = Tools.parse_tool_call(text)
-
         print("PARSED TOOL CALL")
         print(parsed)
-        if isinstance(parsed, list):
-            raw = parsed
-        elif parsed:
+        if parsed:
             raw = [parsed]
         else:
-            # fallback to regex
             raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', text)
 
         # ── B) Dedupe & preserve order ─────────────────────────────────────
@@ -1496,9 +1579,10 @@ class Assembler:
         )
         selected_schemas: List[ContextObject] = []
         full_schemas: List[Dict[str,Any]] = []
+        wanted = {call.split("(")[0] for call in calls}
         for sch_obj in all_schemas:
             schema = json.loads(sch_obj.metadata["schema"])
-            if schema["name"] in {call.split("(")[0] for call in calls}:
+            if schema["name"] in wanted:
                 selected_schemas.append(sch_obj)
                 full_schemas.append(schema)
 
@@ -1514,13 +1598,16 @@ class Assembler:
 
         # ── E) Prompt the LLM, passing only these full schemas ─────────────
         system = (
-            "You have the following tools (full JSON schemas shown).  "
-            "Please confirm or adjust your tool calls.  Reply **ONLY** with JSON:\n"
+            "You have these tools (full JSON schemas shown).\n"
+            "I will send you exactly one JSON object with key \"tool_calls\".\n"
+            "YOUR ONLY JOB is to return back that same JSON object (modifying only calls that violate the schema).\n"
+            "Do NOT add, remove, or simulate any outputs or internal state.\n"
+            "Reply with exactly one JSON object and nothing else:\n\n"
             '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}\n\n'
             f"{docs_blob}"
         )
         self._print_stage_context("tool_chaining", {
-            "plan":   [plan_output[:200]],
+            "plan":    [plan_output[:200]],
             "schemas": docs_blob_parts
         })
         msgs = [
@@ -1529,17 +1616,17 @@ class Assembler:
         ]
         out = self._stream_and_capture(self.secondary_model, msgs, tag="[ToolChain]")
 
-        # ── F) Parse the confirmed calls ───────────────────────────────────
+        # ── F) Parse the confirmed calls, fallback if anything goes wrong ──
+        confirmed = calls
         try:
-            parsed2 = json.loads(out.strip())
-            confirmed = parsed2.get("tool_calls", calls)
-        except:
-            parsed2 = Tools.parse_tool_call(out)
-            confirmed = (
-                parsed2 if isinstance(parsed2, list)
-                else [parsed2] if parsed2
-                else calls
-            )
+            # extract the JSON blob
+            blob = re.search(r'\{.*"tool_calls".*\}', out, flags=re.S).group(0)
+            parsed2 = json.loads(blob)
+            if isinstance(parsed2.get("tool_calls"), list):
+                confirmed = parsed2["tool_calls"]
+        except Exception:
+            # model deviated: stick with our original calls
+            confirmed = calls
 
         # ── G) Persist the final chaining stage, including the docs ─────────
         tc_ctx = ContextObject.make_stage(
@@ -1547,7 +1634,7 @@ class Assembler:
             plan_ctx.references + [s.context_id for s in selected_schemas],
             {
                 "tool_calls": confirmed,
-                "tool_docs": docs_blob
+                "tool_docs":  docs_blob
             }
         )
         tc_ctx.stage_id = "tool_chaining"
@@ -1556,6 +1643,7 @@ class Assembler:
         self.repo.save(tc_ctx)
 
         return tc_ctx, confirmed, selected_schemas
+
 
 
     def _stage8_5_user_confirmation(
