@@ -17,6 +17,8 @@ from tts_service import TTSManager
 from audio_service import AudioService
 from context import ContextObject, ContextRepository, MemoryManager, default_clock
 from tools import TOOL_SCHEMAS, Tools
+from datetime import datetime
+from collections import deque
 import inspect
 logger = logging.getLogger("assembler")
 logging.basicConfig(
@@ -309,6 +311,7 @@ class Assembler:
         top_k:            int = 10,
         tts_manager:      TTSManager | None = None,
     ):
+    
         # — load or init config —
         try:
             self.cfg = json.load(open(config_path))
@@ -372,19 +375,26 @@ class Assembler:
 
         # — text-to-speech manager —
         self.tts = tts_manager
+        self._chat_contexts: dict[int, str] = {}
+        # will be set by telegram_input
+        self._telegram_bot = None
 
-        # — RLController for optional stages —
-        self._optional_stages = [
-            "external_knowledge",
-            "uncertainty_check",
-            "user_confirmation",
-            "reflection_and_replan",
+        # — auto-discover any _stage_<name>() methods as “optional” —
+        all_methods = {name for name, _ in inspect.getmembers(self, inspect.ismethod)}
+        discovered = [
+            s for s in self.STAGES + ["curiosity_probe"]
+            if f"_stage_{s}" in all_methods
         ]
+
+        # allow config override, else use discovered
+        self._optional_stages = self.cfg.get("rl_optional", discovered)
+
         self.rl = RLController(
             stages=self._optional_stages,
             alpha=self.cfg.get("rl_alpha", 0.05),
             path=self.cfg.get("rl_weights_path", "weights.rl")
         )
+
 
         # — seed & load “curiosity” templates from the repo —
         self.curiosity_templates = self.repo.query(
@@ -407,6 +417,26 @@ class Assembler:
                 )
                 tmpl.touch(); self.repo.save(tmpl)
                 self.curiosity_templates.append(tmpl)
+
+        for name, fn in inspect.getmembers(self, inspect.ismethod):
+            if name.startswith("_stage_"):
+                doc = fn.__doc__ or ""
+                for hint in re.findall(r"requires\s+(\w+)", doc, flags=re.I):
+                    label = f"curiosity_require_{hint.lower()}"
+                    # only create each probe once
+                    if not any(t.semantic_label == label for t in self.curiosity_templates):
+                        text = (
+                            f"It looks like stage `{name}` requires `{hint}`—"
+                            " could you clarify?"
+                        )
+                        tmpl = ContextObject.make_policy(
+                            label=label,
+                            policy_text=text,
+                            tags=["dynamic_prompt","curiosity_template"]
+                        )
+                        tmpl.touch()
+                        self.repo.save(tmpl)
+                        self.curiosity_templates.append(tmpl)
 
         # — RLController for curiosity‐template selection —
         self.curiosity_rl = RLController(
@@ -446,6 +476,28 @@ class Assembler:
         self._seed_static_prompts()
         self.tts = tts_manager
             
+
+    def dump_architecture(self):
+            import inspect, json
+
+            arch = {
+                "stages":               self.STAGES,
+                "optional_stages":      self._optional_stages,
+                "curiosity_templates":  [t.semantic_label for t in self.curiosity_templates],
+                "rl_weights":           self.rl.weights,
+                "curiosity_weights":    self.curiosity_rl.weights,
+                "stage_methods":        {}
+            }
+            for s in self.STAGES + ["curiosity_probe"]:
+                fn = getattr(self, f"_stage_{s}", None)
+                if fn:
+                    arch["stage_methods"][s] = {
+                        "signature": str(inspect.signature(fn)),
+                        "doc":       fn.__doc__,
+                    }
+
+            print(json.dumps(arch, indent=2))
+    
     def _stage_curiosity_probe(self, state: Dict[str,Any]) -> List[str]:
         probes = []
         clar = state["clar_ctx"]
@@ -864,17 +916,58 @@ class Assembler:
             # for simplicity, force replanning
             return self.run_with_meta_context(st["user_text"])
         
-        
-    def run_with_meta_context(self, user_text: str) -> str:
-        import json, re
-        from collections import deque
 
-        # 0) If we're in the middle of a yes/no confirmation, handle that first
+    # ────────────────────────────────────────────────────────────────────
+    # NEW: Called from telegram_input to register incoming chats
+    def register_chat(self, chat_id: int, user_text: str):
+        """Remember which Telegram chat issued this request."""
+        self._chat_contexts[chat_id] = user_text
+
+    # ────────────────────────────────────────────────────────────────────
+    # NEW: Proactive “appiphany” ping
+    def _maybe_appiphany(self, chat_id: int):
+        """
+        If our pipeline thinks there’s a high-value insight to share,
+        ping the user in text + voice.
+        """
+        # Example condition: no errors this turn + at least one curiosity probe
+        if not getattr(self, "_last_errors", False) and getattr(self, "curiosity_used", []):
+            text = "💡 I just made an insight that might help you!"
+            # send text
+            self._telegram_bot.send_message(chat_id=chat_id, text=text)
+            # enqueue voice
+            self.tts.enqueue(text)
+            try:
+                ogg = self.tts.wait_for_latest_ogg(timeout=1.0)
+                with open(ogg, "rb") as vf:
+                    self._telegram_bot.send_voice(chat_id=chat_id, voice=vf)
+            except Exception:
+                pass
+
+
+    def run_with_meta_context(
+        self,
+        user_text: str,
+        status_cb: Callable[[str, Any], None] = lambda *a: None,
+        chat_id:  Optional[int]               = None,
+        msg_id:   Optional[int]               = None,
+    ) -> str:
+        """
+        Orchestrate all stages.  If provided, each stage will call:
+            status_cb(stage_name, summary)
+        so you can edit a single “Processing…” Telegram message in place.
+        Returns the full assistant reply.
+        """
+        import json, re, queue, textwrap
+        from collections import deque
+        from datetime import datetime
+
+        # 0) Resume pending yes/no
         if getattr(self, "_awaiting_confirmation", False):
             return self._handle_confirmation(user_text)
 
-        # 1) Build initial stage‐queue
-        queue = deque([
+        # 1) Base pipeline
+        queue_stages = deque([
             "record_input",
             "load_system_prompts",
             "retrieve_and_merge_context",
@@ -884,98 +977,139 @@ class Assembler:
             "planning_summary",
             "plan_validation",
         ])
+
+        # 1-b) RL-driven optional stages
+        for opt in self._optional_stages:
+            if self.rl.should_run(opt) and hasattr(self, f"_stage_{opt}"):
+                queue_stages.append(opt)
+
+        # 2) State bag
         state: Dict[str, Any] = {
-            "user_text":     user_text,
-            "errors":        [],      # collect (stage, error) tuples
-            "curiosity_used": []      # track which probes fired
+            "user_text":      user_text,
+            "errors":         [],
+            "curiosity_used": []
         }
         result: Optional[str] = None
+        self._last_errors = False
 
-        # 2) Orchestrate
-        while queue:
-            stage = queue.popleft()
+        # 3) Remember chat for appiphany
+        if chat_id is not None:
+            self._chat_contexts.add(chat_id)
+
+        # 4) Main loop
+        while queue_stages:
+            stage   = queue_stages.popleft()
+            start_t = datetime.utcnow()
+            ran_ok  = False
+            summary = ""
+
+            # 4a) “starting” ping
             try:
+                status_cb(stage, "…")
+            except:
+                pass
+
+            try:
+                # ───────────────────────────────────────────────────────────
+                #   Core logic unchanged, but capture each stage’s output->summary
+                # ───────────────────────────────────────────────────────────
                 if stage == "record_input":
-                    state["user_ctx"] = self._stage1_record_input(state["user_text"])
+                    ctx = self._stage1_record_input(state["user_text"])
+                    state["user_ctx"] = ctx
+                    summary = ctx.summary
 
                 elif stage == "load_system_prompts":
-                    state["sys_ctx"] = self._stage2_load_system_prompts()
+                    ctx = self._stage2_load_system_prompts()
+                    state["sys_ctx"] = ctx
+                    summary = "(loaded prompts)"
 
                 elif stage == "retrieve_and_merge_context":
-                    recent_segs = self._get_history()
-                    out = self._stage3_retrieve_and_merge_context(
-                        state["user_text"],
-                        state["user_ctx"],
-                        state["sys_ctx"],
-                        extra_ctx=recent_segs,
+                    recent = self._get_history()
+                    out    = self._stage3_retrieve_and_merge_context(
+                        state["user_text"], state["user_ctx"], state["sys_ctx"],
+                        extra_ctx=recent
                     )
                     state.update(out)
+                    # pick whichever summary is most relevant
+                    summary = out.get("know_ctx", state["sys_ctx"]).summary
 
                 elif stage == "intent_clarification":
-                    state["clar_ctx"] = self._stage4_intent_clarification(
-                        state["user_text"], state
-                    )
-                    # immediately follow with a curiosity probe
-                    queue.appendleft("curiosity_probe")
+                    ctx = self._stage4_intent_clarification(state["user_text"], state)
+                    state["clar_ctx"] = ctx
+                    summary = ctx.summary
+                    # trigger curiosity if needed
+                    queue_stages.appendleft("curiosity_probe")
 
                 elif stage == "curiosity_probe":
                     notes = state["clar_ctx"].metadata.get("notes", "")
-                    # only probe if notes are too brief or ambiguous
+                    summary = notes[:60] + ("…" if len(notes) > 60 else "")
                     if len(notes.strip()) < 20:
                         for tmpl in self.curiosity_templates:
                             label = tmpl.semantic_label
                             if self.curiosity_rl.should_run(label):
-                                # format the question
-                                template = tmpl.metadata.get("policy", tmpl.summary)
-                                question = template.replace(
-                                    "{snippet}",
-                                    notes or state["clar_ctx"].summary
+                                policy   = tmpl.metadata.get("policy", tmpl.summary)
+                                q        = policy.format(
+                                    snippet=notes or state["clar_ctx"].summary
                                 )
-                                # ask LLM to expand the clarifier notes
                                 followup = self._stream_and_capture(
                                     self.primary_model,
-                                    [{"role":"system","content":question}],
+                                    [{"role":"system","content":q}],
                                     tag="[Curiosity]"
                                 ).strip()
-                                # append new details back into clarifier
                                 updated = notes + "\n" + followup
-                                state["clar_ctx"].metadata["notes"] = updated
-                                state["clar_ctx"].summary = updated
-                                state["clar_ctx"].touch()
-                                self.repo.save(state["clar_ctx"])
+                                c = state["clar_ctx"]
+                                c.metadata["notes"] = updated
+                                c.summary = updated
+                                c.touch(); self.repo.save(c)
                                 state["curiosity_used"].append(label)
+                                summary = "probe→" + followup[:60]
                                 break
-                    # continue without reinserting anything
 
                 elif stage == "external_knowledge":
-                    state["know_ctx"] = self._stage5_external_knowledge(state["clar_ctx"])
+                    ctx = self._stage5_external_knowledge(state["clar_ctx"])
+                    state["know_ctx"] = ctx
+                    summary = "(external retrieved)"
 
                 elif stage == "prepare_tools":
-                    state["tools_list"] = self._stage6_prepare_tools()
+                    lst = self._stage6_prepare_tools()
+                    state["tools_list"] = lst
+                    summary = f"{len(lst)} tools"
 
                 elif stage == "planning_summary":
                     ctx, plan_str = self._stage7_planning_summary(
-                        state["clar_ctx"],
-                        state["know_ctx"],
-                        state["tools_list"],
-                        state["user_text"],
+                        state["clar_ctx"], state["know_ctx"],
+                        state["tools_list"], state["user_text"]
                     )
                     state["plan_ctx"], state["plan_output"] = ctx, plan_str
+                    summary = plan_str.strip().replace("\n"," ")[:60] + "…"
+
+                    # ── fractal expansion: if subtasks exist, invoke TaskExecutor
+                    try:
+                        tree = json.loads(plan_str)
+                        if any(t.get("subtasks") for t in tree.get("tasks", [])):
+                            roots = self._parse_task_tree(tree)
+                            executor = TaskExecutor(
+                                self, user_text, state["clar_ctx"].metadata
+                            )
+                            for node in roots:
+                                executor.execute(node)
+                    except:
+                        pass
 
                 elif stage == "plan_validation":
-                    valid, errors, fixed_calls = self._stage7b_plan_validation(
-                        state["plan_ctx"],
-                        state["plan_output"],
-                        state["tools_list"],
+                    valid, errors, fixed = self._stage7b_plan_validation(
+                        state["plan_ctx"], state["plan_output"], state["tools_list"]
                     )
                     if errors:
-                        raise RuntimeError(f"Plan validation failed: {errors}")
-                    state["fixed_calls"] = fixed_calls
-                    # now plan the execution phases
-                    queue.clear()
-                    queue.append("tool_chaining")
-                    queue.append("uncertainty_check")
-                    queue.extend([
+                        raise RuntimeError(f"Plan validation errors: {errors}")
+                    state["fixed_calls"] = fixed
+                    summary = f"{len(fixed)} calls"
+
+                    # switch to execution phases
+                    queue_stages.clear()
+                    queue_stages.extend([
+                        "tool_chaining",
+                        "uncertainty_check",
                         "invoke_with_retries",
                         "reflection_and_replan",
                         "assemble_and_infer",
@@ -984,86 +1118,157 @@ class Assembler:
                     ])
 
                 elif stage == "tool_chaining":
-                    tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
+                    tc, raw, schemas = self._stage8_tool_chaining(
                         state["plan_ctx"],
-                        "\n".join(state.get("fixed_calls", [])),
+                        "\n".join(state["fixed_calls"]),
                         state["tools_list"],
                     )
-                    state.update(tc_ctx=tc_ctx, raw_calls=raw_calls, schemas=schemas)
+                    state.update(tc_ctx=tc, raw_calls=raw, schemas=schemas)
+                    summary = "chained"
 
                 elif stage == "uncertainty_check":
-                    if self._should_ask_confirmation(state):
-                        queue.appendleft("user_confirmation")
+                    needed = self._should_ask_confirmation(state)
+                    summary = f"needs_confirm={needed}"
+                    if needed:
+                        queue_stages.appendleft("user_confirmation")
 
                 elif stage == "user_confirmation":
-                    calls_str = "\n".join(state.get("fixed_calls", []))
+                    calls_str = "\n".join(state["fixed_calls"])
                     ask = (
                         "I plan to run these steps:\n"
-                        f"{calls_str}\n\n"
-                        "Does that look good? (yes/no)"
+                        f"{calls_str}\n\nDoes that look good? (yes/no)"
                     )
                     question = self._stream_and_capture(
                         self.primary_model,
-                        [{"role": "system", "content": ask}],
-                        tag="[AskConfirm]",
+                        [{"role":"system","content":ask}],
+                        tag="[AskConfirm]"
                     ).strip()
-                    self.tts.enqueue(question)
+                    #self.tts.enqueue(question)
                     # stash for follow-up
                     self._awaiting_confirmation = True
                     self._pending_state         = state.copy()
-                    self._pending_queue         = list(queue)
+                    self._pending_queue         = list(queue_stages)
                     return question
 
                 elif stage == "invoke_with_retries":
-                    state["tool_ctxs"] = self._stage9_invoke_with_retries(
-                        state["raw_calls"],
-                        state["plan_output"],
-                        state["schemas"],
-                        state["user_text"],
+                    tctxs = self._stage9_invoke_with_retries(
+                        state["raw_calls"], state["plan_output"],
+                        state["schemas"], state["user_text"],
                         state["clar_ctx"].metadata,
                     )
+                    state["tool_ctxs"] = tctxs
+                    summary = f"{len(tctxs)} runs"
 
                 elif stage == "reflection_and_replan":
                     replan = self._stage9b_reflection_and_replan(
-                        state["tool_ctxs"],
-                        state["plan_output"],
-                        state["user_text"],
-                        state["clar_ctx"].metadata,
-                        state["plan_ctx"],
+                        state["tool_ctxs"], state["plan_output"],
+                        state["user_text"], state["clar_ctx"].metadata,
+                        state["plan_ctx"]
                     )
+                    summary = f"replan={bool(replan)}"
                     if replan:
-                        queue.clear()
-                        queue.extend(["planning_summary", "plan_validation"])
+                        queue_stages.clear()
+                        queue_stages.extend([
+                            "planning_summary",
+                            "plan_validation",
+                        ])
 
                 elif stage == "assemble_and_infer":
-                    state["draft"] = self._stage10_assemble_and_infer(
+                    d = self._stage10_assemble_and_infer(
                         state["user_text"], state
                     )
+                    state["draft"] = d
+                    summary = d.strip().replace("\n"," ")[:60] + "…"
 
                 elif stage == "response_critique":
-                    state["final"] = self._stage10b_response_critique_and_safety(
-                        state["draft"],
-                        state["user_text"],
-                        state.get("tool_ctxs", []),
+                    f = self._stage10b_response_critique_and_safety(
+                        state["draft"], state["user_text"],
+                        state.get("tool_ctxs", [])
                     )
+                    state["final"] = f
+                    summary = f.strip().replace("\n"," ")[:60] + "…"
 
                 elif stage == "memory_writeback":
-                    self._stage11_memory_writeback(
-                        state.get("final", ""), state.get("tool_ctxs", [])
-                    )
+                    # — write back to memory store
+                    final = state.get("final","") or ""
+                    self._stage11_memory_writeback(final, state.get("tool_ctxs", []))
                     self.memman.decay_and_promote()
-                    result = state.get("final")
-                    # learn which curiosity probes were helpful
-                    if state["curiosity_used"]:
-                        reward = 1.0 if not state["errors"] else 0.0
-                        self.curiosity_rl.update(state["curiosity_used"], reward)
+
+                    # — split into Telegram-safe chunks & emit via status_cb
+                    chunks = textwrap.wrap(final, width=3800, replace_whitespace=False)
+                    for idx, chunk in enumerate(chunks, 1):
+                        status_cb(f"output_{idx}/{len(chunks)}", chunk)
+
+                    result = final
+                    ran_ok  = True
+                    summary = f"{len(chunks)} chunk(s)"
+
+                    # — curiosity RL reward
+                    used = state.get("curiosity_used", [])
+                    if used:
+                        success = not bool(state["errors"])
+                        base    = 1.0 if success else -1.0
+                        lines   = len(
+                            state["clar_ctx"].metadata.get("notes","").splitlines()
+                        )
+                        bonus   = 0.05 * max(0, lines - 1)
+                        self.curiosity_rl.update(used, base + bonus)
+
+                else:
+                    # any ad-hoc _stage_<name>
+                    fn = getattr(self, f"_stage_{stage}", None)
+                    if callable(fn):
+                        out     = fn(state)
+                        summary = str(out).replace("\n"," ")[:60] + "…"
+                    ran_ok = True
+
+                # non‐writeback stages always mark OK
+                if stage != "memory_writeback":
+                    ran_ok = True
 
             except Exception as e:
                 state["errors"].append((stage, str(e)))
+                summary = f"error:{str(e)[:40]}"
                 logger.warning(f"Stage `{stage}` failed: {e}")
-                continue
 
-        return result
+            finally:
+                # 4b) log performance
+                duration = (datetime.utcnow() - start_t).total_seconds()
+                perf = ContextObject.make_stage(
+                    "stage_performance",
+                    input_refs=[state["user_ctx"].context_id],
+                    output={
+                        "stage":   stage,
+                        "duration": duration,
+                        "error":   not ran_ok
+                    }
+                )
+                perf.touch()
+                self.repo.save(perf)
+                self.memman.reinforce(perf.context_id, state.get("recent_ids", []))
+
+                # 4c) notify done/error
+                try:
+                    status_cb(stage, summary)
+                except:
+                    pass
+
+                # 4d) update error flag
+                self._last_errors |= (not ran_ok) or bool(state["errors"])
+
+        # 5) fallback if somehow memory_writeback never fired
+        if result is None and "final" in state:
+            result = state["final"] or ""
+
+        # 6) spontaneous appiphany ping
+        for cid in list(self._chat_contexts):
+            try:
+                self._maybe_appiphany(cid)
+            except:
+                pass
+
+        # 7) return final text
+        return result or "(no response)"
 
 
 
