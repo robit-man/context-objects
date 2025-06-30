@@ -415,7 +415,7 @@ class Assembler:
 
         # — text-to-speech manager —
         self.tts = tts_manager
-        self._chat_contexts: dict[int, str] = {}
+        self._chat_contexts: set[int] = set()
         # will be set by telegram_input
         self._telegram_bot = None
 

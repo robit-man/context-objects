@@ -15,6 +15,10 @@ from __future__ import annotations
 import shlex, asyncio, os, queue, tempfile, subprocess, uuid
 from typing import Any, Callable, List
 
+# ── build or reuse an isolated Assembler for this chat ──────────
+from assembler     import Assembler       # local import avoids cycles
+from tts_service   import TTSManager
+
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -25,6 +29,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+assemblers: dict[int, "Assembler"] = {}      # chat_id ➜ private Assembler
 
 # ────────────────────────────────────────────────────────────────────────
 # Helper: split & SEND long text – must be *async* and awaited
@@ -178,7 +183,29 @@ def telegram_input(asm):
         if not user_text:
             return
 
-        asm._chat_contexts.add(chat_id)  # for _maybe_appiphany()
+
+        chat_asm = assemblers.get(chat_id)
+        if chat_asm is None:
+            # ► fresh TTS manager (file-mode only)
+            tts_mgr = TTSManager(
+                logger        = asm.tts.log,      # reuse global logger
+                cfg           = asm.cfg,
+                audio_service = None
+            )
+            tts_mgr.set_mode("file")
+
+            # ► dedicated context file per chat
+            chat_asm = Assembler(
+                context_path     = f"context_{chat_id}.jsonl",
+                config_path      = "config.json",
+                lookback_minutes = 60,
+                top_k            = 5,
+                tts_manager      = tts_mgr,
+            )
+            assemblers[chat_id] = chat_asm
+
+        # track chat for proactive pings
+        chat_asm._chat_contexts.add(chat_id)
 
         # Cancel any previous unfinished task in this chat
         prev = running.get(chat_id)
@@ -198,7 +225,7 @@ def telegram_input(asm):
         async def runner() -> None:
             try:
                 # Clear any stale TTS queues
-                for q in (asm.tts._file_q, asm.tts._ogg_q):
+                for q in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
                     while True:
                         try:
                             q.get_nowait()
@@ -206,11 +233,11 @@ def telegram_input(asm):
                             break
 
                 # TTS in file mode so we get .ogg back
-                asm.tts.set_mode("file")
+                chat_asm.tts.set_mode("file")
 
                 # Run the assembler (thread pool) with live status updates
                 final = await asyncio.to_thread(
-                    asm.run_with_meta_context,
+                    chat_asm.run_with_meta_context,
                     user_text,
                     status_cb,
                     chat_id,
@@ -238,16 +265,16 @@ def telegram_input(asm):
                     )
 
                 # ── ONE voice reply (.ogg) ────────────────────────────
-                asm.tts.enqueue(final or "")
+                chat_asm.tts.enqueue(final or "")
 
                 # wait for every chunk to finish rendering
-                await asyncio.to_thread(asm.tts._file_q.join)
+                await asyncio.to_thread(chat_asm.tts._file_q.join)
 
                 # drain finished .ogg paths
                 ogg_paths: List[str] = []
                 while True:
                     try:
-                        p = asm.tts._ogg_q.get_nowait()
+                        p = chat_asm.tts._ogg_q.get_nowait()
                         if os.path.getsize(p) > 0:
                             ogg_paths.append(p)
                     except queue.Empty:
