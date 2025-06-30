@@ -507,10 +507,6 @@ class Tools:
 
         return json.dumps({"results": results}, indent=2)
 
-    @staticmethod
-    def skip_tools():
-        """For simple replies, just skip tools altogether! Please bias towards this for basic greetings or ongoing conversation where no action beyond contextual replies is needed!"""
-        return
 
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
     @staticmethod
@@ -2618,6 +2614,9 @@ class Tools:
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
     @staticmethod
     def get_current_time():
+        """
+        Return the current time and date in a human readable format.
+        """
         from datetime import datetime
         # Grab current local time
         now = datetime.now()
@@ -3040,6 +3039,9 @@ class Tools:
     # This static method retrieves the current location based on the public IP address of the machine. It uses the ip-api.com service to get location data, logs the action, and returns the JSON response. If an error occurs during the request, it logs the error and returns an error message.
     @staticmethod
     def get_current_location():
+        """
+        Resolve the users current location from a json object that also gets IP address and internet provider.
+        """
         try:
             import requests
             log_message("Retrieving current location based on IP.", "PROCESS")
@@ -3175,4 +3177,9 @@ class Tools:
         return TOOL_SCHEMAS[tool_name]
     
 
+    @staticmethod
+    def skip_tools():
+        """For simple replies to queries that dont fall under other tools, just skip tools altogether! Be sure to use real tools if the query relates to others, use this as a fallback!"""
+        return
+    
 Tools.generate_all_tool_schemas()
