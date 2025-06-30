@@ -90,7 +90,7 @@ def _make_status_cb(
     chat_id: int,
     msg_id: int,
     *,
-    max_lines: int = 20,
+    max_lines: int = 10,
     min_interval: float = 5,
 ):
     history: List[str] = []
@@ -130,8 +130,8 @@ def _make_status_cb(
         if disabled:
             return
         snippet = str(output).replace("\n", " ")
-        if len(snippet) > 2000:
-            snippet = snippet[:1997] + "…"
+        if len(snippet) > 1000:
+            snippet = snippet[:997] + "…"
         history.append(f"• {stage}: {snippet}")
         _schedule_edit()
 

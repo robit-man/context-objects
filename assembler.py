@@ -1063,10 +1063,10 @@ class Assembler:
             summary = ""
 
             # notify “starting…”
-            try:
-                status_cb(stage, "…")
-            except:
-                pass
+            #try:
+            #    status_cb(stage, "…")
+            #except:
+            #    pass
 
             try:
                 if stage == "record_input":
@@ -1098,7 +1098,7 @@ class Assembler:
                     keywords   = ctx.metadata.get("keywords", [])
                     complexity = _compute_query_complexity(state["user_text"], notes, keywords)
                     state["complexity"] = complexity
-                    status_cb("complexity", f"{complexity:.2f}")
+                    #status_cb("complexity", f"{complexity:.2f}")
 
                     # branch by complexity
                     if complexity < 0.3:
