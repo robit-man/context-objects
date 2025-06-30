@@ -18,3 +18,5 @@ curiosity_weights.rl
 weights.rl
 context.db
 context_*
+group_*
+user_*

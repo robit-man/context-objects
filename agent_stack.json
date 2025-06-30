@@ -100,5 +100,9 @@
     "chain_of_thought",
     "notification_audit"
   ],
-  "updated": "2025-06-30T02:32:38.121798"
+  "updated": "2025-06-30T14:11:32.536463",
+  "search_preferences": {
+    "prioritize_term": "king",
+    "weight": "high"
+  }
 }

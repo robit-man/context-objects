@@ -14,6 +14,12 @@ import mss
 import psutil
 import traceback
 
+import requests
+from telegram import Bot
+from telegram.error import TelegramError
+from user_registry import _REG
+from group_registry import _GREG
+
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException, TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.service import Service
@@ -3176,6 +3182,97 @@ class Tools:
             return Tools.generate_tool_schema(tool_name)
         return TOOL_SCHEMAS[tool_name]
     
+    @staticmethod
+    def get_known_users() -> list[dict]:
+        """
+        Returns a list of all users we’ve ever seen, each as {'username': str, 'id': int}.
+        """
+        return _REG.list_all()
+
+    @staticmethod
+    def message_user(username: str, message: str) -> str:
+        """
+        Send a DM to a known user.
+        
+        Parameters:
+        - username: their @username (with or without the leading '@')
+        - message: the text to deliver
+        
+        Returns:
+        - "OK" on success
+        - "ERROR: <reason>" if something goes wrong
+        """
+        uname = username.lstrip("@").lower()
+        user_id = _REG.id_for(uname)
+        if user_id is None:
+            return f"ERROR: user @{uname} not found"
+        token = os.getenv("BOT_TOKEN")
+        if not token:
+            return "ERROR: BOT_TOKEN missing"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": user_id, "text": message}
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                return "OK"
+            else:
+                return f"ERROR: HTTP {resp.status_code} – {resp.text}"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    @staticmethod
+    def get_known_groups() -> list[dict]:
+        """
+        Returns a list of all registered groups.
+        Each entry is:
+          { "name": <group_name>, "chat_id": <id> }
+        """
+        try:
+            from group_registry import _GREG
+            return _GREG.list_all()
+        except Exception as e:
+            log_message(f"get_known_groups error: {e}", "ERROR")
+            return []
+
+    @staticmethod
+    def message_group(group_name: str, message: str) -> dict:
+        """
+        Send a message into a previously-registered group.
+
+        Parameters
+        ----------
+        group_name : str
+            The exact group name as recorded (via title) in group_registry.
+        message : str
+            The text to send into that group.
+
+        Returns
+        -------
+        dict
+            { "group_name": <name>, "chat_id": <id>, "status": "sent" }
+
+        Raises
+        ------
+        ValueError
+            If the group_name is not found in the registry.
+        RuntimeError
+            If BOT_TOKEN is not set.
+        """
+        import os, requests
+        token = os.getenv("BOT_TOKEN")
+        if not token:
+            raise RuntimeError("BOT_TOKEN not set")
+        from group_registry import _GREG
+
+        gid = _GREG.id_for(group_name)
+        if gid is None:
+            raise ValueError(f"Group '{group_name}' not found")
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(url, json={"chat_id": gid, "text": message})
+        resp.raise_for_status()
+
+        return {"group_name": group_name, "chat_id": gid, "status": "sent"}
 
     @staticmethod
     def skip_tools():
