@@ -15,3 +15,4 @@ assembler_backup.py
 tts_ogg
 session.log
 curiosity_weights.rl
+weights.rl

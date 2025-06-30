@@ -26,51 +26,60 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] assembler: %(message)s",
 )
 
-
 class RLController:
     """
-    Very lightweight bandit: each optional stage has a weight;
-    inclusion chance = sigmoid(weight).  After each turn we
-    update weights of the stages *we actually ran* toward the
-    observed reward, and persist to disk.
+    Multi-armed bandit with baseline + recall bias.
+    Q[s]: estimated reward for stage s
+    R_bar: global baseline
+    Each optional stage also has a gamma parameter that
+    amplifies the signal from context-recall frequency.
     """
-    def __init__(self, stages: List[str], alpha: float = 0.05, path: str = "weights.rl"):
-        self.alpha = alpha
+    def __init__(self,
+                 stages: List[str],
+                 alpha: float = 0.1,
+                 beta:  float = 0.01,
+                 gamma: float = 0.1,
+                 path:  str   = "rl.weights"):
+        self.alpha = alpha     # LR for Q
+        self.beta  = beta      # LR for baseline
+        self.gamma = gamma     # weight on recall_feature
         self.path  = path
 
-        # load existing weights if present, else start at 0.0
-        if os.path.exists(self.path):
-            try:
-                data = json.load(open(self.path, "r"))
-            except Exception:
-                data = {}
+        if os.path.exists(path):
+            data = json.load(open(path))
         else:
             data = {}
 
-        # ensure every stage has a weight entry
-        self.weights = {s: float(data.get(s, 0.0)) for s in stages}
-        # in case file had extras, ignore them
+        self.Q     = {s: data.get("Q",{}).get(s, 0.0) for s in stages}
+        self.N     = {s: data.get("N",{}).get(s, 0)   for s in stages}
+        self.R_bar = data.get("R_bar", 0.0)
 
-    def probability(self, stage: str) -> float:
-        w = self.weights.get(stage, 0.0)
-        return 1.0 / (1.0 + math.exp(-w))
+    def probability(self, stage: str, recall_feat: float = 0.0) -> float:
+        # advantage plus recall_bias
+        adv = self.Q[stage] - self.R_bar + self.gamma * recall_feat
+        return 1.0 / (1.0 + math.exp(-adv))
 
-    def should_run(self, stage: str) -> bool:
-        return random.random() < self.probability(stage)
+    def should_run(self, stage: str, recall_feat: float = 0.0) -> bool:
+        return random.random() < self.probability(stage, recall_feat)
 
     def update(self, included: List[str], reward: float):
-        # nudge each included stage’s weight toward the observed reward
+        # update baseline
+        self.R_bar += self.beta * (reward - self.R_bar)
+        # update each included stage
         for s in included:
-            if s in self.weights:
-                # simple gradient towards reward
-                self.weights[s] += self.alpha * (reward - self.weights[s])
+            self.N[s] += 1
+            lr = self.alpha / math.sqrt(self.N[s])
+            self.Q[s] += lr * (reward - self.Q[s])
         self.save()
 
     def save(self):
-        """Persist current weights to disk."""
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(self.weights, f, indent=2)
+            json.dump({
+                "Q":     self.Q,
+                "N":     self.N,
+                "R_bar": self.R_bar
+            }, f, indent=2)
         os.replace(tmp, self.path)
 
 @dataclass
@@ -944,7 +953,6 @@ class Assembler:
             except Exception:
                 pass
             
-
     def run_with_meta_context(
         self,
         user_text: str,
@@ -957,6 +965,10 @@ class Assembler:
         so you can stream updates to Telegram.  Returns the full assistant reply.
         """
 
+        import json, textwrap
+        from collections import deque
+        from datetime import datetime
+
         # — Helper: your provided complexity metric —
         def _compute_query_complexity(user_text: str, clar_notes: str, keywords: list[str]) -> float:
             wc         = min(len(user_text.split()), 50) / 50.0
@@ -966,7 +978,6 @@ class Assembler:
             punc_density = punc_count / max(1, len(user_text))
             punc_bonus   = min(punc_density * 5.0, 1.0)
             return 0.4 * wc + 0.2 * note_bonus + 0.2 * kw_bonus + 0.2 * punc_bonus
-
 
         # 1) Base pipeline
         queue_stages = deque([
@@ -979,19 +990,35 @@ class Assembler:
             "planning_summary",
             "plan_validation",
         ])
-        # 1-b) RL-driven optional stages
-        for opt in self._optional_stages:
-            if self.rl.should_run(opt) and hasattr(self, f"_stage_{opt}"):
-                queue_stages.append(opt)
 
-        # 2) State bag
+        # 2) State bag (including RL tracking)
         state = {
             "user_text":      user_text,
             "errors":         [],
-            "curiosity_used": []
+            "curiosity_used": [],
+            "rl_included":    [],   # which optional stages we actually ran
         }
         result = None
         self._last_errors = False
+
+        # 1-b) RL-driven optional stages, with recall-stat bias
+        for opt in self._optional_stages:
+            if not hasattr(self, f"_stage_{opt}"):
+                continue
+            # compute a simple recall feature: average recall count of last contexts
+            recall_ids = state.get("recent_ids", [])
+            counts = []
+            for cid in recall_ids:
+                try:
+                    ctx = self.repo.get(cid)
+                    counts.append(ctx.metadata.get("recall_stats", {}).get("count", 0))
+                except KeyError:
+                    continue
+            recall_feat = sum(counts) / len(counts) if counts else 0.0
+
+            if self.rl.should_run(opt, recall_feat):
+                queue_stages.append(opt)
+                state["rl_included"].append(opt)
 
         # 3) Track chat for appiphany
         if chat_id is not None:
@@ -1004,7 +1031,7 @@ class Assembler:
             ran_ok  = False
             summary = ""
 
-            # 4a) “starting” ping
+            # notify “starting…”
             try:
                 status_cb(stage, "…")
             except:
@@ -1031,20 +1058,18 @@ class Assembler:
                     summary = out.get("know_ctx", state["sys_ctx"]).summary
 
                 elif stage == "intent_clarification":
-                    # — first, do clarifier as before —
                     ctx = self._stage4_intent_clarification(state["user_text"], state)
                     state["clar_ctx"] = ctx
                     summary = ctx.summary
 
-                    # — now COMPUTE complexity & emit it —
+                    # compute & emit complexity
                     notes      = ctx.metadata.get("notes", "")
                     keywords   = ctx.metadata.get("keywords", [])
                     complexity = _compute_query_complexity(state["user_text"], notes, keywords)
                     state["complexity"] = complexity
                     status_cb("complexity", f"{complexity:.2f}")
 
-                    # — based on threshold, enqueue either minimal or full follow-up —
-                    #    (tune 0.3 to taste)
+                    # branch by complexity
                     if complexity < 0.3:
                         queue_stages.extend([
                             "assemble_and_infer",
@@ -1064,7 +1089,6 @@ class Assembler:
                             "memory_writeback",
                         ])
 
-
                 elif stage == "curiosity_probe":
                     notes = state["clar_ctx"].metadata.get("notes", "")
                     summary = notes[:60] + ("…" if len(notes) > 60 else "")
@@ -1078,8 +1102,8 @@ class Assembler:
                                     [{"role":"system","content":q}],
                                     tag="[Curiosity]"
                                 ).strip()
-                                updated = notes + "\n" + followup
-                                c = state["clar_ctx"]
+                                updated  = notes + "\n" + followup
+                                c        = state["clar_ctx"]
                                 c.metadata["notes"] = updated
                                 c.summary = updated
                                 c.touch(); self.repo.save(c)
@@ -1107,10 +1131,11 @@ class Assembler:
                     try:
                         tree = json.loads(plan_str)
                         if any(t.get("subtasks") for t in tree.get("tasks", [])):
-                            roots = self._parse_task_tree(tree)
+                            roots    = self._parse_task_tree(tree)
                             executor = TaskExecutor(
-                                self, user_text, state["clar_ctx"].metadata
-                            )
+                                        self, user_text,
+                                        state["clar_ctx"].metadata
+                                    )
                             for node in roots:
                                 executor.execute(node)
                     except:
@@ -1168,16 +1193,16 @@ class Assembler:
 
                 elif stage == "assemble_and_infer":
                     d = self._stage10_assemble_and_infer(
-                        state["user_text"], state
-                    )
+                                state["user_text"], state
+                            )
                     state["draft"] = d
                     summary = d.strip().replace("\n"," ")[:60] + "…"
 
                 elif stage == "response_critique":
                     f = self._stage10b_response_critique_and_safety(
-                        state["draft"], state["user_text"],
-                        state.get("tool_ctxs", [])
-                    )
+                            state["draft"], state["user_text"],
+                            state.get("tool_ctxs", [])
+                        )
                     state["final"] = f
                     summary = f.strip().replace("\n"," ")[:60] + "…"
 
@@ -1192,7 +1217,6 @@ class Assembler:
                     chunks = textwrap.wrap(final, width=3800, replace_whitespace=False)
                     for idx, chunk in enumerate(chunks, 1):
                         status_cb(f"output_{idx}/{len(chunks)}", chunk)
-
                     result = final
                     ran_ok  = True
                     summary = f"{len(chunks)} chunk(s)"
@@ -1213,11 +1237,11 @@ class Assembler:
                 logger.warning(f"Stage `{stage}` failed: {e}")
 
             finally:
-                duration = (datetime.utcnow() - start_t).total_seconds()
+                dur = (datetime.utcnow() - start_t).total_seconds()
                 perf = ContextObject.make_stage(
                     "stage_performance",
                     input_refs=[state["user_ctx"].context_id],
-                    output={"stage":stage,"duration":duration,"error":not ran_ok}
+                    output={"stage": stage, "duration": dur, "error": not ran_ok}
                 )
                 perf.touch(); self.repo.save(perf)
                 self.memman.reinforce(perf.context_id, state.get("recent_ids", []))
@@ -1227,20 +1251,29 @@ class Assembler:
                     pass
                 self._last_errors |= (not ran_ok) or bool(state["errors"])
 
-        # 5) fallback if writeback never fired
+        # 5) update narrative
+        try:
+            self._stage_generate_narrative(state)
+        except Exception:
+            pass
+
+        # 6) fallback if writeback never fired
         if result is None and "final" in state:
             result = state["final"] or ""
 
-        # 6) spontaneous ping
+        # 6) RL update: reward=1 if no errors, else 0
+        reward = 1.0 if not state["errors"] else 0.0
+        self.rl.update(state["rl_included"], reward)
+
+        # 7) spontaneous ping
         for cid in list(self._chat_contexts):
             try:
                 self._maybe_appiphany(cid)
             except:
                 pass
 
-        # 7) return
+        # 8) return
         return result
-
 
 
 
@@ -2378,7 +2411,50 @@ class Assembler:
             narr.touch()
             self.repo.save(narr)
 
-        
+    def _stage_generate_narrative(self, state: Dict[str, Any]) -> ContextObject:
+        """
+        Build a running narrative of this conversation turn by turn,
+        link it to all the context objects we’ve touched so far,
+        and store the narrative’s ContextObject ID for future reference.
+        """
+        from datetime import datetime
+
+        # gather all the IDs of contexts created/used this turn
+        used_ids = []
+        for key in ("user_ctx","sys_ctx","clar_ctx","know_ctx","plan_ctx","tc_ctx"):
+            if key in state:
+                used_ids.append(state[key].context_id)
+        used_ids += [c.context_id for c in state.get("tool_ctxs",[])]
+        used_ids = list(dict.fromkeys(used_ids))  # dedupe
+
+        # assemble human narrative
+        lines = [
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')}:",
+            f"• User asked: {state['user_text']!r}",
+            f"• Clarified into: {state['clar_ctx'].summary!r}",
+        ]
+        if "plan_output" in state:
+            lines.append(f"• Planner proposed: {state['plan_output']}")
+        if "final" in state:
+            lines.append(f"• Assistant replied: {state['final']!r}")
+
+        narrative_text = "\n".join(lines)
+
+        # either create or update the singleton narrative_context
+        nc = self._get_or_make_singleton(
+            label="narrative_context",
+            component="stage",
+            tags=["narrative"]
+        )
+        nc.metadata.setdefault("history_ids", []).extend(used_ids)
+        nc.metadata["history_text"] = (nc.metadata.get("history_text","") + "\n\n" + narrative_text).strip()
+        nc.summary = nc.metadata["history_text"]
+        nc.references = nc.metadata["history_ids"]
+        nc.touch()
+        self.repo.save(nc)
+        return nc
+
+
 if __name__ == "__main__":
     asm = Assembler(
         context_path="context.jsonl",
