@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Union
 import os
 import contextlib
+import sqlite3
+from threading import Lock
 
 if os.name == "nt":                # Windows ─ use msvcrt
     import msvcrt
@@ -441,66 +443,228 @@ class ContextObject:
         obj.metadata["content"] = content
         return obj
 
-
-# ─ Repository / DAO Layer ──────────────────────────────────────────────────────
-class ContextRepository:
-    """
-    JSONL-backed repository for ContextObjects.
-    """
-    _singleton: "ContextRepository" = None          
+class JSONLContextRepository:
+    _singleton = None
 
     def __init__(self, path: str):
+        import threading
+        from context import _locked
+
+        # ensure the directory exists (allow current dir if no dirname)
+        dirpath = os.path.dirname(path) or "."
+        os.makedirs(dirpath, exist_ok=True)
+
         self.path = path
         self._lock = threading.Lock()
+        # create the file if missing
         open(self.path, "a").close()
+        JSONLContextRepository._singleton = self
 
-        ContextRepository._singleton = self
-
-
-    def get(self, context_id: str) -> ContextObject:
+    def get(self, context_id: str):
+        import json
+        from context import ContextObject, _locked
         with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
             for line in f:
-                obj = json.loads(line)
-                if obj["context_id"] == context_id:
-                    return ContextObject.from_dict(obj)
+                data = json.loads(line)
+                if data["context_id"] == context_id:
+                    return ContextObject.from_dict(data)
         raise KeyError(f"Context {context_id} not found")
 
-    def save(self, ctx: ContextObject) -> None:
+    def save(self, ctx):
+        import os
+        from context import _locked
         if not ctx.dirty:
             return
-        with self._lock:                               # intra-process guard
+        with self._lock:
             with open(self.path, "a", encoding="utf-8") as f, _locked(f, exclusive=True):
                 f.write(ctx.to_json() + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+                f.flush(); os.fsync(f.fileno())
             ctx.dirty = False
 
-    def delete(self, context_id: str) -> None:
+    def delete(self, context_id: str):
+        import json
+        from context import _locked
         with self._lock:
             with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
-                objs = [json.loads(l) for l in f if json.loads(l)["context_id"] != context_id]
-                f.seek(0), f.truncate()
-                for o in objs:
-                    f.write(json.dumps(o) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+                entries = [json.loads(l) for l in f if json.loads(l)["context_id"] != context_id]
+                f.seek(0); f.truncate()
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+                f.flush(); os.fsync(f.fileno())
 
-    def query(self, filter_func: Callable[[ContextObject], bool]) -> List[ContextObject]:
-        results: List[ContextObject] = []
+    def query(self, filter_fn):
+        import json
+        from context import ContextObject, _locked
+        results = []
         with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
             for line in f:
                 ctx = ContextObject.from_dict(json.loads(line))
-                if filter_func(ctx):
+                if filter_fn(ctx):
                     results.append(ctx)
         return results
 
-    def exists(self, context_id: str) -> bool:
+    @classmethod
+    def instance(cls):
+        if cls._singleton is None:
+            raise RuntimeError("ContextRepository not initialised")
+        return cls._singleton
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SQLite-backed archive for long-term storage
+# ──────────────────────────────────────────────────────────────────────────────
+class SQLiteContextRepository:
+    def __init__(self, db_path="context.db"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = Lock()
+        self._init_schema()
+
+    def _init_schema(self):
+        c = self.conn.cursor()
+        c.execute("""
+          CREATE TABLE IF NOT EXISTS contexts (
+            context_id     TEXT PRIMARY KEY,
+            timestamp      TEXT,
+            last_accessed  TEXT,
+            json_blob      TEXT
+          )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON contexts(last_accessed)")
+        self.conn.commit()
+
+    def save(self, ctx):
+        blob = ctx.to_json()
+        now  = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        with self._lock:
+            self.conn.execute("""
+              INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
+              VALUES(?,?,?,?)
+              ON CONFLICT(context_id) DO UPDATE SET
+                json_blob     = excluded.json_blob,
+                last_accessed = excluded.last_accessed
+            """, (ctx.context_id, ctx.timestamp, now, blob))
+            self.conn.commit()
+        ctx.dirty = False
+
+    def get(self, cid):
+        cur = self.conn.cursor()
+        cur.execute("SELECT json_blob FROM contexts WHERE context_id=?", (cid,))
+        row = cur.fetchone()
+        if not row:
+            raise KeyError(cid)
+        from context import ContextObject
+        return ContextObject.from_json(row[0])
+
+    def delete(self, cid):
+        with self._lock:
+            self.conn.execute("DELETE FROM contexts WHERE context_id=?", (cid,))
+            self.conn.commit()
+
+    def query(self, filter_fn):
+        from context import ContextObject
+        out = []
+        for (blob,) in self.conn.execute("SELECT json_blob FROM contexts"):
+            obj = ContextObject.from_json(blob)
+            if filter_fn(obj):
+                out.append(obj)
+        return out
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hybrid: keep recent in JSONL, archive older into SQLite
+# ──────────────────────────────────────────────────────────────────────────────
+class HybridContextRepository:
+    _singleton: "HybridContextRepository" = None
+
+    def __init__(
+        self,
+        jsonl_path: str = "context.jsonl",
+        sqlite_path: str = "context.db",
+        archive_max_mb: float = 10.0,   # max JSONL size in megabytes
+    ):
+        self.json_repo = JSONLContextRepository(jsonl_path)
+        self.sql_repo  = SQLiteContextRepository(sqlite_path)
+        self._max_bytes = int(archive_max_mb * 1024 * 1024)
+        HybridContextRepository._singleton = self                 # register singleton
+
+    def save(self, ctx: ContextObject) -> None:
+        # always append the new object
+        self.json_repo.save(ctx)
+        # then prune by size if needed
+        self._archive_by_size()
+
+    def get(self, cid: str) -> ContextObject:
         try:
-            self.get(context_id)
-            return True
+            return self.json_repo.get(cid)
         except KeyError:
-            return False
-        
+            return self.sql_repo.get(cid)
+
+    def delete(self, cid: str) -> None:
+        self.json_repo.delete(cid)
+        try:
+            self.sql_repo.delete(cid)
+        except KeyError:
+            pass
+
+    def query(self, filter_fn):
+        seen = set()
+        out  = []
+        for repo in (self.json_repo, self.sql_repo):
+            for ctx in repo.query(filter_fn):
+                if ctx.context_id not in seen:
+                    seen.add(ctx.context_id)
+                    out.append(ctx)
+        return out
+
+    def _archive_by_size(self):
+        path = self.json_repo.path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size <= self._max_bytes:
+            return
+
+        # read all lines
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # parse lines, skip non-archiveable objects
+        entries = []
+        for idx, line in enumerate(lines):
+            try:
+                obj = ContextObject.from_json(line)
+            except Exception:
+                continue
+            # never archive schema artifacts
+            if obj.domain == "artifact" and obj.component == "schema":
+                continue
+            # track (index, timestamp, object)
+            ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
+            entries.append((idx, ts, obj))
+
+        # sort oldest first
+        entries.sort(key=lambda x: x[1])
+
+        to_remove = set()
+        # remove oldest until under size limit
+        for idx, ts, obj in entries:
+            # archive into SQLite
+            self.sql_repo.save(obj)
+            to_remove.add(idx)
+            # estimate remaining size
+            rem = 0
+            for i, l in enumerate(lines):
+                if i not in to_remove:
+                    rem += len(l.encode("utf-8"))
+            if rem <= self._max_bytes:
+                break
+
+        # rewrite JSONL without archived lines
+        with open(path, "w", encoding="utf-8") as f:
+            for i, l in enumerate(lines):
+                if i not in to_remove:
+                    f.write(l)
+
     @classmethod
     def instance(cls) -> "ContextRepository":
         """
@@ -511,7 +675,10 @@ class ContextRepository:
             raise RuntimeError("ContextRepository has not been initialised yet")
         
         return cls._singleton
+
     
+ContextRepository = HybridContextRepository
+
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
 class MemoryManager:
     """
