@@ -8,6 +8,32 @@ import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Union
+import os
+import contextlib
+
+if os.name == "nt":                # Windows ─ use msvcrt
+    import msvcrt
+
+    @contextlib.contextmanager
+    def _locked(f, exclusive: bool):
+        mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_NBLCK
+        try:
+            msvcrt.locking(f.fileno(), mode, 1)
+            yield f
+        finally:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:                              # POSIX ─ use fcntl
+    import fcntl
+
+    @contextlib.contextmanager
+    def _locked(f, exclusive: bool):
+        lock = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(f.fileno(), lock)
+            yield f
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 # ─ Utility: default clock ────────────────────────────────────────────────────────
 def default_clock() -> datetime:
@@ -432,7 +458,7 @@ class ContextRepository:
 
 
     def get(self, context_id: str) -> ContextObject:
-        with open(self.path, "r") as f:
+        with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
             for line in f:
                 obj = json.loads(line)
                 if obj["context_id"] == context_id:
@@ -440,16 +466,33 @@ class ContextRepository:
         raise KeyError(f"Context {context_id} not found")
 
     def save(self, ctx: ContextObject) -> None:
-        """
-        Append only if this object was modified since the last save.
-        """
         if not ctx.dirty:
             return
-        with self._lock:
-            with open(self.path, "a") as f:
+        with self._lock:                               # intra-process guard
+            with open(self.path, "a", encoding="utf-8") as f, _locked(f, exclusive=True):
                 f.write(ctx.to_json() + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             ctx.dirty = False
 
+    def delete(self, context_id: str) -> None:
+        with self._lock:
+            with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
+                objs = [json.loads(l) for l in f if json.loads(l)["context_id"] != context_id]
+                f.seek(0), f.truncate()
+                for o in objs:
+                    f.write(json.dumps(o) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def query(self, filter_func: Callable[[ContextObject], bool]) -> List[ContextObject]:
+        results: List[ContextObject] = []
+        with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
+            for line in f:
+                ctx = ContextObject.from_dict(json.loads(line))
+                if filter_func(ctx):
+                    results.append(ctx)
+        return results
 
     def exists(self, context_id: str) -> bool:
         try:
@@ -469,28 +512,6 @@ class ContextRepository:
         
         return cls._singleton
     
-    def delete(self, context_id: str) -> None:
-        with self._lock:
-            objs = []
-            with open(self.path, "r") as f:
-                for line in f:
-                    obj = json.loads(line)
-                    if obj["context_id"] != context_id:
-                        objs.append(obj)
-            with open(self.path, "w") as f:
-                for o in objs:
-                    f.write(json.dumps(o) + "\n")
-
-    def query(self, filter_func: Callable[[ContextObject], bool]) -> List[ContextObject]:
-        results: List[ContextObject] = []
-        with open(self.path, "r") as f:
-            for line in f:
-                ctx = ContextObject.from_dict(json.loads(line))
-                if filter_func(ctx):
-                    results.append(ctx)
-        return results
-
-
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
 class MemoryManager:
     """

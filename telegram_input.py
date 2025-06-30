@@ -1,246 +1,293 @@
 # telegram_input.py
+"""
+Telegram I/O wrapper for the Assembler.
 
-import os
-import asyncio
-import queue
-import tempfile
-import subprocess
-import uuid
+Features
+────────
+• Feeds user text into `asm.run_with_meta_context`
+• Live “🛠 Processing…” message that updates once per stage
+• Replaces the placeholder with the full answer (chunked if >4 000 chars)
+• Streams exactly ONE .ogg voice reply
+"""
+
+from __future__ import annotations
+
+import asyncio, os, queue, tempfile, subprocess, uuid
+from typing import Any, Callable, List
+
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
-from typing import Any, Callable
 
-# ──────────────────────────────────────────────────────────────────────
-def _send_long_text(bot, chat_id: int, text: str, chunk_size: int = 3800):
+
+# ────────────────────────────────────────────────────────────────────────
+# Helper: split & SEND long text – must be *async* and awaited
+# ────────────────────────────────────────────────────────────────────────
+async def _send_long_text_async(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    chunk_size: int = 3800,
+) -> None:
     """
-    Break `text` into sensible ≤chunk_size chunks on paragraph/sentence
-    boundaries, and send each chunk sequentially.
+    Break `text` into ≤chunk_size chunks (paragraph/sentence splits),
+    then **await** a `send_message` for each chunk sequentially.
     """
+    if not text.strip():
+        return
+
     import re
-    paras = text.split("\n\n")
-    buffer = ""
-    parts: list[str] = []
+
+    paras: List[str] = text.split("\n\n")
+    buffer, chunks = "", []
 
     for para in paras:
         if len(buffer) + len(para) + 2 <= chunk_size:
             buffer = (buffer + "\n\n" + para).strip()
         else:
             if buffer:
-                parts.append(buffer)
+                chunks.append(buffer)
                 buffer = ""
             if len(para) <= chunk_size:
                 buffer = para
             else:
-                for sent in re.split(r'(?<=[\.\?\!])\s+', para):
+                # paragraph itself is huge – split on sentences
+                for sent in re.split(r"(?<=[\.\?\!])\s+", para):
                     if len(buffer) + len(sent) + 1 <= chunk_size:
                         buffer = (buffer + " " + sent).strip()
                     else:
                         if buffer:
-                            parts.append(buffer)
+                            chunks.append(buffer)
                         buffer = ""
-                        # hard-slice long sentences
+                        # hard-slice any still-oversized sentence
                         for i in range(0, len(sent), chunk_size):
-                            parts.append(sent[i : i + chunk_size])
-                        buffer = ""
+                            chunks.append(sent[i : i + chunk_size])
     if buffer:
-        parts.append(buffer)
+        chunks.append(buffer)
 
-    for part in parts:
-        bot.send_message(chat_id=chat_id, text=part)
+    # one await per chunk
+    for part in chunks:
+        await bot.send_message(chat_id=chat_id, text=part)
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Factory for the per-stage status callback
+# ────────────────────────────────────────────────────────────────────────
 def _make_status_cb(
     loop: asyncio.AbstractEventLoop,
     bot,
     chat_id: int,
     msg_id: int,
-    max_lines: int = 6
+    *,
+    max_lines: int = 6,
 ) -> Callable[[str, Any], None]:
     """
-    Returns status_cb(stage, output) that appends a rolling history and edits
-    the original “Processing…” message in place. Thread-safe for use inside to_thread().
+    Return a thread-safe `status_cb(stage, output)` that updates a rolling
+    history inside the original “🛠 Processing…” message.
     """
-    history: list[str] = []
+    history: List[str] = []
 
-    async def _do_edit(text: str):
+    async def _do_edit(text: str) -> None:
         try:
-            await bot.edit_message_text(chat_id=chat_id,
-                                        message_id=msg_id,
-                                        text=text)
-        except Exception:
-            pass  # ignore races / deleted message
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+            )
+        except Exception:  # message deleted or race condition – ignore
+            pass
 
-    def status_cb(stage: str, output: Any):
+    def status_cb(stage: str, output: Any) -> None:
         snippet = str(output).replace("\n", " ")
         if len(snippet) > 400:
             snippet = snippet[:397] + "…"
         history.append(f"• {stage}: {snippet}")
         text = "🛠️ Processing…\n" + "\n".join(history[-max_lines:])
-        # Schedule on the event loop safely from any thread
+
+        # schedule safely from ANY thread
         asyncio.run_coroutine_threadsafe(_do_edit(text), loop)
 
     return status_cb
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Main entry-point – launch the Telegram event loop
+# ────────────────────────────────────────────────────────────────────────
 def telegram_input(asm):
-    """
-    Telegram bot loop that:
-      • feeds incoming text into asm.run_with_meta_context
-      • live-updates one “Processing…” message per stage
-      • then replaces it with the full answer (chunked if needed)
-      • finally sends exactly one .ogg voice reply
-    """
+    """Start the Telegram bot loop."""
     load_dotenv()
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    if not BOT_TOKEN:
-        raise RuntimeError("Missing BOT_TOKEN in environment")
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Missing BOT_TOKEN env var")
 
-    # Dedicated asyncio loop for Telegram
+    # Create a dedicated asyncio loop for Telegram
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # HTTPXRequest for robust timeouts
+    # HTTPXRequest *without* unsupported pool arguments
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
-    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
+    app = ApplicationBuilder().token(token).request(req).build()
 
-    running_tasks: dict[int, asyncio.Task] = {}
-    asm._chat_contexts = set()  # for any proactive pings
+    # Track one concurrent runner per chat to allow cancellation
+    running: dict[int, asyncio.Task] = {}
+    asm._chat_contexts = set()  # for possible proactive pings
 
-    async def _handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ──────────────── Telegram update handler ──────────────────────────
+    async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
         user_text = (update.message.text or "").strip()
         if not user_text:
             return
 
-        # Track chat for “appiphany” pings
-        asm._chat_contexts.add(chat_id)
+        asm._chat_contexts.add(chat_id)  # for _maybe_appiphany()
 
-        # Cancel any in-flight task for this chat
-        prev = running_tasks.get(chat_id)
+        # Cancel any previous unfinished task in this chat
+        prev = running.get(chat_id)
         if prev and not prev.done():
             prev.cancel()
 
-        # 1) Send initial placeholder
-        sent = await context.bot.send_message(chat_id=chat_id, text="🛠️ Processing…")
-        msg_id = sent.message_id
+        # Send initial placeholder
+        placeholder = await context.bot.send_message(
+            chat_id=chat_id, text="🛠️ Processing…"
+        )
+        msg_id = placeholder.message_id
 
-        # 2) Build our status callback
+        # Build per-stage callback
         status_cb = _make_status_cb(loop, context.bot, chat_id, msg_id)
 
-        async def runner():
+        # ───────────── background pipeline runner ──────────────────────
+        async def runner() -> None:
             try:
-                # ── Flush any leftover TTS buffers
+                # Clear any stale TTS queues
                 for q in (asm.tts._file_q, asm.tts._ogg_q):
-                    try:
-                        while True:
+                    while True:
+                        try:
                             q.get_nowait()
-                    except queue.Empty:
-                        pass
+                        except queue.Empty:
+                            break
 
-                # ── Switch TTS into file output mode
+                # TTS in file mode so we get .ogg back
                 asm.tts.set_mode("file")
 
-                # ── Run the assembler pipeline with live status updates
+                # Run the assembler (thread pool) with live status updates
                 final = await asyncio.to_thread(
                     asm.run_with_meta_context,
                     user_text,
                     status_cb,
                     chat_id,
-                    msg_id
+                    msg_id,
                 )
 
-                # ── Replace the placeholder with the final text
+                # ── Replace the placeholder with the answer ────────────
                 if final and len(final) < 4000:
-                    # Short enough: edit in place
+                    # short enough → single edit
                     await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=final
+                        chat_id=chat_id, message_id=msg_id, text=final
                     )
                 else:
-                    # Too long (or empty): delete placeholder and send in chunks
+                    # delete placeholder then send chunks (async)
                     try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                    except:
+                        await context.bot.delete_message(
+                            chat_id=chat_id, message_id=msg_id
+                        )
+                    except Exception:
                         pass
-                    _send_long_text(context.bot, chat_id, final or "(no response)")
+                    await _send_long_text_async(
+                        context.bot, chat_id, final or "(no response)"
+                    )
 
-                # ── Enqueue final for TTS and send exactly one voice reply
+                # ── ONE voice reply (.ogg) ────────────────────────────
                 asm.tts.enqueue(final or "")
-                ogg_paths: list[str] = []
+                ogg_paths: List[str] = []
                 while True:
                     try:
-                        path = await asyncio.to_thread(asm.tts.wait_for_latest_ogg, 1.0)
+                        path = await asyncio.to_thread(
+                            asm.tts.wait_for_latest_ogg, 1.0
+                        )
                         ogg_paths.append(path)
                     except queue.Empty:
                         break
 
-                if ogg_paths:
-                    if len(ogg_paths) == 1:
-                        with open(ogg_paths[0], "rb") as vf:
-                            await context.bot.send_voice(chat_id=chat_id, voice=vf)
-                    else:
-                        # Concatenate multiple .ogg files into one
-                        combined = os.path.join(tempfile.gettempdir(),
-                                                f"combined_{uuid.uuid4().hex}.ogg")
-                        listfile = tempfile.NamedTemporaryFile("w+", delete=False)
-                        for p in ogg_paths:
-                            listfile.write(f"file '{p}'\n")
-                        listfile.flush()
-                        listfile.close()
+                if not ogg_paths:
+                    return
 
-                        cmd1 = [
-                            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                            "-i", listfile.name, "-c", "copy", combined
-                        ]
+                if len(ogg_paths) == 1:
+                    with open(ogg_paths[0], "rb") as vf:
+                        await context.bot.send_voice(chat_id=chat_id, voice=vf)
+                else:
+                    # Concatenate multiple .ogg files
+                    combined = os.path.join(
+                        tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg"
+                    )
+                    listfile = tempfile.NamedTemporaryFile("w+", delete=False)
+                    for p in ogg_paths:
+                        listfile.write(f"file '{p}'\n")
+                    listfile.flush(), listfile.close()
+
+                    try:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-f",
+                                "concat",
+                                "-safe",
+                                "0",
+                                "-i",
+                                listfile.name,
+                                "-c",
+                                "copy",
+                                combined,
+                            ],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    finally:
                         try:
-                            subprocess.run(cmd1, check=True,
-                                           stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL)
-                        except subprocess.CalledProcessError:
-                            # Fallback: re-encode/join
-                            inputs = sum([["-i", p] for p in ogg_paths], [])
-                            cmd2 = ["ffmpeg", "-y"] + inputs + [
-                                "-filter_complex", f"concat=n={len(ogg_paths)}:v=0:a=1[out]",
-                                "-map", "[out]", combined
-                            ]
-                            subprocess.run(cmd2, check=True,
-                                           stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL)
-                        finally:
-                            try: os.unlink(listfile.name)
-                            except: pass
+                            os.unlink(listfile.name)
+                        except FileNotFoundError:
+                            pass
 
-                        with open(combined, "rb") as vf:
-                            await context.bot.send_voice(chat_id=chat_id, voice=vf)
+                    with open(combined, "rb") as vf:
+                        await context.bot.send_voice(chat_id=chat_id, voice=vf)
 
             except asyncio.CancelledError:
-                # A newer request preempted this one
+                # superseded by a newer request
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=msg_id,
-                        text="⚠️ Previous request cancelled."
+                        text="⚠️ Previous request cancelled.",
                     )
-                except:
+                except Exception:
                     pass
 
             except Exception as e:
-                # Final fallback on error
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+                # Fallback on any unexpected error
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"❌ Error: {e}"
+                )
 
             finally:
-                running_tasks.pop(chat_id, None)
+                running.pop(chat_id, None)
 
-        # Launch background runner
-        running_tasks[chat_id] = loop.create_task(runner())
+        # Kick off the runner
+        running[chat_id] = loop.create_task(runner())
 
-    # Only handle plain-text (ignore commands)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update))
+    # Only plain text updates (ignore /commands)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle)
+    )
 
-    # Start the bot (blocks this thread)
+    # ─── Start the Telegram application (blocking in this thread) ──────
     loop.run_until_complete(app.initialize())
     loop.run_until_complete(app.start())
     loop.run_until_complete(app.updater.start_polling())

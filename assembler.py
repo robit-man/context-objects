@@ -943,7 +943,7 @@ class Assembler:
                     self._telegram_bot.send_voice(chat_id=chat_id, voice=vf)
             except Exception:
                 pass
-
+            
 
     def run_with_meta_context(
         self,
@@ -953,18 +953,20 @@ class Assembler:
         msg_id:   Optional[int]               = None,
     ) -> str:
         """
-        Orchestrate all stages.  If provided, each stage will call:
-            status_cb(stage_name, summary)
-        so you can edit a single “Processing…” Telegram message in place.
-        Returns the full assistant reply.
+        Orchestrate all stages.  Each stage calls status_cb(stage, summary)
+        so you can stream updates to Telegram.  Returns the full assistant reply.
         """
-        import json, re, queue, textwrap
-        from collections import deque
-        from datetime import datetime
 
-        # 0) Resume pending yes/no
-        if getattr(self, "_awaiting_confirmation", False):
-            return self._handle_confirmation(user_text)
+        # — Helper: your provided complexity metric —
+        def _compute_query_complexity(user_text: str, clar_notes: str, keywords: list[str]) -> float:
+            wc         = min(len(user_text.split()), 50) / 50.0
+            note_bonus = min(len(clar_notes) / 200.0, 1.0)
+            kw_bonus   = min(len(keywords)     /   5.0, 1.0)
+            punc_count = sum(user_text.count(c) for c in "?,;!")
+            punc_density = punc_count / max(1, len(user_text))
+            punc_bonus   = min(punc_density * 5.0, 1.0)
+            return 0.4 * wc + 0.2 * note_bonus + 0.2 * kw_bonus + 0.2 * punc_bonus
+
 
         # 1) Base pipeline
         queue_stages = deque([
@@ -977,22 +979,21 @@ class Assembler:
             "planning_summary",
             "plan_validation",
         ])
-
         # 1-b) RL-driven optional stages
         for opt in self._optional_stages:
             if self.rl.should_run(opt) and hasattr(self, f"_stage_{opt}"):
                 queue_stages.append(opt)
 
         # 2) State bag
-        state: Dict[str, Any] = {
+        state = {
             "user_text":      user_text,
             "errors":         [],
             "curiosity_used": []
         }
-        result: Optional[str] = None
+        result = None
         self._last_errors = False
 
-        # 3) Remember chat for appiphany
+        # 3) Track chat for appiphany
         if chat_id is not None:
             self._chat_contexts.add(chat_id)
 
@@ -1010,9 +1011,6 @@ class Assembler:
                 pass
 
             try:
-                # ───────────────────────────────────────────────────────────
-                #   Core logic unchanged, but capture each stage’s output->summary
-                # ───────────────────────────────────────────────────────────
                 if stage == "record_input":
                     ctx = self._stage1_record_input(state["user_text"])
                     state["user_ctx"] = ctx
@@ -1030,27 +1028,51 @@ class Assembler:
                         extra_ctx=recent
                     )
                     state.update(out)
-                    # pick whichever summary is most relevant
                     summary = out.get("know_ctx", state["sys_ctx"]).summary
 
                 elif stage == "intent_clarification":
+                    # — first, do clarifier as before —
                     ctx = self._stage4_intent_clarification(state["user_text"], state)
                     state["clar_ctx"] = ctx
                     summary = ctx.summary
-                    # trigger curiosity if needed
-                    queue_stages.appendleft("curiosity_probe")
+
+                    # — now COMPUTE complexity & emit it —
+                    notes      = ctx.metadata.get("notes", "")
+                    keywords   = ctx.metadata.get("keywords", [])
+                    complexity = _compute_query_complexity(state["user_text"], notes, keywords)
+                    state["complexity"] = complexity
+                    status_cb("complexity", f"{complexity:.2f}")
+
+                    # — based on threshold, enqueue either minimal or full follow-up —
+                    #    (tune 0.3 to taste)
+                    if complexity < 0.3:
+                        queue_stages.extend([
+                            "assemble_and_infer",
+                            "memory_writeback",
+                        ])
+                    else:
+                        queue_stages.extend([
+                            "external_knowledge",
+                            "prepare_tools",
+                            "planning_summary",
+                            "plan_validation",
+                            "tool_chaining",
+                            "invoke_with_retries",
+                            "reflection_and_replan",
+                            "assemble_and_infer",
+                            "response_critique",
+                            "memory_writeback",
+                        ])
+
 
                 elif stage == "curiosity_probe":
                     notes = state["clar_ctx"].metadata.get("notes", "")
                     summary = notes[:60] + ("…" if len(notes) > 60 else "")
                     if len(notes.strip()) < 20:
                         for tmpl in self.curiosity_templates:
-                            label = tmpl.semantic_label
-                            if self.curiosity_rl.should_run(label):
-                                policy   = tmpl.metadata.get("policy", tmpl.summary)
-                                q        = policy.format(
-                                    snippet=notes or state["clar_ctx"].summary
-                                )
+                            if self.curiosity_rl.should_run(tmpl.semantic_label):
+                                q        = tmpl.metadata.get("policy", tmpl.summary)\
+                                             .format(snippet=notes or state["clar_ctx"].summary)
                                 followup = self._stream_and_capture(
                                     self.primary_model,
                                     [{"role":"system","content":q}],
@@ -1061,7 +1083,7 @@ class Assembler:
                                 c.metadata["notes"] = updated
                                 c.summary = updated
                                 c.touch(); self.repo.save(c)
-                                state["curiosity_used"].append(label)
+                                state["curiosity_used"].append(tmpl.semantic_label)
                                 summary = "probe→" + followup[:60]
                                 break
 
@@ -1081,9 +1103,7 @@ class Assembler:
                         state["tools_list"], state["user_text"]
                     )
                     state["plan_ctx"], state["plan_output"] = ctx, plan_str
-                    summary = plan_str.strip().replace("\n"," ")[:60] + "…"
-
-                    # ── fractal expansion: if subtasks exist, invoke TaskExecutor
+                    summary = plan_str.strip().replace("\n", " ")[:60] + "…"
                     try:
                         tree = json.loads(plan_str)
                         if any(t.get("subtasks") for t in tree.get("tasks", [])):
@@ -1104,12 +1124,9 @@ class Assembler:
                         raise RuntimeError(f"Plan validation errors: {errors}")
                     state["fixed_calls"] = fixed
                     summary = f"{len(fixed)} calls"
-
-                    # switch to execution phases
                     queue_stages.clear()
                     queue_stages.extend([
                         "tool_chaining",
-                        "uncertainty_check",
                         "invoke_with_retries",
                         "reflection_and_replan",
                         "assemble_and_infer",
@@ -1125,30 +1142,6 @@ class Assembler:
                     )
                     state.update(tc_ctx=tc, raw_calls=raw, schemas=schemas)
                     summary = "chained"
-
-                elif stage == "uncertainty_check":
-                    needed = self._should_ask_confirmation(state)
-                    summary = f"needs_confirm={needed}"
-                    if needed:
-                        queue_stages.appendleft("user_confirmation")
-
-                elif stage == "user_confirmation":
-                    calls_str = "\n".join(state["fixed_calls"])
-                    ask = (
-                        "I plan to run these steps:\n"
-                        f"{calls_str}\n\nDoes that look good? (yes/no)"
-                    )
-                    question = self._stream_and_capture(
-                        self.primary_model,
-                        [{"role":"system","content":ask}],
-                        tag="[AskConfirm]"
-                    ).strip()
-                    #self.tts.enqueue(question)
-                    # stash for follow-up
-                    self._awaiting_confirmation = True
-                    self._pending_state         = state.copy()
-                    self._pending_queue         = list(queue_stages)
-                    return question
 
                 elif stage == "invoke_with_retries":
                     tctxs = self._stage9_invoke_with_retries(
@@ -1189,12 +1182,13 @@ class Assembler:
                     summary = f.strip().replace("\n"," ")[:60] + "…"
 
                 elif stage == "memory_writeback":
-                    # — write back to memory store
                     final = state.get("final","") or ""
-                    self._stage11_memory_writeback(final, state.get("tool_ctxs", []))
-                    self.memman.decay_and_promote()
+                    try:
+                        self._stage11_memory_writeback(final, state.get("tool_ctxs", []))
+                        self.memman.decay_and_promote()
+                    except Exception as e:
+                        logger.warning(f"Memory writeback error (continuing): {e}")
 
-                    # — split into Telegram-safe chunks & emit via status_cb
                     chunks = textwrap.wrap(final, width=3800, replace_whitespace=False)
                     for idx, chunk in enumerate(chunks, 1):
                         status_cb(f"output_{idx}/{len(chunks)}", chunk)
@@ -1203,26 +1197,13 @@ class Assembler:
                     ran_ok  = True
                     summary = f"{len(chunks)} chunk(s)"
 
-                    # — curiosity RL reward
-                    used = state.get("curiosity_used", [])
-                    if used:
-                        success = not bool(state["errors"])
-                        base    = 1.0 if success else -1.0
-                        lines   = len(
-                            state["clar_ctx"].metadata.get("notes","").splitlines()
-                        )
-                        bonus   = 0.05 * max(0, lines - 1)
-                        self.curiosity_rl.update(used, base + bonus)
-
                 else:
-                    # any ad-hoc _stage_<name>
                     fn = getattr(self, f"_stage_{stage}", None)
                     if callable(fn):
-                        out     = fn(state)
+                        out = fn(state)
                         summary = str(out).replace("\n"," ")[:60] + "…"
                     ran_ok = True
 
-                # non‐writeback stages always mark OK
                 if stage != "memory_writeback":
                     ran_ok = True
 
@@ -1232,43 +1213,34 @@ class Assembler:
                 logger.warning(f"Stage `{stage}` failed: {e}")
 
             finally:
-                # 4b) log performance
                 duration = (datetime.utcnow() - start_t).total_seconds()
                 perf = ContextObject.make_stage(
                     "stage_performance",
                     input_refs=[state["user_ctx"].context_id],
-                    output={
-                        "stage":   stage,
-                        "duration": duration,
-                        "error":   not ran_ok
-                    }
+                    output={"stage":stage,"duration":duration,"error":not ran_ok}
                 )
-                perf.touch()
-                self.repo.save(perf)
+                perf.touch(); self.repo.save(perf)
                 self.memman.reinforce(perf.context_id, state.get("recent_ids", []))
-
-                # 4c) notify done/error
                 try:
                     status_cb(stage, summary)
                 except:
                     pass
-
-                # 4d) update error flag
                 self._last_errors |= (not ran_ok) or bool(state["errors"])
 
-        # 5) fallback if somehow memory_writeback never fired
+        # 5) fallback if writeback never fired
         if result is None and "final" in state:
             result = state["final"] or ""
 
-        # 6) spontaneous appiphany ping
+        # 6) spontaneous ping
         for cid in list(self._chat_contexts):
             try:
                 self._maybe_appiphany(cid)
             except:
                 pass
 
-        # 7) return final text
-        return result or "(no response)"
+        # 7) return
+        return result
+
 
 
 
