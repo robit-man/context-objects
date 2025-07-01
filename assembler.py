@@ -2022,7 +2022,7 @@ class Assembler:
 
         return resp
 
-        
+            
     def _stage9_invoke_with_retries(
         self,
         raw_calls: List[str],
@@ -2031,12 +2031,6 @@ class Assembler:
         user_text: str,
         clar_metadata: Dict[str, Any],
     ) -> List["ContextObject"]:
-        """
-        Execute tool calls with retry / reflection, tracking exact progress
-        against the plan.  Each plan is fingerprinted and stored in a
-        'plan_tracker' stage so we never re-run a fully successful plan,
-        and we record attempts, successes, failures, and timestamps.
-        """
         import json, re, hashlib, datetime
         from typing import Tuple, Any, Dict, List
 
@@ -2044,38 +2038,50 @@ class Assembler:
         # 0.  PLAN-FINGERPRINT & TRACKER INITIALIZATION
         # ─────────────────────────────────────────────────────────────
         plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
-        # look for existing tracker
         tracker = next(
             (ctx for ctx in self.repo.query(
                 lambda c: c.component == "plan_tracker"
-                          and c.semantic_label == plan_sig
+                        and c.semantic_label == plan_sig
             )),
             None
         )
+
         if not tracker:
             tracker = ContextObject.make_stage(
                 "plan_tracker", [], {
-                    "plan_id":     plan_sig,
-                    "total_calls": len(raw_calls),
-                    "succeeded":   0,
-                    "attempts":    0,
-                    "status":      "in_progress",
-                    "started_at":  datetime.datetime.utcnow().isoformat() + "Z"
+                    "plan_id":          plan_sig,
+                    "plan_calls":       raw_calls.copy(),
+                    "total_calls":      len(raw_calls),
+                    "succeeded":        0,
+                    "attempts":         0,
+                    "call_status_map":  {},  # call → bool
+                    "errors_by_call":   {},  # call → error str
+                    "status":           "in_progress",
+                    "started_at":       datetime.datetime.utcnow().isoformat() + "Z"
                 }
             )
             tracker.semantic_label = plan_sig
             tracker.stage_id       = f"plan_tracker_{plan_sig}"
             tracker.summary        = "initialized plan tracker"
             tracker.touch(); self.repo.save(tracker)
+        else:
+            meta = tracker.metadata
+            meta.setdefault("plan_calls",       raw_calls.copy())
+            meta.setdefault("total_calls",      len(raw_calls))
+            meta.setdefault("succeeded",        0)
+            meta.setdefault("attempts",         0)
+            meta.setdefault("call_status_map",  {})
+            meta.setdefault("errors_by_call",   {})
+            meta.setdefault("status",           "in_progress")
+            meta.setdefault("started_at",       datetime.datetime.utcnow().isoformat() + "Z")
+            tracker.touch(); self.repo.save(tracker)
 
         # increment attempt counter
-        tracker.metadata["attempts"] = tracker.metadata.get("attempts", 0) + 1
+        tracker.metadata["attempts"] += 1
         tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
 
-        # if already succeeded, skip
         if tracker.metadata.get("status") == "success":
-            print(f"🟢 Plan {plan_sig} already succeeded – skipping execution.")
             return []
 
         # ─────────────────────────────────────────────────────────────
@@ -2097,27 +2103,18 @@ class Assembler:
         def normalize_key(k: str) -> str:
             return re.sub(r"\W+", "", k).lower()
 
-        _canon = normalize_key
-
         # ─────────────────────────────────────────────────────────────
         # 2.  INITIALISE STATE
         # ─────────────────────────────────────────────────────────────
-        raw_calls      = _norm(raw_calls)
-        total_calls    = len(raw_calls)
-        completed_ok   = 0
-        seen_success   = set(_done_calls(self.repo))  # persisted successes
-        call_status    = {c: False for c in raw_calls}
+        raw_calls   = _norm(raw_calls)
+        total_calls = len(raw_calls)
         tool_ctxs: List[ContextObject] = []
         last_results: Dict[str, Any] = {}
-        max_retries    = 10
+        call_status = tracker.metadata["call_status_map"]
+        seen_success = {normalize_key(c) for c, ok in call_status.items() if ok}
+        raw_calls = [c for c in raw_calls if normalize_key(c) not in seen_success]
 
-        print("\n--- Stage 9: invoke_with_retries ---")
-        print("Initial raw_calls:", raw_calls)
-
-        # drop calls already done
-        raw_calls = [c for c in raw_calls if _canon(c) not in seen_success]
         if not raw_calls:
-            print("Nothing to run – plan already completed.")
             tracker.metadata["status"] = "success"
             tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
             tracker.touch(); self.repo.save(tracker)
@@ -2126,15 +2123,15 @@ class Assembler:
         # ─────────────────────────────────────────────────────────────
         # 3.  RETRY LOOP
         # ─────────────────────────────────────────────────────────────
+        max_retries = 10
         for attempt in range(1, max_retries + 1):
-            print(f"\n>>> Attempt {attempt}/{max_retries}")
             errors: List[Tuple[str, str]] = []
 
             for original_call in list(raw_calls):
-                if call_status[original_call]:
+                if call_status.get(original_call):
                     continue
 
-                # A) placeholder substitutions [Foo] and ${tool_output}
+                # placeholder substitutions
                 call_str = original_call
                 for ph in re.findall(r"\[([^\]]+)\]", call_str):
                     match = next(
@@ -2146,14 +2143,13 @@ class Assembler:
                 for name, val in last_results.items():
                     call_str = call_str.replace(f"${{{name}_output}}", repr(val))
 
-                # B) nested calls
+                # nested zero-arg calls
                 for inner in re.findall(r"\b([A-Za-z_]\w*)\(\)", call_str):
                     if inner not in last_results:
-                        inner_call = f"{inner}()"
-                        r_i = Tools.run_tool_once(inner_call)
+                        nested = f"{inner}()"
+                        r_i = Tools.run_tool_once(nested)
                         ok_i, err_i = _validate(r_i)
                         last_results[inner] = r_i.get("output")
-                        # persist nested
                         try:
                             sch_i = next(
                                 s for s in selected_schemas
@@ -2168,39 +2164,22 @@ class Assembler:
                         except StopIteration:
                             pass
 
-                # C) main invocation
-                sig = _canon(call_str)
-                if sig in seen_success:
-                    call_status[original_call] = True
-                    completed_ok += 1
-                    continue
-
-                print(f"[ToolInvocation] {call_str}")
+                # main invocation
                 res = Tools.run_tool_once(call_str)
                 ok, err = _validate(res)
-                res["tool_call"] = sig
-                res["ok"] = ok
+                res["tool_call"] = normalize_key(call_str)
+                last_results[original_call] = res.get("output")
 
-                # D) update progress & tracker
-                if ok:
-                    completed_ok += 1
-                    seen_success.add(sig)
-                    tracker.metadata["succeeded"] = tracker.metadata.get("succeeded", 0) + 1
-                    tracker.touch(); self.repo.save(tracker)
-                pct = (completed_ok / total_calls) * 100
-                print(f"[ToolInvocation] {'OK' if ok else 'ERROR'} – {pct:5.2f}%")
-
-                # E) persist tool_output
-                last_results[original_call.split("(",1)[0]] = res.get("output")
+                # persist tool_output
                 try:
                     schema_name = original_call.split("(",1)[0]
                     sch = next(
                         s for s in selected_schemas
                         if json.loads(s.metadata["schema"])["name"] == schema_name
                     )
+                    refs = [sch.context_id]
                 except StopIteration:
-                    sch = None
-                refs = [sch.context_id] if sch else []
+                    refs = []
                 ctx = ContextObject.make_stage("tool_output", refs, res)
                 ctx.stage_id = f"tool_output_{schema_name}"
                 ctx.summary  = str(res.get("output")) if ok else f"ERROR: {err}"
@@ -2208,24 +2187,25 @@ class Assembler:
                 ctx.touch(); self.repo.save(ctx)
                 tool_ctxs.append(ctx)
 
+                # update tracker
                 call_status[original_call] = ok
-                if not ok:
+                if ok:
+                    tracker.metadata["succeeded"] += 1
+                else:
+                    tracker.metadata["errors_by_call"][original_call] = err
                     errors.append((original_call, err))
+                tracker.touch(); self.repo.save(tracker)
 
-            # ── SUCCESS PATH ──────────────────────────────────────────
             if not errors:
-                print("All calls succeeded.")
                 tracker.metadata["status"] = "success"
                 tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
                 tracker.touch(); self.repo.save(tracker)
                 return tool_ctxs
 
-            # ── FAILURE PATH: prepare replan of failed calls ────────────
+            # prepare replan of failed calls
             err_lines    = [f"{c} → {e.splitlines()[-1]}" for c, e in errors]
             failed_calls = [c for c, _ in errors]
-            print("Failures:", err_lines)
-
-            vars_block = "\n".join(f"{k}_output = {v!r}" for k, v in last_results.items())
+            vars_block   = "\n".join(f"{k}_output = {v!r}" for k, v in last_results.items())
             retry_sys = (
                 "Some tool calls failed:\n"
                 + "\n".join(err_lines)
@@ -2248,12 +2228,12 @@ class Assembler:
                 fixed = json.loads(retry_out)["tool_calls"]
             except Exception:
                 parsed = Tools.parse_tool_call(retry_out)
-                fixed  = parsed if isinstance(parsed, list) else (
-                         [parsed] if parsed else failed_calls)
+                fixed  = parsed if isinstance(parsed, list) else ([parsed] if parsed else failed_calls)
             fixed = _norm(fixed) or failed_calls
 
-            # merge fixes back into raw_calls (preserve order)
-            new_raw, fix_iter = [], iter(fixed)
+            # merge fixes back into raw_calls
+            new_raw = []
+            fix_iter = iter(fixed)
             for c in raw_calls:
                 new_raw.append(next(fix_iter, c) if c in failed_calls else c)
             raw_calls = new_raw
@@ -2262,12 +2242,13 @@ class Assembler:
         # ─────────────────────────────────────────────────────────────
         # 4.  STILL FAILING AFTER max_retries – finalize tracker & bail
         # ─────────────────────────────────────────────────────────────
-        tracker.metadata["status"]      = "failed"
-        tracker.metadata["last_errors"] = [e for _, e in errors]
+        tracker.metadata["status"]       = "failed"
+        tracker.metadata["last_errors"]  = [e for _, e in errors]
         tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
 
         return tool_ctxs
+
 
 
 
