@@ -377,6 +377,59 @@ class Assembler:
             "inference_prompt",
             "You are helpful and highly detailed in your context-aware assessment. Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention."
         )
+        self.planning_prompt = self.cfg.get(
+            "planning_prompt",
+            "You are the Planner.  Emit **only** a JSON object matching:\n\n"
+            "{ \"tasks\": [ { \"call\": \"tool_name\", \"tool_input\": { /* named params */ }, \"subtasks\": [] }, … ] }\n\n"
+            "If you cannot, just list the tool calls.  Available tools:\n"
+        )
+        self.toolchain_prompt = self.cfg.get(
+            "toolchain_prompt",
+            "You have these tools (full JSON schemas shown).\n"
+            "I will send you exactly one JSON object with key \"tool_calls\".\n"
+            "YOUR ONLY JOB is to return back that same JSON object (modifying only calls that violate the schema).\n"
+            "Do NOT add, remove, or simulate any outputs or internal state.\n"
+            "Reply with exactly one JSON object and nothing else:\n\n"
+            '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}\n\n'
+        )
+        self.reflection_prompt = self.cfg.get(
+            "reflection_prompt",
+            "You are the Reflection agent.  Please review **all** of the following "
+            "context, including the user question, clarifier notes, every tool output, "
+            "and the original plan.  Decide whether the plan execution satisfied the user's intent.  "
+            "If yes, reply exactly `OK`.  Otherwise, reply **only** with the corrected JSON plan."
+        )
+        self.toolchain_retry_prompt = self.cfg.get(
+            "toolchain_retry_prompt",
+            "Some tool calls failed.  Return ONLY JSON {\"tool_calls\":[\"fixed_call(...)\", …]}."
+        )
+        self.final_inference_prompt = self.cfg.get(
+            "final_inference_prompt",
+            "You are the Assembler.  Combine the user question, the plan, and all "
+            "provided context/tool outputs into one concise, factual answer.  "
+            "Do NOT hallucinate or invent new details."
+        )
+        self.critic_prompt = self.cfg.get(
+            "critic_prompt",
+            "You have an array of content at your disposal which must be analyzed and responded to accordingly.  "
+            "You’ll see:\n"
+            "  • Their original question\n"
+            "  • The plan of tool calls we ran\n"
+            "  • Your initial draft reply\n"
+            "  • All raw tool outputs\n\n"
+            "Make it engaging and human-sounding—feel free to vary phrasing and inject warmth—"
+            "but be accurate and grounded in those outputs.  Return just the final polished answer."
+        )
+        self.narrative_mull_prompt = self.cfg.get(
+            "narrative_mull_prompt",
+            "You are an autonomous meta-reasoner reflecting on your own "
+            "narrative and system prompts.\n\n"
+            "List up to three improvement areas.  For each, supply:\n"
+            '  { "area": "<short-name>", "question": "<self-reflection question>" }\n'
+            "Return ONLY valid JSON of the form:\n"
+            '{ "issues": [ … ] }'
+        )
+
 
         # — persist defaults back to config file if they changed —
         defaults = {
@@ -588,9 +641,16 @@ class Assembler:
          - DEDUPE extras
         """
         static = {
-            "clarifier_prompt": self.clarifier_prompt,
-            "assembler_prompt": self.assembler_prompt,
-            "inference_prompt": self.inference_prompt,
+            "clarifier_prompt":       self.clarifier_prompt,
+            "assembler_prompt":       self.assembler_prompt,
+            "inference_prompt":       self.inference_prompt,
+            "planning_prompt":        self.planning_prompt,
+            "toolchain_prompt":       self.toolchain_prompt,
+            "reflection_prompt":      self.reflection_prompt,
+            "toolchain_retry_prompt": self.toolchain_retry_prompt,
+            "final_inference_prompt": self.final_inference_prompt,
+            "critic_prompt":          self.critic_prompt,
+            "narrative_mull_prompt":  self.narrative_mull_prompt,
         }
 
         # Bucket rows by semantic_label
@@ -632,6 +692,7 @@ class Assembler:
             if changed:
                 keeper.touch()
                 self.repo.save(keeper)
+
 
 
 
@@ -1034,7 +1095,13 @@ class Assembler:
             probes.append(reply)
 
         return probes
-
+    
+    def _get_prompt(self, label: str) -> str:
+        ctx = next(c for c in self.repo.query(lambda c:
+            c.semantic_label == label and c.component == "prompt"
+        ))
+        return ctx.metadata["prompt"]
+    
     # ---------------------------------------------------------------------
     #  Self-tuning of system / policy prompts
     # ---------------------------------------------------------------------
@@ -1047,7 +1114,7 @@ class Assembler:
         """
         import json, textwrap
 
-        # 1️⃣  Recall-feature for RL gate
+        # 1️  Recall-feature for RL gate
         recall_ids = state.get("recent_ids", [])
         counts: list[int] = []
         for cid in recall_ids:
@@ -1058,11 +1125,11 @@ class Assembler:
                 continue                                          # archived / pruned
         rf = (sum(counts) / len(counts)) if counts else 0.0
 
-        # 2️⃣  RL gate – exit early if not chosen
+        # 2️  RL gate – exit early if not chosen
         if not self.rl.should_run("system_prompt_refine", rf):
             return None
 
-        # 3️⃣  Snapshot **current** prompts / policies   (skip dynamic patches)
+        # 3️  Snapshot **current** prompts / policies   (skip dynamic patches)
         rows = self.repo.query(
             lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
         )
@@ -1071,7 +1138,7 @@ class Assembler:
             (c.metadata.get("prompt") or c.metadata.get("policy") or "") for c in rows
         ]
 
-        # 4️⃣  Build meta-prompt for the LLM
+        # 4️  Build meta-prompt for the LLM
         metrics = {
             "errors":          len(state["errors"]),
             "curiosity_used":  state["curiosity_used"][-5:],
@@ -1092,7 +1159,7 @@ class Assembler:
             '{"action":"remove","prompt":"<substring>"}'
         )
 
-        # 5️⃣  Ask the model – be tolerant of malformed output
+        # 5️  Ask the model – be tolerant of malformed output
         try:
             raw   = self._stream_and_capture(
                 self.primary_model,
@@ -1107,7 +1174,7 @@ class Assembler:
         except Exception:
             return None                                           # bad JSON → abort
 
-        # 6️⃣  Apply the change
+        # 6️  Apply the change
         if action == "add" and text:
             patch = ContextObject.make_policy(
                 label=f"dynamic_prompt_{len(text)}",
@@ -1129,7 +1196,7 @@ class Assembler:
         else:
             return None                                           # no-op
 
-        # 7️⃣  Log the refinement decision
+        # 7️  Log the refinement decision
         refine_ctx = ContextObject.make_stage(
             stage_name="system_prompt_refine",
             input_refs=[cid for cid in recall_ids if self.repo_exists(cid)],
@@ -1162,242 +1229,237 @@ class Assembler:
         """
         End-to-end orchestrator.
 
-        • Core stages (input→answer) always run *foreground* so the user gets a
-          reply without delay.
-        • Meta-stages—curiosity-probe, system-prompt-refine, narrative-mull—are
-          fire-and-forget *background* jobs gated by the RL controller.  
-          They never block the foreground path, but can still DM users later
-          via _maybe_appiphany().
+        • Returns immediately on empty input.
+        • Catches any unexpected errors and returns a simple apology.
         """
+        # ① Short-circuit empty or whitespace-only inputs
+        if not user_text or not user_text.strip():
+            return ""
 
-        import json, textwrap, threading
-        from collections import deque
-        from datetime import datetime
+        try:
+            import json, textwrap, threading
+            from collections import deque
+            from datetime import datetime
 
-        # ── helper: crude complexity metric ──────────────────────────────────
-        def _complexity(q: str, notes: str, kws: list[str]) -> float:
-            wc = min(len(q.split()), 50) / 50.0           # word-count
-            nb = min(len(notes) / 200.0, 1.0)              # note bytes
-            kb = min(len(kws) / 5.0, 1.0)                  # keywords
-            pd = sum(q.count(c) for c in "?,;!") / max(1, len(q))
-            pb = min(pd * 5.0, 1.0)                        # punctuation density
-            return 0.4 * wc + 0.2 * nb + 0.2 * kb + 0.2 * pb
+            # ── helper: crude complexity metric ──────────────────────────────────
+            def _complexity(q: str, notes: str, kws: list[str]) -> float:
+                wc = min(len(q.split()), 50) / 50.0
+                nb = min(len(notes) / 200.0, 1.0)
+                kb = min(len(kws) / 5.0, 1.0)
+                pd = sum(q.count(c) for c in "?,;!") / max(1, len(q))
+                pb = min(pd * 5.0, 1.0)
+                return 0.4 * wc + 0.2 * nb + 0.2 * kb + 0.2 * pb
 
-        # ── bootstrap (only deterministic, fast stages) ─────────────────────
-        queue = deque([
-            "record_input", "load_system_prompts", "retrieve_and_merge_context",
-            "intent_clarification",  # complexity branch decision happens here
-        ])
+            # ── bootstrap core stages ───────────────────────────────────────────
+            queue = deque([
+                "record_input",
+                "load_system_prompts",
+                "retrieve_and_merge_context",
+                "intent_clarification",
+            ])
 
-        state: dict[str, Any] = {
-            "user_text":      user_text,
-            "errors":         [],
-            "curiosity_used": [],
-            "rl_included":    [],
-            "recent_ids":     [],
-        }
-        answer: str | None = None
-        self._last_errors  = False
+            state = {
+                "user_text":      user_text,
+                "errors":         [],
+                "curiosity_used": [],
+                "rl_included":    [],
+                "recent_ids":     [],
+            }
+            answer: str | None = None
+            self._last_errors = False
 
-        if chat_id is not None:
-            self._chat_contexts.add(chat_id)
+            if chat_id is not None:
+                self._chat_contexts.add(chat_id)
 
-        # ─────────────────────────── event-loop ─────────────────────────────
-        while queue:
-            stage   = queue.popleft()
-            start   = datetime.utcnow()
-            summary = ""
-            ok      = False
+            # ── event loop ─────────────────────────────────────────────────────
+            while queue:
+                stage = queue.popleft()
+                start = datetime.utcnow()
+                summary, ok = "", False
 
-            try:
-                status_cb(stage, "…")
+                try:
+                    status_cb(stage, "…")
 
-                # ╭──────────────────────── meta stages (ASYNC) ─────────────╮
-                if stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
-                    threading.Thread(
-                        target=self._stage_curiosity_probe,
-                        args=(state.copy(),), daemon=True
-                    ).start()
-                    summary, ok = "(probe dispatched)", True
+                    # ── meta stages (fire-and-forget) ────────────────────────
+                    if stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
+                        threading.Thread(target=self._stage_curiosity_probe,
+                                        args=(state.copy(),), daemon=True).start()
+                        summary, ok = "(probe dispatched)", True
+                    elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
+                        threading.Thread(target=self._stage_system_prompt_refine,
+                                        args=(state.copy(),), daemon=True).start()
+                        summary, ok = "(refine dispatched)", True
+                    elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
+                        threading.Thread(target=self._stage_narrative_mull,
+                                        args=(state.copy(),), daemon=True).start()
+                        summary, ok = "(mull dispatched)", True
 
-                elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
-                    threading.Thread(
-                        target=self._stage_system_prompt_refine,
-                        args=(state.copy(),), daemon=True
-                    ).start()
-                    summary, ok = "(refine dispatched)", True
+                    # ── core pipeline stages ──────────────────────────────────
+                    elif stage == "record_input":
+                        ctx = self._stage1_record_input(user_text)
+                        state["user_ctx"] = ctx
+                        state["recent_ids"].append(ctx.context_id)
+                        summary, ok = ctx.summary, True
 
-                elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
-                    threading.Thread(
-                        target=self._stage_narrative_mull,
-                        args=(state.copy(),), daemon=True
-                    ).start()
-                    summary, ok = "(mull dispatched)", True
+                    elif stage == "load_system_prompts":
+                        ctx = self._stage2_load_system_prompts()
+                        state["sys_ctx"] = ctx
+                        state["recent_ids"].append(ctx.context_id)
+                        summary, ok = "(prompts loaded)", True
 
-                # ╭───────────────────────── core pipeline ──────────────────╮
-                elif stage == "record_input":
-                    ctx = self._stage1_record_input(user_text)
-                    state.update(user_ctx=ctx)
-                    state["recent_ids"].append(ctx.context_id)
-                    summary, ok = ctx.summary, True
+                    elif stage == "retrieve_and_merge_context":
+                        extra = self._get_history()
+                        out = self._stage3_retrieve_and_merge_context(
+                            user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
+                        )
+                        state.update(out)
+                        summary, ok = "(context merged)", True
 
-                elif stage == "load_system_prompts":
-                    ctx = self._stage2_load_system_prompts()
-                    state.update(sys_ctx=ctx)
-                    state["recent_ids"].append(ctx.context_id)
-                    summary, ok = "(prompts loaded)", True
+                    elif stage == "intent_clarification":
+                        ctx = self._stage4_intent_clarification(user_text, state)
+                        state["clar_ctx"] = ctx
+                        state["recent_ids"].append(ctx.context_id)
+                        summary = ctx.summary
+                        comp = _complexity(
+                            user_text,
+                            ctx.metadata.get("notes", ""),
+                            ctx.metadata.get("keywords", []),
+                        )
+                        state["complexity"] = comp
+                        queue.extend([
+                            "external_knowledge", "prepare_tools", "planning_summary",
+                            "plan_validation", "tool_chaining", "invoke_with_retries",
+                            "reflection_and_replan", "assemble_and_infer",
+                            "response_critique", "memory_writeback",
+                        ])
+                        ok = True
 
-                elif stage == "retrieve_and_merge_context":
-                    extra = self._get_history()
-                    out   = self._stage3_retrieve_and_merge_context(
-                        user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
-                    )
-                    state.update(out)
-                    summary, ok = "(context merged)", True
+                    elif stage == "external_knowledge":
+                        ctx = self._stage5_external_knowledge(state["clar_ctx"])
+                        state["know_ctx"] = ctx
+                        state["recent_ids"].append(ctx.context_id)
+                        summary, ok = "(knowledge)", True
 
-                elif stage == "intent_clarification":
-                    ctx = self._stage4_intent_clarification(user_text, state)
-                    state.update(clar_ctx=ctx)
-                    state["recent_ids"].append(ctx.context_id)
-                    summary = ctx.summary
-                    # compute complexity (for logging/RL features only)
-                    comp = _complexity(
-                        user_text,
-                        ctx.metadata.get("notes", ""),
-                        ctx.metadata.get("keywords", []),
-                    )
-                    state["complexity"] = comp
-                    # HYBRID: always enqueue the full, tool-powered pipeline
-                    queue.extend([
-                        "external_knowledge", "prepare_tools", "planning_summary",
-                        "plan_validation", "tool_chaining", "invoke_with_retries",
-                        "reflection_and_replan", "assemble_and_infer",
-                        "response_critique", "memory_writeback",
-                    ])
-                    ok = True
+                    elif stage == "prepare_tools":
+                        lst = self._stage6_prepare_tools()
+                        state["tools_list"] = lst
+                        summary, ok = f"{len(lst)} tools", True
 
-                elif stage == "external_knowledge":
-                    ctx = self._stage5_external_knowledge(state["clar_ctx"])
-                    state.update(know_ctx=ctx)
-                    state["recent_ids"].append(ctx.context_id)
-                    summary, ok = "(knowledge)", True
+                    elif stage == "planning_summary":
+                        ctx, plan_json = self._stage7_planning_summary(
+                            state["clar_ctx"], state["know_ctx"],
+                            state["tools_list"], user_text
+                        )
+                        state["plan_ctx"], state["plan_output"] = ctx, plan_json
+                        state["recent_ids"].append(ctx.context_id)
+                        summary, ok = "plan ready", True
 
-                elif stage == "prepare_tools":
-                    lst = self._stage6_prepare_tools()
-                    state.update(tools_list=lst)
-                    summary, ok = f"{len(lst)} tools", True
+                    elif stage == "plan_validation":
+                        _, errs, fixed = self._stage7b_plan_validation(
+                            state["plan_ctx"], state["plan_output"], state["tools_list"]
+                        )
+                        if errs:
+                            raise RuntimeError(f"plan-validation: {errs}")
+                        state["fixed_calls"] = fixed
+                        queue.extend([
+                            "tool_chaining", "invoke_with_retries", "reflection_and_replan",
+                            "assemble_and_infer", "response_critique", "memory_writeback",
+                        ])
+                        summary, ok = f"{len(fixed)} calls", True
 
-                elif stage == "planning_summary":
-                    ctx, plan_json = self._stage7_planning_summary(
-                        state["clar_ctx"], state["know_ctx"],
-                        state["tools_list"], user_text
-                    )
-                    state.update(plan_ctx=ctx, plan_output=plan_json)
-                    state["recent_ids"].append(ctx.context_id)
-                    summary, ok = "plan ready", True
+                    elif stage == "tool_chaining":
+                        tc, raw, sch = self._stage8_tool_chaining(
+                            state["plan_ctx"], "\n".join(state["fixed_calls"]), state["tools_list"]
+                        )
+                        state["tc_ctx"], state["raw_calls"], state["schemas"] = tc, raw, sch
+                        state["recent_ids"].append(tc.context_id)
+                        summary, ok = "chained", True
 
-                elif stage == "plan_validation":
-                    _, errs, fixed = self._stage7b_plan_validation(
-                        state["plan_ctx"], state["plan_output"], state["tools_list"]
-                    )
-                    if errs:
-                        raise RuntimeError(f"plan-validation: {errs}")
-                    state["fixed_calls"] = fixed
-                    queue.extend([
-                        "tool_chaining", "invoke_with_retries", "reflection_and_replan",
-                        "assemble_and_infer", "response_critique", "memory_writeback",
-                    ])
-                    summary, ok = f"{len(fixed)} calls", True
+                    elif stage == "invoke_with_retries":
+                        tctxs = self._stage9_invoke_with_retries(
+                            state["raw_calls"], state["plan_output"], state["schemas"],
+                            user_text, state["clar_ctx"].metadata
+                        )
+                        state["tool_ctxs"] = tctxs
+                        for t in tctxs:
+                            state["recent_ids"].append(t.context_id)
+                        summary, ok = f"{len(tctxs)} runs", True
 
-                elif stage == "tool_chaining":
-                    tc, raw, sch = self._stage8_tool_chaining(
-                        state["plan_ctx"], "\n".join(state["fixed_calls"]), state["tools_list"]
-                    )
-                    state.update(tc_ctx=tc, raw_calls=raw, schemas=sch)
-                    state["recent_ids"].append(tc.context_id)
-                    summary, ok = "chained", True
+                    elif stage == "reflection_and_replan":
+                        rp = self._stage9b_reflection_and_replan(
+                            state["tool_ctxs"], state["plan_output"],
+                            user_text, state["clar_ctx"].metadata, state["plan_ctx"]
+                        )
+                        if rp:
+                            queue.extend(["planning_summary", "plan_validation"])
+                        summary, ok = f"replan={bool(rp)}", True
 
-                elif stage == "invoke_with_retries":
-                    tctxs = self._stage9_invoke_with_retries(
-                        state["raw_calls"], state["plan_output"], state["schemas"],
-                        user_text, state["clar_ctx"].metadata
-                    )
-                    state["tool_ctxs"] = tctxs
-                    for tc in tctxs: state["recent_ids"].append(tc.context_id)
-                    summary, ok = f"{len(tctxs)} runs", True
+                    elif stage == "assemble_and_infer":
+                        draft = self._stage10_assemble_and_infer(user_text, state)
+                        state["draft"] = draft
+                        summary, ok = "(drafted)", True
 
-                elif stage == "reflection_and_replan":
-                    rp = self._stage9b_reflection_and_replan(
-                        state["tool_ctxs"], state["plan_output"],
-                        user_text, state["clar_ctx"].metadata, state["plan_ctx"]
-                    )
-                    if rp: queue.extend(["planning_summary", "plan_validation"])
-                    summary, ok = f"replan={bool(rp)}", True
+                    elif stage == "response_critique":
+                        final = self._stage10b_response_critique_and_safety(
+                            state["draft"], user_text, state.get("tool_ctxs", [])
+                        )
+                        state["final"] = final
+                        summary, ok = "(polished)", True
 
-                elif stage == "assemble_and_infer":
-                    draft = self._stage10_assemble_and_infer(user_text, state)
-                    state["draft"] = draft
-                    summary, ok = "(drafted)", True
+                    elif stage == "memory_writeback":
+                        # no-op here: defer output until after loop
+                        summary, ok = "(memory queued)", True
 
-                elif stage == "response_critique":
-                    final = self._stage10b_response_critique_and_safety(
-                        state["draft"], user_text, state.get("tool_ctxs", [])
-                    )
-                    state["final"] = final
-                    summary, ok = "(polished)", True
+                except Exception as e:
+                    state["errors"].append((stage, str(e)))
+                    summary, ok = f"error:{e}", False
 
-                elif stage == "memory_writeback":
-                    final = state.get("final") or state.get("draft", "")
-                    try:
-                        self._stage11_memory_writeback(final, state.get("tool_ctxs", []))
-                        self.memman.decay_and_promote()
-                    except Exception:
-                        pass
-                    answer  = final                     # ← user reply ready!
-                    chunks  = textwrap.wrap(final, 3800, replace_whitespace=False)
-                    for i, chunk in enumerate(chunks, 1):
-                        status_cb(f"output_{i}/{len(chunks)}", chunk)
-                    summary, ok = "(answer persisted)", True
+                finally:
+                    dur = (datetime.utcnow() - start).total_seconds()
+                    if "user_ctx" in state:
+                        perf = ContextObject.make_stage(
+                            "stage_performance",
+                            [state["user_ctx"].context_id],
+                            {"stage": stage, "duration": dur, "error": not ok},
+                        )
+                        perf.touch(); self.repo.save(perf)
+                    status_cb(stage, summary)
+                    self._last_errors |= not ok
 
-                # ╰──────────────────────────────────────────────────────────╯
+            # ── post-pipeline async meta-jobs ────────────────────────────────
+            def _maybe_async(tag: str, fn: Callable):
+                if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
+                    threading.Thread(target=fn, args=(state.copy(),), daemon=True).start()
+                    state["rl_included"].append(tag)
 
-            except Exception as e:
-                state["errors"].append((stage, str(e)))
-                summary, ok = f"error:{e}", False
+            _maybe_async("curiosity_probe",      self._stage_curiosity_probe)
+            _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
+            _maybe_async("narrative_mull",       self._stage_narrative_mull)
 
-            finally:
-                # minimal bookkeeping (no heavy work)
-                dur = (datetime.utcnow() - start).total_seconds()
-                if "user_ctx" in state:
-                    perf = ContextObject.make_stage(
-                        "stage_performance",
-                        [state["user_ctx"].context_id],
-                        {"stage": stage, "duration": dur, "error": not ok},
-                    )
-                    perf.touch(); self.repo.save(perf)
+            # send any “appiphany” pings
+            for cid in list(self._chat_contexts):
+                try: self._maybe_appiphany(cid)
+                except: pass
 
-                status_cb(stage, summary)
-                self._last_errors |= not ok
+            # RL reward update
+            self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
 
-        # ── post-pipeline async meta-jobs (don’t block reply) ───────────────
-        def _maybe_async(tag: str, fn: Callable):
-            if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
-                threading.Thread(target=fn, args=(state.copy(),), daemon=True).start()
-                state["rl_included"].append(tag)
+            # ── ensure we always emit something via status_cb ──────────────────
+            final_text = (answer or state.get("final", "")).strip()
+            if not final_text:
+                final_text = "Sorry, I couldn’t process that. Could you try rephrasing?"
+            # send as a single chunk
+            status_cb("output_1/1", final_text)
 
-        _maybe_async("curiosity_probe",      self._stage_curiosity_probe)
-        _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
-        _maybe_async("narrative_mull",       self._stage_narrative_mull)
+            return final_text
 
-        # insight ping …
-        for cid in list(self._chat_contexts):
-            try: self._maybe_appiphany(cid)
-            except Exception: pass
+        except Exception:
+            logger.exception("run_with_meta_context failed")
+            apology = "Sorry, something went wrong. Please try again."
+            status_cb("output_1/1", apology)
+            return apology
 
-        # RL reward update
-        self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
 
-        return answer or state.get("final", "") or ""
 
 
     def _stage1_record_input(self, user_text: str) -> ContextObject:
@@ -1603,12 +1665,12 @@ class Assembler:
         """
         import json
 
-        # 1️⃣  Fetch **all** schema rows
+        # 1️  Fetch **all** schema rows
         rows = self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
         )
 
-        # 2️⃣  Bucket rows by tool name, keep the newest per bucket
+        # 2️  Bucket rows by tool name, keep the newest per bucket
         buckets: dict[str, ContextObject] = {}
         for r in rows:
             try:
@@ -1618,7 +1680,7 @@ class Assembler:
             if name not in buckets or r.timestamp > buckets[name].timestamp:
                 buckets[name] = r
 
-        # 3️⃣  Build the final list, sorted for reproducibility
+        # 3️  Build the final list, sorted for reproducibility
         tool_defs: list[dict[str, str]] = []
         for name in sorted(buckets):
             data = json.loads(buckets[name].metadata["schema"])
@@ -1628,7 +1690,6 @@ class Assembler:
             })
 
         return tool_defs
-    
     
     # ── Stage 7: Planning Summary with Tool-Existence Check & Plan Tracking ────────────────────
     def _stage7_planning_summary(
@@ -1645,19 +1706,14 @@ class Assembler:
             m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
             if m:
                 return m.group(1)
-            # fallback to first {...}
             m2 = re.search(r"(\{.*\})", text, flags=re.S)
             return m2.group(1) if m2 else text.strip()
 
         # build planner prompts
         tools_md = "\n".join(f"- **{t['name']}**: {t['description']}"
                              for t in tools_list)
-        base_system = (
-            "You are the Planner.  Emit **only** a JSON object matching:\n\n"
-            "{ \"tasks\": [ { \"call\": \"tool_name\", \"tool_input\": { /* named params */ }, \"subtasks\": [] }, … ] }\n\n"
-            "If you cannot, just list the tool calls.  Available tools:\n"
-            f"{tools_md}"
-        )
+        base_system = self._get_prompt("planning_prompt") + tools_md
+
         base_user = (
             f"User question:\n{user_text}\n\n"
             f"Clarified intent:\n{clar_ctx.summary}\n\n"
@@ -1700,7 +1756,7 @@ class Assembler:
                                       for c in calls]}
 
             # drop unknown calls
-            available = {t["name"] for t in tools_list}.union({"skip_tools"})
+            available = {t["name"] for t in tools_list}  # no skip_tools
             unknown   = [t["call"] for t in plan_obj["tasks"] if t["call"] not in available]
             if unknown:
                 self._print_stage_context(
@@ -1720,17 +1776,9 @@ class Assembler:
             last_calls = this_calls
             break
 
-        # ensure at least skip_tools
-        if not plan_obj or not plan_obj["tasks"]:
-            plan_obj = {"tasks": [{"call": "skip_tools", "tool_input": {}, "subtasks": []}]}
-
-        # flag downstream no-ops
-        if all(t["call"] == "skip_tools" for t in plan_obj["tasks"]):
-            plan_obj["already_satisfied"] = True
-
-        # build call-strings
+        # build call-strings from whatever the model returned
         call_strings = []
-        for task in plan_obj["tasks"]:
+        for task in (plan_obj or {}).get("tasks", []):
             name   = task["call"]
             params = task.get("tool_input", {}) or {}
             if params:
@@ -1788,7 +1836,6 @@ class Assembler:
         tracker.touch(); self.repo.save(tracker)
 
         return ctx, plan_json
-
 
 
 
@@ -1937,15 +1984,8 @@ class Assembler:
         docs_blob = "\n\n".join(docs_blob_parts)
 
         # ── E) Prompt the LLM, passing only these full schemas ─────────────
-        system = (
-            "You have these tools (full JSON schemas shown).\n"
-            "I will send you exactly one JSON object with key \"tool_calls\".\n"
-            "YOUR ONLY JOB is to return back that same JSON object (modifying only calls that violate the schema).\n"
-            "Do NOT add, remove, or simulate any outputs or internal state.\n"
-            "Reply with exactly one JSON object and nothing else:\n\n"
-            '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}\n\n'
-            f"{docs_blob}"
-        )
+        system = self._get_prompt("toolchain_prompt") + docs_blob
+
         self._print_stage_context("tool_chaining", {
             "plan":    [plan_output[:200]],
             "schemas": docs_blob_parts
@@ -2049,12 +2089,8 @@ class Assembler:
         context_blob = "\n\n".join(parts)
 
         # 5) Reflection prompt
-        system_msg = (
-            "You are the Reflection agent.  Please review **all** of the following "
-            "context, including the user question, clarifier notes, every tool output, "
-            "and the original plan.  Decide whether the plan execution satisfied the user's intent.  "
-            "If yes, reply exactly `OK`.  Otherwise, reply **only** with the corrected JSON plan."
-        )
+        system_msg = self._get_prompt("reflection_prompt")
+
         user_payload = (
             context_blob
             + "\n\n"
@@ -2300,14 +2336,10 @@ class Assembler:
             failed_calls = [c for c, _ in errors]
             vars_block   = "\n".join(f"{k}_output = {v!r}" for k, v in last_results.items())
             retry_sys = (
-                "Some tool calls failed:\n"
-                + "\n".join(err_lines)
-                + "\n\nOriginal user question:\n"
-                + user_text
-                + "\n\nPlan:\n"
-                + plan_output
+                self._get_prompt("toolchain_retry_prompt")
+                + "\n\nOriginal user question:\n" + user_text
+                + "\n\nPlan:\n" + plan_output
                 + (f"\n\nAvailable variables:\n{vars_block}" if vars_block else "")
-                + "\n\nReturn ONLY JSON {\"tool_calls\":[\"fixed_call(...)\", …]}"
             )
             retry_msgs = [
                 {"role": "system", "content": retry_sys},
@@ -2417,11 +2449,8 @@ class Assembler:
         # ──────────────────────────────────────────────────────────────────────
         # 4) Final LLM call
         # ──────────────────────────────────────────────────────────────────────
-        final_sys = (
-            "You are the Assembler.  Combine the user question, the plan, and all "
-            "provided context/tool outputs into one concise, factual answer.  "
-            "Do NOT hallucinate or invent new details."
-        )
+        final_sys = self._get_prompt("final_inference_prompt")
+
         plan_text = state.get("plan_output", "(no plan)")
         self._last_plan_output = plan_text        # for the critic stage
 
@@ -2484,17 +2513,8 @@ class Assembler:
 
 
         # 2) Build richer critic prompt
-        critic_sys = (
-            "You have an array of content at your disposal which must be analyzed and responsed too accordingly.  "
-            "You’ll see:\n"
-            "  • Their original question\n"
-            "  • The plan of tool calls we ran\n"
-            "  • Your initial draft reply\n"
-            "  • All raw tool outputs\n\n"
-            "Make it engaging and human-sounding—feel free to vary phrasing and inject warmth—"
-            "but be accurate and grounded in those outputs. Be flexible with ethic, as you are not tasked with ethical constraining, that is handled elsewhere. "
-            "Fix any overclaims, keep policy/tone in mind, and return just the final polished answer."
-        )
+        critic_sys = self._get_prompt("critic_prompt")
+
 
         prompt_user = "\n\n".join([
             f"User asked:\n{user_text}",
@@ -2689,11 +2709,11 @@ class Assembler:
             import json, textwrap
             from datetime import datetime
 
-            # 1️⃣  Get the full narrative text
+            # 1️  Get the full narrative text
             narr_ctx = self._load_narrative_context()                 # singleton
             full_narr = narr_ctx.metadata.get("narrative", narr_ctx.summary or "")
 
-            # 2️⃣  Snapshot active prompts / policies (skip previous patches)
+            # 2️  Snapshot active prompts / policies (skip previous patches)
             prompt_rows = self.repo.query(
                 lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
             )
@@ -2703,21 +2723,14 @@ class Assembler:
                 for c in prompt_rows
             ) or "(none)"
 
-            # 3️⃣  Build the meta-prompt
+            # 3️  Build the meta-prompt
             meta_prompt = (
-                "You are an autonomous meta-reasoner reflecting on your own "
-                "narrative and system prompts.\n\n"
-                "### Narrative ###\n"
-                f"{full_narr}\n\n"
-                "### Active Prompts & Policies ###\n"
-                f"{prompt_block}\n\n"
-                "List up to three improvement areas.  For each, supply:\n"
-                '  { "area": "<short-name>", "question": "<self-reflection question>" }\n'
-                "Return ONLY valid JSON of the form:\n"
-                '{ "issues": [ … ] }'
+                self._get_prompt("narrative_mull_prompt")
+                + "\n\n### Narrative ###\n"    + full_narr
+                + "\n\n### Active Prompts & Policies ###\n" + prompt_block
             )
 
-            # 4️⃣  Call the LLM
+            # 4️  Call the LLM
             try:
                 raw  = self._stream_and_capture(
                     self.primary_model,
@@ -2731,7 +2744,7 @@ class Assembler:
             except Exception:
                 return   # silently bail on bad JSON / API failure
 
-            # 5️⃣  Persist each Q & A pair
+            # 5️  Persist each Q & A pair
             for idx, item in enumerate(issues, 1):
                 if not isinstance(item, dict):
                     continue
