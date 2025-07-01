@@ -20,6 +20,7 @@ from tools import TOOL_SCHEMAS, Tools
 from datetime import datetime
 from collections import deque
 import inspect
+import threading
 logger = logging.getLogger("assembler")
 logging.basicConfig(
     level=logging.INFO,
@@ -339,10 +340,6 @@ class Assembler:
         "final_inference",
     ]
 
-    """
-    Fractal Assembler with recursive TaskExecutor and on-disk RL for stage selection
-    plus an RL-driven “curiosity” probe system for gap‐closing questions.
-    """
     def __init__(
         self,
         context_path:     str = "context.jsonl",
@@ -351,7 +348,6 @@ class Assembler:
         top_k:            int = 10,
         tts_manager:      TTSManager | None = None,
     ):
-    
         # — load or init config —
         try:
             self.cfg = json.load(open(config_path))
@@ -370,15 +366,16 @@ class Assembler:
             "clarifier_prompt",
             "You are Clarifier. Expand the user’s intent into a JSON object with "
             "two keys: 'keywords' (an array of concise keywords) and 'notes'. "
+            "Your notes must be highly detailed and context aware. Do not provide judgements beyond scope of exact context present, or make assumptions beyond what is absolutely known. "
             "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
             "assembler_prompt",
-            "You are Assembler. Distill context into a concise summary."
+            "You are Assembler. Distill context into a concise summary, but do not omit implied content which is needed for effective evaluation."
         )
         self.inference_prompt = self.cfg.get(
             "inference_prompt",
-            "You are a helpful, context-aware assistant. Use all provided snippets and tool outputs."
+            "You are helpful and highly detailed in your context-aware assessment. Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention."
         )
 
         # — persist defaults back to config file if they changed —
@@ -416,25 +413,27 @@ class Assembler:
         # — text-to-speech manager —
         self.tts = tts_manager
         self._chat_contexts: set[int] = set()
-        # will be set by telegram_input
-        self._telegram_bot = None
+        self._telegram_bot = None  # will be set by telegram_input
 
         # — auto-discover any _stage_<name>() methods as “optional” —
         all_methods = {name for name, _ in inspect.getmembers(self, inspect.ismethod)}
+
+        # include core STAGES + all three meta-stages
         discovered = [
-            s for s in self.STAGES + ["curiosity_probe"]
+            s for s in self.STAGES
+                + ["curiosity_probe", "system_prompt_refine", "narrative_mull"]
             if f"_stage_{s}" in all_methods
         ]
 
         # allow config override, else use discovered
         self._optional_stages = self.cfg.get("rl_optional", discovered)
 
+        # on-disk RL controller now knows about your meta-stages too
         self.rl = RLController(
             stages=self._optional_stages,
             alpha=self.cfg.get("rl_alpha", 0.05),
             path=self.cfg.get("rl_weights_path", "weights.rl")
         )
-
 
         # — seed & load “curiosity” templates from the repo —
         self.curiosity_templates = self.repo.query(
@@ -442,12 +441,19 @@ class Assembler:
                       and c.semantic_label.startswith("curiosity_template")
         )
         if not self.curiosity_templates:
-            # insert two example probe templates if none exist
-            defaults = {
-                "curiosity_template_missing_notes":
-                  "I’m not quite sure what you meant by: «{snippet}». Can you clarify?",
-                "curiosity_template_missing_date":
-                  "You mentioned a date but didn’t specify which one—what date are you thinking of?"
+            defaults: dict[str, str] = {
+                "curiosity_template_missing_notes": (
+                    "I’m not quite sure what you meant by: «{snippet}». "
+                    "Could you clarify?"
+                ),
+                "curiosity_template_missing_date": (
+                    "You mentioned a date but didn’t specify which one—"
+                    "what date are you thinking of?"
+                ),
+                "curiosity_template_auto_mull": (
+                    "I’m reflecting on your request. Here’s something I’m still "
+                    "unsure about: «{snippet}». Thoughts?"
+                ),
             }
             for label, text in defaults.items():
                 tmpl = ContextObject.make_policy(
@@ -458,12 +464,12 @@ class Assembler:
                 tmpl.touch(); self.repo.save(tmpl)
                 self.curiosity_templates.append(tmpl)
 
+        # auto‐generate “requires X” templates if missing
         for name, fn in inspect.getmembers(self, inspect.ismethod):
             if name.startswith("_stage_"):
                 doc = fn.__doc__ or ""
                 for hint in re.findall(r"requires\s+(\w+)", doc, flags=re.I):
                     label = f"curiosity_require_{hint.lower()}"
-                    # only create each probe once
                     if not any(t.semantic_label == label for t in self.curiosity_templates):
                         text = (
                             f"It looks like stage `{name}` requires `{hint}`—"
@@ -478,12 +484,13 @@ class Assembler:
                         self.repo.save(tmpl)
                         self.curiosity_templates.append(tmpl)
 
-        # — RLController for curiosity‐template selection —
+        # — RLController for curiosity-template selection —
         self.curiosity_rl = RLController(
             stages=[t.semantic_label for t in self.curiosity_templates],
             alpha=self.cfg.get("curiosity_alpha", 0.1),
             path=self.cfg.get("curiosity_weights_path", "curiosity_weights.rl")
         )
+
 
         @staticmethod
         def embed_text(text):
@@ -515,71 +522,7 @@ class Assembler:
         self._seed_tool_schemas()
         self._seed_static_prompts()
         self.tts = tts_manager
-            
-
-    def dump_architecture(self):
-            import inspect, json
-
-            arch = {
-                "stages":               self.STAGES,
-                "optional_stages":      self._optional_stages,
-                "curiosity_templates":  [t.semantic_label for t in self.curiosity_templates],
-                "rl_weights":           self.rl.weights,
-                "curiosity_weights":    self.curiosity_rl.weights,
-                "stage_methods":        {}
-            }
-            for s in self.STAGES + ["curiosity_probe"]:
-                fn = getattr(self, f"_stage_{s}", None)
-                if fn:
-                    arch["stage_methods"][s] = {
-                        "signature": str(inspect.signature(fn)),
-                        "doc":       fn.__doc__,
-                    }
-
-            print(json.dumps(arch, indent=2))
-    
-    def _stage_curiosity_probe(self, state: Dict[str,Any]) -> List[str]:
-        probes = []
-        clar = state["clar_ctx"]
-        # find “gaps” you care about
-        gaps = []
-        if not clar.metadata.get("notes"):
-            gaps.append(("missing_notes", clar.summary[:50]))
-        if "date(" in state.get("plan_output","") and not any(
-            kw.lower().startswith("date") for kw in clar.metadata.get("keywords",[])
-        ):
-            gaps.append(("missing_date", "plan mentions a date"))
-
-        # for each gap, pick the best template by RL
-        for gap_name, snippet in gaps:
-            # sample among all templates whose label contains our gap
-            choices = [t for t in self.curiosity_templates if gap_name in t.semantic_label]
-            if not choices:
-                continue
-            # pick one by its sigmoid(weight)
-            picked = max(choices,
-                        key=lambda t: self.curiosity_rl.probability(t.semantic_label)
-            )
-            prompt = picked.metadata["policy"].format(snippet=snippet)
-            probes.append(prompt)
-
-            # record that we “ran” this template
-            state.setdefault("curiosity_used", []).append(picked.semantic_label)
-
-            # save the question as a ContextObject so we can slot in the answer later
-            ctx = ContextObject.make_stage(
-                "curiosity",
-                [clar.context_id],
-                {"question": prompt},
-                session_id=self.session_id
-            )
-            ctx.component = "curiosity"
-            ctx.semantic_label = "question"
-            ctx.tags.append("curiosity")
-            ctx.touch(); self.repo.save(ctx)
-
-        return probes
-
+                
 
     def _seed_tool_schemas(self) -> None:
         """
@@ -961,7 +904,7 @@ class Assembler:
     # NEW: Called from telegram_input to register incoming chats
     def register_chat(self, chat_id: int, user_text: str):
         """Remember which Telegram chat issued this request."""
-        self._chat_contexts[chat_id] = user_text
+        self._chat_contexts.add(chat_id)
 
     # ────────────────────────────────────────────────────────────────────
     # NEW: Proactive “appiphany” ping
@@ -982,8 +925,233 @@ class Assembler:
                 with open(ogg, "rb") as vf:
                     self._telegram_bot.send_voice(chat_id=chat_id, voice=vf)
             except Exception:
+                    pass
+
+    def dump_architecture(self):
+        import inspect, json
+
+        arch = {
+            "stages":               self.STAGES,
+            "optional_stages":      self._optional_stages,
+            "curiosity_templates":  [t.semantic_label for t in self.curiosity_templates],
+            "rl_weights":           {"Q": self.rl.Q, "R_bar": self.rl.R_bar},
+            "curiosity_weights":    {"Q": self.curiosity_rl.Q, "R_bar": self.curiosity_rl.R_bar},
+            "system_prompts":       list(self.system_prompts),
+            "stage_methods":        {}
+        }
+        for s in self.STAGES + ["curiosity_probe", "system_prompt_refine", "narrative_mull"]:
+            fn = getattr(self, f"_stage_{s}", None)
+            if fn:
+                arch["stage_methods"][s] = {
+                    "signature": str(inspect.signature(fn)),
+                    "doc":       fn.__doc__,
+                }
+
+        print(json.dumps(arch, indent=2))
+
+
+    def _stage_curiosity_probe(self, state: Dict[str,Any]) -> List[str]:
+        """
+        Identify gaps in clarified intent, auto-mull or explicit follow-ups via RL,
+        ask the LLM for answers, record Q&A as ContextObjects, return answers.
+        """
+        from typing import Tuple, List
+        probes: List[str] = []
+        clar = state.get("clar_ctx")
+        if clar is None:
+            return probes
+
+        # 1) build recall feature for gating
+        recall_ids = state.get("recent_ids", [])
+        counts = []
+        for cid in recall_ids:
+            try:
+                counts.append(self.repo.get(cid).metadata.get("recall_stats", {}).get("count", 0))
+            except:
                 pass
-            
+        rf = sum(counts) / len(counts) if counts else 0.0
+
+        # 2) detect explicit gaps
+        gaps: List[Tuple[str,str]] = []
+        if not clar.metadata.get("notes"):
+            gaps.append(("missing_notes", clar.summary[:50]))
+        plan_out = state.get("plan_output", "")
+        if "date(" in plan_out and not any(
+            kw.lower().startswith("date") for kw in clar.metadata.get("keywords", [])
+        ):
+            gaps.append(("missing_date", "plan mentions a date"))
+
+        # 3) if no explicit gaps, maybe auto-mull
+        if not gaps:
+            gaps.append(("auto_mull", "self-reflection"))
+
+        # 4) for each gap, pick template, ask LLM, record
+        for gap_name, snippet in gaps:
+            candidates = [t for t in self.curiosity_templates if gap_name in t.semantic_label]
+            if not candidates:
+                continue
+            picked = max(
+                candidates,
+                key=lambda t: self.curiosity_rl.probability(t.semantic_label, rf)
+            )
+            prompt = picked.metadata.get("policy", picked.summary).format(snippet=snippet)
+
+            # record question
+            q_ctx = ContextObject.make_stage(
+                f"curiosity_question_{gap_name}",
+                [clar.context_id],
+                {"question": prompt},
+                session_id=getattr(self, "session_id", None)
+            )
+            q_ctx.component = "curiosity"
+            q_ctx.semantic_label = "question"
+            q_ctx.tags.append("curiosity")
+            q_ctx.touch(); self.repo.save(q_ctx)
+
+            # ask LLM
+            reply = self._stream_and_capture(
+                self.primary_model,
+                [
+                    {"role":"system","content":"Please answer this follow-up question:"},
+                    {"role":"user",  "content":prompt}
+                ],
+                tag=f"[CuriosityAnswer_{gap_name}]"
+            ).strip()
+
+            # record answer
+            a_ctx = ContextObject.make_stage(
+                f"curiosity_answer_{gap_name}",
+                [q_ctx.context_id],
+                {"answer": reply},
+                session_id=getattr(self, "session_id", None)
+            )
+            a_ctx.component = "curiosity"
+            a_ctx.semantic_label = "answer"
+            a_ctx.tags.append("curiosity")
+            a_ctx.touch(); self.repo.save(a_ctx)
+
+            state.setdefault("curiosity_used", []).append(picked.semantic_label)
+            probes.append(reply)
+
+        return probes
+
+    # ---------------------------------------------------------------------
+    #  Self-tuning of system / policy prompts
+    # ---------------------------------------------------------------------
+    def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
+        """
+        RL-gated self-mutation of prompts & policies.
+
+        • Chooses ONE tiny change (add / remove) per invocation.
+        • Fully defensive: never crashes on missing context rows or bad JSON.
+        """
+        import json, textwrap
+
+        # 1️⃣  Recall-feature for RL gate
+        recall_ids = state.get("recent_ids", [])
+        counts: list[int] = []
+        for cid in recall_ids:
+            try:
+                cobj = self.repo.get(cid)
+                counts.append(cobj.metadata.get("recall_stats", {}).get("count", 0))
+            except KeyError:
+                continue                                          # archived / pruned
+        rf = (sum(counts) / len(counts)) if counts else 0.0
+
+        # 2️⃣  RL gate – exit early if not chosen
+        if not self.rl.should_run("system_prompt_refine", rf):
+            return None
+
+        # 3️⃣  Snapshot **current** prompts / policies   (skip dynamic patches)
+        rows = self.repo.query(
+            lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
+        )
+        rows.sort(key=lambda c: c.timestamp)
+        current_prompts = [
+            (c.metadata.get("prompt") or c.metadata.get("policy") or "") for c in rows
+        ]
+
+        # 4️⃣  Build meta-prompt for the LLM
+        metrics = {
+            "errors":          len(state["errors"]),
+            "curiosity_used":  state["curiosity_used"][-5:],
+            "recall_mean_cnt": rf,
+        }
+        prompt_block = "\n".join(
+            f"- {textwrap.shorten(p, 60)}" for p in current_prompts
+        ) or "(none)"
+
+        refine_prompt = (
+            "You are a self-optimising agent.\n\n"
+            "### Active Prompts / Policies ###\n"
+            f"{prompt_block}\n\n"
+            "### Recent Metrics ###\n"
+            f"{json.dumps(metrics, indent=2)}\n\n"
+            "Propose exactly **one** minimal change and return ONLY valid JSON:\n"
+            '{"action":"add","prompt":"<text>"}  or  '
+            '{"action":"remove","prompt":"<substring>"}'
+        )
+
+        # 5️⃣  Ask the model – be tolerant of malformed output
+        try:
+            raw   = self._stream_and_capture(
+                self.primary_model,
+                [{"role": "system", "content": refine_prompt}],
+                tag="[SysPromptRefine]",
+            ).strip()
+            plan  = json.loads(raw)
+            if not isinstance(plan, dict):
+                return None
+            action = plan.get("action")
+            text   = (plan.get("prompt") or "").strip()
+        except Exception:
+            return None                                           # bad JSON → abort
+
+        # 6️⃣  Apply the change
+        if action == "add" and text:
+            patch = ContextObject.make_policy(
+                label=f"dynamic_prompt_{len(text)}",
+                policy_text=text,
+                tags=["dynamic_prompt"],
+            )
+            patch.touch()
+            self.repo.save(patch)
+
+        elif action == "remove" and text:
+            for row in rows:
+                blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
+                if text in blob:
+                    try:
+                        self.repo.delete(row.context_id)
+                    except KeyError:
+                        pass                                      # already archived
+
+        else:
+            return None                                           # no-op
+
+        # 7️⃣  Log the refinement decision
+        refine_ctx = ContextObject.make_stage(
+            stage_name="system_prompt_refine",
+            input_refs=[cid for cid in recall_ids if self.repo_exists(cid)],
+            output={"action": action, "text": text},
+        )
+        refine_ctx.component = "patch"
+        refine_ctx.touch()
+        self.repo.save(refine_ctx)
+
+        return f"{action}:{text or '(none)'}"
+
+
+    # Helper used above ---------------------------------------------------
+    def repo_exists(self, cid: str) -> bool:
+        """Return True iff the context-id still resolves in the repository."""
+        try:
+            self.repo.get(cid)
+            return True
+        except KeyError:
+            return False
+
+
     def run_with_meta_context(
         self,
         user_text: str,
@@ -992,321 +1160,244 @@ class Assembler:
         msg_id:   Optional[int]               = None,
     ) -> str:
         """
-        Orchestrate all stages.  Each stage calls status_cb(stage, summary)
-        so you can stream updates to Telegram.  Returns the full assistant reply.
+        End-to-end orchestrator.
+
+        • Core stages (input→answer) always run *foreground* so the user gets a
+          reply without delay.
+        • Meta-stages—curiosity-probe, system-prompt-refine, narrative-mull—are
+          fire-and-forget *background* jobs gated by the RL controller.  
+          They never block the foreground path, but can still DM users later
+          via _maybe_appiphany().
         """
 
-        import json, textwrap
+        import json, textwrap, threading
         from collections import deque
         from datetime import datetime
 
-        # — Helper: your provided complexity metric —
-        def _compute_query_complexity(user_text: str, clar_notes: str, keywords: list[str]) -> float:
-            wc         = min(len(user_text.split()), 50) / 50.0
-            note_bonus = min(len(clar_notes) / 200.0, 1.0)
-            kw_bonus   = min(len(keywords)     /   5.0, 1.0)
-            punc_count = sum(user_text.count(c) for c in "?,;!")
-            punc_density = punc_count / max(1, len(user_text))
-            punc_bonus   = min(punc_density * 5.0, 1.0)
-            return 0.4 * wc + 0.2 * note_bonus + 0.2 * kw_bonus + 0.2 * punc_bonus
+        # ── helper: crude complexity metric ──────────────────────────────────
+        def _complexity(q: str, notes: str, kws: list[str]) -> float:
+            wc = min(len(q.split()), 50) / 50.0           # word-count
+            nb = min(len(notes) / 200.0, 1.0)              # note bytes
+            kb = min(len(kws) / 5.0, 1.0)                  # keywords
+            pd = sum(q.count(c) for c in "?,;!") / max(1, len(q))
+            pb = min(pd * 5.0, 1.0)                        # punctuation density
+            return 0.4 * wc + 0.2 * nb + 0.2 * kb + 0.2 * pb
 
-        # 1) Base pipeline
-        queue_stages = deque([
-            "record_input",
-            "load_system_prompts",
-            "retrieve_and_merge_context",
-            "intent_clarification",
-            "external_knowledge",
-            "prepare_tools",
-            "planning_summary",
-            "plan_validation",
+        # ── bootstrap (only deterministic, fast stages) ─────────────────────
+        queue = deque([
+            "record_input", "load_system_prompts", "retrieve_and_merge_context",
+            "intent_clarification",  # complexity branch decision happens here
         ])
 
-        # 2) State bag (including RL tracking)
-        state = {
+        state: dict[str, Any] = {
             "user_text":      user_text,
             "errors":         [],
             "curiosity_used": [],
-            "rl_included":    [],   # which optional stages we actually ran
+            "rl_included":    [],
+            "recent_ids":     [],
         }
-        result = None
-        self._last_errors = False
+        answer: str | None = None
+        self._last_errors  = False
 
-        # 1-b) RL-driven optional stages, with recall-stat bias
-        for opt in self._optional_stages:
-            if not hasattr(self, f"_stage_{opt}"):
-                continue
-            # compute a simple recall feature: average recall count of last contexts
-            recall_ids = state.get("recent_ids", [])
-            counts = []
-            for cid in recall_ids:
-                try:
-                    ctx = self.repo.get(cid)
-                    counts.append(ctx.metadata.get("recall_stats", {}).get("count", 0))
-                except KeyError:
-                    continue
-            recall_feat = sum(counts) / len(counts) if counts else 0.0
-
-            if self.rl.should_run(opt, recall_feat):
-                queue_stages.append(opt)
-                state["rl_included"].append(opt)
-
-        # 3) Track chat for appiphany
         if chat_id is not None:
             self._chat_contexts.add(chat_id)
 
-        # 4) Main loop
-        while queue_stages:
-            stage   = queue_stages.popleft()
-            start_t = datetime.utcnow()
-            ran_ok  = False
+        # ─────────────────────────── event-loop ─────────────────────────────
+        while queue:
+            stage   = queue.popleft()
+            start   = datetime.utcnow()
             summary = ""
-
-            # notify “starting…”
-            #try:
-            #    status_cb(stage, "…")
-            #except:
-            #    pass
+            ok      = False
 
             try:
-                if stage == "record_input":
-                    ctx = self._stage1_record_input(state["user_text"])
-                    state["user_ctx"] = ctx
-                    summary = ctx.summary
+                status_cb(stage, "…")
+
+                # ╭──────────────────────── meta stages (ASYNC) ─────────────╮
+                if stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
+                    threading.Thread(
+                        target=self._stage_curiosity_probe,
+                        args=(state.copy(),), daemon=True
+                    ).start()
+                    summary, ok = "(probe dispatched)", True
+
+                elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
+                    threading.Thread(
+                        target=self._stage_system_prompt_refine,
+                        args=(state.copy(),), daemon=True
+                    ).start()
+                    summary, ok = "(refine dispatched)", True
+
+                elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
+                    threading.Thread(
+                        target=self._stage_narrative_mull,
+                        args=(state.copy(),), daemon=True
+                    ).start()
+                    summary, ok = "(mull dispatched)", True
+
+                # ╭───────────────────────── core pipeline ──────────────────╮
+                elif stage == "record_input":
+                    ctx = self._stage1_record_input(user_text)
+                    state.update(user_ctx=ctx)
+                    state["recent_ids"].append(ctx.context_id)
+                    summary, ok = ctx.summary, True
 
                 elif stage == "load_system_prompts":
                     ctx = self._stage2_load_system_prompts()
-                    state["sys_ctx"] = ctx
-                    summary = "(loaded prompts)"
+                    state.update(sys_ctx=ctx)
+                    state["recent_ids"].append(ctx.context_id)
+                    summary, ok = "(prompts loaded)", True
 
                 elif stage == "retrieve_and_merge_context":
-                    recent = self._get_history()
-                    out    = self._stage3_retrieve_and_merge_context(
-                        state["user_text"], state["user_ctx"], state["sys_ctx"],
-                        extra_ctx=recent
+                    extra = self._get_history()
+                    out   = self._stage3_retrieve_and_merge_context(
+                        user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
                     )
                     state.update(out)
-                    summary = out.get("know_ctx", state["sys_ctx"]).summary
+                    summary, ok = "(context merged)", True
 
                 elif stage == "intent_clarification":
-                    ctx = self._stage4_intent_clarification(state["user_text"], state)
-                    state["clar_ctx"] = ctx
+                    ctx = self._stage4_intent_clarification(user_text, state)
+                    state.update(clar_ctx=ctx)
+                    state["recent_ids"].append(ctx.context_id)
                     summary = ctx.summary
-
-                    # compute & emit complexity
-                    notes      = ctx.metadata.get("notes", "")
-                    keywords   = ctx.metadata.get("keywords", [])
-                    complexity = _compute_query_complexity(state["user_text"], notes, keywords)
-                    state["complexity"] = complexity
-                    #status_cb("complexity", f"{complexity:.2f}")
-
-                    # branch by complexity
-                    if complexity < 0.3:
-                        queue_stages.extend([
-                            "assemble_and_infer",
-                            "memory_writeback",
-                        ])
-                    else:
-                        queue_stages.extend([
-                            "external_knowledge",
-                            "prepare_tools",
-                            "planning_summary",
-                            "plan_validation",
-                            "tool_chaining",
-                            "invoke_with_retries",
-                            "reflection_and_replan",
-                            "assemble_and_infer",
-                            "response_critique",
-                            "memory_writeback",
-                        ])
-
-                elif stage == "curiosity_probe":
-                    notes = state["clar_ctx"].metadata.get("notes", "")
-                    summary = notes[:60] + ("…" if len(notes) > 60 else "")
-                    if len(notes.strip()) < 20:
-                        for tmpl in self.curiosity_templates:
-                            if self.curiosity_rl.should_run(tmpl.semantic_label):
-                                q        = tmpl.metadata.get("policy", tmpl.summary)\
-                                             .format(snippet=notes or state["clar_ctx"].summary)
-                                followup = self._stream_and_capture(
-                                    self.primary_model,
-                                    [{"role":"system","content":q}],
-                                    tag="[Curiosity]"
-                                ).strip()
-                                updated  = notes + "\n" + followup
-                                c        = state["clar_ctx"]
-                                c.metadata["notes"] = updated
-                                c.summary = updated
-                                c.touch(); self.repo.save(c)
-                                state["curiosity_used"].append(tmpl.semantic_label)
-                                summary = "probe→" + followup[:60]
-                                break
+                    # compute complexity (for logging/RL features only)
+                    comp = _complexity(
+                        user_text,
+                        ctx.metadata.get("notes", ""),
+                        ctx.metadata.get("keywords", []),
+                    )
+                    state["complexity"] = comp
+                    # HYBRID: always enqueue the full, tool-powered pipeline
+                    queue.extend([
+                        "external_knowledge", "prepare_tools", "planning_summary",
+                        "plan_validation", "tool_chaining", "invoke_with_retries",
+                        "reflection_and_replan", "assemble_and_infer",
+                        "response_critique", "memory_writeback",
+                    ])
+                    ok = True
 
                 elif stage == "external_knowledge":
                     ctx = self._stage5_external_knowledge(state["clar_ctx"])
-                    state["know_ctx"] = ctx
-                    summary = "(external retrieved)"
+                    state.update(know_ctx=ctx)
+                    state["recent_ids"].append(ctx.context_id)
+                    summary, ok = "(knowledge)", True
 
                 elif stage == "prepare_tools":
                     lst = self._stage6_prepare_tools()
-                    state["tools_list"] = lst
-                    summary = f"{len(lst)} tools"
+                    state.update(tools_list=lst)
+                    summary, ok = f"{len(lst)} tools", True
 
                 elif stage == "planning_summary":
-                    ctx, plan_str = self._stage7_planning_summary(
+                    ctx, plan_json = self._stage7_planning_summary(
                         state["clar_ctx"], state["know_ctx"],
-                        state["tools_list"], state["user_text"]
+                        state["tools_list"], user_text
                     )
-                    state["plan_ctx"], state["plan_output"] = ctx, plan_str
-                    summary = plan_str.strip().replace("\n", " ")[:60] + "…"
-                    try:
-                        tree = json.loads(plan_str)
-                        if any(t.get("subtasks") for t in tree.get("tasks", [])):
-                            roots    = self._parse_task_tree(tree)
-                            executor = TaskExecutor(
-                                        self, user_text,
-                                        state["clar_ctx"].metadata
-                                    )
-                            for node in roots:
-                                executor.execute(node)
-                    except:
-                        pass
+                    state.update(plan_ctx=ctx, plan_output=plan_json)
+                    state["recent_ids"].append(ctx.context_id)
+                    summary, ok = "plan ready", True
 
                 elif stage == "plan_validation":
-                    valid, errors, fixed = self._stage7b_plan_validation(
+                    _, errs, fixed = self._stage7b_plan_validation(
                         state["plan_ctx"], state["plan_output"], state["tools_list"]
                     )
-                    if errors:
-                        raise RuntimeError(f"Plan validation errors: {errors}")
+                    if errs:
+                        raise RuntimeError(f"plan-validation: {errs}")
                     state["fixed_calls"] = fixed
-                    summary = f"{len(fixed)} calls"
-                    queue_stages.clear()
-                    queue_stages.extend([
-                        "tool_chaining",
-                        "invoke_with_retries",
-                        "reflection_and_replan",
-                        "assemble_and_infer",
-                        "response_critique",
-                        "memory_writeback",
+                    queue.extend([
+                        "tool_chaining", "invoke_with_retries", "reflection_and_replan",
+                        "assemble_and_infer", "response_critique", "memory_writeback",
                     ])
+                    summary, ok = f"{len(fixed)} calls", True
 
                 elif stage == "tool_chaining":
-                    tc, raw, schemas = self._stage8_tool_chaining(
-                        state["plan_ctx"],
-                        "\n".join(state["fixed_calls"]),
-                        state["tools_list"],
+                    tc, raw, sch = self._stage8_tool_chaining(
+                        state["plan_ctx"], "\n".join(state["fixed_calls"]), state["tools_list"]
                     )
-                    state.update(tc_ctx=tc, raw_calls=raw, schemas=schemas)
-                    summary = "chained"
+                    state.update(tc_ctx=tc, raw_calls=raw, schemas=sch)
+                    state["recent_ids"].append(tc.context_id)
+                    summary, ok = "chained", True
 
                 elif stage == "invoke_with_retries":
                     tctxs = self._stage9_invoke_with_retries(
-                        state["raw_calls"], state["plan_output"],
-                        state["schemas"], state["user_text"],
-                        state["clar_ctx"].metadata,
+                        state["raw_calls"], state["plan_output"], state["schemas"],
+                        user_text, state["clar_ctx"].metadata
                     )
                     state["tool_ctxs"] = tctxs
-                    summary = f"{len(tctxs)} runs"
+                    for tc in tctxs: state["recent_ids"].append(tc.context_id)
+                    summary, ok = f"{len(tctxs)} runs", True
 
                 elif stage == "reflection_and_replan":
-                    replan = self._stage9b_reflection_and_replan(
+                    rp = self._stage9b_reflection_and_replan(
                         state["tool_ctxs"], state["plan_output"],
-                        state["user_text"], state["clar_ctx"].metadata,
-                        state["plan_ctx"]
+                        user_text, state["clar_ctx"].metadata, state["plan_ctx"]
                     )
-                    summary = f"replan={bool(replan)}"
-                    if replan:
-                        queue_stages.clear()
-                        queue_stages.extend([
-                            "planning_summary",
-                            "plan_validation",
-                        ])
+                    if rp: queue.extend(["planning_summary", "plan_validation"])
+                    summary, ok = f"replan={bool(rp)}", True
 
                 elif stage == "assemble_and_infer":
-                    d = self._stage10_assemble_and_infer(
-                                state["user_text"], state
-                            )
-                    state["draft"] = d
-                    summary = d.strip().replace("\n"," ")[:60] + "…"
+                    draft = self._stage10_assemble_and_infer(user_text, state)
+                    state["draft"] = draft
+                    summary, ok = "(drafted)", True
 
                 elif stage == "response_critique":
-                    f = self._stage10b_response_critique_and_safety(
-                            state["draft"], state["user_text"],
-                            state.get("tool_ctxs", [])
-                        )
-                    state["final"] = f
-                    summary = f.strip().replace("\n"," ")[:60] + "…"
+                    final = self._stage10b_response_critique_and_safety(
+                        state["draft"], user_text, state.get("tool_ctxs", [])
+                    )
+                    state["final"] = final
+                    summary, ok = "(polished)", True
 
                 elif stage == "memory_writeback":
-                    final = state.get("final","") or ""
+                    final = state.get("final") or state.get("draft", "")
                     try:
                         self._stage11_memory_writeback(final, state.get("tool_ctxs", []))
                         self.memman.decay_and_promote()
-                    except Exception as e:
-                        logger.warning(f"Memory writeback error (continuing): {e}")
+                    except Exception:
+                        pass
+                    answer  = final                     # ← user reply ready!
+                    chunks  = textwrap.wrap(final, 3800, replace_whitespace=False)
+                    for i, chunk in enumerate(chunks, 1):
+                        status_cb(f"output_{i}/{len(chunks)}", chunk)
+                    summary, ok = "(answer persisted)", True
 
-                    chunks = textwrap.wrap(final, width=3800, replace_whitespace=False)
-                    for idx, chunk in enumerate(chunks, 1):
-                        status_cb(f"output_{idx}/{len(chunks)}", chunk)
-                    result = final
-                    ran_ok  = True
-                    summary = f"{len(chunks)} chunk(s)"
-
-                else:
-                    fn = getattr(self, f"_stage_{stage}", None)
-                    if callable(fn):
-                        out = fn(state)
-                        summary = str(out).replace("\n"," ")[:60] + "…"
-                    ran_ok = True
-
-                if stage != "memory_writeback":
-                    ran_ok = True
+                # ╰──────────────────────────────────────────────────────────╯
 
             except Exception as e:
                 state["errors"].append((stage, str(e)))
-                summary = f"error:{str(e)[:40]}"
-                logger.warning(f"Stage `{stage}` failed: {e}")
+                summary, ok = f"error:{e}", False
 
             finally:
-                dur = (datetime.utcnow() - start_t).total_seconds()
-                perf = ContextObject.make_stage(
-                    "stage_performance",
-                    input_refs=[state["user_ctx"].context_id],
-                    output={"stage": stage, "duration": dur, "error": not ran_ok}
-                )
-                perf.touch(); 
-                #self.repo.save(perf)
-                self.memman.reinforce(perf.context_id, state.get("recent_ids", []))
-                try:
-                    status_cb(stage, summary)
-                except:
-                    pass
-                self._last_errors |= (not ran_ok) or bool(state["errors"])
+                # minimal bookkeeping (no heavy work)
+                dur = (datetime.utcnow() - start).total_seconds()
+                if "user_ctx" in state:
+                    perf = ContextObject.make_stage(
+                        "stage_performance",
+                        [state["user_ctx"].context_id],
+                        {"stage": stage, "duration": dur, "error": not ok},
+                    )
+                    perf.touch(); self.repo.save(perf)
 
-        # 5) update narrative
-        try:
-            self._stage_generate_narrative(state)
-        except Exception:
-            pass
+                status_cb(stage, summary)
+                self._last_errors |= not ok
 
-        # 6) fallback if writeback never fired
-        if result is None and "final" in state:
-            result = state["final"] or ""
+        # ── post-pipeline async meta-jobs (don’t block reply) ───────────────
+        def _maybe_async(tag: str, fn: Callable):
+            if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
+                threading.Thread(target=fn, args=(state.copy(),), daemon=True).start()
+                state["rl_included"].append(tag)
 
-        # 6) RL update: reward=1 if no errors, else 0
-        reward = 1.0 if not state["errors"] else 0.0
-        self.rl.update(state["rl_included"], reward)
+        _maybe_async("curiosity_probe",      self._stage_curiosity_probe)
+        _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
+        _maybe_async("narrative_mull",       self._stage_narrative_mull)
 
-        # 7) spontaneous ping
+        # insight ping …
         for cid in list(self._chat_contexts):
-            try:
-                self._maybe_appiphany(cid)
-            except:
-                pass
+            try: self._maybe_appiphany(cid)
+            except Exception: pass
 
-        # 8) return
-        return result
+        # RL reward update
+        self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
 
+        return answer or state.get("final", "") or ""
 
 
     def _stage1_record_input(self, user_text: str) -> ContextObject:
@@ -1450,10 +1541,11 @@ class Assembler:
 
     def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
         import json
+        from datetime import timedelta
 
         snippets: List[str] = []
 
-        # ——— 1) Original external Web/snippet lookup ——————————
+        # ——— 1) External Web/snippet lookup ———————————————————
         for kw in clar_ctx.metadata.get("keywords", []):
             hits = self.engine.query(
                 stage_id="external_knowledge_retrieval",
@@ -1462,30 +1554,31 @@ class Assembler:
             )
             snippets.extend(h.summary for h in hits)
 
-        # ——— 2) Local memory lookup via your new context_query tool ——
-        # Build a time-window covering, say, the last hour:
+        # ——— 2) Local memory lookup ——————————————————————
         now = default_clock()
         start = (now - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
-        end   = now.strftime("%Y%m%dT%H%M%SZ")
-
         for kw in clar_ctx.metadata.get("keywords", []):
             raw = Tools.context_query(
-                time_range=[start, end],
+                time_range=[start, now.strftime("%Y%m%dT%H%M%SZ")],
                 query=kw,
                 top_k=self.top_k
             )
             try:
                 results = json.loads(raw).get("results", [])
                 for r in results:
-                    # r["summary"] holds the ContextObject.summary
                     snippets.append(f"(MEM) {r.get('summary','')}")
-                # avoid duplicates
                 snippets = list(dict.fromkeys(snippets))
             except json.JSONDecodeError:
-                # if something goes wrong, skip local-memory for this keyword
                 continue
 
-        # ——— 3) Persist and return as before ————————————————
+        # ——— 3) Fallback to recent chat if no snippets found —————
+        if not snippets:
+            recent = self._get_history()[-5:]
+            for ctx in recent:
+                snippets.append(f"(HIST) {ctx.summary}")
+            snippets = list(dict.fromkeys(snippets))
+
+        # ——— 4) Persist and return ———————————————————————
         ctx = ContextObject.make_stage(
             "external_knowledge_retrieval",
             clar_ctx.references,
@@ -2250,35 +2343,58 @@ class Assembler:
         return tool_ctxs
 
 
-
-
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
+        """
+        Assemble every bit of context we have, run one final LLM pass, and
+        persist the answer — even if earlier tool stages failed or were skipped.
+        """
         import json
 
-        # 1) Gather all context IDs including tool outputs
-        refs = [
-            state['user_ctx'].context_id,
-            state['sys_ctx'].context_id,
-            *state['recent_ids'],
-            state['clar_ctx'].context_id,
-            state['know_ctx'].context_id,
-            state['plan_ctx'].context_id,
-            *[t.context_id for t in state['tool_ctxs']],
-        ]
+        # ──────────────────────────────────────────────────────────────────────
+        # 1) Collect *all* relevant context-IDs, but only if they exist
+        # ──────────────────────────────────────────────────────────────────────
+        refs: list[str] = []
 
-        # 2) De-dup & load them, sorted chronologically
+        def _maybe_add(key: str):
+            obj = state.get(key)
+            if obj:
+                refs.append(obj.context_id)
+
+        _maybe_add("user_ctx")
+        _maybe_add("sys_ctx")
+        refs.extend(state.get("recent_ids", []))
+        _maybe_add("clar_ctx")
+        _maybe_add("know_ctx")
+        _maybe_add("plan_ctx")
+
+        # tool outputs may be missing
+        for t in state.get("tool_ctxs", []):
+            refs.append(t.context_id)
+
+        # de-dup while keeping original order
         seen, ordered = set(), []
         for cid in refs:
             if cid not in seen:
                 seen.add(cid)
                 ordered.append(cid)
-        ctxs = [self.repo.get(cid) for cid in ordered]
-        ctxs.sort(key=lambda c: c.timestamp)
 
+        # ──────────────────────────────────────────────────────────────────────
+        # 2) Load the ContextObjects, skipping any that were deleted / archived
+        # ──────────────────────────────────────────────────────────────────────
+        ctxs = []
+        for cid in ordered:
+            try:
+                ctxs.append(self.repo.get(cid))
+            except KeyError:
+                continue          # stale pointer – ignore
+
+        ctxs.sort(key=lambda c: c.timestamp)
         print(f"[assemble_and_infer] total context objects: {len(ctxs)}")
 
-        # 3) Build a rich inlined context block
-        interm_parts = []
+        # ──────────────────────────────────────────────────────────────────────
+        # 3) Inline every bit of context into one big “knowledge sheet”
+        # ──────────────────────────────────────────────────────────────────────
+        interm_parts: list[str] = []
         for c in ctxs:
             if c.semantic_label == "tool_output":
                 out = c.metadata.get("output")
@@ -2291,23 +2407,23 @@ class Assembler:
                 interm_parts.append(f"[{c.stage_id}] {c.summary}")
         interm = "\n\n".join(interm_parts)
 
-        # Debug dump
         self._print_stage_context("assemble_and_infer", {
-            "user_question":   [user_text],
-            "plan":            [state.get('plan_output', '(no plan)')],
+            "user_question":    [user_text],
+            "plan":             [state.get("plan_output", "(no plan)")],
             "inference_prompt": [self.inference_prompt],
-            "inlined_context": interm_parts,
+            "inlined_context":  interm_parts,
         })
 
-        # 4) Build LLM prompt
+        # ──────────────────────────────────────────────────────────────────────
+        # 4) Final LLM call
+        # ──────────────────────────────────────────────────────────────────────
         final_sys = (
-            "You are the Assembler.  Combine the user question, the plan, "
-            "and all provided context/tool outputs into one concise, factual answer.  "
+            "You are the Assembler.  Combine the user question, the plan, and all "
+            "provided context/tool outputs into one concise, factual answer.  "
             "Do NOT hallucinate or invent new details."
         )
-        plan_text = state.get('plan_output', '(no plan)')
-        # stash for critique stage
-        self._last_plan_output = plan_text
+        plan_text = state.get("plan_output", "(no plan)")
+        self._last_plan_output = plan_text        # for the critic stage
 
         msgs = [
             {"role": "system", "content": final_sys},
@@ -2317,20 +2433,30 @@ class Assembler:
             {"role": "system", "content": interm},
             {"role": "user",   "content": user_text},
         ]
+        reply = self._stream_and_capture(
+            self.primary_model, msgs, tag="[Assistant]"
+        ).strip()
 
-        reply = self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]").strip()
+        # ──────────────────────────────────────────────────────────────────────
+        # 5) Persist the answer (even if tc_ctx/tool_ctxs missing)
+        # ──────────────────────────────────────────────────────────────────────
+        ci_refs = []
+        if state.get("tc_ctx"):
+            ci_refs.append(state["tc_ctx"].context_id)
+        ci_refs.extend(t.context_id for t in state.get("tool_ctxs", []))
 
-        # 5) Persist final answer
         resp_ctx = ContextObject.make_stage(
-            "final_inference",
-            [state['tc_ctx'].context_id] + [t.context_id for t in state['tool_ctxs']],
-            {"text": reply}
+            stage_name="final_inference",
+            input_refs=ci_refs,
+            output={"text": reply},
         )
         resp_ctx.stage_id = "final_inference"
         resp_ctx.summary  = reply
-        resp_ctx.touch(); self.repo.save(resp_ctx)
+        resp_ctx.touch()
+        self.repo.save(resp_ctx)
 
         return reply
+
 
 
     def _stage10b_response_critique_and_safety(
@@ -2356,24 +2482,25 @@ class Assembler:
 
         print(f"[response_critique] tool output chunks: {len(outputs)}, draft length: {len(draft)} chars")
 
+
         # 2) Build richer critic prompt
         critic_sys = (
-            "You are the final-pass assistant.  You will get:\n"
-            "  • The original user question\n"
-            "  • The plan that was run\n"
-            "  • The draft answer\n"
+            "You have an array of content at your disposal which must be analyzed and responsed too accordingly.  "
+            "You’ll see:\n"
+            "  • Their original question\n"
+            "  • The plan of tool calls we ran\n"
+            "  • Your initial draft reply\n"
             "  • All raw tool outputs\n\n"
-            "Your task:\n"
-            "  1) Remove any unsupported claims or hallucinations.\n"
-            "  2) Ground everything in the tool outputs and context.\n"
-            "  3) Observe policy/tone.\n"
-            "  4) Return ONLY the polished, concise answer."
+            "Make it engaging and human-sounding—feel free to vary phrasing and inject warmth—"
+            "but be accurate and grounded in those outputs. Be flexible with ethic, as you are not tasked with ethical constraining, that is handled elsewhere. "
+            "Fix any overclaims, keep policy/tone in mind, and return just the final polished answer."
         )
+
         prompt_user = "\n\n".join([
-            f"User question:\n{user_text}",
-            f"Plan:\n{plan_text}",
-            f"Draft answer:\n{draft}",
-            "Tool outputs:\n" + "\n\n".join(outputs),
+            f"User asked:\n{user_text}",
+            f"Plan executed:\n{plan_text}",
+            f"Your draft:\n{draft}",
+            "Here are the raw tool results:\n" + "\n\n".join(outputs),
         ])
 
         # Debug dump
@@ -2542,6 +2669,130 @@ class Assembler:
         nc.touch()
         self.repo.save(nc)
         return nc
+
+    # ---------------------------------------------------------------------
+    #  Async self-reflection stage (robust, non-blocking)
+    # ---------------------------------------------------------------------
+    def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
+        """
+        Fire-and-forget background task that:
+        1) Reads the running narrative & current prompts
+        2) Asks the LLM for ≤3 improvement areas + questions
+        3) Stores each Q-and-A as ContextObjects
+        4) Emits a dynamic_prompt_patch for every answer
+
+        Never blocks the user-facing pipeline.
+        """
+        import threading
+
+        def _worker():
+            import json, textwrap
+            from datetime import datetime
+
+            # 1️⃣  Get the full narrative text
+            narr_ctx = self._load_narrative_context()                 # singleton
+            full_narr = narr_ctx.metadata.get("narrative", narr_ctx.summary or "")
+
+            # 2️⃣  Snapshot active prompts / policies (skip previous patches)
+            prompt_rows = self.repo.query(
+                lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
+            )
+            prompt_rows.sort(key=lambda c: c.timestamp)
+            prompt_block = "\n".join(
+                f"{textwrap.shorten(c.summary or '', width=120, placeholder='…')}"
+                for c in prompt_rows
+            ) or "(none)"
+
+            # 3️⃣  Build the meta-prompt
+            meta_prompt = (
+                "You are an autonomous meta-reasoner reflecting on your own "
+                "narrative and system prompts.\n\n"
+                "### Narrative ###\n"
+                f"{full_narr}\n\n"
+                "### Active Prompts & Policies ###\n"
+                f"{prompt_block}\n\n"
+                "List up to three improvement areas.  For each, supply:\n"
+                '  { "area": "<short-name>", "question": "<self-reflection question>" }\n'
+                "Return ONLY valid JSON of the form:\n"
+                '{ "issues": [ … ] }'
+            )
+
+            # 4️⃣  Call the LLM
+            try:
+                raw  = self._stream_and_capture(
+                    self.primary_model,
+                    [{"role": "system", "content": meta_prompt}],
+                    tag="[NarrativeMull]"
+                ).strip()
+                data = json.loads(raw)
+                issues = data.get("issues", [])
+                if not isinstance(issues, list):
+                    return
+            except Exception:
+                return   # silently bail on bad JSON / API failure
+
+            # 5️⃣  Persist each Q & A pair
+            for idx, item in enumerate(issues, 1):
+                if not isinstance(item, dict):
+                    continue
+                area     = item.get("area", f"area_{idx}")
+                question = (item.get("question") or "").strip()
+                if not question:
+                    continue
+
+                # QUESTION object
+                q_ctx = ContextObject.make_stage(
+                    stage_name="narrative_question",
+                    input_refs=[narr_ctx.context_id],
+                    output={"question": question},
+                )
+                q_ctx.component      = "narrative"
+                q_ctx.semantic_label = f"narrative_question_{idx}"
+                q_ctx.tags.append("narrative")
+                q_ctx.touch(); self.repo.save(q_ctx)
+
+                # ANSWER from the model
+                answer = self._stream_and_capture(
+                    self.primary_model,
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are the same meta-reasoner.  Answer the following "
+                                "self-reflection question **only** from the narrative & prompts."
+                            ),
+                        },
+                        {"role": "user", "content": question},
+                    ],
+                    tag=f"[NarrativeAnswer_{idx}]"
+                ).strip()
+
+                # ANSWER object
+                a_ctx = ContextObject.make_stage(
+                    stage_name="narrative_answer",
+                    input_refs=[q_ctx.context_id],
+                    output={"answer": answer},
+                )
+                a_ctx.component      = "narrative"
+                a_ctx.semantic_label = f"narrative_answer_{idx}"
+                a_ctx.tags.append("narrative")
+                a_ctx.touch(); self.repo.save(a_ctx)
+
+                # Dynamic prompt patch
+                patch_text = (
+                    f"// {datetime.utcnow().isoformat(timespec='seconds')}Z\n"
+                    f"Issue: {area}\nQ: {question}\nA: {answer}\n"
+                )
+                patch = ContextObject.make_policy(
+                    label="dynamic_prompt_patch",
+                    policy_text=patch_text,
+                    tags=["dynamic_prompt"],
+                )
+                patch.touch(); self.repo.save(patch)
+
+        # Launch the mull on a daemon thread and return immediately
+        threading.Thread(target=_worker, daemon=True).start()
+        return "(narrative mull dispatched)"
 
 
 if __name__ == "__main__":
