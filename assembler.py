@@ -21,11 +21,6 @@ from datetime import datetime
 from collections import deque
 import inspect
 import threading
-logger = logging.getLogger("assembler")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] assembler: %(message)s",
-)
 import ast, json, re
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
@@ -388,9 +383,10 @@ class Assembler:
             "You have these tools (full JSON schemas shown).\n"
             "I will send you exactly one JSON object with key \"tool_calls\".\n"
             "YOUR ONLY JOB is to return back that same JSON object (modifying only calls that violate the schema).\n"
+            "When building each call, you **must** inline any placeholder of the form [alias from full_function_name] or {{alias}} by substituting the actual value returned by that tool in previous steps.\n"
             "Do NOT add, remove, or simulate any outputs or internal state.\n"
             "Reply with exactly one JSON object and nothing else:\n\n"
-            '{"tool_calls": ["tool1(arg1=...,arg2=...)", ...]}\n\n'
+            "{\"tool_calls\": [\"tool1(arg1=...,arg2=...)\", ...]}\n\n"
         )
         self.reflection_prompt = self.cfg.get(
             "reflection_prompt",
@@ -1237,9 +1233,6 @@ class Assembler:
             return ""
 
         try:
-            import json, textwrap, threading
-            from collections import deque
-            from datetime import datetime
 
             # ── helper: crude complexity metric ──────────────────────────────────
             def _complexity(q: str, notes: str, kws: list[str]) -> float:
@@ -1366,25 +1359,28 @@ class Assembler:
                             "assemble_and_infer", "response_critique", "memory_writeback",
                         ])
                         summary, ok = f"{len(fixed)} calls", True
-
                     elif stage == "tool_chaining":
-                        tc, raw, sch = self._stage8_tool_chaining(
-                            state["plan_ctx"], "\n".join(state["fixed_calls"]), state["tools_list"]
+                        tc_ctx, confirmed_calls, schemas = self._stage8_tool_chaining(
+                            state["plan_ctx"],
+                            "\n".join(state["fixed_calls"]),
+                            state["tools_list"]
                         )
-                        state["tc_ctx"], state["raw_calls"], state["schemas"] = tc, raw, sch
-                        state["recent_ids"].append(tc.context_id)
-                        summary, ok = "chained", True
-
+                        state.update({
+                        "tc_ctx": tc_ctx,
+                        "raw_calls": confirmed_calls,
+                        "schemas": schemas,
+                        # also store the exact chainer input so we can re-use it:
+                        "chainer_input": "\n".join(state["fixed_calls"])
+                        })
                     elif stage == "invoke_with_retries":
                         tctxs = self._stage9_invoke_with_retries(
-                            state["raw_calls"], state["plan_output"], state["schemas"],
-                            user_text, state["clar_ctx"].metadata
+                            raw_calls=state["raw_calls"],
+                            plan_output=state["chainer_input"],      # must be the same text you gave to stage8
+                            selected_schemas=state["schemas"],
+                            user_text=state["user_text"],
+                            clar_metadata=state["clar_ctx"].metadata
                         )
                         state["tool_ctxs"] = tctxs
-                        for t in tctxs:
-                            state["recent_ids"].append(t.context_id)
-                        summary, ok = f"{len(tctxs)} runs", True
-
                     elif stage == "reflection_and_replan":
                         rp = self._stage9b_reflection_and_replan(
                             state["tool_ctxs"], state["plan_output"],
@@ -1454,7 +1450,6 @@ class Assembler:
             return final_text
 
         except Exception:
-            logger.exception("run_with_meta_context failed")
             apology = "Sorry, something went wrong. Please try again."
             status_cb("output_1/1", apology)
             return apology
@@ -1700,6 +1695,7 @@ class Assembler:
         user_text: str,
     ) -> Tuple[ContextObject, str]:
         import json, re, hashlib, datetime
+        from typing import Any, Dict, List, Tuple
 
         # strip markdown fences and pull out a bare JSON object
         def _clean_json_block(text: str) -> str:
@@ -1709,11 +1705,14 @@ class Assembler:
             m2 = re.search(r"(\{.*\})", text, flags=re.S)
             return m2.group(1) if m2 else text.strip()
 
-        # build planner prompts
+        # build a markdown list of available tools
         tools_md = "\n".join(f"- **{t['name']}**: {t['description']}"
                              for t in tools_list)
-        base_system = self._get_prompt("planning_prompt") + tools_md
 
+        # inject it directly into the system prompt
+        base_system = self._get_prompt("planning_prompt") + "\n" + tools_md
+
+        # assemble the user prompt
         base_user = (
             f"User question:\n{user_text}\n\n"
             f"Clarified intent:\n{clar_ctx.summary}\n\n"
@@ -1756,7 +1755,7 @@ class Assembler:
                                       for c in calls]}
 
             # drop unknown calls
-            available = {t["name"] for t in tools_list}  # no skip_tools
+            available = {t["name"] for t in tools_list}
             unknown   = [t["call"] for t in plan_obj["tasks"] if t["call"] not in available]
             if unknown:
                 self._print_stage_context(
@@ -1776,9 +1775,20 @@ class Assembler:
             last_calls = this_calls
             break
 
-        # build call-strings from whatever the model returned
-        call_strings = []
-        for task in (plan_obj or {}).get("tasks", []):
+        # ── Flatten tasks + subtasks ──────────────────────────────────────────
+        def _flatten(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+            out = [task]
+            for sub in task.get("subtasks", []):
+                out.extend(_flatten(sub))
+            return out
+
+        flat_tasks: List[Dict[str, Any]] = []
+        for t in (plan_obj or {}).get("tasks", []):
+            flat_tasks.extend(_flatten(t))
+
+        # build call-strings from the flattened list
+        call_strings: List[str] = []
+        for task in flat_tasks:
             name   = task["call"]
             params = task.get("tool_input", {}) or {}
             if params:
@@ -1793,7 +1803,7 @@ class Assembler:
                                           for s in call_strings]})
         plan_sig  = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
 
-        # persist planning_summary with plan_id and attempt count
+        # persist planning_summary context
         ctx = ContextObject.make_stage(
             "planning_summary",
             clar_ctx.references + know_ctx.references,
@@ -1836,6 +1846,7 @@ class Assembler:
         tracker.touch(); self.repo.save(tracker)
 
         return ctx, plan_json
+
 
 
 
@@ -1942,87 +1953,97 @@ class Assembler:
     ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
         import json, re
 
-        # ── A) Extract raw calls from the plan ──────────────────────────────
-        text = plan_output
-        parsed = Tools.parse_tool_call(text)
-        print("PARSED TOOL CALL")
-        print(parsed)
-        if parsed:
-            raw = [parsed]
-        else:
-            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', text)
-
-        # ── B) Dedupe & preserve order ─────────────────────────────────────
-        seen = set()
+        # ── A) JSON-first extraction of calls ──────────────────────────────
         calls: List[str] = []
-        for c in raw:
-            if isinstance(c, str) and c not in seen:
-                seen.add(c)
-                calls.append(c)
+        try:
+            plan = json.loads(plan_output)
+            def _flatten(tasks):
+                out = []
+                for t in tasks:
+                    out.append(t)
+                    out.extend(_flatten(t.get("subtasks", [])))
+                return out
 
-        # ── C) Retrieve only the schemas that match these calls ────────────
+            flat = _flatten(plan.get("tasks", []))
+            for t in flat:
+                name = t["call"]
+                inp  = t.get("tool_input", {}) or {}
+                if inp:
+                    args = ",".join(
+                        f'{k}={json.dumps(v, ensure_ascii=False)}'
+                        for k, v in inp.items()
+                    )
+                    calls.append(f"{name}({args})")
+                else:
+                    calls.append(f"{name}()")
+
+        except Exception:
+            # only if JSON really is broken, fallback to regex
+            parsed = Tools.parse_tool_call(plan_output)
+            if parsed:
+                raw = [parsed]
+            else:
+                raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
+            seen = set()
+            for c in raw:
+                if c not in seen:
+                    seen.add(c)
+                    calls.append(c)
+
+        # ── B) Load matching schemas & build docs blob ──────────────────
         all_schemas = self.repo.query(
             lambda c: c.component=="schema" and "tool_schema" in c.tags
         )
-        selected_schemas: List[ContextObject] = []
-        full_schemas: List[Dict[str,Any]] = []
-        wanted = {call.split("(")[0] for call in calls}
+        selected_schemas, docs_blob_parts = [], []
+        wanted = {c.split("(")[0] for c in calls}
         for sch_obj in all_schemas:
             schema = json.loads(sch_obj.metadata["schema"])
             if schema["name"] in wanted:
                 selected_schemas.append(sch_obj)
-                full_schemas.append(schema)
-
-        # ── D) Build a docs_blob with the full JSON schema for each tool ───
-        docs_blob_parts = []
-        for schema in full_schemas:
-            docs_blob_parts.append(
-                f"**{schema['name']}**\n```json\n"
-                + json.dumps(schema, indent=2)
-                + "\n```"
-            )
+                docs_blob_parts.append(
+                    f"**{schema['name']}**\n```json\n"
+                    + json.dumps(schema, indent=2)
+                    + "\n```"
+                )
         docs_blob = "\n\n".join(docs_blob_parts)
 
-        # ── E) Prompt the LLM, passing only these full schemas ─────────────
+        # ── C) Confirm with the LLM ────────────────────────────────────
         system = self._get_prompt("toolchain_prompt") + docs_blob
-
         self._print_stage_context("tool_chaining", {
             "plan":    [plan_output[:200]],
             "schemas": docs_blob_parts
         })
-        msgs = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": json.dumps({"tool_calls": calls})},
-        ]
-        out = self._stream_and_capture(self.secondary_model, msgs, tag="[ToolChain]")
+        out = self._stream_and_capture(
+            self.secondary_model,
+            [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": json.dumps({"tool_calls": calls})},
+            ],
+            tag="[ToolChain]"
+        )
 
-        # ── F) Parse the confirmed calls, fallback if anything goes wrong ──
+        # ── D) Parse back the confirmed list ────────────────────────────
         confirmed = calls
         try:
-            # extract the JSON blob
             blob = re.search(r'\{.*"tool_calls".*\}', out, flags=re.S).group(0)
             parsed2 = json.loads(blob)
             if isinstance(parsed2.get("tool_calls"), list):
                 confirmed = parsed2["tool_calls"]
         except Exception:
-            # model deviated: stick with our original calls
-            confirmed = calls
+            pass
 
-        # ── G) Persist the final chaining stage, including the docs ─────────
+        # ── E) Persist & return ─────────────────────────────────────────
         tc_ctx = ContextObject.make_stage(
             "tool_chaining",
             plan_ctx.references + [s.context_id for s in selected_schemas],
-            {
-                "tool_calls": confirmed,
-                "tool_docs":  docs_blob
-            }
+            {"tool_calls": confirmed, "tool_docs": docs_blob}
         )
         tc_ctx.stage_id = "tool_chaining"
         tc_ctx.summary  = json.dumps(confirmed)
-        tc_ctx.touch()
-        self.repo.save(tc_ctx)
+        tc_ctx.touch(); self.repo.save(tc_ctx)
 
         return tc_ctx, confirmed, selected_schemas
+
 
 
 
@@ -2044,8 +2065,6 @@ class Assembler:
         ctx.summary  = f"Auto-approved: {confirmed}"
         ctx.touch(); self.repo.save(ctx)
         return confirmed
-
-
 
     def _stage9b_reflection_and_replan(
         self,
@@ -2090,11 +2109,9 @@ class Assembler:
 
         # 5) Reflection prompt
         system_msg = self._get_prompt("reflection_prompt")
-
         user_payload = (
             context_blob
-            + "\n\n"
-            + "Did these tool outputs satisfy the original intent? "
+            + "\n\nDid these tool outputs satisfy the original intent? "
               "If yes, reply OK.  If not, return only the corrected JSON plan."
         )
 
@@ -2104,8 +2121,7 @@ class Assembler:
         ]
         resp = self._stream_and_capture(self.secondary_model, msgs, tag="[Reflection]").strip()
 
-        # ────────────────────────────────────────────────────────────────────────
-        # NEW GUARD: if the model simply echoes the exact same plan JSON, treat as OK
+        # ── NEW GUARD: identical-equals treat as OK
         try:
             new_plan = json.loads(resp)
             old_plan = json.loads(plan_output)
@@ -2114,30 +2130,26 @@ class Assembler:
                     description="Reflection confirmed plan (identical echo)",
                     refs=[c.context_id for c in tool_ctxs]
                 )
-                ok_ctx.touch()
-                self.repo.save(ok_ctx)
+                ok_ctx.touch(); self.repo.save(ok_ctx)
                 return None
-        except Exception:
+        except:
             pass
-        # ────────────────────────────────────────────────────────────────────────
 
-        # 6) If it’s literally “OK”, we keep the original outputs
+        # ── If literally "OK", keep original
         if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp):
             ok_ctx = ContextObject.make_success(
                 description="Reflection confirmed plan satisfied intent",
                 refs=[c.context_id for c in tool_ctxs]
             )
-            ok_ctx.touch()
-            self.repo.save(ok_ctx)
+            ok_ctx.touch(); self.repo.save(ok_ctx)
             return None
 
-        # 7) Otherwise record the new plan
+        # ── Else record replan
         fail_ctx = ContextObject.make_failure(
             description="Reflection triggered replan",
             refs=[c.context_id for c in tool_ctxs]
         )
-        fail_ctx.touch()
-        self.repo.save(fail_ctx)
+        fail_ctx.touch(); self.repo.save(fail_ctx)
 
         repl = ContextObject.make_stage(
             "reflection_and_replan",
@@ -2145,13 +2157,12 @@ class Assembler:
             {"replan": resp}
         )
         repl.stage_id = "reflection_and_replan"
-        repl.summary  = resp  # full JSON plan
-        repl.touch()
-        self.repo.save(repl)
+        repl.summary  = resp
+        repl.touch(); self.repo.save(repl)
 
         return resp
 
-            
+
     def _stage9_invoke_with_retries(
         self,
         raw_calls: List[str],
@@ -2163,30 +2174,26 @@ class Assembler:
         import json, re, hashlib, datetime
         from typing import Tuple, Any, Dict, List
 
-        # ─────────────────────────────────────────────────────────────
-        # 0.  PLAN-FINGERPRINT & TRACKER INITIALIZATION
-        # ─────────────────────────────────────────────────────────────
+        # ── 0) Tracker init ────────────────────────────────────────────────
         plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
         tracker = next(
-            (ctx for ctx in self.repo.query(
-                lambda c: c.component == "plan_tracker"
-                        and c.semantic_label == plan_sig
+            (c for c in self.repo.query(
+                lambda c: c.component=="plan_tracker" and c.semantic_label==plan_sig
             )),
             None
         )
-
         if not tracker:
             tracker = ContextObject.make_stage(
                 "plan_tracker", [], {
-                    "plan_id":          plan_sig,
-                    "plan_calls":       raw_calls.copy(),
-                    "total_calls":      len(raw_calls),
-                    "succeeded":        0,
-                    "attempts":         0,
-                    "call_status_map":  {},  # call → bool
-                    "errors_by_call":   {},  # call → error str
-                    "status":           "in_progress",
-                    "started_at":       datetime.datetime.utcnow().isoformat() + "Z"
+                    "plan_id":        plan_sig,
+                    "plan_calls":     raw_calls.copy(),
+                    "total_calls":    len(raw_calls),
+                    "succeeded":      0,
+                    "attempts":       0,
+                    "call_status_map":{},
+                    "errors_by_call": {},
+                    "status":         "in_progress",
+                    "started_at":     datetime.datetime.utcnow().isoformat()+"Z"
                 }
             )
             tracker.semantic_label = plan_sig
@@ -2195,27 +2202,23 @@ class Assembler:
             tracker.touch(); self.repo.save(tracker)
         else:
             meta = tracker.metadata
-            meta.setdefault("plan_calls",       raw_calls.copy())
-            meta.setdefault("total_calls",      len(raw_calls))
-            meta.setdefault("succeeded",        0)
-            meta.setdefault("attempts",         0)
-            meta.setdefault("call_status_map",  {})
-            meta.setdefault("errors_by_call",   {})
-            meta.setdefault("status",           "in_progress")
-            meta.setdefault("started_at",       datetime.datetime.utcnow().isoformat() + "Z")
+            meta.setdefault("plan_calls",     raw_calls.copy())
+            meta.setdefault("total_calls",    len(raw_calls))
+            meta.setdefault("succeeded",      0)
+            meta.setdefault("attempts",       0)
+            meta.setdefault("call_status_map",{})
+            meta.setdefault("errors_by_call", {})
+            meta.setdefault("status",         "in_progress")
+            meta.setdefault("started_at",     datetime.datetime.utcnow().isoformat()+"Z")
             tracker.touch(); self.repo.save(tracker)
 
-        # increment attempt counter
         tracker.metadata["attempts"] += 1
-        tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat()+"Z"
         tracker.touch(); self.repo.save(tracker)
-
         if tracker.metadata.get("status") == "success":
             return []
 
-        # ─────────────────────────────────────────────────────────────
-        # 1.  HELPERS
-        # ─────────────────────────────────────────────────────────────
+        # ── Helpers ─────────────────────────────────────────────────────────
         def _norm(calls: List[Any]) -> List[str]:
             out = []
             for c in calls:
@@ -2225,153 +2228,168 @@ class Assembler:
                     out.append(c)
             return out
 
-        def _validate(res: Dict[str, Any]) -> Tuple[bool, str]:
+        def _validate(res: Dict[str,Any]) -> Tuple[bool,str]:
             exc = res.get("exception")
             return (exc is None, exc or "")
 
         def normalize_key(k: str) -> str:
-            return re.sub(r"\W+", "", k).lower()
+            return re.sub(r"\W+","",k).lower()
 
-        # ─────────────────────────────────────────────────────────────
-        # 2.  INITIALISE STATE
-        # ─────────────────────────────────────────────────────────────
-        raw_calls   = _norm(raw_calls)
-        total_calls = len(raw_calls)
-        tool_ctxs: List[ContextObject] = []
-        last_results: Dict[str, Any] = {}
+        # ── 1) Initialise pending calls in original order ────────────────
+        all_calls   = _norm(raw_calls)
         call_status = tracker.metadata["call_status_map"]
-        seen_success = {normalize_key(c) for c, ok in call_status.items() if ok}
-        raw_calls = [c for c in raw_calls if normalize_key(c) not in seen_success]
+        pending     = [c for c in all_calls if not call_status.get(c, False)]
+        last_results: Dict[str,Any] = {}
+        tool_ctxs: List[ContextObject] = []
 
-        if not raw_calls:
-            tracker.metadata["status"] = "success"
-            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        if not pending:
+            tracker.metadata["status"]       = "success"
+            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
             tracker.touch(); self.repo.save(tracker)
             return []
 
-        # ─────────────────────────────────────────────────────────────
-        # 3.  RETRY LOOP
-        # ─────────────────────────────────────────────────────────────
+        # ── 2) Retry loop over only pending calls ────────────────────────────
         max_retries = 10
-        for attempt in range(1, max_retries + 1):
-            errors: List[Tuple[str, str]] = []
+        for attempt in range(1, max_retries+1):
+            errors: List[Tuple[str,str]] = []
 
-            for original_call in list(raw_calls):
-                if call_status.get(original_call):
-                    continue
+            for original in list(pending):
+                call_str = original
 
-                # placeholder substitutions
-                call_str = original_call
+                # 1) [alias from tool_name] style placeholders
                 for ph in re.findall(r"\[([^\]]+)\]", call_str):
+                    # does it look like "[alias from tool]"?
+                    if " from " in ph:
+                        alias, toolname = ph.split(" from ", 1)
+                        alias_key   = normalize_key(alias)
+                        tool_key    = normalize_key(toolname)
+                        # find the exact last_results entry for that tool
+                        match = tool_key if tool_key in last_results else None
+
+                    else:
+                        # fallback: match placeholder substring to any key
+                        phn = normalize_key(ph)
+                        match = next(
+                            (k for k in last_results
+                            if phn in normalize_key(k)
+                            or normalize_key(k) in phn),
+                            None
+                        )
+                    if match:
+                        value = last_results[match]
+                        call_str = call_str.replace(f"[{ph}]", repr(value))
+
+
+                # 2) {{alias}} style placeholders
+                for ph in re.findall(r"\{\{([^}]+)\}\}", call_str):
+                    phn = normalize_key(ph)
                     match = next(
-                        (k for k in last_results if normalize_key(k).find(normalize_key(ph)) != -1),
+                        (k for k in last_results
+                        if phn in normalize_key(k)
+                        or normalize_key(k) in phn),
                         None
                     )
                     if match:
-                        call_str = call_str.replace(f"[{ph}]", repr(last_results[match]))
-                for name, val in last_results.items():
-                    call_str = call_str.replace(f"${{{name}_output}}", repr(val))
+                        call_str = call_str.replace(f"{{{{{ph}}}}}", repr(last_results[match]))
 
-                # nested zero-arg calls
-                for inner in re.findall(r"\b([A-Za-z_]\w*)\(\)", call_str):
-                    if inner not in last_results:
-                        nested = f"{inner}()"
+
+                # 3) inline nested zero-arg calls only if embedded (not top‐level)
+                for inner in re.findall(r"\B([A-Za-z_]\w*)\(\)", call_str):
+                    nested = f"{inner}()"
+                    if nested in call_str and inner not in last_results:
                         r_i = Tools.run_tool_once(nested)
                         ok_i, err_i = _validate(r_i)
-                        last_results[inner] = r_i.get("output")
+                        out_i = r_i.get("output")
+                        last_results[inner] = out_i
+                        call_str = re.sub(
+                            rf"\b{re.escape(inner)}\(\)",
+                            repr(out_i),
+                            call_str
+                        )
+                        # persist nested output
                         try:
                             sch_i = next(
                                 s for s in selected_schemas
                                 if json.loads(s.metadata["schema"])["name"] == inner
                             )
-                            ctx_i = ContextObject.make_stage("tool_output", [sch_i.context_id], r_i)
+                            ctx_i = ContextObject.make_stage(
+                                "tool_output", [sch_i.context_id], r_i
+                            )
                             ctx_i.stage_id = f"tool_output_nested_{inner}"
-                            ctx_i.summary  = str(r_i.get("output")) if ok_i else f"ERROR: {err_i}"
+                            ctx_i.summary  = str(out_i) if ok_i else f"ERROR: {err_i}"
                             ctx_i.metadata.update(r_i)
                             ctx_i.touch(); self.repo.save(ctx_i)
                             tool_ctxs.append(ctx_i)
                         except StopIteration:
                             pass
 
-                # main invocation
+                # 4) main invocation
                 res = Tools.run_tool_once(call_str)
                 ok, err = _validate(res)
-                res["tool_call"] = normalize_key(call_str)
-                last_results[original_call] = res.get("output")
+                tool_key = normalize_key(call_str.split("(",1)[0])
+                last_results[tool_key] = res["output"]
 
-                # persist tool_output
+                # persist output
                 try:
-                    schema_name = original_call.split("(",1)[0]
-                    sch = next(
+                    name = original.split("(",1)[0]
+                    sch  = next(
                         s for s in selected_schemas
-                        if json.loads(s.metadata["schema"])["name"] == schema_name
+                        if json.loads(s.metadata["schema"])["name"] == name
                     )
                     refs = [sch.context_id]
                 except StopIteration:
                     refs = []
                 ctx = ContextObject.make_stage("tool_output", refs, res)
-                ctx.stage_id = f"tool_output_{schema_name}"
+                ctx.stage_id = f"tool_output_{name}"
                 ctx.summary  = str(res.get("output")) if ok else f"ERROR: {err}"
                 ctx.metadata.update(res)
                 ctx.touch(); self.repo.save(ctx)
                 tool_ctxs.append(ctx)
 
-                # update tracker
-                call_status[original_call] = ok
+                # record success/failure
+                call_status[original] = ok
+                tracker.metadata["succeeded"] += int(ok)
                 if ok:
-                    tracker.metadata["succeeded"] += 1
+                    pending.remove(original)
                 else:
-                    tracker.metadata["errors_by_call"][original_call] = err
-                    errors.append((original_call, err))
+                    tracker.metadata["errors_by_call"][original] = err
+                    errors.append((original, err))
                 tracker.touch(); self.repo.save(tracker)
 
-            if not errors:
-                tracker.metadata["status"] = "success"
-                tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+            # if all succeeded, finish
+            if not pending:
+                tracker.metadata["status"]       = "success"
+                tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
                 tracker.touch(); self.repo.save(tracker)
                 return tool_ctxs
 
-            # prepare replan of failed calls
-            err_lines    = [f"{c} → {e.splitlines()[-1]}" for c, e in errors]
-            failed_calls = [c for c, _ in errors]
-            vars_block   = "\n".join(f"{k}_output = {v!r}" for k, v in last_results.items())
+            # otherwise replan only the remaining pending calls
             retry_sys = (
                 self._get_prompt("toolchain_retry_prompt")
-                + "\n\nOriginal user question:\n" + user_text
+                + "\n\nOriginal question:\n" + user_text
                 + "\n\nPlan:\n" + plan_output
-                + (f"\n\nAvailable variables:\n{vars_block}" if vars_block else "")
+                + "\n\nPending calls:\n" + "\n".join(pending)
             )
             retry_msgs = [
-                {"role": "system", "content": retry_sys},
-                {"role": "user",   "content": json.dumps({"tool_calls": failed_calls})},
+                {"role":"system","content":retry_sys},
+                {"role":"user",  "content":json.dumps({"tool_calls":pending})},
             ]
-            retry_out = self._stream_and_capture(
+            out = self._stream_and_capture(
                 self.secondary_model, retry_msgs, tag="[ToolChainRetry]"
             ).strip()
 
             try:
-                fixed = json.loads(retry_out)["tool_calls"]
-            except Exception:
-                parsed = Tools.parse_tool_call(retry_out)
-                fixed  = parsed if isinstance(parsed, list) else ([parsed] if parsed else failed_calls)
-            fixed = _norm(fixed) or failed_calls
+                pending = json.loads(out)["tool_calls"]
+            except:
+                parsed = Tools.parse_tool_call(out)
+                pending = _norm(parsed if isinstance(parsed, list) else [parsed] or pending)
 
-            # merge fixes back into raw_calls
-            new_raw = []
-            fix_iter = iter(fixed)
-            for c in raw_calls:
-                new_raw.append(next(fix_iter, c) if c in failed_calls else c)
-            raw_calls = new_raw
-            call_status = {c: False for c in raw_calls}
-
-        # ─────────────────────────────────────────────────────────────
-        # 4.  STILL FAILING AFTER max_retries – finalize tracker & bail
-        # ─────────────────────────────────────────────────────────────
+        # ── 3) Give up after max_retries ────────────────────────────────────
         tracker.metadata["status"]       = "failed"
-        tracker.metadata["last_errors"]  = [e for _, e in errors]
-        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        tracker.metadata["last_errors"]  = [e for _,e in errors]
+        
+        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
         tracker.touch(); self.repo.save(tracker)
-
         return tool_ctxs
 
 

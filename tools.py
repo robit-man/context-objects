@@ -2964,12 +2964,12 @@ class Tools:
         Summarize web pages for a search topic.
 
         1. Call summarize_search(topic=str, top_n=int)
-        - topic (str): the search term, use `topic`
-        - top_n (int): how many results, use `top_n`
+        - topic (str): the search term
+        - top_n (int): how many results
 
         2. For each page returned (dict with "url", "title", "content"):
         a. Truncate content to 2000 chars, replace newlines.
-        b. Then it calls auxiliary_inference(prompt: str, temperature: float) automatically (you do not have to do this)
+        b. Calls auxiliary_inference(prompt: str, temperature: float):
             - prompt: "Here is the content of {url}: ... Please give me a 2–3 sentence summary."
             - temperature: 0.3
 
@@ -2977,8 +2977,8 @@ class Tools:
         """
         try:
             pages = Tools.search_internet(
-                query=topic,
-                num_results=top_n,
+                topic=topic,
+                top_n=top_n,
                 deep_scrape=True
             )
         except Exception as e:
@@ -3002,7 +3002,7 @@ class Tools:
 
             try:
                 summary = Tools.auxiliary_inference(prompt, temperature=0.3).strip()
-            except Exception as ex:
+            except Exception:
                 summary = "Failed to summarise that page."
 
             summaries.append(f"{i}. {title} — {summary}")
