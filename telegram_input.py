@@ -16,15 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-import queue
+import queue as _queue
 import tempfile
 import subprocess
 import uuid
-import threading
-import sqlite3
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -35,6 +32,7 @@ from assembler import Assembler
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
+from context import ContextObject        # ← import the ContextObject factory
 
 import whisper
 _WHISPER = whisper.load_model("base")  # load once
@@ -43,10 +41,20 @@ _WHISPER = whisper.load_model("base")  # load once
 # chat_id → dedicated Assembler instance
 assemblers: dict[int, Assembler] = {}
 
+# chat_id → pending inference queue
+_pending: dict[int, asyncio.Queue[Tuple[str,int]]] = {}
+
 # ────────────────────────────────────────────────────────────────────────
-# Helper to split & send long text (async)
+# Helper to split & send long text (async), with optional reply_to
 # ────────────────────────────────────────────────────────────────────────
-async def _send_long_text_async(bot, chat_id: int, text: str, *, chunk_size: int = 3800) -> None:
+async def _send_long_text_async(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    chunk_size: int = 3800,
+    reply_to: Optional[int] = None
+) -> None:
     if not text.strip():
         return
     import re
@@ -73,14 +81,26 @@ async def _send_long_text_async(bot, chat_id: int, text: str, *, chunk_size: int
                             chunks.append(sent[i : i + chunk_size])
     if buffer:
         chunks.append(buffer)
+
     for part in chunks:
-        await bot.send_message(chat_id=chat_id, text=part)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            reply_to_message_id=reply_to
+        )
 
 # ────────────────────────────────────────────────────────────────────────
 # Factory for per-stage status callback
 # ────────────────────────────────────────────────────────────────────────
-def _make_status_cb(loop: asyncio.AbstractEventLoop, bot, chat_id: int, msg_id: int,
-                    *, max_lines: int = 10, min_interval: float = 5):
+def _make_status_cb(
+    loop: asyncio.AbstractEventLoop,
+    bot,
+    chat_id: int,
+    msg_id: int,
+    *,
+    max_lines: int = 10,
+    min_interval: float = 5,
+):
     history: List[str] = []
     last_edit_at: float = 0.0
     pending_handle: asyncio.TimerHandle | None = None
@@ -88,10 +108,15 @@ def _make_status_cb(loop: asyncio.AbstractEventLoop, bot, chat_id: int, msg_id: 
 
     async def _do_edit():
         nonlocal last_edit_at, pending_handle
-        if disabled: return
+        if disabled:
+            return
         text = "🛠️ Processing…\n" + "\n".join(history[-max_lines:])
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text
+            )
         except:
             pass
         last_edit_at = loop.time()
@@ -99,18 +124,21 @@ def _make_status_cb(loop: asyncio.AbstractEventLoop, bot, chat_id: int, msg_id: 
 
     def _schedule_edit():
         nonlocal pending_handle
-        if disabled or pending_handle: return
+        if disabled or pending_handle:
+            return
         delay = max(min_interval - (loop.time() - last_edit_at), 0.0)
         if delay <= 0:
             asyncio.run_coroutine_threadsafe(_do_edit(), loop)
         else:
-            pending_handle = loop.call_later(delay,
+            pending_handle = loop.call_later(
+                delay,
                 lambda: asyncio.run_coroutine_threadsafe(_do_edit(), loop)
             )
 
     def status_cb(stage: str, output: Any):
         nonlocal history
-        if disabled: return
+        if disabled:
+            return
         snippet = str(output).replace("\n", " ")
         if len(snippet) > 1000:
             snippet = snippet[:997] + "…"
@@ -145,27 +173,79 @@ def telegram_input(asm: Assembler):
 
     async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id   = update.effective_chat.id
-        chat_type = update.effective_chat.type  # "private", "group", etc.
+        chat_type = update.effective_chat.type
         bot_name  = context.bot.username.lower()
         msg       = update.message
         if not msg:
             return
 
-        # record user in registry
+        # 1) Record user & group in registries
         user = update.effective_user
         if user.username:
             _REG.add(user.username, user.id)
-
-        # record group if in a group chat
         if chat_type in ("group", "supergroup", "channel"):
             title = update.effective_chat.title or f"chat_{chat_id}"
             _GREG.add(title, chat_id)
 
-        # private‐only commands for both users and groups
-        text = msg.text or ""
+        # 2) Instantiate Assembler for this chat if needed
+        chat_asm = assemblers.get(chat_id)
+        if chat_asm is None:
+            tts = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
+            tts.set_mode("file")
+            chat_asm = Assembler(
+                context_path     = f"context_{chat_id}.jsonl",
+                config_path      = "config.json",
+                lookback_minutes = 60,
+                top_k            = 5,
+                tts_manager      = tts,
+            )
+            assemblers[chat_id] = chat_asm
+        chat_asm._chat_contexts.add(chat_id)
+
+        # 3) Extract or transcribe text
+        text = (msg.text or "").strip()
+        if msg.voice and not text:
+            try:
+                raw_ogg = tempfile.mktemp(suffix=".oga")
+                vf = await context.bot.get_file(msg.voice.file_id)
+                await vf.download_to_drive(raw_ogg)
+                wav = raw_ogg + ".wav"
+                subprocess.run(
+                    ["ffmpeg","-y","-loglevel","error","-i",raw_ogg,
+                     "-ac","1","-ar","16000",wav],
+                    check=True
+                )
+                result = _WHISPER.transcribe(wav, language="en")
+                text = result.get("text","").strip() or text
+            except Exception as ex:
+                await context.bot.send_message(
+                    chat_id,
+                    f"❌ Voice note error: {ex}",
+                    reply_to_message_id=msg.message_id
+                )
+            finally:
+                for p in (locals().get("raw_ogg"), locals().get("wav")):
+                    if p and os.path.exists(p):
+                        try: os.unlink(p)
+                        except: pass
+
+        # 4) Always store *every* message into the Assembler context
+        if text:
+            # build a segment object and save it immediately
+            seg = ContextObject.make_segment(
+                "user_message",
+                [], 
+                tags=["user_message"],
+                text=text
+            )
+            seg.summary = text
+            seg.touch()
+            chat_asm.repo.save(seg)
+
+        # 5) Handle private-only slash commands
         if chat_type == "private" and text.startswith("/"):
             parts = text.split(None, 2)
-            cmd = parts[0].lower()
+            cmd   = parts[0].lower()
 
             if cmd == "/list_users":
                 users = _REG.list_all()
@@ -187,169 +267,199 @@ def telegram_input(asm: Assembler):
                 target, body = parts[1], parts[2]
                 target_id = _REG.id_for(target)
                 if not target_id:
-                    await context.bot.send_message(chat_id, f"User @{target} not found.")
+                    await context.bot.send_message(
+                        chat_id, f"User @{target} not found.",
+                        reply_to_message_id=msg.message_id
+                    )
                 else:
                     await context.bot.send_message(
                         target_id, f"DM from @{user.username}: {body}"
                     )
-                    await context.bot.send_message(chat_id, f"✔️ Sent to @{target}")
+                    await context.bot.send_message(
+                        chat_id, f"✔️ Sent to @{target}",
+                        reply_to_message_id=msg.message_id
+                    )
                 return
 
             if cmd == "/gm" and len(parts) == 3:
                 grp, body = parts[1], parts[2]
                 grp_id = _GREG.id_for(grp)
                 if not grp_id:
-                    await context.bot.send_message(chat_id, f"Group '{grp}' not found.")
+                    await context.bot.send_message(
+                        chat_id, f"Group '{grp}' not found.",
+                        reply_to_message_id=msg.message_id
+                    )
                 else:
                     await context.bot.send_message(grp_id, f"[Group DM] {body}")
-                    await context.bot.send_message(chat_id, f"✔️ Sent to group '{grp}'")
+                    await context.bot.send_message(
+                        chat_id, f"✔️ Sent to group '{grp}'",
+                        reply_to_message_id=msg.message_id
+                    )
                 return
 
-        # decide if we run the assembler
-        addressed = (chat_type == "private") or bool(msg.voice)
-        cleaned = ""
-        # mentions
+        # 6) Decide whether to *run* inference on this message
+        do_infer = False
+        if chat_type == "private" or msg.voice:
+            do_infer = True
+        # @-mention in group
         if msg.text and msg.entities:
             for ent in msg.entities:
                 if ent.type == "mention":
                     mention = msg.text[ent.offset:ent.offset+ent.length]
                     if mention.lstrip("@").lower() == bot_name:
-                        addressed = True
-                        cleaned = (msg.text[:ent.offset] + msg.text[ent.offset+ent.length:]).strip()
+                        do_infer = True
+                        text = (msg.text[:ent.offset] +
+                                msg.text[ent.offset+ent.length:]).strip()
                         break
-        # replies
-        if not addressed and msg.reply_to_message:
+        # reply to bot triggers
+        if not do_infer and msg.reply_to_message:
             if msg.reply_to_message.from_user.id == context.bot.id:
-                addressed = True
+                do_infer = True
 
-        if not addressed:
-            return
+        if not do_infer:
+            return   # stored but no inference run
 
-        # plain text
-        if not cleaned:
-            cleaned = msg.text or ""
-        cleaned = cleaned.strip()
+        # 7) Build "sender: text" prompt
+        sender    = user.username or user.first_name
+        user_text = f"{sender}: {text}"
+        trigger_id = msg.message_id
 
-        # voice note transcription
-        if msg.voice:
-            try:
-                raw_ogg = tempfile.mktemp(suffix=".oga")
-                vf = await context.bot.get_file(msg.voice.file_id)
-                await vf.download_to_drive(raw_ogg)
-                wav = raw_ogg + ".wav"
-                subprocess.run(
-                    ["ffmpeg","-y","-loglevel","error","-i",raw_ogg,"-ac","1","-ar","16000",wav],
-                    check=True
-                )
-                result = _WHISPER.transcribe(wav, language="en")
-                cleaned = result.get("text","").strip() or cleaned
-            except Exception as ex:
-                await context.bot.send_message(chat_id, f"❌ Voice note error: {ex}")
-            finally:
-                for p in (locals().get("raw_ogg"), locals().get("wav")):
-                    if p and os.path.exists(p):
-                        try: os.unlink(p)
-                        except: pass
-
-        if not cleaned:
-            return
-
-        # prefix username
-        sender = user.username or user.first_name
-        user_text = f"{sender}: {cleaned}"
-
-        # per-chat assembler
-        chat_asm = assemblers.get(chat_id)
-        if chat_asm is None:
-            tts = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
-            tts.set_mode("file")
-            chat_asm = Assembler(
-                context_path=f"context_{chat_id}.jsonl",
-                config_path="config.json",
-                lookback_minutes=60,
-                top_k=5,
-                tts_manager=tts,
+        # 8) Enqueue or start immediately
+        queue = _pending.setdefault(chat_id, asyncio.Queue())
+        if (prev := running.get(chat_id)) and not prev.done():
+            # already working → queue it
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ I’m still working on your previous request—I’ll handle this one next.",
+                reply_to_message_id=trigger_id
             )
-            assemblers[chat_id] = chat_asm
+            await queue.put((user_text, trigger_id))
+            return
 
-        chat_asm._chat_contexts.add(chat_id)
+        # helper to kick off a runner
+        async def start_runner(request_text: str, reply_to_id: int):
+            placeholder = await context.bot.send_message(
+                chat_id=chat_id,
+                text="🛠️ Processing…",
+                reply_to_message_id=reply_to_id
+            )
+            placeholder_id = placeholder.message_id
+            status_cb, stop_status = _make_status_cb(
+                loop, context.bot, chat_id, placeholder_id
+            )
 
-        # cancel previous
-        prev = running.get(chat_id)
-        if prev and not prev.done():
-            prev.cancel()
-
-        placeholder = await context.bot.send_message(chat_id=chat_id, text="🛠️ Processing…")
-        msg_id = placeholder.message_id
-        status_cb, stop_status = _make_status_cb(loop, context.bot, chat_id, msg_id)
-
-        async def runner():
-            try:
-                # clear any lingering TTS queues
-                for q in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
-                    while True:
-                        try: q.get_nowait()
-                        except queue.Empty: break
-
-                chat_asm.tts.set_mode("file")
-                final = await asyncio.to_thread(
-                    chat_asm.run_with_meta_context,
-                    user_text, status_cb, chat_id, msg_id
-                )
-                stop_status()
-
-                # send text or chunks
-                if final and len(final) < 4000:
-                    await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=final)
-                else:
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                    except: pass
-                    await _send_long_text_async(context.bot, chat_id, final or "(no response)")
-
-                # send voice reply
-                chat_asm.tts.enqueue(final or "")
-                await asyncio.to_thread(chat_asm.tts._file_q.join)
-                oggs = []
-                while True:
-                    try:
-                        p = chat_asm.tts._ogg_q.get_nowait()
-                        if os.path.getsize(p) > 0:
-                            oggs.append(p)
-                    except queue.Empty:
-                        break
-
-                if not oggs:
-                    return
-                if len(oggs) == 1:
-                    with open(oggs[0],"rb") as vf:
-                        await context.bot.send_voice(chat_id=chat_id, voice=vf)
-                    return
-
-                # combine multiple oggs
-                combined = os.path.join(tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg")
-                ins = sum([["-i",p] for p in oggs], [])
-                streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
-                filt = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
-                subprocess.run(
-                    ["ffmpeg","-y","-loglevel","error",*ins,"-filter_complex",filt,
-                     "-c:a","libopus","-b:a","48k",combined],
-                    check=True
-                )
-                with open(combined,"rb") as vf:
-                    await context.bot.send_voice(chat_id=chat_id, voice=vf)
-
-            except asyncio.CancelledError:
+            async def runner():
                 try:
-                    await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
-                                                        text="⚠️ Previous request cancelled.")
-                except: pass
-            except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
-            finally:
-                running.pop(chat_id, None)
+                    # clear old TTS queues
+                    for qobj in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
+                        while True:
+                            try:
+                                qobj.get_nowait()
+                            except _queue.Empty:
+                                break
 
-        running[chat_id] = loop.create_task(runner())
+                    chat_asm.tts.set_mode("file")
+                    final = await asyncio.to_thread(
+                        chat_asm.run_with_meta_context,
+                        request_text, status_cb, chat_id, placeholder_id
+                    )
+                    stop_status()
+
+                    # text response
+                    if final and len(final) < 4000:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=placeholder_id,
+                            text=final
+                        )
+                    else:
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=chat_id, message_id=placeholder_id
+                            )
+                        except:
+                            pass
+                        await _send_long_text_async(
+                            context.bot,
+                            chat_id,
+                            final or "(no response)",
+                            reply_to=reply_to_id
+                        )
+
+                    # voice response
+                    chat_asm.tts.enqueue(final or "")
+                    await asyncio.to_thread(chat_asm.tts._file_q.join)
+                    oggs: List[str] = []
+                    while True:
+                        try:
+                            p = chat_asm.tts._ogg_q.get_nowait()
+                            if os.path.getsize(p) > 0:
+                                oggs.append(p)
+                        except _queue.Empty:
+                            break
+
+                    if not oggs:
+                        return
+
+                    if len(oggs) == 1:
+                        with open(oggs[0], "rb") as vf:
+                            await context.bot.send_voice(
+                                chat_id=chat_id,
+                                voice=vf,
+                                reply_to_message_id=reply_to_id
+                            )
+                        return
+
+                    combined = os.path.join(
+                        tempfile.gettempdir(),
+                        f"combined_{uuid.uuid4().hex}.ogg"
+                    )
+                    ins     = sum([["-i", p] for p in oggs], [])
+                    streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
+                    filt    = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
+                    subprocess.run(
+                        ["ffmpeg","-y","-loglevel","error", *ins,
+                         "-filter_complex", filt,
+                         "-c:a","libopus","-b:a","48k", combined],
+                        check=True
+                    )
+                    with open(combined, "rb") as vf:
+                        await context.bot.send_voice(
+                            chat_id=chat_id,
+                            voice=vf,
+                            reply_to_message_id=reply_to_id
+                        )
+
+                except asyncio.CancelledError:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=placeholder_id,
+                            text="⚠️ Previous request cancelled."
+                        )
+                    except:
+                        pass
+
+                except Exception as e:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Error: {e}",
+                        reply_to_message_id=reply_to_id
+                    )
+
+                finally:
+                    running.pop(chat_id, None)
+                    # process next in queue if any
+                    try:
+                        nxt, nxt_id = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    await start_runner(nxt, nxt_id)
+
+            running[chat_id] = loop.create_task(runner())
+
+        # 9) Start the very first runner
+        await start_runner(user_text, trigger_id)
 
     app.add_handler(
         MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, _handle)
