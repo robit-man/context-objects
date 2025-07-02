@@ -312,6 +312,60 @@ except Exception as e:
     print(f"Error setting up Telegram thread: {e}")
 
 
+# ─── 5) GIT‐REPO WATCHER ──────────────────────────────────────────────────────
+def _monitor_git_updates(interval: float = 10.0):
+    """
+    Periodically fetch the remote and auto-pull if the local branch is behind.
+
+    Args:
+        interval (float, optional): Seconds between fetch+check cycles. Defaults to 10.0s.
+
+    Behavior:
+        • Runs `git rev-parse --abbrev-ref HEAD` to find the current branch.
+        • Runs `git fetch` to update remote tracking refs.
+        • Checks `git rev-list HEAD..origin/<branch> --count`. If > 0,
+          logs and runs `git pull --ff-only`.
+        • Any errors are caught and logged as warnings.
+
+    Example:
+        # Spawns in a background thread
+        threading.Thread(target=_monitor_git_updates, daemon=True).start()
+    """
+    import subprocess
+    import time
+
+    def _run(cmd):
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+
+    # determine repo root (this script’s dir)
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    while True:
+        try:
+            # 1) figure out the current branch name
+            branch = _run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
+            # 2) fetch from remote
+            _run(["git", "-C", repo_dir, "fetch"])
+            # 3) check if HEAD is behind origin/<branch>
+            behind = int(_run([
+                "git", "-C", repo_dir,
+                "rev-list", "HEAD..origin/" + branch, "--count"
+            ]))
+            if behind > 0:
+                log_message(f"Remote update detected on branch '{branch}' ({behind} new commit(s)), pulling…", "INFO")
+                pull_out = _run(["git", "-C", repo_dir, "pull", "--ff-only"])
+                log_message(f"Git pull succeeded:\n{pull_out}", "SUCCESS")
+            # else: up-to-date; do nothing
+        except subprocess.CalledProcessError as e:
+            log_message(f"Git-watcher error: {e.output.strip()}", "WARNING")
+        except Exception as ex:
+            log_message(f"Unexpected error in git-watcher: {ex}", "WARNING")
+
+        time.sleep(interval)
+
+# — spawn the Git-watcher in the background ─────────────────────────────────
+threading.Thread(target=_monitor_git_updates, daemon=True, name="GitWatcher").start()
+
 # ─── WAIT FOR CTRL-C ───────────────────────────────────────────────────────
 import atexit
 def _cleanup():
