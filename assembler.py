@@ -1118,7 +1118,7 @@ class Assembler:
                 cobj = self.repo.get(cid)
                 counts.append(cobj.metadata.get("recall_stats", {}).get("count", 0))
             except KeyError:
-                continue                                          # archived / pruned
+                continue  # archived / pruned
         rf = (sum(counts) / len(counts)) if counts else 0.0
 
         # 2️  RL gate – exit early if not chosen
@@ -1157,20 +1157,20 @@ class Assembler:
 
         # 5️  Ask the model – be tolerant of malformed output
         try:
-            raw   = self._stream_and_capture(
+            raw = self._stream_and_capture(
                 self.primary_model,
                 [{"role": "system", "content": refine_prompt}],
                 tag="[SysPromptRefine]",
             ).strip()
-            plan  = json.loads(raw)
+            plan = json.loads(raw)
             if not isinstance(plan, dict):
                 return None
             action = plan.get("action")
-            text   = (plan.get("prompt") or "").strip()
+            text = (plan.get("prompt") or "").strip()
         except Exception:
-            return None                                           # bad JSON → abort
+            return None  # bad JSON → abort
 
-        # 6️  Apply the change
+        # 6️  Apply the change and update static prompts in the repo
         if action == "add" and text:
             patch = ContextObject.make_policy(
                 label=f"dynamic_prompt_{len(text)}",
@@ -1180,6 +1180,9 @@ class Assembler:
             patch.touch()
             self.repo.save(patch)
 
+            # bake this change into the static prompt records
+            self._seed_static_prompts()
+
         elif action == "remove" and text:
             for row in rows:
                 blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
@@ -1187,22 +1190,26 @@ class Assembler:
                     try:
                         self.repo.delete(row.context_id)
                     except KeyError:
-                        pass                                      # already archived
+                        pass  # already archived
+
+            # reflect removals in the static prompt records
+            self._seed_static_prompts()
 
         else:
-            return None                                           # no-op
+            return None  # no-op
 
         # 7️  Log the refinement decision
         refine_ctx = ContextObject.make_stage(
-            stage_name="system_prompt_refine",
-            input_refs=[cid for cid in recall_ids if self.repo_exists(cid)],
-            output={"action": action, "text": text},
+            "system_prompt_refine",
+            [cid for cid in recall_ids if self.repo_exists(cid)],
+            {"action": action, "text": text},
         )
         refine_ctx.component = "patch"
         refine_ctx.touch()
         self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
+
 
 
     # Helper used above ---------------------------------------------------
