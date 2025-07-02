@@ -1451,19 +1451,33 @@ class Tools:
 
         # keep the public manifest in sync for other agents
         Tools.discover_agent_stack()
+
+
     @staticmethod
-    def create_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
+    def create_file(filename: str,
+                    content: str,
+                    base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Create or overwrite a file under the specified base directory.
+       Create (or overwrite) a new text file.
 
-        This will automatically create any missing directories in the path.
+        Args:
+            filename (str, required): Name **or relative path** of the file to create under
+                `base_dir`. Use forward slashes for sub-dirs (“notes/poem.txt”).
+            content  (str, required): Full text to write.  Pass "" for an empty file.
+            base_dir (str, optional, default=WORKSPACE_DIR): Root folder for the workspace.
+                Should normally be left as default.
 
-        :param filename: Name (or relative path) of the file to create.
-        :param content:  Text to write into the new file. Use an empty string to create an empty file.
-        :param base_dir: Directory under which to create the file. Defaults to the workspace root.
+        Returns:
+            str: "Created file: <absolute_path>" on success, otherwise
+                 "Error creating file '<absolute_path>': <reason>".
 
-        :returns: A confirmation message including the full path of the created file,
-                  or an error message if creation failed.
+        Errors:
+            • Intermediate directories that cannot be created.
+            • I/O permission problems.
+
+        Example:
+            Tools.create_file("german_poem.txt",
+                              "Goldener Abend, still und rein…")
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1476,18 +1490,23 @@ class Tools:
             return f"Error creating file {path!r}: {e}"
 
     @staticmethod
-    def append_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
+    def append_file(filename: str,
+                    content: str,
+                    base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Append content to a file under the specified base directory.
+       Append text to the end of a file (create if missing).
 
-        If the file does not exist, it will be created along with any necessary directories.
+        Args:
+            filename (str, required): Relative path under `base_dir`.
+            content  (str, required): Text to append (no newline automatically added).
+            base_dir (str, optional): Defaults to WORKSPACE_DIR.
 
-        :param filename: Name (or relative path) of the file to append to.
-        :param content:  Text to append at the end of the file.
-        :param base_dir: Directory under which to append the file. Defaults to the workspace root.
+        Returns:
+            str: "Appended to file: <absolute_path>" or
+                 "Error appending to file '<absolute_path>': <reason>".
 
-        :returns: A confirmation message including the full path of the file,
-                  or an error message if the operation failed.
+        Example:
+            Tools.append_file("log/run.txt", "\\nFinished at 21:03")
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1500,16 +1519,21 @@ class Tools:
             return f"Error appending to file {path!r}: {e}"
 
     @staticmethod
-    def delete_file(filename: str, base_dir: str = WORKSPACE_DIR) -> str:
+    def delete_file(filename: str,
+                    base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Delete a file under the specified base directory.
+       Delete a file.
 
-        :param filename: Name (or relative path) of the file to delete.
-        :param base_dir: Directory under which the file resides. Defaults to the workspace root.
+        Args:
+            filename (str, required): Relative path under `base_dir`.
+            base_dir (str, optional): Workspace root.
 
-        :returns: A confirmation message if deletion succeeded,
-                  "File not found" if the file was missing,
-                  or an error message for other failures.
+        Returns:
+            str: "Deleted file: <absolute_path>", "File not found: <absolute_path>",
+                 or "Error deleting file '<absolute_path>': <reason>".
+
+        Example:
+            Tools.delete_file("old/tmp.txt")
         """
         import os
         path = os.path.join(base_dir, filename)
@@ -1521,14 +1545,24 @@ class Tools:
         except Exception as e:
             return f"Error deleting file {path!r}: {e}"
 
+    # ────────────────────────────────────────
+    #  Directory / listing helpers
+    # ────────────────────────────────────────
+
     @staticmethod
     def list_workspace(base_dir: str = WORKSPACE_DIR) -> str:
         """
-        List all entries (files and subdirectories) under the specified directory.
+       Return the top-level directory listing as **JSON text**.
 
-        :param base_dir: Directory whose contents to list. Defaults to the workspace root.
+        Args:
+            base_dir (str, optional): Folder to list. Default is WORKSPACE_DIR.
 
-        :returns: A JSON‐encoded list of entry names, or a JSON object with an "error" key on failure.
+        Returns:
+            str (JSON array): e.g. '["file1.txt", "subdir", …]'  — or
+            str (JSON object): '{"error":"<reason>"}' on failure.
+
+        Example:
+            contents_json = Tools.list_workspace()
         """
         import os, json
         try:
@@ -1538,22 +1572,24 @@ class Tools:
             return json.dumps({"error": str(e)})
 
     @staticmethod
-    def find_files(pattern: str, path: str = WORKSPACE_DIR) -> str:
+    def find_files(pattern: str,
+                   path: str = WORKSPACE_DIR) -> str:
         """
-        Recursively search for files matching a glob pattern under the given path.
+       Recursive file search (glob).
 
-        :param pattern:  Unix‐style glob pattern (e.g. "*.txt").
-        :param path:     Root directory in which to search. Defaults to the workspace root.
+        Args:
+            pattern (str, required): Unix glob (e.g. "*.md").
+            path    (str, optional): Directory root for the walk.
 
-        :returns: A JSON‐encoded list of objects, each containing:
-                  {
-                    "file": "<filename>",
-                    "dir":  "<directory path containing the file>"
-                  }
+        Returns:
+            str (JSON array): Each element = {"file": "<name>", "dir": "<abs dir>"}.
+
+        Example:
+            matches_json = Tools.find_files("*.py")
         """
         import os, fnmatch, json
         matches = []
-        for root, dirs, files in os.walk(path):
+        for root, _, files in os.walk(path):
             for fname in files:
                 if fnmatch.fnmatch(fname, pattern):
                     matches.append({"file": fname, "dir": root})
@@ -1562,11 +1598,16 @@ class Tools:
     @staticmethod
     def list_dir(path: str = WORKSPACE_DIR) -> str:
         """
-        List the contents of a single directory (non‐recursive).
+       Non-recursive listing (JSON string).
 
-        :param path: Directory whose entries to list. Defaults to the workspace root.
+        Args:
+            path (str, optional): Directory to list.
 
-        :returns: A JSON‐encoded list of entry names, or a JSON object with an "error" key on failure.
+        Returns:
+            str (JSON array | JSON object{"error":…})
+
+        Example:
+            Tools.list_dir("data")
         """
         import os, json
         try:
@@ -1575,27 +1616,42 @@ class Tools:
             return json.dumps({"error": str(e)})
 
     @staticmethod
-    def list_files(path: str = WORKSPACE_DIR, pattern: str = "*") -> list:
+    def list_files(path: str = WORKSPACE_DIR,
+                   pattern: str = "*") -> list:
         """
-        Alias for `find_files(pattern, path)`, returning a Python list of matches.
+       Pythonic wrapper around `find_files()`.
 
-        :param path:     Directory in which to search. Defaults to the workspace root.
-        :param pattern:  Unix‐style glob pattern. Defaults to "*" (everything).
+        Args:
+            path    (str, optional): Search root.
+            pattern (str, optional): Glob (default "*").
 
-        :returns: A Python list of filename/dir dictionaries matching the pattern.
+        Returns:
+            list[dict]: Same objects as `find_files`, but decoded.
+
+        Example:
+            py_files = Tools.list_files("src", "*.py")
         """
         import json
         return json.loads(Tools.find_files(pattern, path))
 
+    # ────────────────────────────────────────
+    #  File-reading / writing helpers
+    # ────────────────────────────────────────
+
     @staticmethod
     def read_files(path: str, *filenames: str) -> dict:
         """
-        Read the contents of multiple files under a given directory.
+       Read multiple files in one call.
 
-        :param path:      Directory in which the files reside.
-        :param filenames: One or more filenames (relative to `path`) to read.
+        Args:
+            path       (str, required): Directory containing the files.
+            *filenames (str, required): One or more filenames.
 
-        :returns: A dict mapping each filename to its text content, or an error string.
+        Returns:
+            dict[str,str]: {filename: content | error string}.
+
+        Example:
+            texts = Tools.read_files("logs", "out.txt", "err.txt")
         """
         out = {}
         for fn in filenames:
@@ -1603,14 +1659,22 @@ class Tools:
         return out
 
     @staticmethod
-    def read_file(filepath: str, base_dir: str | None = None) -> str:
+    def read_file(filepath: str,
+                  base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Read and return the contents of a single file.
+       Read a single text file.
 
-        :param filepath:  Path to the file to read. If `base_dir` is provided, `filepath` is relative.
-        :param base_dir:  Optional base directory to prefix to `filepath`.
+        Args:
+            filepath (str, required): Absolute path **or** path relative to `base_dir`.
+            base_dir (str | None, optional): If provided, `filepath` is resolved
+                under it.
 
-        :returns: The file’s text content, or an error message if reading fails.
+        Returns:
+            str: File contents on success, or
+                 "Error reading '<absolute_path>': <reason>".
+
+        Example:
+            body = Tools.read_file("notes/poem.txt", Tools.WORKSPACE_DIR)
         """
         import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
@@ -1621,15 +1685,24 @@ class Tools:
             return f"Error reading {path!r}: {e}"
 
     @staticmethod
-    def write_file(filepath: str, content: str, base_dir: str | None = None) -> str:
+    def write_file(filepath: str,
+                   content: str,
+                   base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Write text content to a file, creating any missing directories.
+       Write (overwrite) a text file. **This is the canonical write helper.**
 
-        :param filepath:  Path (relative or absolute) of the file to write.
-        :param content:   Text to write into the file.
-        :param base_dir:  Optional base directory to prefix to `filepath`.
+        Args:
+            filepath (str, required): Destination file path (use forward slashes).
+            content  (str, required): Full text to write.  
+            base_dir (str | None, optional): Prefix directory; if `None`, `filepath`
+                must be absolute.
 
-        :returns: A summary "<n> chars written to <path>", or an error message on failure.
+        Returns:
+            str: "Wrote <n> chars to '<absolute_path>'" or
+                 "Error writing '<absolute_path>': <reason>".
+
+        Example:
+            Tools.write_file("docs/readme.md", "# Intro\\n")
         """
         import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
@@ -1641,19 +1714,30 @@ class Tools:
         except Exception as e:
             return f"Error writing {path!r}: {e}"
 
+    # ────────────────────────────────────────
+    #  Rename / copy helpers
+    # ────────────────────────────────────────
+
     @staticmethod
-    def rename_file(old: str, new: str, base_dir: str = WORKSPACE_DIR) -> str:
+    def rename_file(old: str,
+                    new: str,
+                    base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Rename a file from `old` to `new`, under the specified base directory.
+       Rename (move) a file **within** the workspace.
 
-        Prevents directory‐traversal attacks by normalizing paths.
+        Args:
+            old (str, required): Existing relative path.
+            new (str, required): New relative path.
+            base_dir (str, optional): Workspace root.
 
-        :param old:      Original filename or relative path.
-        :param new:      Desired new filename or relative path.
-        :param base_dir: Directory under which both paths reside. Defaults to the workspace root.
+        Returns:
+            str: "Renamed <old> → <new>" or "Error renaming file: <reason>".
 
-        :returns: A confirmation message "Renamed old → new",
-                  or an error message if the operation fails or paths are invalid.
+        Security:
+            • Both paths are `os.path.normpath()`’d and must stay under `base_dir`.
+
+        Example:
+            Tools.rename_file("tmp.txt", "archive/tmp.txt")
         """
         import os
         safe_old = os.path.normpath(old)
@@ -1670,18 +1754,22 @@ class Tools:
             return f"Error renaming file: {e}"
 
     @staticmethod
-    def copy_file(src: str, dst: str, base_dir: str = WORKSPACE_DIR) -> str:
+    def copy_file(src: str,
+                  dst: str,
+                  base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Copy a file from `src` to `dst` under the specified base directory.
+       Copy a file inside the workspace.
 
-        Prevents directory‐traversal attacks by normalizing paths.
+        Args:
+            src (str, required): Existing file path.
+            dst (str, required): Destination path.
+            base_dir (str, optional): Workspace root.
 
-        :param src:      Source filename or relative path.
-        :param dst:      Destination filename or relative path.
-        :param base_dir: Directory under which both paths reside. Defaults to the workspace root.
+        Returns:
+            str: "Copied <src> → <dst>" or "Error copying file: <reason>".
 
-        :returns: A confirmation message "Copied src → dst",
-                  or an error message if the operation fails or paths are invalid.
+        Example:
+            Tools.copy_file("data/raw.csv", "backup/raw.csv")
         """
         import os, shutil
         safe_src = os.path.normpath(src)
@@ -1697,17 +1785,25 @@ class Tools:
         except Exception as e:
             return f"Error copying file: {e}"
 
+    # ────────────────────────────────────────
+    #  Metadata helpers
+    # ────────────────────────────────────────
+
     @staticmethod
-    def file_exists(filename: str, base_dir: str = WORKSPACE_DIR) -> bool:
+    def file_exists(filename: str,
+                    base_dir: str = WORKSPACE_DIR) -> bool:
         """
-        Check whether a file exists under the specified base directory.
+       Check existence of a file.
 
-        Prevents directory‐traversal attacks by normalizing the path.
+        Args:
+            filename (str, required): Relative path.
+            base_dir (str, optional)
 
-        :param filename: Name or relative path of the file.
-        :param base_dir: Directory in which to look. Defaults to the workspace root.
+        Returns:
+            bool: True if present and within workspace, False otherwise.
 
-        :returns: True if the file exists, False otherwise (or if the path is invalid).
+        Example:
+            if Tools.file_exists("output/result.json"): ...
         """
         import os
         safe = os.path.normpath(filename)
@@ -1716,19 +1812,23 @@ class Tools:
         return os.path.exists(os.path.join(base_dir, safe))
 
     @staticmethod
-    def file_info(filename: str, base_dir: str = WORKSPACE_DIR) -> dict:
+    def file_info(filename: str,
+                  base_dir: str = WORKSPACE_DIR) -> dict:
         """
-        Return size and last-modified timestamp for a file under the specified base directory.
+       Stat a file (size & mtime).
 
-        Prevents directory‐traversal attacks by normalizing the path.
+        Args:
+            filename (str, required)
+            base_dir (str, optional)
 
-        :param filename: Name or relative path of the file.
-        :param base_dir: Directory in which to stat. Defaults to the workspace root.
+        Returns:
+            dict:
+                • "size" (int) in bytes  
+                • "modified" (float) UNIX epoch seconds  
+              or {"error": "<reason>"}.
 
-        :returns: A dict with keys:
-                  - "size":     file size in bytes,
-                  - "modified": last-modified time as a UNIX timestamp,
-                  or {"error": "..."} on failure.
+        Example:
+            meta = Tools.file_info("report.pdf")
         """
         import os
         safe = os.path.normpath(filename)
@@ -1741,24 +1841,37 @@ class Tools:
         except Exception as e:
             return {"error": str(e)}
 
+    # ────────────────────────────────────────
+    #  Utility helpers
+    # ────────────────────────────────────────
+
     @staticmethod
     def get_workspace_dir() -> str:
         """
-        Return the absolute path of the workspace directory.
+       Absolute workspace root.
 
-        :returns: The constant WORKSPACE_DIR used as the base for all file operations.
+        Returns:
+            str: Value of Tools.WORKSPACE_DIR.
+
+        Example:
+            root = Tools.get_workspace_dir()
         """
         return Tools.WORKSPACE_DIR
 
     @staticmethod
     def get_cwd() -> str:
         """
-        Return the current working directory of this process.
+       Process current working directory.
 
-        :returns: The output of os.getcwd().
+        Returns:
+            str: Result of os.getcwd().
+
+        Example:
+            print("Running from", Tools.get_cwd())
         """
         import os
         return os.getcwd()
+
     
     # We define a static method to introspect the available tools and agents, writing the results to a JSON file named `agent_stack.json`. This method collects tool and agent names, default stages, and the last updated timestamp.
     @staticmethod

@@ -1372,6 +1372,7 @@ class Assembler:
                         # also store the exact chainer input so we can re-use it:
                         "chainer_input": "\n".join(state["fixed_calls"])
                         })
+
                     elif stage == "invoke_with_retries":
                         tctxs = self._stage9_invoke_with_retries(
                             raw_calls=state["raw_calls"],

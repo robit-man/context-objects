@@ -185,8 +185,8 @@ CTX_PATH = "context.jsonl"
 audio_svc = AudioService(
     sample_rate         = config.get("sample_rate",        16000),
     rms_threshold       = config.get("rms_threshold",      0.01),
-    silence_duration    = config.get("silence_duration",   2.0),
-    consensus_threshold = config.get("consensus_threshold",0.5),
+    silence_duration    = config.get("silence_duration",   0.5),
+    consensus_threshold = config.get("consensus_threshold",0.3),
     enable_denoise      = config.get("enable_noise_reduction", False),
     on_transcription    = None,      # set below
     logger              = log_message,
@@ -205,13 +205,18 @@ asm_audio = Assembler(
     top_k            = 5,
     tts_manager      = tts_audio,
 )
-# wire up the mic callback to asm_audio
+
+# —– **Changed**: catch assembler’s return and enqueue it for live TTS
 def _audio_input_cb(text: str):
-    asm_audio.run_with_meta_context(text)
+    answer = asm_audio.run_with_meta_context(text)
+    if answer and answer.strip():
+        tts_audio.enqueue(answer)
+
 audio_svc.on_transcription = _audio_input_cb
 
 # start audio in its own thread
 threading.Thread(target=audio_svc.start, daemon=True).start()
+
 
 # ─── 2) CLI PIPELINE ──────────────────────────────────────────────────────
 def cli_loop():
@@ -242,9 +247,10 @@ def cli_loop():
         # live TTS will speak automatically
     print("CLI loop exiting…")
    
-
 threading.Thread(target=cli_loop, daemon=True).start()
 
+
+# ─── 3) FILE-WATCHER ───────────────────────────────────────────────────────
 def _monitor_files(interval=1):
     paths = [
         os.path.abspath(__file__),
@@ -270,9 +276,11 @@ def _monitor_files(interval=1):
                     os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
                 continue
+
 threading.Thread(target=_monitor_files, daemon=True).start()
 
-# ─── 3) TELEGRAM PIPELINE ────────────────────────────────────────────────
+
+# ─── 4) TELEGRAM PIPELINE ─────────────────────────────────────────────────
 try:
     tts_tele = TTSManager(
         logger        = log_message,
@@ -303,7 +311,8 @@ try:
 except Exception as e:
     print(f"Error setting up Telegram thread: {e}")
 
-# ─── WAIT FOR CTRL-C ──────────────────────────────────────────────────────
+
+# ─── WAIT FOR CTRL-C ───────────────────────────────────────────────────────
 import atexit
 def _cleanup():
     log_message("Shutting down services…", "INFO")
