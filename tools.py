@@ -2530,7 +2530,6 @@ class Tools:
             for i, e in enumerate(entries, 1)
         )
     
-
     @staticmethod
     def get_chat_history(
         arg1=None,
@@ -2545,7 +2544,8 @@ class Tools:
         count: int = None
     ) -> str:
         """
-        Retrieve context objects from `context.jsonl`.
+        Retrieve context objects from *the* active repository (JSONL / SQLite hybrid),
+        not a hard-coded `context.jsonl` file.
 
         Legacy positional modes:
           • get_chat_history("today"/"yesterday"/"last N days")
@@ -2564,11 +2564,12 @@ class Tools:
 
         Returns JSON: {"results": [ {timestamp, role, content, score}, … ] }
         """
-        import os, re, json
+        import re, json
         from datetime import datetime, timedelta
-        from context import ContextObject
+        from numpy import dot, linalg
+        from context import ContextObject, HybridContextRepository
 
-        # --- Normalize old & new kwargs ---
+        # --- Normalize legacy vs. new args ---
         if keyword is not None:
             arg1 = keyword
         if query is not None:
@@ -2580,24 +2581,18 @@ class Tools:
         if n is not None:
             arg2 = n
 
-        # --- Load on-disk ContextObjects ---
-        ctx_path = os.path.join(os.getcwd(), "context.jsonl")
+        # ─── LOAD *FROM THE ACTIVE REPO* ────────────────────────────────
+        repo = HybridContextRepository.instance()
         entries = []
-        if os.path.isfile(ctx_path):
-            with open(ctx_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        obj = ContextObject.from_json(line)
-                    except Exception:
-                        continue
-                    entries.append({
-                        "timestamp":      obj.timestamp,
-                        "role":           obj.metadata.get("role"),
-                        "content":        obj.metadata.get("content", obj.summary or ""),
-                        "domain":         obj.domain,
-                        "component":      obj.component,
-                        "semantic_label": obj.semantic_label
-                    })
+        for ctx in repo.query(lambda c: True):
+            entries.append({
+                "timestamp":      ctx.timestamp,
+                "role":           ctx.metadata.get("role"),
+                "content":        ctx.metadata.get("content", ctx.summary or ""),
+                "domain":         ctx.domain,
+                "component":      ctx.component,
+                "semantic_label": ctx.semantic_label
+            })
 
         # --- Apply domain/component/semantic_label filters ---
         def _in(val, flt):
@@ -2607,16 +2602,17 @@ class Tools:
 
         entries = [
             e for e in entries
-            if _in(e["domain"], domain)
-            and _in(e["component"], component)
-            and _in(e["semantic_label"], semantic_label)
+            if _in(e["domain"],         domain)
+            and _in(e["component"],     component)
+            and _in(e["semantic_label"],semantic_label)
         ]
 
         # --- Timestamp parser ---
         def _parse_ts(s: str) -> datetime:
             try:
-                return datetime.fromisoformat(s)
-            except ValueError:
+                # allow both ISO and our YYYYMMDD…Z form
+                return datetime.fromisoformat(s.rstrip("Z"))
+            except Exception:
                 return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
 
         # --- 1) Timeframe-only mode ---
@@ -2700,7 +2696,6 @@ class Tools:
         # --- Score & rank ---
         scored = []
         if qtext:
-            from numpy import dot, linalg
             qv = Utils.embed_text(qtext)
             candidates = filtered[-100:]
             for e in candidates:

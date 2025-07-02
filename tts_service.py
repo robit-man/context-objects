@@ -103,6 +103,17 @@ class TTSManager:
         return chunks
 
     def enqueue(self, text: str):
+                # ──── filter out common Unicode emojis ─────────────────────────
+        emoji_pattern = re.compile(
+            "[" 
+            "\U0001F600-\U0001F64F"  # Emoticons
+            "\U0001F300-\U0001F5FF"  # Symbols & pictographs
+            "\U0001F680-\U0001F6FF"  # Transport & map symbols
+            "\U0001F1E0-\U0001F1FF"  # Flags
+            "]+",
+            flags=re.UNICODE
+        )
+        text = emoji_pattern.sub('', text)
         text = text.strip().replace("*", "")
         if not text:
             return

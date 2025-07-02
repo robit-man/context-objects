@@ -66,7 +66,7 @@ class RLController:
                  alpha: float = 0.1,
                  beta:  float = 0.01,
                  gamma: float = 0.1,
-                 path:  str   = "rl.weights"):
+                 path:  str   = "weights.rl"):
         self.alpha = alpha     # LR for Q
         self.beta  = beta      # LR for baseline
         self.gamma = gamma     # weight on recall_feature
@@ -341,15 +341,27 @@ class Assembler:
         config_path:      str = "config.json",
         lookback_minutes: int = 60,
         top_k:            int = 10,
-        tts_manager:      TTSManager | None = None,
+        tts_manager:      TTSManager | None    = None,
+        engine:           Any | None           = None,
+        rl_controller:    RLController | None  = None,
     ):
+        # 1) Remember your store paths
+        self.context_path = context_path
+        self.config_path  = config_path
         # — load or init config —
         try:
             self.cfg = json.load(open(config_path))
         except FileNotFoundError:
             self.cfg = {}
+            
+        # New pruning & window parameters, with sane defaults
+        self.context_ttl_days   = self.cfg.get("context_ttl_days",    7)
+        self.max_history_items  = self.cfg.get("max_history_items",  10)
+        self.max_semantic_items = self.cfg.get("max_semantic_items", 10)
+        self.max_memory_items   = self.cfg.get("max_memory_items",   10)
+        self.max_tool_outputs   = self.cfg.get("max_tool_outputs",   10)
 
-        # — models & lookback settings —
+        # 4) Models & lookback
         self.primary_model   = self.cfg.get("primary_model",   "gemma3:4b")
         self.secondary_model = self.cfg.get("secondary_model", self.primary_model)
         self.lookback        = self.cfg.get("lookback_minutes", lookback_minutes)
@@ -361,7 +373,7 @@ class Assembler:
             "clarifier_prompt",
             "You are Clarifier. Expand the user’s intent into a JSON object with "
             "two keys: 'keywords' (an array of concise keywords) and 'notes'. "
-            "Your notes must be highly detailed and context aware. Do not provide judgements beyond scope of exact context present, or make assumptions beyond what is absolutely known. "
+            "Notes should produce NO value judgements or claims, and should only expand on what the user said."
             "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
@@ -376,7 +388,7 @@ class Assembler:
             "planning_prompt",
             "You are the Planner.  Emit **only** a JSON object matching:\n\n"
             "{ \"tasks\": [ { \"call\": \"tool_name\", \"tool_input\": { /* named params */ }, \"subtasks\": [] }, … ] }\n\n"
-            "If you cannot, just list the tool calls.  Available tools:\n"
+            "If you cannot, just list the tool calls. Only return exact objects from the list of Available tools:\n"
         )
         self.toolchain_prompt = self.cfg.get(
             "toolchain_prompt",
@@ -433,10 +445,11 @@ class Assembler:
             "secondary_model":  self.secondary_model,
             "lookback_minutes": self.lookback,
             "top_k":            self.top_k,
-            "history_turns":    self.hist_k
+            "history_turns":    self.hist_k,
         }
-        if defaults != self.cfg:
-            json.dump(defaults, open(config_path, "w"), indent=2)
+        if any(defaults[k] != self.cfg.get(k) for k in defaults):
+            json.dump({**self.cfg, **defaults}, open(self.config_path, "w"), indent=2)
+
 
         # — init context store & memory manager —
         self.repo   = ContextRepository(context_path)
@@ -478,10 +491,20 @@ class Assembler:
         self._optional_stages = self.cfg.get("rl_optional", discovered)
 
         # on-disk RL controller now knows about your meta-stages too
-        self.rl = RLController(
-            stages=self._optional_stages,
-            alpha=self.cfg.get("rl_alpha", 0.05),
-            path=self.cfg.get("rl_weights_path", "weights.rl")
+        self.rl = rl_controller or RLController(
+            stages=[
+                "curiosity_probe",
+                "system_prompt_refine",
+                "narrative_mull",
+                "prune_context_store",
+                "semantic_retrieval",
+                "memory_retrieval",
+                "tool_output_retrieval",
+            ],
+            alpha=self.cfg.get("rl_alpha", 0.1),
+            beta= self.cfg.get("rl_beta",  0.01),
+            gamma=self.cfg.get("rl_gamma", 0.1),
+            path=self.cfg.get("rl_path", "weights.rl"),
         )
 
         # — seed & load “curiosity” templates from the repo —
@@ -547,7 +570,7 @@ class Assembler:
             Embed into a 1-D numpy array of shape (768,).
             """
             try:
-                #log_message("Embedding text for context.", "PROCESS")
+                #print("Embedding text for context.", "PROCESS")
                 response = embed(model="nomic-embed-text", input=text)
                 vec = np.array(response["embeddings"], dtype=float)
                 # ensure 1-D
@@ -555,10 +578,10 @@ class Assembler:
                 norm = np.linalg.norm(vec)
                 if norm > 0:
                     vec = vec / norm
-                #log_message("Text embedding computed and normalized.", "SUCCESS")
+                #print("Text embedding computed and normalized.", "SUCCESS")
                 return vec
             except Exception as e:
-                #log_message("Error during text embedding: " + str(e), "ERROR")
+                #print("Error during text embedding: " + str(e), "ERROR")
                 return np.zeros(768, dtype=float)
 
 
@@ -806,6 +829,7 @@ class Assembler:
         return segs[-self.hist_k:]
 
     def _print_stage_context(self, name: str, sections: Dict[str, Any]):
+        print("--- Stage Context Dump -----------------------------------------------------")
         print(f"\n>>> [Stage: {name}] Context window:")
         for title, lines in sections.items():
             print(f"  -- {title}:")
@@ -817,6 +841,7 @@ class Assembler:
                     print(f"     {ln}")
             else:
                 print(f"     {lines}")
+        print("--- Stage Context Dump End -------------------------------------------------")
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
@@ -1108,6 +1133,7 @@ class Assembler:
         • Restores the original store if any exception occurs.
         """
         import json, textwrap, os, shutil
+        from datetime import datetime
 
         # 1️  Recall-feature for RL gate
         recall_ids = state.get("recent_ids", [])
@@ -1130,25 +1156,46 @@ class Assembler:
         )
         rows.sort(key=lambda c: c.timestamp)
         current_prompts = [
-            (c.metadata.get("prompt") or c.metadata.get("policy") or "")
-            for c in rows
+            c.metadata.get("prompt") or c.metadata.get("policy") or "" for c in rows
         ]
 
-        # 4️  Build LLM prompt
+        # 4A  Build metrics block
         metrics = {
             "errors":         len(state.get("errors", [])),
             "curiosity_used": state.get("curiosity_used", [])[-5:],
             "recall_mean":    rf,
         }
+
+        # 4B  Build diagnostics block
+        rl_snapshot = {
+            stage: round(self.rl.Q.get(stage, 0.0), 3)
+            for stage in ("curiosity_probe", "system_prompt_refine", "narrative_mull")
+        }
+        rl_baseline = round(self.rl.R_bar, 3)
+        total_objs = len(list(self.repo.query(lambda _: True)))
+        ephemeral_objs = len(list(self.repo.query(
+            lambda c: c.component in {"segment","tool_output","narrative","knowledge","stage_performance"}
+        )))
+        diagnostics = {
+            "rl_Q":       rl_snapshot,
+            "rl_R_bar":   rl_baseline,
+            "repo_total": total_objs,
+            "repo_ephemeral": ephemeral_objs,
+        }
+
         prompt_block = "\n".join(
             f"- {textwrap.shorten(p, 60)}" for p in current_prompts
         ) or "(none)"
+
+        # 4C  Assemble full refine prompt
         refine_prompt = (
             "You are a self-optimising agent.\n\n"
             "### Active Prompts / Policies ###\n"
             f"{prompt_block}\n\n"
             "### Recent Metrics ###\n"
             f"{json.dumps(metrics, indent=2)}\n\n"
+            "### Diagnostics ###\n"
+            f"{json.dumps(diagnostics, indent=2)}\n\n"
             "Propose exactly **one** minimal change and return ONLY valid JSON:\n"
             '{"action":"add","prompt":"<text>"} or '
             '{"action":"remove","prompt":"<substring>"}'
@@ -1169,16 +1216,15 @@ class Assembler:
         except Exception:
             return None
 
-        # 6️  Backup context.jsonl
-        backup = self.context_path + ".bak"
+        # 6️  Backup context store
+        backup_path = self.context_path + ".bak"
         try:
-            shutil.copy(self.context_path, backup)
+            shutil.copy(self.context_path, backup_path)
         except Exception as e:
-            # if we can’t back up, abort
             print(f"Failed to back up context store: {e}", "ERROR")
             return None
 
-        # 7️  Apply patch + reseed, with rollback on any error
+        # 7️  Apply patch + reseed, with rollback on error
         try:
             if action == "add" and text:
                 patch = ContextObject.make_policy(
@@ -1198,39 +1244,39 @@ class Assembler:
                             pass
 
             else:
-                # nothing to do
-                os.remove(backup)    # clean up backup
+                # nothing changed: clean up and exit
+                os.remove(backup_path)
                 return None
 
-            # now bake into the “static” prompt entries
+            # re-seed static prompts so context.jsonl stays coherent
             self._seed_static_prompts()
 
         except Exception as e:
             # rollback entire store
             try:
-                shutil.move(backup, self.context_path)
+                shutil.move(backup_path, self.context_path)
                 print(f"Rolled back prompt changes due to error: {e}", "WARNING")
             except Exception as e2:
                 print(f"Rollback failed: {e2}", "ERROR")
             return None
 
-        # success → remove backup
+        # 8️  On success, remove backup
         try:
-            os.remove(backup)
-        except:
+            os.remove(backup_path)
+        except OSError:
             pass
 
-        # 8️  Log the decision
+        # 9️  Log the decision
         refine_ctx = ContextObject.make_stage(
             "system_prompt_refine",
             [cid for cid in recall_ids if self.repo_exists(cid)],
             {"action": action, "text": text},
         )
         refine_ctx.component = "patch"
-        refine_ctx.touch(); self.repo.save(refine_ctx)
+        refine_ctx.touch()
+        self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
-
 
 
 
@@ -1243,7 +1289,6 @@ class Assembler:
         except KeyError:
             return False
 
-
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1254,14 +1299,19 @@ class Assembler:
         """
         End-to-end orchestrator.
 
+        • First prunes old/overflow contexts.
         • Returns immediately on empty input.
-        • Catches any unexpected errors and returns a simple apology.
+        • Catches unexpected errors and returns a simple apology.
         """
+
         # ① Short-circuit empty or whitespace-only inputs
         if not user_text or not user_text.strip():
             return ""
 
         try:
+            from datetime import datetime
+            from collections import deque
+            import threading
 
             # ── helper: crude complexity metric ──────────────────────────────────
             def _complexity(q: str, notes: str, kws: list[str]) -> float:
@@ -1278,6 +1328,7 @@ class Assembler:
                 "load_system_prompts",
                 "retrieve_and_merge_context",
                 "intent_clarification",
+                "prune_context_store",
             ])
 
             state = {
@@ -1299,24 +1350,42 @@ class Assembler:
                 start = datetime.utcnow()
                 summary, ok = "", False
 
-                try:
-                    status_cb(stage, "…")
+                # report start
+                status_cb(stage, "…")
 
-                    # ── meta stages (fire-and-forget) ────────────────────────
-                    if stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
-                        threading.Thread(target=self._stage_curiosity_probe,
-                                        args=(state.copy(),), daemon=True).start()
+                try:
+                    # ── 0) Prune old/overflow contexts ─────────────────────────────
+                    if stage == "prune_context_store":
+                        # this returns a string like "pruned 42 items (…)”
+                        summary = self._stage_prune_context_store(state)
+                        ok = True
+
+                    # ── meta stages (fire-and-forget) ─────────────────────────────
+                    elif stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
+                        threading.Thread(
+                            target=self._stage_curiosity_probe,
+                            args=(state.copy(),),
+                            daemon=True
+                        ).start()
                         summary, ok = "(probe dispatched)", True
+
                     elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
-                        threading.Thread(target=self._stage_system_prompt_refine,
-                                        args=(state.copy(),), daemon=True).start()
+                        threading.Thread(
+                            target=self._stage_system_prompt_refine,
+                            args=(state.copy(),),
+                            daemon=True
+                        ).start()
                         summary, ok = "(refine dispatched)", True
+
                     elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
-                        threading.Thread(target=self._stage_narrative_mull,
-                                        args=(state.copy(),), daemon=True).start()
+                        threading.Thread(
+                            target=self._stage_narrative_mull,
+                            args=(state.copy(),),
+                            daemon=True
+                        ).start()
                         summary, ok = "(mull dispatched)", True
 
-                    # ── core pipeline stages ──────────────────────────────────
+                    # ── core pipeline stages ───────────────────────────────────────
                     elif stage == "record_input":
                         ctx = self._stage1_record_input(user_text)
                         state["user_ctx"] = ctx
@@ -1332,9 +1401,14 @@ class Assembler:
                     elif stage == "retrieve_and_merge_context":
                         extra = self._get_history()
                         out = self._stage3_retrieve_and_merge_context(
-                            user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
+                            user_text,
+                            state["user_ctx"],
+                            state["sys_ctx"],
+                            extra_ctx=extra,
+                            recall_ids=state["recent_ids"]
                         )
                         state.update(out)
+                        state["recent_ids"].insert(0, state["narrative_ctx"].context_id)
                         summary, ok = "(context merged)", True
 
                     elif stage == "intent_clarification":
@@ -1342,12 +1416,11 @@ class Assembler:
                         state["clar_ctx"] = ctx
                         state["recent_ids"].append(ctx.context_id)
                         summary = ctx.summary
-                        comp = _complexity(
+                        state["complexity"] = _complexity(
                             user_text,
                             ctx.metadata.get("notes", ""),
                             ctx.metadata.get("keywords", []),
                         )
-                        state["complexity"] = comp
                         queue.extend([
                             "external_knowledge", "prepare_tools", "planning_summary",
                             "plan_validation", "tool_chaining", "invoke_with_retries",
@@ -1388,6 +1461,7 @@ class Assembler:
                             "assemble_and_infer", "response_critique", "memory_writeback",
                         ])
                         summary, ok = f"{len(fixed)} calls", True
+
                     elif stage == "tool_chaining":
                         tc_ctx, confirmed_calls, schemas = self._stage8_tool_chaining(
                             state["plan_ctx"],
@@ -1395,22 +1469,24 @@ class Assembler:
                             state["tools_list"]
                         )
                         state.update({
-                        "tc_ctx": tc_ctx,
-                        "raw_calls": confirmed_calls,
-                        "schemas": schemas,
-                        # also store the exact chainer input so we can re-use it:
-                        "chainer_input": "\n".join(state["fixed_calls"])
+                            "tc_ctx":        tc_ctx,
+                            "raw_calls":     confirmed_calls,
+                            "schemas":       schemas,
+                            "chainer_input": "\n".join(state["fixed_calls"]),
                         })
+                        summary, ok = f"{len(confirmed_calls)} chained", True
 
                     elif stage == "invoke_with_retries":
                         tctxs = self._stage9_invoke_with_retries(
                             raw_calls=state["raw_calls"],
-                            plan_output=state["chainer_input"],      # must be the same text you gave to stage8
+                            plan_output=state["chainer_input"],
                             selected_schemas=state["schemas"],
                             user_text=state["user_text"],
                             clar_metadata=state["clar_ctx"].metadata
                         )
                         state["tool_ctxs"] = tctxs
+                        summary, ok = f"{len(tctxs)} tools run", True
+
                     elif stage == "reflection_and_replan":
                         rp = self._stage9b_reflection_and_replan(
                             state["tool_ctxs"], state["plan_output"],
@@ -1433,7 +1509,6 @@ class Assembler:
                         summary, ok = "(polished)", True
 
                     elif stage == "memory_writeback":
-                        # no-op here: defer output until after loop
                         summary, ok = "(memory queued)", True
 
                 except Exception as e:
@@ -1441,6 +1516,7 @@ class Assembler:
                     summary, ok = f"error:{e}", False
 
                 finally:
+                    # record stage performance
                     dur = (datetime.utcnow() - start).total_seconds()
                     if "user_ctx" in state:
                         perf = ContextObject.make_stage(
@@ -1448,11 +1524,13 @@ class Assembler:
                             [state["user_ctx"].context_id],
                             {"stage": stage, "duration": dur, "error": not ok},
                         )
-                        perf.touch(); self.repo.save(perf)
+                        perf.touch()
+                        self.repo.save(perf)
+
                     status_cb(stage, summary)
                     self._last_errors |= not ok
 
-            # ── post-pipeline async meta-jobs ────────────────────────────────
+            # ── post-pipeline async meta-jobs ───────────────────────────────────
             def _maybe_async(tag: str, fn: Callable):
                 if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
                     threading.Thread(target=fn, args=(state.copy(),), daemon=True).start()
@@ -1462,19 +1540,21 @@ class Assembler:
             _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
             _maybe_async("narrative_mull",       self._stage_narrative_mull)
 
-            # send any “appiphany” pings
+            # push any “appiphany” pings
             for cid in list(self._chat_contexts):
-                try: self._maybe_appiphany(cid)
-                except: pass
+                try:
+                    self._maybe_appiphany(cid)
+                except:
+                    pass
 
             # RL reward update
             self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
+            self.curiosity_used = state["curiosity_used"]
 
-            # ── ensure we always emit something via status_cb ──────────────────
+            # ── final output via status_cb ─────────────────────────────────────
             final_text = (answer or state.get("final", "")).strip()
             if not final_text:
                 final_text = "Sorry, I couldn’t process that. Could you try rephrasing?"
-            # send as a single chunk
             status_cb("output_1/1", final_text)
 
             return final_text
@@ -1495,98 +1575,148 @@ class Assembler:
         ctx.touch()
         self.repo.save(ctx)
         return ctx
+    
 
     def _stage2_load_system_prompts(self) -> ContextObject:
         return self._load_system_prompts()
+        
 
     def _stage3_retrieve_and_merge_context(
         self,
         user_text: str,
         user_ctx: ContextObject,
         sys_ctx: ContextObject,
-        extra_ctx: List[ContextObject] = None
+        extra_ctx: List[ContextObject] = None,
+        recall_ids: List[str] = None
     ) -> Dict[str, Any]:
         """
-        Merge together:
-          1) the last raw segments (user/assistant),
-          2) our tool-driven chat_history,
-          3) semantic retrieval,
-          4) associative memory,
-          5) recent tool outputs.
+        Merge together, in chronological order:
+        • system prompts
+        • narrative
+        • recent raw segments (user/assistant)
+        • any explicit chat_history (extra_ctx)
+        • semantic retrieval (RL-gated)
+        • associative memory (RL-gated)
+        • recent tool outputs (RL-gated)
+
+        Returns a dict with:
+          "narrative_ctx": ContextObject,
+          "history":      List[ContextObject],
+          "recent":       List[ContextObject],
+          "assoc":        List[ContextObject],
+          "recent_ids":   List[str],  # full merged order
         """
         from datetime import timedelta
-        now, past = default_clock(), default_clock() - timedelta(minutes=self.lookback)
-        tr = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
 
-        # 1) raw user+assistant up to hist_k turns
-        all_segs = self.repo.query(lambda c:
-            c.domain=="segment" and c.component in ("user_input","assistant")
+        # ── 1) Compute RL “recall feature” from prior recalls ────────────────
+        rf = 0.0
+        if recall_ids:
+            counts = []
+            for cid in recall_ids:
+                try:
+                    stats = self.repo.get(cid).metadata.get("recall_stats", {})
+                    counts.append(stats.get("count", 0))
+                except KeyError:
+                    continue
+            rf = sum(counts) / len(counts) if counts else 0.0
+
+        # ── 2) Time-window for semantic retrieval ────────────────────────────
+        now  = default_clock()
+        past = now - timedelta(minutes=self.lookback)
+        tr   = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
+
+        # ── 3) Load the running narrative singleton ──────────────────────────
+        narr_ctx = self._load_narrative_context()
+
+        # ── 4) Raw history segments (always include) ────────────────────────
+        segments = self.repo.query(
+            lambda c: c.domain == "segment"
+                    and c.semantic_label in ("user_input", "assistant")
         )
-        all_segs.sort(key=lambda c: c.timestamp)
-        history = all_segs[-self.hist_k*2:]  # e.g. last 10 user + 10 assistant
-
-        # 1.5) fold in any explicit chat_history objs
+        segments.sort(key=lambda c: c.timestamp)
+        history = segments[-(self.hist_k * 2):]  # last N turns
         if extra_ctx:
             history.extend(extra_ctx)
 
-        # 2) semantic recent retrieval (exclude everything except mind-map snippets)
-        recent = self.engine.query(
-            stage_id="recent_retrieval",
-            time_range=tr,
-            similarity_to=user_text,
-            exclude_tags=self.STAGES
-                         + ["tool_schema","tool_output","assistant","system_prompt"],
-            top_k=self.top_k
-        )
+        # ── 5) Semantic retrieval (RL-gated) ───────────────────────────────
+        if self.rl.should_run("semantic_retrieval", rf):
+            recent = self.engine.query(
+                stage_id="recent_retrieval",
+                time_range=tr,
+                similarity_to=user_text,
+                exclude_tags=(
+                    self.STAGES
+                    + ["tool_schema", "tool_output", "assistant", "system_prompt"]
+                ),
+                top_k=self.top_k
+            )
+        else:
+            recent = []
 
-        # 3) associative memory (first pass)
-        assoc1 = self.memman.recall([user_ctx.context_id], k=self.top_k)
-        for c in assoc1:
-            c.record_recall(stage_id="recent_retrieval",
-                            coactivated_with=[user_ctx.context_id])
-            self.repo.save(c)
+        # ── 6) Associative memory (RL-gated) ───────────────────────────────
+        if self.rl.should_run("memory_retrieval", rf):
+            assoc = self.memman.recall([user_ctx.context_id], k=self.top_k)
+            for c in assoc:
+                c.record_recall(
+                    stage_id="recent_retrieval",
+                    coactivated_with=[user_ctx.context_id]
+                )
+                self.repo.save(c)
+        else:
+            assoc = []
 
-        # 4) include recent tool outputs
-        tool_outs = self.repo.query(lambda c: c.component=="tool_output")
+        # ── 7) Recent tool outputs (RL-gated) ───────────────────────────────
+        tool_outs = self.repo.query(lambda c: c.component == "tool_output")
         tool_outs.sort(key=lambda c: c.timestamp)
-        recent_tools = tool_outs[-self.top_k:]
+        if self.rl.should_run("tool_output_retrieval", rf):
+            recent_tools = tool_outs[-self.top_k:]
+        else:
+            recent_tools = []
 
-        # merge everything, preserving chronology but deduping
-        merged = []
+        # ── 8) Merge + dedupe in chronological order, seeding with narrative ─
+        merged: List[ContextObject] = []
         seen = set()
-        for bucket in (history, recent, assoc1, recent_tools):
-            for c in bucket:
+        for bucket in ([narr_ctx], history, recent, assoc, recent_tools):
+            for c in (bucket if isinstance(bucket, list) else [bucket]):
                 if c.context_id not in seen:
                     merged.append(c)
                     seen.add(c.context_id)
 
-        recent_ids = [c.context_id for c in merged]
+        merged_ids = [c.context_id for c in merged]
 
-        # debug print
+        # ── 9) Debug print including narrative ───────────────────────────────
         self._print_stage_context("recent_retrieval", {
             "system_prompts": [sys_ctx.summary],
+            "narrative":      [narr_ctx.summary],
             "history":        [f"{c.semantic_label}: {c.summary}" for c in history],
             "semantic":       [f"{c.semantic_label}: {c.summary}" for c in recent],
-            "memory":         [f"{c.semantic_label}: {c.summary}" for c in assoc1],
+            "memory":         [f"{c.semantic_label}: {c.summary}" for c in assoc],
             "tool_outputs":   [f"{c.semantic_label}: {c.summary}" for c in recent_tools],
         })
 
         return {
-            "history":    history,
-            "recent":     recent,
-            "assoc":      assoc1,
-            "recent_ids": recent_ids
+            "narrative_ctx": narr_ctx,
+            "history":       history,
+            "recent":        recent,
+            "assoc":         assoc,
+            "recent_ids":    merged_ids
         }
+
+
 
     # ── Stage 4: Intent Clarification ─────────────────────────────────────
     def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
         import json, re
 
-        # 1) Build the context block
-        pieces = [state['sys_ctx']] + state['history'] + state['recent'] + state['assoc']
+        # 1) Build the context block, now including the narrative up front
+        pieces = [
+            state['sys_ctx'],
+            state['narrative_ctx'],       # ← inject running narrative
+        ] + state['history'] + state['recent'] + state['assoc']
+
         block = "\n".join(f"[{c.semantic_label}] {c.summary}" for c in pieces)
 
-        # 2) Force valid JSON out of the clarifier
+        # 2) Ask the clarifier for valid JSON
         clarifier_system = self.clarifier_prompt  # “Output only valid JSON…”
         msgs = [
             {"role": "system", "content": clarifier_system},
@@ -1595,14 +1725,17 @@ class Assembler:
         ]
 
         out = self._stream_and_capture(self.secondary_model, msgs, tag="[Clarifier]")
-        # retry once if it isn’t JSON
+        # retry once on JSON parse failure
         for attempt in (1, 2):
             try:
                 clar = json.loads(out)
                 break
-            except:
+            except json.JSONDecodeError:
                 if attempt == 1:
-                    retry_sys = "⚠️ Your last response wasn’t valid JSON.  Please output only JSON with keys `keywords` and `notes`."
+                    retry_sys = (
+                        "⚠️ Your last response wasn’t valid JSON.  "
+                        "Please output only JSON with keys `keywords` and `notes`."
+                    )
                     out = self._stream_and_capture(
                         self.secondary_model,
                         [
@@ -1612,27 +1745,57 @@ class Assembler:
                         tag="[ClarifierRetry]"
                     )
                 else:
-                    # give up: empty intent
+                    # give up: wrap raw text into notes
                     clar = {"keywords": [], "notes": out}
 
-        # 3) Build the ContextObject (summary = notes)
+        # 3) Build the ContextObject, referencing narrative_ctx as well
+        input_refs = [
+            state['user_ctx'].context_id,
+            state['sys_ctx'].context_id,
+            state['narrative_ctx'].context_id,
+        ] + state['recent_ids']
+
         ctx = ContextObject.make_stage(
             "intent_clarification",
-            [state['user_ctx'].context_id, state['sys_ctx'].context_id] + state['recent_ids'],
+            input_refs,
             clar
         )
         ctx.stage_id = "intent_clarification"
         ctx.summary  = clar.get("notes", "")
-        ctx.touch(); self.repo.save(ctx)
+        ctx.touch()
+        self.repo.save(ctx)
         return ctx
+
 
     def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
         import json
-        from datetime import timedelta
+        from datetime import timedelta, datetime
 
-        snippets: List[str] = []
+        # ── 0) Prune stale/overflow contexts to keep a rolling memory ───────
+        # (we pass an empty dict because _stage_prune_context_store ignores state contents)
+        prune_summary = self._stage_prune_context_store({})
 
-        # ——— 1) External Web/snippet lookup ———————————————————
+        # Build a “working memory” from the survivors
+        EPHEMERAL = {"segment", "tool_output", "knowledge", "narrative", "stage_performance"}
+        # fetch all remaining ephemeral contexts
+        survivors = [
+            c for c in self.repo.query(lambda c: c.component in EPHEMERAL)
+        ]
+        # sort newest first
+        survivors.sort(
+            key=lambda c: datetime.fromisoformat(
+                c.timestamp.rstrip("Z") if isinstance(c.timestamp, str) else datetime.utcnow().isoformat()
+            ),
+            reverse=True
+        )
+        # take up to top_k and reverse so oldest appear first
+        working_memory = [f"(WM) {c.summary}" for c in reversed(survivors[: self.top_k])]
+
+        snippets: list[str] = []
+        # seed with working memory
+        snippets.extend(working_memory)
+
+        # ── 1) External Web/snippet lookup ————————————————————————
         for kw in clar_ctx.metadata.get("keywords", []):
             hits = self.engine.query(
                 stage_id="external_knowledge_retrieval",
@@ -1641,7 +1804,7 @@ class Assembler:
             )
             snippets.extend(h.summary for h in hits)
 
-        # ——— 2) Local memory lookup ——————————————————————
+        # ── 2) Local memory lookup —————————————————————————
         now = default_clock()
         start = (now - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
         for kw in clar_ctx.metadata.get("keywords", []):
@@ -1654,69 +1817,83 @@ class Assembler:
                 results = json.loads(raw).get("results", [])
                 for r in results:
                     snippets.append(f"(MEM) {r.get('summary','')}")
-                snippets = list(dict.fromkeys(snippets))
             except json.JSONDecodeError:
                 continue
 
-        # ——— 3) Fallback to recent chat if no snippets found —————
+        # ── 3) Fallback to recent chat if still empty ——————————————
         if not snippets:
             recent = self._get_history()[-5:]
             for ctx in recent:
                 snippets.append(f"(HIST) {ctx.summary}")
-            snippets = list(dict.fromkeys(snippets))
 
-        # ——— 4) Persist and return ———————————————————————
+        # dedupe while preserving order
+        seen = set()
+        unique_snips = []
+        for s in snippets:
+            if s not in seen:
+                seen.add(s)
+                unique_snips.append(s)
+
+        # ── 4) Persist and return —————————————————————————————
         ctx = ContextObject.make_stage(
             "external_knowledge_retrieval",
             clar_ctx.references,
-            {"snippets": snippets}
+            {"snippets": unique_snips}
         )
         ctx.stage_id = "external_knowledge_retrieval"
-        ctx.summary  = "\n".join(snippets) or "(none)"
+        ctx.summary  = "\n".join(unique_snips) or "(none)"
         ctx.touch()
         self.repo.save(ctx)
 
+        # for debugging
         self._print_stage_context("external_knowledge_retrieval", {
-            "snippets": snippets or ["(none)"]
+            "pruned":        prune_summary,
+            "working_memory": working_memory or ["(none)"],
+            "snippets":      unique_snips or ["(none)"]
         })
+
         return ctx
-    
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # Stage 6: Gather & Dedupe Tool Schemas
+    # ────────────────────────────────────────────────────────────────────────────────
     def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
         """
-        Return a de-duplicated list of tool schemas:
-
-        * Only the most-recent row per tool-name is used.
-        * Output order is stable (lexicographic by tool name).
+        Return a de-duplicated, lexicographically sorted list of:
+        { "name": "<tool_name>", "description": "<one-line desc>" }
+        for every tool_schema in the repo.
         """
         import json
 
-        # 1️  Fetch **all** schema rows
+        # 1) Load every schema context object tagged "tool_schema"
         rows = self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
         )
 
-        # 2️  Bucket rows by tool name, keep the newest per bucket
+        # 2) Keep only the newest per tool name
         buckets: dict[str, ContextObject] = {}
-        for r in rows:
+        for ctx in rows:
             try:
-                name = json.loads(r.metadata["schema"])["name"]
+                blob = json.loads(ctx.metadata["schema"])
+                name = blob["name"]
             except Exception:
                 continue
-            if name not in buckets or r.timestamp > buckets[name].timestamp:
-                buckets[name] = r
+            if name not in buckets or ctx.timestamp > buckets[name].timestamp:
+                buckets[name] = ctx
 
-        # 3️  Build the final list, sorted for reproducibility
+        # 3) Build the list, sorted by tool name
         tool_defs: list[dict[str, str]] = []
         for name in sorted(buckets):
-            data = json.loads(buckets[name].metadata["schema"])
-            tool_defs.append({
-                "name":        data["name"],
-                "description": data.get("description", "").split("\n", 1)[0],
-            })
+            blob = json.loads(buckets[name].metadata["schema"])
+            desc = blob.get("description", "").split("\n", 1)[0]
+            tool_defs.append({"name": name, "description": desc})
 
         return tool_defs
-    
-    # ── Stage 7: Planning Summary with Tool-Existence Check & Plan Tracking ────────────────────
+
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # Stage 7: Planning Summary with Tool-List Injection & Strict Validation
+    # ────────────────────────────────────────────────────────────────────────────────
     def _stage7_planning_summary(
         self,
         clar_ctx: ContextObject,
@@ -1727,7 +1904,7 @@ class Assembler:
         import json, re, hashlib, datetime
         from typing import Any, Dict, List, Tuple
 
-        # strip markdown fences and pull out a bare JSON object
+        # Helper to strip out a bare JSON block
         def _clean_json_block(text: str) -> str:
             m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
             if m:
@@ -1735,14 +1912,27 @@ class Assembler:
             m2 = re.search(r"(\{.*\})", text, flags=re.S)
             return m2.group(1) if m2 else text.strip()
 
-        # build a markdown list of available tools
-        tools_md = "\n".join(f"- **{t['name']}**: {t['description']}"
-                             for t in tools_list)
+        # 0) Load prior plan critiques for optional feedback (unchanged)
+        critique_rows = self.repo.query(
+            lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"
+        )
+        critique_rows.sort(key=lambda c: c.timestamp)
+        critique_block = (
+            "\n".join(f"• {c.metadata.get('critique','')}" for c in critique_rows)
+            if critique_rows else "(no prior critiques)"
+        )
+        critique_ids = [c.context_id for c in critique_rows]
 
-        # inject it directly into the system prompt
-        base_system = self._get_prompt("planning_prompt") + "\n" + tools_md
+        # 1) Build the strict system prompt + injected tool list
+        #    planning_prompt ends with "Available tools:\n"
+        tool_lines = "\n".join(f"- **{t['name']}**: {t['description']}"
+                                for t in tools_list) or "(none)"
+        base_system = (
+            self._get_prompt("planning_prompt")
+            + tool_lines
+        )
 
-        # assemble the user prompt
+        # 2) Build the user prompt
         base_user = (
             f"User question:\n{user_text}\n\n"
             f"Clarified intent:\n{clar_ctx.summary}\n\n"
@@ -1750,10 +1940,10 @@ class Assembler:
         )
 
         last_calls = None
-        plan_obj   = None
-        cleaned    = ""
+        plan_obj = None
+        cleaned = ""
 
-        # up to 3 attempts to get a valid plan
+        # 3) Up to 3 passes to produce valid JSON & exact tool names
         for attempt in range(1, 4):
             tag = "[Planner]" if attempt == 1 else "[PlannerReplan]"
             if attempt == 1:
@@ -1764,37 +1954,37 @@ class Assembler:
             else:
                 msgs = [
                     {"role": "system", "content":
-                        "Your previous plan used unknown or invalid tools.  "
-                        "Please replan using only valid tools."},
+                        "Your previous plan used invalid or non-exact tool names.  "
+                        "Please use only the EXACT names listed and output only the required JSON."},
                     {"role": "user",   "content": cleaned},
                 ]
 
-            raw     = self._stream_and_capture(self.secondary_model, msgs, tag=tag)
+            raw = self._stream_and_capture(self.secondary_model, msgs, tag=tag)
             cleaned = _clean_json_block(raw)
 
-            # parse JSON or fallback to regex extraction
+            # Attempt to parse
             try:
                 cand = json.loads(cleaned)
-                if isinstance(cand, dict) and "tasks" in cand:
-                    plan_obj = cand
-                else:
-                    raise ValueError
-            except Exception:
+                assert isinstance(cand, dict) and "tasks" in cand
+                plan_obj = cand
+            except:
+                # Fallback: regex extract any calls (won't match exact names, but let validation catch)
                 calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', raw)
-                plan_obj = {"tasks": [{"call": c, "tool_input": {}, "subtasks": []}
-                                      for c in calls]}
+                plan_obj = {"tasks": [
+                    {"call": c, "tool_input": {}, "subtasks": []} for c in calls
+                ]}
 
-            # drop unknown calls
-            available = {t["name"] for t in tools_list}
-            unknown   = [t["call"] for t in plan_obj["tasks"] if t["call"] not in available]
+            # 4) Reject any non-exact tool names
+            valid_names = {t["name"] for t in tools_list}
+            unknown = [t["call"] for t in plan_obj["tasks"] if t["call"] not in valid_names]
             if unknown:
                 self._print_stage_context(
                     f"planning_summary:unknown_tools(attempt={attempt})",
-                    {"unknown": unknown, "available": sorted(available)}
+                    {"unknown": unknown, "allowed": sorted(valid_names)}
                 )
                 continue
 
-            # plateau guard (same plan twice → stop)
+            # 5) Plateau guard
             this_calls = [t["call"] for t in plan_obj["tasks"]]
             if last_calls is not None and this_calls == last_calls:
                 self._print_stage_context(
@@ -1805,21 +1995,20 @@ class Assembler:
             last_calls = this_calls
             break
 
-        # ── Flatten tasks + subtasks ──────────────────────────────────────────
+        # 6) Flatten subtasks → list of calls
         def _flatten(task: Dict[str, Any]) -> List[Dict[str, Any]]:
             out = [task]
             for sub in task.get("subtasks", []):
                 out.extend(_flatten(sub))
             return out
 
-        flat_tasks: List[Dict[str, Any]] = []
-        for t in (plan_obj or {}).get("tasks", []):
-            flat_tasks.extend(_flatten(t))
+        flat = []
+        for t in plan_obj.get("tasks", []):
+            flat.extend(_flatten(t))
 
-        # build call-strings from the flattened list
-        call_strings: List[str] = []
-        for task in flat_tasks:
-            name   = task["call"]
+        call_strings = []
+        for task in flat:
+            name = task["call"]
             params = task.get("tool_input", {}) or {}
             if params:
                 args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}'
@@ -1828,58 +2017,56 @@ class Assembler:
             else:
                 call_strings.append(f"{name}()")
 
-        # serialize plan and compute a short plan_id
-        plan_json = json.dumps({"tasks": [{"call": s, "subtasks": []}
-                                          for s in call_strings]})
-        plan_sig  = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
+        # 7) Serialize final plan & compute short ID
+        plan_json = json.dumps({"tasks": [
+            {"call": s, "subtasks": []} for s in call_strings
+        ]})
+        plan_sig = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
 
-        # persist planning_summary context
+        # 8) Persist planning_summary context
         ctx = ContextObject.make_stage(
             "planning_summary",
-            clar_ctx.references + know_ctx.references,
+            clar_ctx.references + know_ctx.references + critique_ids,
             {"plan": plan_obj, "attempt": attempt, "plan_id": plan_sig}
         )
         ctx.stage_id = f"planning_summary_{plan_sig}"
-        ctx.summary  = plan_json
+        ctx.summary = plan_json
         ctx.touch(); self.repo.save(ctx)
 
-        # RL signal for the planning step
+        # Signal success/failure for RL
         if call_strings:
             succ = ContextObject.make_success(
-                f"Planner → {len(call_strings)} task(s)",
-                refs=[ctx.context_id]
+                f"Planner → {len(call_strings)} task(s)", refs=[ctx.context_id]
             )
         else:
             succ = ContextObject.make_failure(
-                "Planner → empty plan",
-                refs=[ctx.context_id]
+                "Planner → empty plan", refs=[ctx.context_id]
             )
         succ.stage_id = f"planning_summary_signal_{plan_sig}"
         succ.touch(); self.repo.save(succ)
 
-        # create initial plan-tracker context
+        # 9) Initialize plan tracker
         tracker = ContextObject.make_stage(
             "plan_tracker",
             [ctx.context_id],
             {
-                "plan_id":     plan_sig,
+                "plan_id": plan_sig,
                 "total_calls": len(call_strings),
-                "succeeded":   0,
-                "attempts":    0,
-                "status":      "in_progress",
-                "started_at":  datetime.datetime.utcnow().isoformat() + "Z"
+                "succeeded": 0,
+                "attempts": 0,
+                "status": "in_progress",
+                "started_at": datetime.datetime.utcnow().isoformat() + "Z"
             }
         )
         tracker.semantic_label = plan_sig
-        tracker.stage_id       = f"plan_tracker_{plan_sig}"
-        tracker.summary        = "initialized plan tracker"
+        tracker.stage_id = f"plan_tracker_{plan_sig}"
+        tracker.summary = "initialized plan tracker"
         tracker.touch(); self.repo.save(tracker)
 
         return ctx, plan_json
 
 
-
-
+    # ── Stage 7b: Plan Validation with Full-Docstring Injection ────────────────────────────────────────────────────
     def _stage7b_plan_validation(
         self,
         plan_ctx: ContextObject,
@@ -1890,10 +2077,13 @@ class Assembler:
         Robust JSON-based plan validation. Keeps original tool_input intact,
         asks the LLM to fill in only truly missing parameters, and then
         reconstructs call-strings with full, exact arguments.
-        """
-        import json, re
 
-        # A) Load all known tool schemas
+        Now *honors* the tools_list you passed in and injects full docstrings
+        for just those tools you actually plan to call.
+        """
+        import json, re, inspect, importlib
+
+        # A) Load all known tool schemas from your repo
         all_schemas = {
             json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
             for c in self.repo.query(
@@ -1906,17 +2096,45 @@ class Assembler:
             plan_obj = json.loads(plan_output)
             tasks    = plan_obj.get("tasks", [])
         except Exception:
-            # fallback to regex-only if the planner wasn’t JSON
-            #calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
-            #return calls, [], calls
             raise RuntimeError("Planner output was not valid JSON; cannot validate tool_input parameters")
 
-        # C) Up to 3 repair passes: fill any missing required params
+        # C) Figure out which tools the plan actually calls
+        selected_calls = [t.get("call") for t in tasks if isinstance(t.get("call"), str)]
+        available     = {t["name"] for t in tools_list}
+        selected      = [name for name in selected_calls if name in available]
+
+        # D) Build a filtered schema map for *just* those selected tools
+        schemas_for_prompt = {
+            name: all_schemas[name]
+            for name in selected
+            if name in all_schemas
+        }
+
+        # E) Inject full docstring into each filtered schema
+        for name, schema in schemas_for_prompt.items():
+            doc = None
+            # 1) try Tools.<name>
+            if hasattr(Tools, name):
+                doc = inspect.getdoc(getattr(Tools, name))
+            else:
+                # 2) try top-level tools module
+                try:
+                    mod = importlib.import_module("tools")
+                    if hasattr(mod, name):
+                        doc = inspect.getdoc(getattr(mod, name))
+                except ImportError:
+                    pass
+
+            if doc:
+                schema["description"] = doc  # overwrite truncated desc
+
+        # F) Up to 3 repair passes: fill any missing required params
+        missing = {}
         for _ in range(3):
-            missing = {}
+            missing.clear()
             for idx, task in enumerate(tasks):
                 name       = task.get("call")
-                schema     = all_schemas.get(name)
+                schema     = schemas_for_prompt.get(name)
                 tool_input = task.get("tool_input", {}) or {}
                 if not schema:
                     continue
@@ -1929,19 +2147,18 @@ class Assembler:
             if not missing:
                 break
 
-            # build a prompt for the LLM to repair only the missing fields
             prompt = {
                 "description": "Some tool calls are missing required arguments.",
                 "missing":     missing,
                 "plan":        plan_obj,
-                "schemas":     {n: all_schemas[n] for n in all_schemas}
+                "schemas":     schemas_for_prompt
             }
             repair = self._stream_and_capture(
                 self.secondary_model,
                 [
-                  {"role":"system","content":
-                    "Return ONLY a JSON `{'tasks':[…]}` with each task’s `tool_input` now complete."},
-                  {"role":"user","content": json.dumps(prompt)}
+                    {"role": "system", "content":
+                        "Return ONLY a JSON {'tasks':[...]} with each task’s tool_input now complete."},
+                    {"role": "user",   "content": json.dumps(prompt)},
                 ],
                 tag="[PlanFix]"
             ).strip()
@@ -1949,21 +2166,21 @@ class Assembler:
             try:
                 plan_obj = json.loads(repair)
                 tasks    = plan_obj.get("tasks", [])
-            except:
+            except Exception:
                 break
 
-        # D) Re-serialize every task into a real, exact call string
+        # G) Re-serialize every task into a real call string
         fixed_calls = []
         for task in tasks:
             name = task["call"]
             ti   = task.get("tool_input", {}) or {}
-            args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k,v in ti.items())
+            args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k, v in ti.items())
             fixed_calls.append(f"{name}({args})")
 
-        # E) Persist the validation step
+        # H) Persist the validation step
         meta = {
             "valid":       fixed_calls,
-            "errors":      [],  # we never hard-fail
+            "errors":      [],  
             "fixed_calls": fixed_calls
         }
         pv_ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
@@ -1973,6 +2190,8 @@ class Assembler:
         self._print_stage_context("plan_validation", meta)
 
         return fixed_calls, [], fixed_calls
+
+
 
         
     def _stage8_tool_chaining(
@@ -2277,53 +2496,56 @@ class Assembler:
             tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
             tracker.touch(); self.repo.save(tracker)
             return []
-
         # ── 2) Retry loop over only pending calls ────────────────────────────
         max_retries = 10
-        for attempt in range(1, max_retries+1):
-            errors: List[Tuple[str,str]] = []
+        prev_pending = None
+        for attempt in range(1, max_retries + 1):
+            errors: List[Tuple[str, str]] = []
+
+            # plateau detection: if the LLM returns the exact same list twice, give up
+            if prev_pending is not None and pending == prev_pending:
+                logging.warning(f"[ToolChainRetry] plateau on attempt {attempt}, giving up")
+                break
+            prev_pending = pending.copy()
+
+            # shuffle the order to introduce stochasticity
+            random.shuffle(pending)
 
             for original in list(pending):
                 call_str = original
 
                 # 1) [alias from tool_name] style placeholders
                 for ph in re.findall(r"\[([^\]]+)\]", call_str):
-                    # does it look like "[alias from tool]"?
                     if " from " in ph:
                         alias, toolname = ph.split(" from ", 1)
-                        alias_key   = normalize_key(alias)
-                        tool_key    = normalize_key(toolname)
-                        # find the exact last_results entry for that tool
+                        alias_key = normalize_key(alias)
+                        tool_key = normalize_key(toolname)
                         match = tool_key if tool_key in last_results else None
-
                     else:
-                        # fallback: match placeholder substring to any key
                         phn = normalize_key(ph)
                         match = next(
                             (k for k in last_results
-                            if phn in normalize_key(k)
-                            or normalize_key(k) in phn),
+                             if phn in normalize_key(k)
+                             or normalize_key(k) in phn),
                             None
                         )
                     if match:
                         value = last_results[match]
                         call_str = call_str.replace(f"[{ph}]", repr(value))
 
-
                 # 2) {{alias}} style placeholders
                 for ph in re.findall(r"\{\{([^}]+)\}\}", call_str):
                     phn = normalize_key(ph)
                     match = next(
                         (k for k in last_results
-                        if phn in normalize_key(k)
-                        or normalize_key(k) in phn),
+                         if phn in normalize_key(k)
+                         or normalize_key(k) in phn),
                         None
                     )
                     if match:
                         call_str = call_str.replace(f"{{{{{ph}}}}}", repr(last_results[match]))
 
-
-                # 3) inline nested zero-arg calls only if embedded (not top‐level)
+                # 3) inline nested zero-arg calls only if embedded (not top-level)
                 for inner in re.findall(r"\B([A-Za-z_]\w*)\(\)", call_str):
                     nested = f"{inner}()"
                     if nested in call_str and inner not in last_results:
@@ -2346,7 +2568,7 @@ class Assembler:
                                 "tool_output", [sch_i.context_id], r_i
                             )
                             ctx_i.stage_id = f"tool_output_nested_{inner}"
-                            ctx_i.summary  = str(out_i) if ok_i else f"ERROR: {err_i}"
+                            ctx_i.summary = str(out_i) if ok_i else f"ERROR: {err_i}"
                             ctx_i.metadata.update(r_i)
                             ctx_i.touch(); self.repo.save(ctx_i)
                             tool_ctxs.append(ctx_i)
@@ -2356,13 +2578,13 @@ class Assembler:
                 # 4) main invocation
                 res = Tools.run_tool_once(call_str)
                 ok, err = _validate(res)
-                tool_key = normalize_key(call_str.split("(",1)[0])
+                tool_key = normalize_key(call_str.split("(", 1)[0])
                 last_results[tool_key] = res["output"]
 
                 # persist output
                 try:
-                    name = original.split("(",1)[0]
-                    sch  = next(
+                    name = original.split("(", 1)[0]
+                    sch = next(
                         s for s in selected_schemas
                         if json.loads(s.metadata["schema"])["name"] == name
                     )
@@ -2371,7 +2593,7 @@ class Assembler:
                     refs = []
                 ctx = ContextObject.make_stage("tool_output", refs, res)
                 ctx.stage_id = f"tool_output_{name}"
-                ctx.summary  = str(res.get("output")) if ok else f"ERROR: {err}"
+                ctx.summary = str(res.get("output")) if ok else f"ERROR: {err}"
                 ctx.metadata.update(res)
                 ctx.touch(); self.repo.save(ctx)
                 tool_ctxs.append(ctx)
@@ -2386,33 +2608,42 @@ class Assembler:
                     errors.append((original, err))
                 tracker.touch(); self.repo.save(tracker)
 
-            # if all succeeded, finish
+            # if everything succeeded, finish
             if not pending:
-                tracker.metadata["status"]       = "success"
-                tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+                tracker.metadata["status"] = "success"
+                tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
                 tracker.touch(); self.repo.save(tracker)
                 return tool_ctxs
 
-            # otherwise replan only the remaining pending calls
+            # otherwise ask the LLM to repair only the remaining calls, and show it the errors
             retry_sys = (
                 self._get_prompt("toolchain_retry_prompt")
                 + "\n\nOriginal question:\n" + user_text
                 + "\n\nPlan:\n" + plan_output
                 + "\n\nPending calls:\n" + "\n".join(pending)
+                + "\n\nErrors so far:\n"
+                + "\n".join(f"- {c}: {e}" for c, e in errors)
+                + "\n\n(Feel free to reorder or adjust these calls.)"
             )
             retry_msgs = [
-                {"role":"system","content":retry_sys},
-                {"role":"user",  "content":json.dumps({"tool_calls":pending})},
+                {"role": "system", "content": retry_sys},
+                {"role": "user",   "content": json.dumps({"tool_calls": pending})},
             ]
             out = self._stream_and_capture(
                 self.secondary_model, retry_msgs, tag="[ToolChainRetry]"
             ).strip()
-
             try:
                 pending = json.loads(out)["tool_calls"]
             except:
                 parsed = Tools.parse_tool_call(out)
                 pending = _norm(parsed if isinstance(parsed, list) else [parsed] or pending)
+
+        # ── 3) If we exit the loop with some calls still pending, mark failure ──
+        if pending:
+            tracker.metadata["status"] = "failed"
+            tracker.metadata["errors_by_call"].update({c: "unresolved" for c in pending})
+            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+            tracker.touch(); self.repo.save(tracker)
 
         # ── 3) Give up after max_retries ────────────────────────────────────
         tracker.metadata["status"]       = "failed"
@@ -2421,14 +2652,15 @@ class Assembler:
         tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
         tracker.touch(); self.repo.save(tracker)
         return tool_ctxs
-
-
+    
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
         """
         Assemble every bit of context we have, run one final LLM pass, and
         persist the answer — even if earlier tool stages failed or were skipped.
+        Also record the assistant’s reply as a segment for future context.
         """
         import json
+        from context import ContextObject  # adjust import as needed
 
         # ──────────────────────────────────────────────────────────────────────
         # 1) Collect *all* relevant context-IDs, but only if they exist
@@ -2446,12 +2678,11 @@ class Assembler:
         _maybe_add("clar_ctx")
         _maybe_add("know_ctx")
         _maybe_add("plan_ctx")
-
-        # tool outputs may be missing
+        # include any tool calls
         for t in state.get("tool_ctxs", []):
             refs.append(t.context_id)
 
-        # de-dup while keeping original order
+        # de-dup while preserving order
         seen, ordered = set(), []
         for cid in refs:
             if cid not in seen:
@@ -2459,17 +2690,15 @@ class Assembler:
                 ordered.append(cid)
 
         # ──────────────────────────────────────────────────────────────────────
-        # 2) Load the ContextObjects, skipping any that were deleted / archived
+        # 2) Load the ContextObjects, skipping stale ones
         # ──────────────────────────────────────────────────────────────────────
         ctxs = []
         for cid in ordered:
             try:
                 ctxs.append(self.repo.get(cid))
             except KeyError:
-                continue          # stale pointer – ignore
-
+                continue
         ctxs.sort(key=lambda c: c.timestamp)
-        print(f"[assemble_and_infer] total context objects: {len(ctxs)}")
 
         # ──────────────────────────────────────────────────────────────────────
         # 3) Inline every bit of context into one big “knowledge sheet”
@@ -2498,9 +2727,8 @@ class Assembler:
         # 4) Final LLM call
         # ──────────────────────────────────────────────────────────────────────
         final_sys = self._get_prompt("final_inference_prompt")
-
         plan_text = state.get("plan_output", "(no plan)")
-        self._last_plan_output = plan_text        # for the critic stage
+        self._last_plan_output = plan_text  # for critic stage
 
         msgs = [
             {"role": "system", "content": final_sys},
@@ -2532,17 +2760,31 @@ class Assembler:
         resp_ctx.touch()
         self.repo.save(resp_ctx)
 
+        # ──────────────────────────────────────────────────────────────────────
+        # 6) **NEW**: also record this reply as an assistant segment for next turn
+        # ──────────────────────────────────────────────────────────────────────
+        seg = ContextObject.make_segment(
+            semantic_label="assistant",
+            content_refs=[resp_ctx.context_id],
+            tags=["assistant"]
+        )
+        seg.summary  = reply
+        seg.stage_id = "assistant"
+        seg.touch()
+        self.repo.save(seg)
+
         return reply
 
 
 
+    # ── Stage 10b: Response Critique & Safety ─────────────────────────────────────────────
     def _stage10b_response_critique_and_safety(
         self,
         draft: str,
         user_text: str,
         tool_ctxs: List[ContextObject]
     ) -> str:
-        import json, difflib
+        import json, difflib, datetime
 
         # Recover the plan
         plan_text = getattr(self, "_last_plan_output", "(no plan)")
@@ -2553,17 +2795,12 @@ class Assembler:
             out = c.metadata.get("output")
             try:
                 blob = json.dumps(out, indent=2, ensure_ascii=False)
-            except Exception:
+            except:
                 blob = repr(out)
             outputs.append(f"[{c.stage_id}]\n{blob}")
 
-        print(f"[response_critique] tool output chunks: {len(outputs)}, draft length: {len(draft)} chars")
-
-
         # 2) Build richer critic prompt
         critic_sys = self._get_prompt("critic_prompt")
-
-
         prompt_user = "\n\n".join([
             f"User asked:\n{user_text}",
             f"Plan executed:\n{plan_text}",
@@ -2571,7 +2808,6 @@ class Assembler:
             "Here are the raw tool results:\n" + "\n\n".join(outputs),
         ])
 
-        # Debug dump
         self._print_stage_context("response_critique", {
             "system_directives": [critic_sys],
             "user_payload":      [prompt_user],
@@ -2584,11 +2820,11 @@ class Assembler:
         ]
         polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]").strip()
 
-        # 4) If unchanged, return draft
+        # 4) If unchanged, just return it
         if polished == draft.strip():
             return polished
 
-        # 5) Compute one-line diff
+        # 5) Compute diff summary
         diff = difflib.unified_diff(
             draft.splitlines(), polished.splitlines(),
             lineterm="", n=1
@@ -2597,7 +2833,7 @@ class Assembler:
             ln for ln in diff if ln.startswith(("+ ", "- "))
         ) or "(minor re-formatting)"
 
-        # 6) Upsert dynamic_prompt_patch
+        # 6) Upsert dynamic_prompt_patch (as before)
         patch_rows = self.repo.query(
             lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
         )
@@ -2610,24 +2846,34 @@ class Assembler:
             patch = ContextObject.make_policy(
                 "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
             )
-
         if patch.summary != diff_summary:
             patch.summary = diff_summary
             patch.metadata["policy"] = diff_summary
             patch.touch(); self.repo.save(patch)
             self._print_stage_context("dynamic_patch_written", {"patch": diff_summary})
 
-        # 7) Persist polished reply
-        ctx = ContextObject.make_stage(
+        # 7) Persist the polished reply
+        resp_ctx = ContextObject.make_stage(
             "response_critique",
             [],  # no extra refs
             {"text": polished}
         )
-        ctx.stage_id = "response_critique"
-        ctx.summary = polished
-        ctx.touch(); self.repo.save(ctx)
+        resp_ctx.stage_id = "response_critique"
+        resp_ctx.summary  = polished
+        resp_ctx.touch(); self.repo.save(resp_ctx)
+
+        # 8) Create a standalone plan_critique that will feed into the next planner run
+        critique_ctx = ContextObject.make_stage(
+            "plan_critique",
+            [resp_ctx.context_id] + [c.context_id for c in tool_ctxs],
+            {"critique": polished, "diff": diff_summary}
+        )
+        critique_ctx.component      = "analysis"
+        critique_ctx.semantic_label = "plan_critique"
+        critique_ctx.touch(); self.repo.save(critique_ctx)
 
         return polished
+
 
 
     # ----------------------------------------------------------------------
@@ -2737,6 +2983,58 @@ class Assembler:
         nc.touch()
         self.repo.save(nc)
         return nc
+        
+        
+    def _stage_prune_context_store(self, state: Dict[str, Any]) -> str:
+        """
+        Remove *only* ephemeral contexts older than `context_ttl_days`
+        or beyond a hard cap, leaving static prompts/schemas untouched.
+        Returns a one-line summary for status_cb.
+        """
+        from datetime import datetime, timedelta
+
+        cutoff = default_clock() - timedelta(days=self.context_ttl_days)
+        EPHEMERAL = {
+            "segment", "tool_output", "knowledge", "narrative", "stage_performance"
+        }
+
+        deleted = 0
+        # 1) Delete by age
+        for ctx in self.repo.query(lambda c: c.component in EPHEMERAL):
+            ts_raw = ctx.timestamp.rstrip("Z") if isinstance(ctx.timestamp, str) else None
+            try:
+                ts = datetime.fromisoformat(ts_raw) if ts_raw else None
+            except Exception:
+                continue
+            if ts and ts < cutoff:
+                try:
+                    self.repo.delete(ctx.context_id)
+                    deleted += 1
+                except KeyError:
+                    pass
+
+        # 2) Hard cap
+        all_ephe = [
+            c for c in self.repo.query(lambda c: c.component in EPHEMERAL)
+        ]
+        all_ephe.sort(
+            key=lambda c: datetime.fromisoformat(
+                (c.timestamp.rstrip("Z") if isinstance(c.timestamp, str) else default_clock().isoformat())
+            ),
+            reverse=True
+        )
+        cap = self.cfg.get("max_total_context", 1000)
+        for old_ctx in all_ephe[cap:]:
+            try:
+                self.repo.delete(old_ctx.context_id)
+                deleted += 1
+            except KeyError:
+                pass
+
+        return f"pruned {deleted} items (ttl={self.context_ttl_days}d, cap={cap})"
+
+
+
 
     # ---------------------------------------------------------------------
     #  Async self-reflection stage (robust, non-blocking)
@@ -2855,18 +3153,3 @@ class Assembler:
         threading.Thread(target=_worker, daemon=True).start()
         return "(narrative mull dispatched)"
 
-
-if __name__ == "__main__":
-    asm = Assembler(
-        context_path="context.jsonl",
-        config_path="config.json",
-        top_k=5,
-    )
-    print("Assembler ready. Type your message, Ctrl-C to quit.")
-    try:
-        while True:
-            msg = input(">> ").strip()
-            if msg:
-                print(asm.run_with_meta_context(msg))
-    except KeyboardInterrupt:
-        print("\nGoodbye.")
