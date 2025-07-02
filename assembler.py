@@ -1098,17 +1098,16 @@ class Assembler:
         ))
         return ctx.metadata["prompt"]
     
-    # ---------------------------------------------------------------------
-    #  Self-tuning of system / policy prompts
-    # ---------------------------------------------------------------------
     def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
         """
-        RL-gated self-mutation of prompts & policies.
+        RL-gated self-mutation of prompts & policies, with full rollback
+        on any failure.
 
         • Chooses ONE tiny change (add / remove) per invocation.
-        • Fully defensive: never crashes on missing context rows or bad JSON.
+        • Creates a backup of the context store before mutating.
+        • Restores the original store if any exception occurs.
         """
-        import json, textwrap
+        import json, textwrap, os, shutil
 
         # 1️  Recall-feature for RL gate
         recall_ids = state.get("recent_ids", [])
@@ -1118,32 +1117,32 @@ class Assembler:
                 cobj = self.repo.get(cid)
                 counts.append(cobj.metadata.get("recall_stats", {}).get("count", 0))
             except KeyError:
-                continue  # archived / pruned
+                continue
         rf = (sum(counts) / len(counts)) if counts else 0.0
 
-        # 2️  RL gate – exit early if not chosen
+        # 2️  RL gate – maybe skip
         if not self.rl.should_run("system_prompt_refine", rf):
             return None
 
-        # 3️  Snapshot **current** prompts / policies   (skip dynamic patches)
+        # 3️  Snapshot current static prompts (skip dynamic)
         rows = self.repo.query(
             lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
         )
         rows.sort(key=lambda c: c.timestamp)
         current_prompts = [
-            (c.metadata.get("prompt") or c.metadata.get("policy") or "") for c in rows
+            (c.metadata.get("prompt") or c.metadata.get("policy") or "")
+            for c in rows
         ]
 
-        # 4️  Build meta-prompt for the LLM
+        # 4️  Build LLM prompt
         metrics = {
-            "errors":          len(state["errors"]),
-            "curiosity_used":  state["curiosity_used"][-5:],
-            "recall_mean_cnt": rf,
+            "errors":         len(state.get("errors", [])),
+            "curiosity_used": state.get("curiosity_used", [])[-5:],
+            "recall_mean":    rf,
         }
         prompt_block = "\n".join(
             f"- {textwrap.shorten(p, 60)}" for p in current_prompts
         ) or "(none)"
-
         refine_prompt = (
             "You are a self-optimising agent.\n\n"
             "### Active Prompts / Policies ###\n"
@@ -1151,64 +1150,87 @@ class Assembler:
             "### Recent Metrics ###\n"
             f"{json.dumps(metrics, indent=2)}\n\n"
             "Propose exactly **one** minimal change and return ONLY valid JSON:\n"
-            '{"action":"add","prompt":"<text>"}  or  '
+            '{"action":"add","prompt":"<text>"} or '
             '{"action":"remove","prompt":"<substring>"}'
         )
 
-        # 5️  Ask the model – be tolerant of malformed output
+        # 5️  Run the model
         try:
             raw = self._stream_and_capture(
                 self.primary_model,
                 [{"role": "system", "content": refine_prompt}],
-                tag="[SysPromptRefine]",
+                tag="[SysPromptRefine]"
             ).strip()
             plan = json.loads(raw)
             if not isinstance(plan, dict):
                 return None
             action = plan.get("action")
-            text = (plan.get("prompt") or "").strip()
+            text   = (plan.get("prompt") or "").strip()
         except Exception:
-            return None  # bad JSON → abort
+            return None
 
-        # 6️  Apply the change and update static prompts in the repo
-        if action == "add" and text:
-            patch = ContextObject.make_policy(
-                label=f"dynamic_prompt_{len(text)}",
-                policy_text=text,
-                tags=["dynamic_prompt"],
-            )
-            patch.touch()
-            self.repo.save(patch)
+        # 6️  Backup context.jsonl
+        backup = self.context_path + ".bak"
+        try:
+            shutil.copy(self.context_path, backup)
+        except Exception as e:
+            # if we can’t back up, abort
+            print(f"Failed to back up context store: {e}", "ERROR")
+            return None
 
-            # bake this change into the static prompt records
+        # 7️  Apply patch + reseed, with rollback on any error
+        try:
+            if action == "add" and text:
+                patch = ContextObject.make_policy(
+                    label=f"dynamic_prompt_{len(text)}",
+                    policy_text=text,
+                    tags=["dynamic_prompt"],
+                )
+                patch.touch(); self.repo.save(patch)
+
+            elif action == "remove" and text:
+                for row in rows:
+                    blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
+                    if text in blob:
+                        try:
+                            self.repo.delete(row.context_id)
+                        except KeyError:
+                            pass
+
+            else:
+                # nothing to do
+                os.remove(backup)    # clean up backup
+                return None
+
+            # now bake into the “static” prompt entries
             self._seed_static_prompts()
 
-        elif action == "remove" and text:
-            for row in rows:
-                blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
-                if text in blob:
-                    try:
-                        self.repo.delete(row.context_id)
-                    except KeyError:
-                        pass  # already archived
+        except Exception as e:
+            # rollback entire store
+            try:
+                shutil.move(backup, self.context_path)
+                print(f"Rolled back prompt changes due to error: {e}", "WARNING")
+            except Exception as e2:
+                print(f"Rollback failed: {e2}", "ERROR")
+            return None
 
-            # reflect removals in the static prompt records
-            self._seed_static_prompts()
+        # success → remove backup
+        try:
+            os.remove(backup)
+        except:
+            pass
 
-        else:
-            return None  # no-op
-
-        # 7️  Log the refinement decision
+        # 8️  Log the decision
         refine_ctx = ContextObject.make_stage(
             "system_prompt_refine",
             [cid for cid in recall_ids if self.repo_exists(cid)],
             {"action": action, "text": text},
         )
         refine_ctx.component = "patch"
-        refine_ctx.touch()
-        self.repo.save(refine_ctx)
+        refine_ctx.touch(); self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
+
 
 
 
