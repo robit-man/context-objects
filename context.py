@@ -481,12 +481,11 @@ def sanitize_jsonl(path: str):
         f.writelines(good_lines)
         f.flush()
         os.fsync(f.fileno())
-        
+
 class JSONLContextRepository:
     _singleton = None
 
     def __init__(self, path: str):
-
         # 0) Clean up any existing corruption
         sanitize_jsonl(path)
 
@@ -502,55 +501,78 @@ class JSONLContextRepository:
         # 3) Register singleton
         JSONLContextRepository._singleton = self
 
-    def get(self, context_id: str):
-        import json
-        from context import ContextObject, _locked
+    def get(self, context_id: str) -> ContextObject:
+        """
+        Look up a single context; skip any corrupted JSON lines.
+        """
         with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
-            for line in f:
-                data = json.loads(line)
-                if data["context_id"] == context_id:
+            for lineno, line in enumerate(f, start=1):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
+                    continue
+                if data.get("context_id") == context_id:
                     return ContextObject.from_dict(data)
         raise KeyError(f"Context {context_id} not found")
 
-    def save(self, ctx):
-        import os
-        from context import _locked
+    def save(self, ctx: ContextObject) -> None:
+        """
+        Append a dirty context object to JSONL.
+        """
         if not ctx.dirty:
             return
         with self._lock:
             with open(self.path, "a", encoding="utf-8") as f, _locked(f, exclusive=True):
                 f.write(ctx.to_json() + "\n")
-                f.flush(); os.fsync(f.fileno())
+                f.flush()
+                os.fsync(f.fileno())
             ctx.dirty = False
 
-    def delete(self, context_id: str):
-        import json
-        from context import _locked
+    def delete(self, context_id: str) -> None:
+        """
+        Remove all entries matching context_id, skipping corrupted lines.
+        """
+        kept = []
         with self._lock:
             with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
-                entries = [json.loads(l) for l in f if json.loads(l)["context_id"] != context_id]
-                f.seek(0); f.truncate()
-                for entry in entries:
+                for lineno, line in enumerate(f, start=1):
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
+                        continue
+                    if data.get("context_id") != context_id:
+                        kept.append(data)
+                f.seek(0)
+                f.truncate()
+                for entry in kept:
                     f.write(json.dumps(entry) + "\n")
-                f.flush(); os.fsync(f.fileno())
+                f.flush()
+                os.fsync(f.fileno())
 
-    def query(self, filter_fn):
-        import json
-        from context import ContextObject, _locked
-        results = []
+    def query(self, filter_fn) -> list[ContextObject]:
+        """
+        Iterate all contexts, skipping corrupted lines.
+        """
+        results: list[ContextObject] = []
         with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
-            for line in f:
-                ctx = ContextObject.from_dict(json.loads(line))
+            for lineno, line in enumerate(f, start=1):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
+                    continue
+                ctx = ContextObject.from_dict(data)
                 if filter_fn(ctx):
                     results.append(ctx)
         return results
 
     @classmethod
-    def instance(cls):
+    def instance(cls) -> "JSONLContextRepository":
         if cls._singleton is None:
             raise RuntimeError("ContextRepository not initialised")
         return cls._singleton
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SQLite-backed archive for long-term storage

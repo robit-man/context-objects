@@ -166,15 +166,21 @@ class TTSManager:
         try:
             # build Piper + aplay commands
             script_dir = os.path.dirname(__file__)
-            piper_exe  = os.path.join(script_dir, "piper", "piper")
+            # pull executable name & model filenames from config
+            piper_exe  = os.path.join(
+                script_dir,
+                "piper",
+                self.config.get("piper_executable", "piper")
+            )
             onnx_json  = os.path.join(
                 script_dir,
-                self.config.get("onnx_json", "overwatch.onnx.json")
+                self.config.get("onnx_json_filename", "overwatch.onnx.json")
             )
             onnx_model = os.path.join(
                 script_dir,
-                self.config.get("onnx_model",  "overwatch.onnx")
+                self.config.get("onnx_model_filename",  "overwatch.onnx")
             )
+
 
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
@@ -246,10 +252,22 @@ class TTSManager:
             try:
                 # prepare paths
                 script_dir = os.path.dirname(__file__)
-                piper_exe  = os.path.join(script_dir, "piper", "piper")
-                onnx_json  = os.path.join(script_dir, self.config.get("onnx_json", "overwatch.onnx.json"))
-                onnx_model = os.path.join(script_dir, self.config.get("onnx_model",  "overwatch.onnx"))
+                # pull executable name & model filenames from config
+                piper_exe  = os.path.join(
+                    script_dir,
+                    "piper",
+                    self.config.get("piper_executable", "piper")
+                )
+                onnx_json  = os.path.join(
+                    script_dir,
+                    self.config.get("onnx_json_filename", "overwatch.onnx.json")
+                )
+                onnx_model = os.path.join(
+                    script_dir,
+                    self.config.get("onnx_model_filename",  "overwatch.onnx")
+                )
                 out_dir    = self.config.get("ogg_dir", "tts_ogg")
+
                 os.makedirs(out_dir, exist_ok=True)
 
                 filename = f"{uuid.uuid4().hex}.ogg"

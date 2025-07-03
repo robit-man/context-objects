@@ -68,72 +68,6 @@ def create_and_activate_venv():
 if not in_virtualenv():
     create_and_activate_venv()
 
-# ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
-def setup_piper_and_onnx():
-    script_dir   = os.path.dirname(os.path.abspath(__file__))
-    piper_folder = os.path.join(script_dir, "piper")
-    piper_exe    = os.path.join(piper_folder, "piper")
-    log_message(f"Checking for Piper at {piper_exe}", "INFO")
-
-    os_name = platform.system()
-    arch    = platform.machine().lower()
-    if os_name=="Linux":
-        if arch=="x86_64":
-            release="piper_linux_x86_64.tar.gz"
-        elif arch in ("arm64","aarch64"):
-            release="piper_linux_aarch64.tar.gz"
-        else:
-            release="piper_linux_armv7l.tar.gz"
-    elif os_name=="Darwin":
-        if arch in ("arm64","aarch64"):
-            release="piper_macos_aarch64.tar.gz"
-        else:
-            release="piper_macos_x64.tar.gz"
-    elif os_name=="Windows":
-        release="piper_windows_amd64.zip"
-    else:
-        log_message(f"Unsupported OS: {os_name}", "ERROR")
-        sys.exit(1)
-
-    if not os.path.isfile(piper_exe):
-        url     = f"https://github.com/rhasspy/piper/releases/download/2023.11.14-2/{release}"
-        archive = os.path.join(script_dir, release)
-        log_message(f"Downloading Piper: {release}", "PROCESS")
-        subprocess.check_call(["wget","-O",archive,url])
-        os.makedirs(piper_folder, exist_ok=True)
-        if release.endswith(".tar.gz"):
-            subprocess.check_call([
-                "tar","-xzvf",archive,
-                "-C",piper_folder,"--strip-components=1"
-            ])
-        else:
-            subprocess.check_call([
-                "unzip","-o",archive,
-                "-d",piper_folder
-            ])
-        log_message("Piper unpacked.", "SUCCESS")
-    else:
-        log_message("Piper already present.", "SUCCESS")
-
-    onnx_json  = os.path.join(script_dir, "overwatch.onnx.json")
-    onnx_model = os.path.join(script_dir, "overwatch.onnx")
-    if not os.path.isfile(onnx_json):
-        log_message("Downloading ONNX JSON…", "PROCESS")
-        subprocess.check_call([
-            "wget","-O",onnx_json,
-            "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json"
-        ])
-    log_message("ONNX JSON present.", "SUCCESS")
-    if not os.path.isfile(onnx_model):
-        log_message("Downloading ONNX model…", "PROCESS")
-        subprocess.check_call([
-            "wget","-O",onnx_model,
-            "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx"
-        ])
-    log_message("ONNX model present.", "SUCCESS")
-
-setup_piper_and_onnx()
-
 # ──────────── FIRST-RUN DEPENDENCIES ─────────────────────────────────────────
 SETUP_MARKER = os.path.join(os.path.dirname(__file__), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
@@ -161,16 +95,121 @@ if not os.path.exists(SETUP_MARKER):
         f.write("done")
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
-
 # ──────────── LOAD / GENERATE config.json ────────────────────────────────────
 CONFIG_FILE = "config.json"
-default_cfg = {"primary_model":"gemma3:4b","secondary_model":"gemma3:4b"}
-if not os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE,"w") as f:
-        json.dump(default_cfg, f, indent=2)
-    log_message(f"Created default {CONFIG_FILE}", "INFO")
-with open(CONFIG_FILE) as f:
-    config = json.load(f)
+DEFAULT_CFG = {
+    # core LLM models
+    "primary_model":   "gemma3:4b",
+    "secondary_model": "gemma3:4b",
+
+    # audio thresholds
+    "sample_rate":         16000,
+    "rms_threshold":       0.01,
+    "silence_duration":    0.5,
+    "consensus_threshold": 0.3,
+    "enable_noise_reduction": False,
+
+    # Piper release base URL & local executable name
+    "piper_base_url":    "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/",
+    "piper_executable":  "piper",  # name of the binary inside piper/
+    # platform-specific Piper archives
+    "piper_release_linux_x86_64": "piper_linux_x86_64.tar.gz",
+    "piper_release_linux_arm64":  "piper_linux_aarch64.tar.gz",
+    "piper_release_linux_armv7l": "piper_linux_armv7l.tar.gz",
+    "piper_release_macos_x64":    "piper_macos_x64.tar.gz",
+    "piper_release_macos_arm64":  "piper_macos_aarch64.tar.gz",
+    "piper_release_windows":      "piper_windows_amd64.zip",
+
+    # ONNX assets: point at your *local* filenames here
+    "onnx_json_filename":  "combine_soldier.onnx.json",
+    "onnx_model_filename": "combine_soldier.onnx",
+    # …but also keep the URLs so we can download if missing…
+    "onnx_json_url":  "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json",
+    "onnx_model_url": "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx",
+}
+
+# load or init
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE) as f:
+        config = json.load(f)
+else:
+    config = {}
+
+# fill in any missing defaults
+updated = False
+for k, v in DEFAULT_CFG.items():
+    if k not in config:
+        config[k] = v
+        updated = True
+
+if updated:
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
+
+# ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
+def setup_piper_and_onnx():
+    script_dir   = os.path.dirname(os.path.abspath(__file__))
+    piper_folder = os.path.join(script_dir, "piper")
+    exe_name     = config["piper_executable"]
+    piper_exe    = os.path.join(piper_folder, exe_name)
+    log_message(f"Checking for Piper at {piper_exe}", "INFO")
+
+    # pick the correct archive name
+    os_name = platform.system()
+    arch    = platform.machine().lower()
+    if os_name == "Linux":
+        if arch == "x86_64":
+            release = config["piper_release_linux_x86_64"]
+        elif arch in ("arm64", "aarch64"):
+            release = config["piper_release_linux_arm64"]
+        else:
+            release = config["piper_release_linux_armv7l"]
+    elif os_name == "Darwin":
+        if arch in ("arm64", "aarch64"):
+            release = config["piper_release_macos_arm64"]
+        else:
+            release = config["piper_release_macos_x64"]
+    elif os_name == "Windows":
+        release = config["piper_release_windows"]
+    else:
+        log_message(f"Unsupported OS: {os_name}", "ERROR")
+        sys.exit(1)
+
+    # download & unpack Piper if missing
+    if not os.path.isfile(piper_exe):
+        url     = config["piper_base_url"] + release
+        archive = os.path.join(script_dir, release)
+        log_message(f"Downloading Piper: {release}", "PROCESS")
+        subprocess.check_call(["wget", "-O", archive, url])
+        os.makedirs(piper_folder, exist_ok=True)
+        if release.endswith(".tar.gz"):
+            subprocess.check_call(["tar", "-xzvf", archive, "-C", piper_folder, "--strip-components=1"])
+        else:
+            subprocess.check_call(["unzip", "-o", archive, "-d", piper_folder])
+        log_message("Piper unpacked.", "SUCCESS")
+    else:
+        log_message("Piper executable already present.", "SUCCESS")
+
+    # ONNX JSON
+    onnx_json = os.path.join(script_dir, config["onnx_json_filename"])
+    if not os.path.isfile(onnx_json):
+        log_message("Downloading ONNX JSON…", "PROCESS")
+        subprocess.check_call(["wget", "-O", onnx_json, config["onnx_json_url"]])
+    else:
+        log_message(f"Found ONNX JSON: {config['onnx_json_filename']}", "SUCCESS")
+
+    # ONNX model
+    onnx_model = os.path.join(script_dir, config["onnx_model_filename"])
+    if not os.path.isfile(onnx_model):
+        log_message("Downloading ONNX model…", "PROCESS")
+        subprocess.check_call(["wget", "-O", onnx_model, config["onnx_model_url"]])
+    else:
+        log_message(f"Found ONNX model: {config['onnx_model_filename']}", "SUCCESS")
+
+# finally, run it
+setup_piper_and_onnx()
+
 
 
 # ─── IMPORT THE CORE CLASSES ──────────────────────────────────────────────

@@ -1396,6 +1396,7 @@ class Assembler:
             return True
         except KeyError:
             return False
+        
 
     def run_with_meta_context(
         self,
@@ -1405,287 +1406,325 @@ class Assembler:
         msg_id:   Optional[int]               = None,
     ) -> str:
         """
-        End-to-end orchestrator.
+        End-to-end orchestrator with retry logic and JSONL sanitization.
 
         • First prunes old/overflow contexts.
         • Returns immediately on empty input.
-        • Catches unexpected errors and returns a simple apology.
+        • On any error or empty final output, retries the entire pipeline
+          (with exponential backoff) up to `pipeline_retries` times.
         """
         # ① Short-circuit empty or whitespace-only inputs
         if not user_text or not user_text.strip():
             return ""
 
-        # Stop any prior self-review loop
-        self._stop_self_review.set()
-        if self._self_review_thread and self._self_review_thread.is_alive():
-            self._self_review_thread.join(timeout=1.0)
-        # Prepare for new run
-        self._stop_self_review.clear()
+        # Pull retry settings
+        max_retries     = self.cfg.get("pipeline_retries", 3)
+        backoff_base    = self.cfg.get("pipeline_backoff_base", 1.0)
+        attempt         = 0
+        backoff         = backoff_base
 
-        try:
-            from datetime import datetime
-            from collections import deque
-            import threading
+        # Ensure JSONL store is clean before starting
+        from context import sanitize_jsonl
+        repo_root = getattr(self.repo, "json_repo", self.repo)
+        sanitize_jsonl(repo_root.path)
 
+        import time, threading
+        from datetime import datetime
+        from collections import deque
 
-            # ── helper: crude complexity metric ──────────────────────────────────
-            def _complexity(q: str, notes: str, kws: list[str]) -> float:
-                wc = min(len(q.split()), 50) / 50.0
-                nb = min(len(notes) / 200.0, 1.0)
-                kb = min(len(kws) / 5.0, 1.0)
-                pd = sum(q.count(c) for c in "?,;!") / max(1, len(q))
-                pb = min(pd * 5.0, 1.0)
-                return 0.4 * wc + 0.2 * nb + 0.2 * kb + 0.2 * pb
+        while True:
+            attempt += 1
 
-            # ── bootstrap core stages ───────────────────────────────────────────
-            queue = deque([
-                "record_input",
-                "load_system_prompts",
-                "retrieve_and_merge_context",
-                "intent_clarification",
-                "prune_context_store",
-            ])
+            # Stop any prior self-review loop
+            self._stop_self_review.set()
+            if self._self_review_thread and self._self_review_thread.is_alive():
+                self._self_review_thread.join(timeout=1.0)
+            self._stop_self_review.clear()
 
-            state = {
-                "user_text":      user_text,
-                "errors":         [],
-                "curiosity_used": [],
-                "rl_included":    [],
-                "recent_ids":     [],
-            }
-            self._last_state = state
+            try:
+                # ── helper: crude complexity metric ─────────────────────────
+                def _complexity(q: str, notes: str, kws: list[str]) -> float:
+                    wc = min(len(q.split()), 50) / 50.0
+                    nb = min(len(notes) / 200.0, 1.0)
+                    kb = min(len(kws) / 5.0, 1.0)
+                    pd = sum(q.count(c) for c in "?,;!") / max(1, len(q))
+                    pb = min(pd * 5.0, 1.0)
+                    return 0.4*wc + 0.2*nb + 0.2*kb + 0.2*pb
 
-            answer: str | None = None
-            self._last_errors = False
+                # ── bootstrap core stages ───────────────────────────────────
+                queue = deque([
+                    "record_input",
+                    "load_system_prompts",
+                    "retrieve_and_merge_context",
+                    "intent_clarification",
+                    "prune_context_store",
+                ])
 
-            if chat_id is not None:
-                self._chat_contexts.add(chat_id)
+                state = {
+                    "user_text":      user_text,
+                    "errors":         [],
+                    "curiosity_used": [],
+                    "rl_included":    [],
+                    "recent_ids":     [],
+                }
+                self._last_state = state
+                answer: str | None = None
+                self._last_errors  = False
 
-            # ── event loop ─────────────────────────────────────────────────────
-            while queue:
-                stage = queue.popleft()
-                start = datetime.utcnow()
-                summary, ok = "", False
+                if chat_id is not None:
+                    self._chat_contexts.add(chat_id)
 
-                # report start
-                status_cb(stage, "…")
+                # ── event loop ────────────────────────────────────────────
+                while queue:
+                    stage = queue.popleft()
+                    start = datetime.utcnow()
+                    summary, ok = "", False
 
-                try:
-                    # ── 0) Prune old/overflow contexts ─────────────────────────────
-                    if stage == "prune_context_store":
-                        # this returns a string like "pruned 42 items (…)”
-                        summary = self._stage_prune_context_store(state)
-                        ok = True
+                    status_cb(stage, "…")
 
-                    # ── meta stages (fire-and-forget) ─────────────────────────────
-                    elif stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
+                    try:
+                        # ── 0) Prune overflow contexts
+                        if stage == "prune_context_store":
+                            summary = self._stage_prune_context_store(state)
+                            ok = True
+
+                        # ── meta (fire-and-forget)
+                        elif stage == "curiosity_probe" and hasattr(self, "_stage_curiosity_probe"):
+                            threading.Thread(
+                                target=self._stage_curiosity_probe,
+                                args=(state.copy(),),
+                                daemon=True
+                            ).start()
+                            summary, ok = "(probe dispatched)", True
+
+                        elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
+                            threading.Thread(
+                                target=self._stage_system_prompt_refine,
+                                args=(state.copy(),),
+                                daemon=True
+                            ).start()
+                            summary, ok = "(refine dispatched)", True
+
+                        elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
+                            threading.Thread(
+                                target=self._stage_narrative_mull,
+                                args=(state.copy(),),
+                                daemon=True
+                            ).start()
+                            summary, ok = "(mull dispatched)", True
+
+                        # ── core stages ────────────────────────────────────────
+                        elif stage == "record_input":
+                            ctx = self._stage1_record_input(user_text)
+                            state["user_ctx"] = ctx
+                            state["recent_ids"].append(ctx.context_id)
+                            summary, ok = ctx.summary, True
+
+                        elif stage == "load_system_prompts":
+                            ctx = self._stage2_load_system_prompts()
+                            state["sys_ctx"] = ctx
+                            state["recent_ids"].append(ctx.context_id)
+                            summary, ok = "(prompts loaded)", True
+
+                        elif stage == "retrieve_and_merge_context":
+                            extra = self._get_history()
+                            out = self._stage3_retrieve_and_merge_context(
+                                user_text,
+                                state["user_ctx"],
+                                state["sys_ctx"],
+                                extra_ctx=extra,
+                                recall_ids=state["recent_ids"]
+                            )
+                            state.update(out)
+                            state["recent_ids"].insert(0, state["narrative_ctx"].context_id)
+                            summary, ok = "(context merged)", True
+
+                        elif stage == "intent_clarification":
+                            ctx = self._stage4_intent_clarification(user_text, state)
+                            state["clar_ctx"] = ctx
+                            state["recent_ids"].append(ctx.context_id)
+                            summary = ctx.summary
+                            state["complexity"] = _complexity(
+                                user_text,
+                                ctx.metadata.get("notes", ""),
+                                ctx.metadata.get("keywords", [])
+                            )
+                            queue.extend([
+                                "external_knowledge", "prepare_tools", "planning_summary",
+                                "plan_validation", "tool_chaining", "invoke_with_retries",
+                                "reflection_and_replan", "assemble_and_infer",
+                                "response_critique", "memory_writeback",
+                            ])
+                            ok = True
+
+                        elif stage == "external_knowledge":
+                            ctx = self._stage5_external_knowledge(state["clar_ctx"])
+                            state["know_ctx"] = ctx
+                            state["recent_ids"].append(ctx.context_id)
+                            summary, ok = "(knowledge)", True
+
+                        elif stage == "prepare_tools":
+                            lst = self._stage6_prepare_tools()
+                            state["tools_list"] = lst
+                            summary, ok = f"{len(lst)} tools", True
+
+                        elif stage == "planning_summary":
+                            ctx, plan_json = self._stage7_planning_summary(
+                                state["clar_ctx"], state["know_ctx"],
+                                state["tools_list"], user_text
+                            )
+                            state["plan_ctx"], state["plan_output"] = ctx, plan_json
+                            state["recent_ids"].append(ctx.context_id)
+                            summary, ok = "plan ready", True
+
+                        elif stage == "plan_validation":
+                            _, errs, fixed = self._stage7b_plan_validation(
+                                state["plan_ctx"], state["plan_output"], state["tools_list"]
+                            )
+                            if errs:
+                                raise RuntimeError(f"plan-validation: {errs}")
+                            state["fixed_calls"] = fixed
+                            queue.extend([
+                                "tool_chaining", "invoke_with_retries", "reflection_and_replan",
+                                "assemble_and_infer", "response_critique", "memory_writeback",
+                            ])
+                            summary, ok = f"{len(fixed)} calls", True
+
+                        elif stage == "tool_chaining":
+                            tc_ctx, confirmed_calls, schemas = self._stage8_tool_chaining(
+                                state["plan_ctx"],
+                                "\n".join(state["fixed_calls"]),
+                                state["tools_list"]
+                            )
+                            state.update({
+                                "tc_ctx":        tc_ctx,
+                                "raw_calls":     confirmed_calls,
+                                "schemas":       schemas,
+                                "chainer_input": "\n".join(state["fixed_calls"]),
+                            })
+                            summary, ok = f"{len(confirmed_calls)} chained", True
+
+                        elif stage == "invoke_with_retries":
+                            try:
+                                tctxs = self._stage9_invoke_with_retries(...)
+                                ok = True
+                            except Exception as e:
+                                tctxs = []
+                                state["errors"].append(("invoke_with_retries", str(e)))
+                                ok = False
+                            state["tool_ctxs"] = tctxs
+                            summary = f"{len(tctxs)} tools run" if ok else "(tool invocation failed)"
+                            
+                        elif stage == "reflection_and_replan":
+                            # Safely grab whatever tool outputs we have (empty list if none)
+                            tctxs = state.get("tool_ctxs", [])
+                            if not tctxs:
+                                # No tool outputs → skip reflection but don’t fail the pipeline
+                                summary, ok = "(skipping reflection—no tool outputs)", True
+                            else:
+                                try:
+                                    rp = self._stage9b_reflection_and_replan(
+                                        tctxs,
+                                        state["plan_output"],
+                                        user_text,
+                                        state["clar_ctx"].metadata,
+                                        state["plan_ctx"]
+                                    )
+                                    if rp:
+                                        queue.extend(["planning_summary", "plan_validation"])
+                                    summary, ok = f"replan={bool(rp)}", True
+
+                                except Exception as e:
+                                    # Record the error and continue
+                                    state["errors"].append(("reflection_and_replan", str(e)))
+                                    summary, ok = f"reflection error:{e}", False
+
+                        elif stage == "assemble_and_infer":
+                            draft = self._stage10_assemble_and_infer(user_text, state)
+                            state["draft"] = draft
+                            summary, ok = "(drafted)", True
+
+                        elif stage == "response_critique":
+                            final = self._stage10b_response_critique_and_safety(
+                                state["draft"], user_text, state.get("tool_ctxs", [])
+                            )
+                            state["final"] = final
+                            summary, ok = "(polished)", True
+
+                        elif stage == "memory_writeback":
+                            summary, ok = "(memory queued)", True
+
+                    except Exception as e:
+                        state["errors"].append((stage, str(e)))
+                        summary, ok = f"error:{e}", False
+
+                    finally:
+                        dur = (datetime.utcnow() - start).total_seconds()
+                        if "user_ctx" in state:
+                            perf = ContextObject.make_stage(
+                                "stage_performance",
+                                [state["user_ctx"].context_id],
+                                {"stage": stage, "duration": dur, "error": not ok}
+                            )
+                            perf.touch()
+                            self.repo.save(perf)
+
+                        status_cb(stage, summary)
+                        self._last_errors |= not ok
+
+                # ── post-pipeline async meta-jobs ─────────────────────────
+                def _maybe_async(tag: str, fn: Callable):
+                    if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
                         threading.Thread(
-                            target=self._stage_curiosity_probe,
+                            target=fn,
                             args=(state.copy(),),
                             daemon=True
                         ).start()
-                        summary, ok = "(probe dispatched)", True
+                        state["rl_included"].append(tag)
 
-                    elif stage == "system_prompt_refine" and hasattr(self, "_stage_system_prompt_refine"):
-                        threading.Thread(
-                            target=self._stage_system_prompt_refine,
-                            args=(state.copy(),),
-                            daemon=True
-                        ).start()
-                        summary, ok = "(refine dispatched)", True
+                _maybe_async("curiosity_probe",      self._stage_curiosity_probe)
+                _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
+                _maybe_async("narrative_mull",       self._stage_narrative_mull)
 
-                    elif stage == "narrative_mull" and hasattr(self, "_stage_narrative_mull"):
-                        threading.Thread(
-                            target=self._stage_narrative_mull,
-                            args=(state.copy(),),
-                            daemon=True
-                        ).start()
-                        summary, ok = "(mull dispatched)", True
+                for cid in list(self._chat_contexts):
+                    try:
+                        self._maybe_appiphany(cid)
+                    except:
+                        pass
 
-                    # ── core pipeline stages ───────────────────────────────────────
-                    elif stage == "record_input":
-                        ctx = self._stage1_record_input(user_text)
-                        state["user_ctx"] = ctx
-                        state["recent_ids"].append(ctx.context_id)
-                        summary, ok = ctx.summary, True
-
-                    elif stage == "load_system_prompts":
-                        ctx = self._stage2_load_system_prompts()
-                        state["sys_ctx"] = ctx
-                        state["recent_ids"].append(ctx.context_id)
-                        summary, ok = "(prompts loaded)", True
-
-                    elif stage == "retrieve_and_merge_context":
-                        extra = self._get_history()
-                        out = self._stage3_retrieve_and_merge_context(
-                            user_text,
-                            state["user_ctx"],
-                            state["sys_ctx"],
-                            extra_ctx=extra,
-                            recall_ids=state["recent_ids"]
-                        )
-                        state.update(out)
-                        state["recent_ids"].insert(0, state["narrative_ctx"].context_id)
-                        summary, ok = "(context merged)", True
-
-                    elif stage == "intent_clarification":
-                        ctx = self._stage4_intent_clarification(user_text, state)
-                        state["clar_ctx"] = ctx
-                        state["recent_ids"].append(ctx.context_id)
-                        summary = ctx.summary
-                        state["complexity"] = _complexity(
-                            user_text,
-                            ctx.metadata.get("notes", ""),
-                            ctx.metadata.get("keywords", []),
-                        )
-                        queue.extend([
-                            "external_knowledge", "prepare_tools", "planning_summary",
-                            "plan_validation", "tool_chaining", "invoke_with_retries",
-                            "reflection_and_replan", "assemble_and_infer",
-                            "response_critique", "memory_writeback",
-                        ])
-                        ok = True
-
-                    elif stage == "external_knowledge":
-                        ctx = self._stage5_external_knowledge(state["clar_ctx"])
-                        state["know_ctx"] = ctx
-                        state["recent_ids"].append(ctx.context_id)
-                        summary, ok = "(knowledge)", True
-
-                    elif stage == "prepare_tools":
-                        lst = self._stage6_prepare_tools()
-                        state["tools_list"] = lst
-                        summary, ok = f"{len(lst)} tools", True
-
-                    elif stage == "planning_summary":
-                        ctx, plan_json = self._stage7_planning_summary(
-                            state["clar_ctx"], state["know_ctx"],
-                            state["tools_list"], user_text
-                        )
-                        state["plan_ctx"], state["plan_output"] = ctx, plan_json
-                        state["recent_ids"].append(ctx.context_id)
-                        summary, ok = "plan ready", True
-
-                    elif stage == "plan_validation":
-                        _, errs, fixed = self._stage7b_plan_validation(
-                            state["plan_ctx"], state["plan_output"], state["tools_list"]
-                        )
-                        if errs:
-                            raise RuntimeError(f"plan-validation: {errs}")
-                        state["fixed_calls"] = fixed
-                        queue.extend([
-                            "tool_chaining", "invoke_with_retries", "reflection_and_replan",
-                            "assemble_and_infer", "response_critique", "memory_writeback",
-                        ])
-                        summary, ok = f"{len(fixed)} calls", True
-
-                    elif stage == "tool_chaining":
-                        tc_ctx, confirmed_calls, schemas = self._stage8_tool_chaining(
-                            state["plan_ctx"],
-                            "\n".join(state["fixed_calls"]),
-                            state["tools_list"]
-                        )
-                        state.update({
-                            "tc_ctx":        tc_ctx,
-                            "raw_calls":     confirmed_calls,
-                            "schemas":       schemas,
-                            "chainer_input": "\n".join(state["fixed_calls"]),
-                        })
-                        summary, ok = f"{len(confirmed_calls)} chained", True
-
-                    elif stage == "invoke_with_retries":
-                        tctxs = self._stage9_invoke_with_retries(
-                            raw_calls=state["raw_calls"],
-                            plan_output=state["chainer_input"],
-                            selected_schemas=state["schemas"],
-                            user_text=state["user_text"],
-                            clar_metadata=state["clar_ctx"].metadata
-                        )
-                        state["tool_ctxs"] = tctxs
-                        summary, ok = f"{len(tctxs)} tools run", True
-
-                    elif stage == "reflection_and_replan":
-                        rp = self._stage9b_reflection_and_replan(
-                            state["tool_ctxs"], state["plan_output"],
-                            user_text, state["clar_ctx"].metadata, state["plan_ctx"]
-                        )
-                        if rp:
-                            queue.extend(["planning_summary", "plan_validation"])
-                        summary, ok = f"replan={bool(rp)}", True
-
-                    elif stage == "assemble_and_infer":
-                        draft = self._stage10_assemble_and_infer(user_text, state)
-                        state["draft"] = draft
-                        summary, ok = "(drafted)", True
-
-                    elif stage == "response_critique":
-                        final = self._stage10b_response_critique_and_safety(
-                            state["draft"], user_text, state.get("tool_ctxs", [])
-                        )
-                        state["final"] = final
-                        summary, ok = "(polished)", True
-
-                    elif stage == "memory_writeback":
-                        summary, ok = "(memory queued)", True
-
-                except Exception as e:
-                    state["errors"].append((stage, str(e)))
-                    summary, ok = f"error:{e}", False
-
-                finally:
-                    # record stage performance
-                    dur = (datetime.utcnow() - start).total_seconds()
-                    if "user_ctx" in state:
-                        perf = ContextObject.make_stage(
-                            "stage_performance",
-                            [state["user_ctx"].context_id],
-                            {"stage": stage, "duration": dur, "error": not ok},
-                        )
-                        perf.touch()
-                        self.repo.save(perf)
-
-                    status_cb(stage, summary)
-                    self._last_errors |= not ok
-
-            # ── post-pipeline async meta-jobs ───────────────────────────────────
-            def _maybe_async(tag: str, fn: Callable):
-                if hasattr(self, fn.__name__) and self.rl.should_run(tag, 0.0):
-                    threading.Thread(target=fn, args=(state.copy(),), daemon=True).start()
-                    state["rl_included"].append(tag)
-
-            _maybe_async("curiosity_probe",      self._stage_curiosity_probe)
-            _maybe_async("system_prompt_refine", self._stage_system_prompt_refine)
-            _maybe_async("narrative_mull",       self._stage_narrative_mull)
-
-            # push any “appiphany” pings
-            for cid in list(self._chat_contexts):
-                try:
-                    self._maybe_appiphany(cid)
-                except:
-                    pass
-
-            # RL reward update
-            self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
-            self.curiosity_used = state["curiosity_used"]
-            # Launch background self-review thread
-            if not self._self_review_thread or not self._self_review_thread.is_alive():
-                self._self_review_thread = threading.Thread(
-                    target=self._background_self_review, daemon=True
+                self.rl.update(
+                    state["rl_included"],
+                    1.0 if not state["errors"] else 0.0
                 )
-                self._self_review_thread.start()
+                self.curiosity_used = state["curiosity_used"]
 
-            # ── final output via status_cb ─────────────────────────────────────
-            final_text = (answer or state.get("final", "")).strip()
-            if not final_text:
-                final_text = "Sorry, I couldn’t process that. Could you try rephrasing?"
-            status_cb("output_1/1", final_text)
+                if not self._self_review_thread or not self._self_review_thread.is_alive():
+                    self._self_review_thread = threading.Thread(
+                        target=self._background_self_review,
+                        daemon=True
+                    )
+                    self._self_review_thread.start()
 
-            return final_text
+                # ── final output via status_cb ─────────────────────────
+                final_text = (answer or state.get("final", "")).strip()
+                if final_text:
+                    status_cb("output_1/1", final_text)
+                    return final_text
+                else:
+                    # trigger retry on empty final
+                    raise RuntimeError("Empty final output")
 
-        except Exception:
-            apology = "Sorry, something went wrong. Please try again."
-            status_cb("output_1/1", apology)
-            return apology
+            except Exception as exc:
+                if attempt >= max_retries:
+                    status_cb("output_1/1", "")  # give up, return empty
+                    return ""
+                status_cb(
+                    "retry",
+                    f"Attempt {attempt} failed: {exc}. Retrying in {backoff}s…"
+                )
+                time.sleep(backoff)
+                backoff *= 2
+                continue
 
 
     def _background_self_review(self):
