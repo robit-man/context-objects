@@ -10,6 +10,9 @@ Also integrates:
   • TTSManager  (live Piper-based TTS playback)
 """
 
+# ──────────── VIRTUALENV BOOTSTRAP & FIRST-RUN DEPENDENCIES ─────────────────────────
+
+
 import sys
 import os
 import subprocess
@@ -21,32 +24,31 @@ import time
 import threading
 from datetime import datetime
 
-# ──────────── CTRL-C HANDLING ───────────────────────────────────────────────
+# CTRL-C handler
 def _exit_on_sigint(signum, frame):
     print("\nInterrupted. Shutting down.")
     sys.exit(0)
 signal.signal(signal.SIGINT, _exit_on_sigint)
 
-# ──────────── COLOR CODES FOR LOGGING ─────────────────────────────────────────
+# Logging helper
 COLOR_RESET   = "\033[0m"
 COLOR_INFO    = "\033[94m"
 COLOR_SUCCESS = "\033[92m"
 COLOR_WARNING = "\033[93m"
 COLOR_ERROR   = "\033[91m"
-COLOR_DEBUG   = "\033[95m"
 COLOR_PROCESS = "\033[96m"
 
 def log_message(msg: str, category: str="INFO"):
-    cat   = category.upper()
+    cat = category.upper()
     color = {
-      "INFO":COLOR_INFO, "SUCCESS":COLOR_SUCCESS, "WARNING":COLOR_WARNING,
-      "ERROR":COLOR_ERROR, "DEBUG":COLOR_DEBUG, "PROCESS":COLOR_PROCESS
+        "INFO":    COLOR_INFO,
+        "SUCCESS": COLOR_SUCCESS,
+        "WARNING": COLOR_WARNING,
+        "ERROR":   COLOR_ERROR,
+        "PROCESS": COLOR_PROCESS,
     }.get(cat, COLOR_RESET)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{color}[{ts}] {cat}: {msg}{COLOR_RESET}")
-
-# ──────────── VIRTUALENV BOOTSTRAP ────────────────────────────────────────────
-import platform
 
 def in_virtualenv() -> bool:
     base = getattr(sys, "base_prefix", None)
@@ -55,41 +57,39 @@ def in_virtualenv() -> bool:
 def create_and_activate_venv():
     venv_dir = os.path.join(os.getcwd(), ".venv")
 
-    # 1) Locate a Python 3.10 interpreter
+    # 1) Find or install python3.10 on Debian/Ubuntu
     py310 = shutil.which("python3.10")
-
-    # 2) If not found on Debian/Ubuntu, add Deadsnakes PPA and install it
-    if not py310 and platform.system() == "Linux" and shutil.which("apt-get"):
+    if not py310 and platform.system()=="Linux" and shutil.which("apt-get"):
         log_message("python3.10 not found—adding Deadsnakes PPA & installing...", "PROCESS")
         try:
-            subprocess.check_call(["sudo", "apt-get", "update"])
-            subprocess.check_call(["sudo", "apt-get", "install", "-y", "software-properties-common"])
-            subprocess.check_call(["sudo", "add-apt-repository", "-y", "ppa:deadsnakes/ppa"])
-            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call(["sudo","apt-get","update"])
+            subprocess.check_call(["sudo","apt-get","install","-y","software-properties-common"])
+            subprocess.check_call(["sudo","add-apt-repository","-y","ppa:deadsnakes/ppa"])
+            subprocess.check_call(["sudo","apt-get","update"])
             subprocess.check_call([
-                "sudo", "apt-get", "install", "-y",
-                "python3.10", "python3.10-venv", "python3.10-distutils"
+                "sudo","apt-get","install","-y",
+                "python3.10","python3.10-venv","python3.10-distutils"
             ])
             py310 = shutil.which("python3.10")
         except subprocess.CalledProcessError as e:
             log_message(f"Failed to install python3.10: {e}", "ERROR")
 
-    # 3) Fall back to current interpreter if still missing
+    # 2) Fallback to current interpreter if still missing
     if not py310:
         log_message("python3.10 unavailable—falling back to current Python", "WARNING")
         py310 = sys.executable
 
     python_bin = os.path.join(venv_dir, "bin", "python")
-    pip_bin = os.path.join(venv_dir, "bin", "pip")
+    pip_bin    = os.path.join(venv_dir, "bin", "pip")
 
-    # 4) Create the venv under .venv if needed
+    # 3) Create venv if needed
     if not os.path.isdir(venv_dir):
         log_message(f"Creating virtualenv in .venv/ with {os.path.basename(py310)}", "PROCESS")
         subprocess.check_call([py310, "-m", "venv", venv_dir])
         log_message("Upgrading pip in venv…", "PROCESS")
         subprocess.check_call([pip_bin, "install", "--upgrade", "pip"])
 
-    # 5) Re‐exec into the new venv
+    # 4) Re-exec into the venv
     log_message("Re-launching under virtualenv…", "PROCESS")
     os.execve(
         python_bin,
@@ -97,41 +97,40 @@ def create_and_activate_venv():
         {
             **os.environ,
             "VIRTUAL_ENV": venv_dir,
-            "PATH": f"{venv_dir}/bin:{os.environ.get('PATH','')}",
+            "PATH":        f"{venv_dir}/bin:{os.environ.get('PATH','')}"
         },
     )
 
 if not in_virtualenv():
     create_and_activate_venv()
 
-
 # ──────────── FIRST-RUN DEPENDENCIES ─────────────────────────────────────────
+
 SETUP_MARKER = os.path.join(os.path.dirname(__file__), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
     log_message("Installing system & Python deps…", "PROCESS")
+    # System packages on Debian/Ubuntu
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
         subprocess.check_call(["sudo","apt-get","update"])
         subprocess.check_call([
             "sudo","apt-get","install","-y",
             "libsqlite3-dev","ffmpeg","wget","unzip"
         ])
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--upgrade", "pip"
-    ])
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install"
-    ] + [
+    # Python packages
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install"] + [
         "sounddevice","numpy","scipy","openai-whisper","ollama",
         "python-dotenv","beautifulsoup4","html5lib","psutil",
         "noisereduce","denoiser","pillow","opencv-python",
         "mss","networkx","pandas","selenium","webdriver-manager",
         "flask_cors","flask","tiktoken","python-telegram-bot",
-        "asyncio","nest-asyncio","sentence-transformers", "telegram", "num2words"
+        "asyncio","nest-asyncio","sentence-transformers","telegram","num2words"
     ])
-    with open(SETUP_MARKER,"w") as f:
+    with open(SETUP_MARKER, "w") as f:
         f.write("done")
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
 # ──────────── LOAD / GENERATE config.json ────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CFG = {
