@@ -1089,22 +1089,30 @@ class Assembler:
         ask the LLM for answers, record Q&A as ContextObjects, return answers.
         """
         from typing import Tuple, List
+        from datetime import datetime
+
         probes: List[str] = []
         clar = state.get("clar_ctx")
         if clar is None:
             return probes
 
-        # 1) build recall feature for gating
+        # 1) Compute cascade-activation–based recall feature
         recall_ids = state.get("recent_ids", [])
-        counts = []
-        for cid in recall_ids:
-            try:
-                counts.append(self.repo.get(cid).metadata.get("recall_stats", {}).get("count", 0))
-            except:
-                pass
-        rf = sum(counts) / len(counts) if counts else 0.0
+        if recall_ids:
+            activation_map = self.memman.spread_activation(
+                seed_ids=recall_ids,
+                hops=2,
+                decay=0.6,
+                assoc_weight=1.0,
+                recency_weight=0.5
+            )
+            # take mean of top-N activations
+            top_vals = sorted(activation_map.values(), reverse=True)[: len(recall_ids)]
+            rf = sum(top_vals) / len(top_vals) if top_vals else 0.0
+        else:
+            rf = 0.0
 
-        # 2) detect explicit gaps
+        # 2) Detect explicit gaps
         gaps: List[Tuple[str,str]] = []
         if not clar.metadata.get("notes"):
             gaps.append(("missing_notes", clar.summary[:50]))
@@ -1114,13 +1122,17 @@ class Assembler:
         ):
             gaps.append(("missing_date", "plan mentions a date"))
 
-        # 3) if no explicit gaps, maybe auto-mull
+        # 3) If no explicit gaps, auto-mull
         if not gaps:
             gaps.append(("auto_mull", "self-reflection"))
 
-        # 4) for each gap, pick template, ask LLM, record
+        # 4) For each gap, pick a template, probe LLM, record Q&A
         for gap_name, snippet in gaps:
-            candidates = [t for t in self.curiosity_templates if gap_name in t.semantic_label]
+            # choose best template by RL probability
+            candidates = [
+                t for t in self.curiosity_templates
+                if gap_name in t.semantic_label
+            ]
             if not candidates:
                 continue
             picked = max(
@@ -1129,19 +1141,25 @@ class Assembler:
             )
             prompt = picked.metadata.get("policy", picked.summary).format(snippet=snippet)
 
-            # record question
+            # 4a) Record question ContextObject
             q_ctx = ContextObject.make_stage(
                 f"curiosity_question_{gap_name}",
                 [clar.context_id],
-                {"question": prompt},
-                session_id=getattr(self, "session_id", None)
+                {"question": prompt}
             )
-            q_ctx.component = "curiosity"
-            q_ctx.semantic_label = "question"
+            q_ctx.component        = "curiosity"
+            q_ctx.semantic_label   = "question"
             q_ctx.tags.append("curiosity")
-            q_ctx.touch(); self.repo.save(q_ctx)
+            # annotate retrieval metrics
+            score = activation_map.get(picked.context_id, 0.0)
+            q_ctx.retrieval_score    = score
+            q_ctx.retrieval_metadata = {"template": picked.semantic_label}
+            # record reinforcement: clar -> question
+            self.memman.reinforce(clar.context_id, [q_ctx.context_id])
+            q_ctx.touch()
+            self.repo.save(q_ctx)
 
-            # ask LLM
+            # 4b) Ask the LLM
             reply = self._stream_and_capture(
                 self.primary_model,
                 [
@@ -1151,22 +1169,30 @@ class Assembler:
                 tag=f"[CuriosityAnswer_{gap_name}]"
             ).strip()
 
-            # record answer
+            # 4c) Record answer ContextObject
             a_ctx = ContextObject.make_stage(
                 f"curiosity_answer_{gap_name}",
                 [q_ctx.context_id],
-                {"answer": reply},
-                session_id=getattr(self, "session_id", None)
+                {"answer": reply}
             )
-            a_ctx.component = "curiosity"
-            a_ctx.semantic_label = "answer"
+            a_ctx.component        = "curiosity"
+            a_ctx.semantic_label   = "answer"
             a_ctx.tags.append("curiosity")
-            a_ctx.touch(); self.repo.save(a_ctx)
+            # annotate retrieval metrics
+            a_score = activation_map.get(q_ctx.context_id, 0.0)
+            a_ctx.retrieval_score    = a_score
+            a_ctx.retrieval_metadata = {"question_id": q_ctx.context_id}
+            # record reinforcement: question -> answer
+            self.memman.reinforce(q_ctx.context_id, [a_ctx.context_id])
+            a_ctx.touch()
+            self.repo.save(a_ctx)
 
+            # track which template you used and collect the reply
             state.setdefault("curiosity_used", []).append(picked.semantic_label)
             probes.append(reply)
 
         return probes
+
     
     def _get_prompt(self, label: str) -> str:
         ctx = next(c for c in self.repo.query(lambda c:
@@ -1191,24 +1217,46 @@ class Assembler:
             return buf.getvalue()
 
         # 1) Compute RL recall feature
+        # 1) Compute cascade-activation–based recall feature
         recall_ids = state.get("recent_ids", [])
-        counts = []
-        for cid in recall_ids:
-            try:
-                counts.append(self.repo.get(cid).metadata.get("recall_stats", {}).get("count", 0))
-            except KeyError:
-                pass
-        rf = sum(counts) / len(counts) if counts else 0.0
+        if recall_ids:
+            # 2-hop spread with decay
+            activation_map = self.memman.spread_activation(
+                seed_ids=recall_ids,
+                hops=2,
+                decay=0.7,
+                assoc_weight=1.0,
+                recency_weight=0.5
+            )
+            # collapse to a single feature: mean of top activations
+            top_vals = sorted(activation_map.values(), reverse=True)[: len(recall_ids)]
+            rf = sum(top_vals) / len(top_vals)
+        else:
+            rf = 0.0
 
-        # 2) RL-gate: maybe skip
+        # 2) RL-gate: maybe skip based on richer feature
         if not self.rl.should_run("system_prompt_refine", rf):
             return None
+
 
         # 3) Snapshot static prompts/policies
         rows = list(self.repo.query(
             lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
         ))
         rows.sort(key=lambda c: c.timestamp)
+
+        # ── NEW: annotate each with its activation score ────────────────
+        for ctx in rows:
+            score = activation_map.get(ctx.context_id, 0.0)
+            ctx.retrieval_score    = score
+            ctx.retrieval_metadata = {"seed_ids": recall_ids}
+            ctx.record_recall(
+                stage_id="system_prompt_refine",
+                coactivated_with=recall_ids,
+                retrieval_score=score
+            )
+            self.repo.save(ctx)
+
         prompt_block = "\n".join(
             f"- {textwrap.shorten(c.metadata.get('prompt', c.metadata.get('policy','')), 80)}"
             for c in rows
@@ -1668,7 +1716,6 @@ class Assembler:
     def _stage2_load_system_prompts(self) -> ContextObject:
         return self._load_system_prompts()
         
-
     def _stage3_retrieve_and_merge_context(
         self,
         user_text: str,
@@ -1684,102 +1731,120 @@ class Assembler:
         • recent raw segments (user/assistant)
         • any explicit chat_history (extra_ctx)
         • semantic retrieval (RL-gated)
-        • associative memory (RL-gated)
+        • associative memory via spread-activation (RL-gated)
         • recent tool outputs (RL-gated)
-
-        Returns a dict with:
-          "narrative_ctx": ContextObject,
-          "history":      List[ContextObject],
-          "recent":       List[ContextObject],
-          "assoc":        List[ContextObject],
-          "recent_ids":   List[str],  # full merged order
         """
-        from datetime import timedelta
 
-        # ── 1) Compute RL “recall feature” from prior recalls ────────────────
+        from datetime import timedelta, datetime
+
+        # ① compute RL “recall feature” from prior recalls
         rf = 0.0
         if recall_ids:
             counts = []
             for cid in recall_ids:
                 try:
-                    stats = self.repo.get(cid).metadata.get("recall_stats", {})
-                    counts.append(stats.get("count", 0))
+                    st = self.repo.get(cid).recall_stats.get("count", 0)
+                    counts.append(st)
                 except KeyError:
                     continue
             rf = sum(counts) / len(counts) if counts else 0.0
 
-        # ── 2) Time-window for semantic retrieval ────────────────────────────
+        # ② time-window for semantic retrieval
         now  = default_clock()
         past = now - timedelta(minutes=self.lookback)
         tr   = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
 
-        # ── 3) Load the running narrative singleton ──────────────────────────
+        # ③ load narrative
         narr_ctx = self._load_narrative_context()
 
-        # ── 4) Raw history segments (always include) ────────────────────────
+        # ④ raw history segments
         segments = self.repo.query(
-            lambda c: c.domain == "segment"
-                    and c.semantic_label in ("user_input", "assistant")
+            lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
         )
         segments.sort(key=lambda c: c.timestamp)
-        history = segments[-(self.hist_k * 2):]  # last N turns
+        history = segments[-(self.hist_k*2):]
         if extra_ctx:
             history.extend(extra_ctx)
 
-        # ── 5) Semantic retrieval (RL-gated) ───────────────────────────────
+        # ⑤ semantic retrieval (unchanged)
         if self.rl.should_run("semantic_retrieval", rf):
             recent = self.engine.query(
                 stage_id="recent_retrieval",
                 time_range=tr,
                 similarity_to=user_text,
                 exclude_tags=(
-                    self.STAGES
-                    + ["tool_schema", "tool_output", "assistant", "system_prompt"]
+                    self.STAGES +
+                    ["tool_schema","tool_output","assistant","system_prompt"]
                 ),
                 top_k=self.top_k
             )
         else:
             recent = []
 
-        # ── 6) Associative memory (RL-gated) ───────────────────────────────
+        # ⑥ associative memory via cascade activation
         if self.rl.should_run("memory_retrieval", rf):
-            assoc = self.memman.recall([user_ctx.context_id], k=self.top_k)
-            for c in assoc:
-                c.record_recall(
-                    stage_id="recent_retrieval",
-                    coactivated_with=[user_ctx.context_id]
+            # run 3-hop spread, with decay
+            scores = self.memman.spread_activation(
+                seed_ids=[user_ctx.context_id],
+                hops=3,
+                decay=0.6,
+                assoc_weight=1.0,
+                recency_weight=1.0
+            )
+            # pick top-k IDs
+            top_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[: self.top_k]
+
+            assoc: List[ContextObject] = []
+            for cid in top_ids:
+                try:
+                    cobj = self.repo.get(cid)
+                except KeyError:
+                    continue
+
+                # stamp retrieval metadata
+                cobj.retrieval_score    = scores[cid]
+                cobj.retrieval_metadata = {"seed_ids":[user_ctx.context_id]}
+
+                # record recall event
+                cobj.record_recall(
+                    stage_id="memory_retrieval",
+                    coactivated_with=[user_ctx.context_id],
+                    retrieval_score=scores[cid]
                 )
-                self.repo.save(c)
+
+                # persist
+                self.repo.save(cobj)
+                assoc.append(cobj)
         else:
             assoc = []
 
-        # ── 7) Recent tool outputs (RL-gated) ───────────────────────────────
-        tool_outs = self.repo.query(lambda c: c.component == "tool_output")
-        tool_outs.sort(key=lambda c: c.timestamp)
+        # ⑦ recent tool outputs (unchanged)
+        tools = self.repo.query(lambda c: c.component=="tool_output")
+        tools.sort(key=lambda c: c.timestamp)
         if self.rl.should_run("tool_output_retrieval", rf):
-            recent_tools = tool_outs[-self.top_k:]
+            recent_tools = tools[-self.top_k:]
         else:
             recent_tools = []
 
-        # ── 8) Merge + dedupe in chronological order, seeding with narrative ─
+        # ⑧ merge & dedupe
         merged: List[ContextObject] = []
         seen = set()
         for bucket in ([narr_ctx], history, recent, assoc, recent_tools):
-            for c in (bucket if isinstance(bucket, list) else [bucket]):
+            for c in (bucket if isinstance(bucket,list) else [bucket]):
                 if c.context_id not in seen:
                     merged.append(c)
                     seen.add(c.context_id)
 
         merged_ids = [c.context_id for c in merged]
 
-        # ── 9) Debug print including narrative ───────────────────────────────
+        # ⑨ debug-print
         self._print_stage_context("recent_retrieval", {
-            "system_prompts": [sys_ctx.summary],
-            "narrative":      [narr_ctx.summary],
-            "history":        [f"{c.semantic_label}: {c.summary}" for c in history],
-            "semantic":       [f"{c.semantic_label}: {c.summary}" for c in recent],
-            "memory":         [f"{c.semantic_label}: {c.summary}" for c in assoc],
-            "tool_outputs":   [f"{c.semantic_label}: {c.summary}" for c in recent_tools],
+            "system_prompts":[sys_ctx.summary],
+            "narrative":[narr_ctx.summary],
+            "history":[f"{c.semantic_label}: {c.summary}" for c in history],
+            "semantic":[f"{c.semantic_label}: {c.summary}" for c in recent],
+            "memory":[f"{c.semantic_label}: {c.summary}" for c in assoc],
+            "tool_outputs":[f"{c.semantic_label}: {c.summary}" for c in recent_tools],
         })
 
         return {
@@ -1787,9 +1852,8 @@ class Assembler:
             "history":       history,
             "recent":        recent,
             "assoc":         assoc,
-            "recent_ids":    merged_ids
+            "recent_ids":    merged_ids,
         }
-
 
 
     # ── Stage 4: Intent Clarification ─────────────────────────────────────

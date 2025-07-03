@@ -733,7 +733,8 @@ ContextRepository = HybridContextRepository
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
 class MemoryManager:
     """
-    High-level service for associative recall, reinforcement, and pruning.
+    High-level service for associative recall, reinforcement, pruning,
+    and spreading-activation (“thought chains”).
     """
     def __init__(self, repo: ContextRepository):
         self.repo = repo
@@ -745,22 +746,91 @@ class MemoryManager:
         weights: Optional[Dict[str, float]] = None
     ) -> List[ContextObject]:
         weights = weights or {"assoc": 1.0, "recency": 1.0}
-        candidates: Dict[str, float] = {}
         now = default_clock()
 
+        # 1) one‐hop candidate scoring
+        scores: Dict[str, float] = {}
         for sid in seed_ids:
             seed = self.repo.get(sid)
-            for other_id, strength in seed.association_strengths.items():
-                score = strength * weights["assoc"]
-                other = self.repo.get(other_id)
+            for oid, strength in seed.association_strengths.items():
+                base = strength * weights["assoc"]
+                other = self.repo.get(oid)
                 last = datetime.strptime(other.last_accessed, "%Y%m%dT%H%M%SZ")
                 age = (now - last).total_seconds()
-                score += weights["recency"] / (1.0 + age)
-                candidates[other_id] = candidates.get(other_id, 0.0) + score
+                base += weights["recency"] / (1.0 + age)
+                scores[oid] = scores.get(oid, 0.0) + base
 
-        sorted_ids = sorted(candidates, key=lambda x: candidates[x], reverse=True)
-        return [self.repo.get(cid) for cid in sorted_ids[:k]]
-    
+        # 2) pick top‐k
+        top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+        results: List[ContextObject] = []
+
+        for cid, score in top:
+            ctx = self.repo.get(cid)
+
+            # a) stamp retrieval_score & metadata
+            ctx.retrieval_score = score
+            ctx.retrieval_metadata = {"seed_ids": seed_ids}
+
+            # b) record the recall event
+            ctx.record_recall(
+                stage_id="recall",
+                coactivated_with=seed_ids,
+                retrieval_score=score
+            )
+
+            # c) save the updated object
+            self.repo.save(ctx)
+
+            results.append(ctx)
+
+        return results
+
+    def spread_activation(
+        self,
+        seed_ids: List[str],
+        hops: int = 3,
+        decay: float = 0.5,
+        assoc_weight: float = 1.0,
+        recency_weight: float = 1.0
+    ) -> Dict[str, float]:
+        """
+        Perform spreading-activation from seed_ids over N hops.
+
+        - hops: max graph distance
+        - decay: per-hop multiplier (0 < decay ≤ 1)
+        - assoc_weight: scales edge strengths
+        - recency_weight: bonus per node based on recency
+        Returns a map {context_id: activation_score}.
+        """
+        now = default_clock()
+        # Initialize activations
+        activation: Dict[str, float] = {cid: 1.0 for cid in seed_ids}
+
+        for hop in range(1, hops + 1):
+            new_act: Dict[str, float] = {}
+            for cid, act in list(activation.items()):
+                try:
+                    ctx = self.repo.get(cid)
+                except KeyError:
+                    continue
+                for neigh, strength in ctx.association_strengths.items():
+                    inc = act * strength * assoc_weight * (decay ** (hop - 1))
+                    new_act[neigh] = new_act.get(neigh, 0.0) + inc
+            # Merge new activations
+            for cid, inc in new_act.items():
+                activation[cid] = activation.get(cid, 0.0) + inc
+
+        # Recency bonus
+        for cid in list(activation.keys()):
+            try:
+                ctx = self.repo.get(cid)
+                last = datetime.strptime(ctx.last_accessed, "%Y%m%dT%H%M%SZ")
+                age = (now - last).total_seconds()
+                activation[cid] += recency_weight / (1.0 + age)
+            except Exception:
+                continue
+
+        return activation
 
     def decay_and_promote(
         self,
@@ -768,21 +838,18 @@ class MemoryManager:
         promote_threshold: int = 3
     ) -> None:
         import math
-        from datetime import datetime
 
         now = default_clock()
-
-        # snapshot to avoid mutation-during-iteration
         for row in list(self.repo.query(lambda c: True)):
             try:
                 ctx = self.repo.get(row.context_id)
             except KeyError:
                 continue
 
-            # compute the decayed strengths
             last_ts = datetime.strptime(ctx.last_accessed, "%Y%m%dT%H%M%SZ")
             delta = (now - last_ts).total_seconds()
-            new_strengths = {}
+
+            new_strengths: Dict[str, float] = {}
             for oid, strength in ctx.association_strengths.items():
                 try:
                     self.repo.get(oid)
@@ -792,50 +859,37 @@ class MemoryManager:
                 if decayed > 1e-6:
                     new_strengths[oid] = decayed
 
-            # figure out if we need to promote
             should_promote = ctx.recall_stats.get("count", 0) >= promote_threshold
-            promoted = (ctx.memory_tier != "LTM") and should_promote
-
-            # only update & save if anything really changed
-            if new_strengths != ctx.association_strengths or promoted:
+            if new_strengths != ctx.association_strengths or (should_promote and ctx.memory_tier!="LTM"):
                 ctx.association_strengths = new_strengths
                 if should_promote:
                     ctx.memory_tier = "LTM"
                 ctx.touch()
                 self.repo.save(ctx)
 
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # CURRENT (replace everything in this method)
-    # ──────────────────────────────────────────────────────────────────────────
     def reinforce(self, context_id: str, coactivated: List[str]) -> None:
         """
         Strengthen edges between `context_id` and every ID in `coactivated`
-        while **skipping dangling references safely**.
+        while skipping dangling references.
         """
-        # ensure the target still exists
         try:
             ctx = self.repo.get(context_id)
         except KeyError:
-            return  # target row was deleted → nothing to do
+            return
 
-        # keep only co-activated IDs that still resolve
         valid_refs: List[str] = []
         for rid in coactivated:
             try:
                 self.repo.get(rid)
                 valid_refs.append(rid)
             except KeyError:
-                continue  # silently drop dangling ref
+                continue
 
         if not valid_refs:
-            return  # nothing valid to link
+            return
 
         ctx.record_recall(stage_id=None, coactivated_with=valid_refs)
         self.repo.save(ctx)
-
-
 
     def prune(self, ttl_hours: int) -> None:
         cutoff = default_clock() - timedelta(hours=ttl_hours)
@@ -849,16 +903,21 @@ class MemoryManager:
 # ─ Graph Interface Layer ───────────────────────────────────────────────────────
 class ContextGraph:
     """
-    Simple in-memory directed graph for context-object relations.
+    In-memory directed graph with weighted edges for context associations.
     """
     def __init__(self):
-        self.adj: Dict[str, List[str]] = {}
+        # map: from_id → { to_id → weight }
+        self.adj: Dict[str, Dict[str, float]] = {}
 
     def add_node(self, ctx: ContextObject) -> None:
-        self.adj.setdefault(ctx.context_id, [])
+        self.adj.setdefault(ctx.context_id, {})
 
-    def add_edge(self, from_id: str, to_id: str, label: Optional[str] = None) -> None:
-        self.adj.setdefault(from_id, []).append(to_id)
+    def add_edge(self, from_id: str, to_id: str, weight: float = 1.0) -> None:
+        self.adj.setdefault(from_id, {})
+        self.adj[from_id][to_id] = self.adj[from_id].get(to_id, 0.0) + weight
 
     def neighbors(self, context_id: str) -> List[str]:
-        return self.adj.get(context_id, [])
+        return list(self.adj.get(context_id, {}).keys())
+
+    def neighbors_with_weights(self, context_id: str) -> Dict[str, float]:
+        return dict(self.adj.get(context_id, {}))
