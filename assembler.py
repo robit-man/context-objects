@@ -692,6 +692,21 @@ class Assembler:
          - UPDATE if text differs
          - DEDUPE extras
         """
+        # ── ADD THIS LINE ────────────────────────────────────────────
+        self.system_prompts = {
+            "clarifier_prompt":       self.clarifier_prompt,
+            "assembler_prompt":       self.assembler_prompt,
+            "inference_prompt":       self.inference_prompt,
+            "planning_prompt":        self.planning_prompt,
+            "toolchain_prompt":       self.toolchain_prompt,
+            "reflection_prompt":      self.reflection_prompt,
+            "toolchain_retry_prompt": self.toolchain_retry_prompt,
+            "final_inference_prompt": self.final_inference_prompt,
+            "critic_prompt":          self.critic_prompt,
+            "narrative_mull_prompt":  self.narrative_mull_prompt,
+        }
+        # ─────────────────────────────────────────────────────────────
+
         static = {
             "clarifier_prompt":       self.clarifier_prompt,
             "assembler_prompt":       self.assembler_prompt,
