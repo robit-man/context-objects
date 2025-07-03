@@ -242,10 +242,18 @@ def cli_loop():
             break
         if not line:
             continue
-        # run and speak
+
+        # 1) Run the assembler
         answer = asm_cli.run_with_meta_context(line)
-        # live TTS will speak automatically
+
+        # 2) Enqueue for live TTS (so you hear it immediately)
+        if answer and answer.strip():
+            tts_cli.enqueue(answer)
+
+        # (no print needed; the TTS will speak your response)
     print("CLI loop exiting…")
+
+
    
 threading.Thread(target=cli_loop, daemon=True).start()
 
