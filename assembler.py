@@ -1397,7 +1397,7 @@ class Assembler:
         except KeyError:
             return False
         
-
+        
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1605,39 +1605,24 @@ class Assembler:
                             summary, ok = f"{len(confirmed_calls)} chained", True
 
                         elif stage == "invoke_with_retries":
-                            try:
-                                tctxs = self._stage9_invoke_with_retries(...)
-                                ok = True
-                            except Exception as e:
-                                tctxs = []
-                                state["errors"].append(("invoke_with_retries", str(e)))
-                                ok = False
+                            tctxs = self._stage9_invoke_with_retries(
+                                raw_calls=state["raw_calls"],
+                                plan_output=state["chainer_input"],
+                                selected_schemas=state["schemas"],
+                                user_text=state["user_text"],
+                                clar_metadata=state["clar_ctx"].metadata
+                            )
                             state["tool_ctxs"] = tctxs
-                            summary = f"{len(tctxs)} tools run" if ok else "(tool invocation failed)"
-                            
-                        elif stage == "reflection_and_replan":
-                            # Safely grab whatever tool outputs we have (empty list if none)
-                            tctxs = state.get("tool_ctxs", [])
-                            if not tctxs:
-                                # No tool outputs → skip reflection but don’t fail the pipeline
-                                summary, ok = "(skipping reflection—no tool outputs)", True
-                            else:
-                                try:
-                                    rp = self._stage9b_reflection_and_replan(
-                                        tctxs,
-                                        state["plan_output"],
-                                        user_text,
-                                        state["clar_ctx"].metadata,
-                                        state["plan_ctx"]
-                                    )
-                                    if rp:
-                                        queue.extend(["planning_summary", "plan_validation"])
-                                    summary, ok = f"replan={bool(rp)}", True
+                            summary, ok = f"{len(tctxs)} tools run", True
 
-                                except Exception as e:
-                                    # Record the error and continue
-                                    state["errors"].append(("reflection_and_replan", str(e)))
-                                    summary, ok = f"reflection error:{e}", False
+                        elif stage == "reflection_and_replan":
+                            rp = self._stage9b_reflection_and_replan(
+                                state["tool_ctxs"], state["plan_output"],
+                                user_text, state["clar_ctx"].metadata, state["plan_ctx"]
+                            )
+                            if rp:
+                                queue.extend(["planning_summary", "plan_validation"])
+                            summary, ok = f"replan={bool(rp)}", True
 
                         elif stage == "assemble_and_infer":
                             draft = self._stage10_assemble_and_infer(user_text, state)
