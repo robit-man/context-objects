@@ -482,11 +482,12 @@ def sanitize_jsonl(path: str):
         f.flush()
         os.fsync(f.fileno())
 
+        
 class JSONLContextRepository:
     _singleton = None
 
     def __init__(self, path: str):
-        # 0) Clean up any existing corruption
+        # 0) Repair any pre‐existing corruption
         sanitize_jsonl(path)
 
         # 1) Ensure directory exists
@@ -503,22 +504,41 @@ class JSONLContextRepository:
 
     def get(self, context_id: str) -> ContextObject:
         """
-        Look up a single context; skip any corrupted JSON lines.
+        Look up a single context; if a JSON error is encountered,
+        attempt one repair pass then retry.
         """
-        with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
-            for lineno, line in enumerate(f, start=1):
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
-                    continue
-                if data.get("context_id") == context_id:
-                    return ContextObject.from_dict(data)
+        tried_sanitize = False
+
+        while True:
+            with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
+                for lineno, line in enumerate(f, start=1):
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        logging.warning(
+                            f"JSONLContextRepository.get: parse error on line {lineno}: {e}"
+                        )
+                        if not tried_sanitize:
+                            sanitize_jsonl(self.path)
+                            tried_sanitize = True
+                            break  # abort this read, retry after repair
+                        else:
+                            continue  # skip this line on second pass
+                    if data.get("context_id") == context_id:
+                        return ContextObject.from_dict(data)
+                else:
+                    # finished file without finding ID
+                    break
+
+            # if we repaired once already, don't loop again
+            if tried_sanitize:
+                break
+
         raise KeyError(f"Context {context_id} not found")
 
     def save(self, ctx: ContextObject) -> None:
         """
-        Append a dirty context object to JSONL.
+        Append a dirty context object to JSONL under exclusive lock.
         """
         if not ctx.dirty:
             return
@@ -531,8 +551,11 @@ class JSONLContextRepository:
 
     def delete(self, context_id: str) -> None:
         """
-        Remove all entries matching context_id, skipping corrupted lines.
+        Remove all entries matching context_id, skipping any corrupted lines.
         """
+        # First ensure file is clean
+        sanitize_jsonl(self.path)
+
         kept = []
         with self._lock:
             with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
@@ -540,7 +563,9 @@ class JSONLContextRepository:
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
-                        logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
+                        logging.warning(
+                            f"JSONLContextRepository.delete: skipping bad line {lineno}"
+                        )
                         continue
                     if data.get("context_id") != context_id:
                         kept.append(data)
@@ -553,19 +578,38 @@ class JSONLContextRepository:
 
     def query(self, filter_fn) -> list[ContextObject]:
         """
-        Iterate all contexts, skipping corrupted lines.
+        Iterate all contexts, skipping any bad lines; attempt one repair pass if needed.
         """
-        results: list[ContextObject] = []
-        with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
-            for lineno, line in enumerate(f, start=1):
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    logging.warning(f"Skipping invalid JSON on line {lineno} in {self.path}")
+        results = []
+        tried_sanitize = False
+
+        while True:
+            with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
+                bad_line = False
+                for lineno, line in enumerate(f, start=1):
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        logging.warning(
+                            f"JSONLContextRepository.query: parse error on line {lineno}: {e}"
+                        )
+                        if not tried_sanitize:
+                            sanitize_jsonl(self.path)
+                            tried_sanitize = True
+                            bad_line = True
+                            break  # restart after repair
+                        else:
+                            continue
+                    ctx = ContextObject.from_dict(data)
+                    if filter_fn(ctx):
+                        results.append(ctx)
+
+                if bad_line:
+                    # we repaired; retry the query on clean file
                     continue
-                ctx = ContextObject.from_dict(data)
-                if filter_fn(ctx):
-                    results.append(ctx)
+                # no bad line or already sanitized
+                break
+
         return results
 
     @classmethod
@@ -573,7 +617,6 @@ class JSONLContextRepository:
         if cls._singleton is None:
             raise RuntimeError("ContextRepository not initialised")
         return cls._singleton
-
 # ──────────────────────────────────────────────────────────────────────────────
 # SQLite-backed archive for long-term storage
 # ──────────────────────────────────────────────────────────────────────────────

@@ -1216,11 +1216,10 @@ class Assembler:
                 self.dump_architecture()
             return buf.getvalue()
 
-        # 1) Compute RL recall feature
-        # 1) Compute cascade-activation–based recall feature
+        # 1) Compute RL recall feature via spreading activation
         recall_ids = state.get("recent_ids", [])
+        activation_map: Dict[str, float] = {}
         if recall_ids:
-            # 2-hop spread with decay
             activation_map = self.memman.spread_activation(
                 seed_ids=recall_ids,
                 hops=2,
@@ -1228,7 +1227,6 @@ class Assembler:
                 assoc_weight=1.0,
                 recency_weight=0.5
             )
-            # collapse to a single feature: mean of top activations
             top_vals = sorted(activation_map.values(), reverse=True)[: len(recall_ids)]
             rf = sum(top_vals) / len(top_vals)
         else:
@@ -1238,14 +1236,13 @@ class Assembler:
         if not self.rl.should_run("system_prompt_refine", rf):
             return None
 
-
         # 3) Snapshot static prompts/policies
         rows = list(self.repo.query(
             lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
         ))
         rows.sort(key=lambda c: c.timestamp)
 
-        # ── NEW: annotate each with its activation score ────────────────
+        # 3A) Annotate each with its activation score
         for ctx in rows:
             score = activation_map.get(ctx.context_id, 0.0)
             ctx.retrieval_score    = score
@@ -1264,21 +1261,21 @@ class Assembler:
 
         # 4A) Metrics & diagnostics
         metrics = {
-            "errors":         len(state.get("errors", [])),
+            "errors":       len(state.get("errors", [])),
             "curiosity_used": state.get("curiosity_used", [])[-5:],
-            "recall_mean":    rf,
+            "recall_mean":  rf,
         }
         rl_snapshot = {
             stage: round(self.rl.Q.get(stage, 0.0), 3)
             for stage in ("curiosity_probe", "system_prompt_refine", "narrative_mull")
         }
         diagnostics = {
-            "rl_Q":         rl_snapshot,
-            "rl_R_bar":     round(self.rl.R_bar, 3),
-            "repo_total":   sum(1 for _ in self.repo.query(lambda _: True)),
+            "rl_Q":           rl_snapshot,
+            "rl_R_bar":       round(self.rl.R_bar, 3),
+            "repo_total":     sum(1 for _ in self.repo.query(lambda _: True)),
             "repo_ephemeral": sum(
                 1 for c in self.repo.query(lambda c: c.component in {
-                    "segment","tool_output","narrative","knowledge","stage_performance"
+                    "segment", "tool_output", "narrative", "knowledge", "stage_performance"
                 })
             ),
         }
@@ -1292,10 +1289,10 @@ class Assembler:
         tools_summary = json.dumps([
             {
                 "call":   t.metadata.get("call", "<unknown>"),
-                "result": t.metadata.get("output", {}).get("result", "<no result>")
+                "result": (t.metadata.get("output") or {}).get("result", "<no result>")
                          if isinstance(t.metadata.get("output"), dict)
                          else t.metadata.get("output", "<no result>"),
-                "error":  t.metadata.get("output", {}).get("error", False)
+                "error":  (t.metadata.get("output") or {}).get("error", False)
                          if isinstance(t.metadata.get("output"), dict)
                          else False
             }
@@ -1303,7 +1300,7 @@ class Assembler:
         ], indent=2)
 
         # 5) Build the refine prompt
-        arch       = _arch_dump()
+        arch = _arch_dump()
         refine_prompt = (
             "You are a self-optimising agent, reflecting on your entire run.\n\n"
             "### Active System Prompts & Policies ###\n"
@@ -1354,7 +1351,8 @@ class Assembler:
                     policy_text=text,
                     tags=["dynamic_prompt"],
                 )
-                patch.touch(); self.repo.save(patch)
+                patch.touch()
+                self.repo.save(patch)
 
             elif action == "remove" and text:
                 for row in rows:
@@ -1373,8 +1371,10 @@ class Assembler:
             return None
 
         # 8) Clean up & log
-        try: os.remove(backup)
-        except: pass
+        try:
+            os.remove(backup)
+        except:
+            pass
 
         refine_ctx = ContextObject.make_stage(
             "system_prompt_refine",
@@ -1382,9 +1382,11 @@ class Assembler:
             {"action": action, "text": text},
         )
         refine_ctx.component = "patch"
-        refine_ctx.touch(); self.repo.save(refine_ctx)
+        refine_ctx.touch()
+        self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
+
 
 
 
