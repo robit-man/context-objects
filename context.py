@@ -576,11 +576,11 @@ class JSONLContextRepository:
                 f.flush()
                 os.fsync(f.fileno())
 
-    def query(self, filter_fn) -> List[ContextObject]:
+    def query(self, filter_fn) -> list[ContextObject]:
         """
         Iterate all contexts, skipping any bad lines; attempt one repair pass if needed.
         """
-        results: List[ContextObject] = []
+        results = []
         tried_sanitize = False
 
         while True:
@@ -607,11 +607,10 @@ class JSONLContextRepository:
                 if bad_line:
                     # we repaired; retry the query on clean file
                     continue
-                # no bad line or already sanitized → done
+                # no bad line or already sanitized
                 break
 
         return results
-
 
     @classmethod
     def instance(cls) -> "JSONLContextRepository":

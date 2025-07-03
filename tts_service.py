@@ -8,7 +8,6 @@ import os
 import uuid
 import numpy as np
 import re
-from typing import List
 
 # lock to prevent Piper/process races
 tts_lock = threading.Lock()
@@ -56,22 +55,24 @@ class TTSManager:
                 try: self._live_q.get_nowait()
                 except queue.Empty: break
 
-    def _split_text(self, text: str) -> List[str]:
+    def _split_text(self, text: str) -> list[str]:
         """
         1) Split on blank lines (paragraphs)
         2) Within each paragraph, split on sentence boundaries or any newline
         3) Pack sentences into chunks ≤ max_chunk_size
         4) If still too large, hard-slice into max_chunk_size windows
         """
+        # normalize line endings
         import re
 
         # 1) Break into paragraphs
         paras = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
-        chunks: List[str] = []
+        chunks: list[str] = []
 
         for para in paras:
             # 2) Split on sentence punctuation OR on any newline/bullet
             parts = re.split(r'(?<=[\.\?\!])\s+|\n+|(?<=\u2022)\s*', para)
+            # you can also include r'(?<=^[-\*\u2022]\s*)' if you want bullets
             buffer = ""
             for part in parts:
                 part = part.strip()
@@ -100,7 +101,6 @@ class TTSManager:
                 chunks.append(buffer)
 
         return chunks
-
 
     def enqueue(self, text: str):
                 # ──── filter out common Unicode emojis ─────────────────────────
