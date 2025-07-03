@@ -1044,6 +1044,7 @@ class Assembler:
 
     def dump_architecture(self):
         import inspect, json
+        from datetime import datetime
 
         arch = {
             "stages":               self.STAGES,
@@ -1051,9 +1052,11 @@ class Assembler:
             "curiosity_templates":  [t.semantic_label for t in self.curiosity_templates],
             "rl_weights":           {"Q": self.rl.Q, "R_bar": self.rl.R_bar},
             "curiosity_weights":    {"Q": self.curiosity_rl.Q, "R_bar": self.curiosity_rl.R_bar},
-            "system_prompts":       list(self.system_prompts),
+            # now output the full mapping of prompt names → text
+            "system_prompts":       self.system_prompts,
             "stage_methods":        {}
         }
+
         for s in self.STAGES + ["curiosity_probe", "system_prompt_refine", "narrative_mull"]:
             fn = getattr(self, f"_stage_{s}", None)
             if fn:
