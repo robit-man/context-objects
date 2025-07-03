@@ -12,6 +12,7 @@ import os
 import contextlib
 import sqlite3
 from threading import Lock
+from json import JSONDecodeError
 
 if os.name == "nt":                # Windows ─ use msvcrt
     import msvcrt
@@ -448,20 +449,33 @@ class ContextObject:
 
 def sanitize_jsonl(path: str):
     """
-    Reads path under shared lock, drops any corrupted JSON lines,
-    and atomically rewrites it with only the valid ones.
+    Reads 'path' under shared lock, drops any corrupted JSON lines,
+    logs them into 'path.corrupt', and atomically rewrites with only valid ones.
     """
-    import os, tempfile
+    if not os.path.exists(path):
+        return
+
+    corrupt_path = path + ".corrupt"
     good_lines = []
-    # 1) Read under shared lock
+    bad_entries = []
+
+    # 1) Read & classify under shared lock
     with open(path, "r+", encoding="utf-8") as f, _locked(f, exclusive=False):
         for idx, line in enumerate(f, start=1):
             try:
                 json.loads(line)
                 good_lines.append(line)
-            except json.JSONDecodeError:
-                logging.warning(f"sanitize_jsonl: dropping invalid JSON on line {idx} in {path}")
-        # 2) Rewrite in-place
+            except JSONDecodeError as e:
+                logging.warning(f"sanitize_jsonl: dropping invalid JSON at line {idx} in {path}: {e}")
+                bad_entries.append((idx, line.rstrip("\n")))
+
+        # 2) If we found bad lines, log them out
+        if bad_entries:
+            with open(corrupt_path, "a", encoding="utf-8") as cf:
+                for idx, text in bad_entries:
+                    cf.write(f"{datetime.utcnow().isoformat()} LINE {idx}: {text}\n")
+
+        # 3) Rewrite the JSONL in-place
         f.seek(0)
         f.truncate()
         f.writelines(good_lines)
@@ -472,17 +486,20 @@ class JSONLContextRepository:
     _singleton = None
 
     def __init__(self, path: str):
-        import threading
-        from context import _locked
 
-        # ensure the directory exists (allow current dir if no dirname)
+        # 0) Clean up any existing corruption
+        sanitize_jsonl(path)
+
+        # 1) Ensure directory exists
         dirpath = os.path.dirname(path) or "."
         os.makedirs(dirpath, exist_ok=True)
 
+        # 2) Initialize file and lock
         self.path = path
         self._lock = threading.Lock()
-        # create the file if missing
-        open(self.path, "a").close()
+        open(self.path, "a").close()  # create file if missing
+
+        # 3) Register singleton
         JSONLContextRepository._singleton = self
 
     def get(self, context_id: str):
