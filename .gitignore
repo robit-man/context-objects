@@ -6,6 +6,8 @@
 *.db*
 *.corrupt
 *.jsonl
+*.ogg
+agent_stack.json
 captures
 config.json
 tts_ogg

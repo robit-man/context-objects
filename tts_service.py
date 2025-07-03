@@ -309,6 +309,16 @@ class TTSManager:
 
                 # enqueue the result path for retrieval
                 self._ogg_q.put(ogg_path)
+                # schedule .ogg file removal after TTL seconds
+                ttl_seconds = int(self.config.get("ogg_ttl", 300))  # default 5 min
+                timer = threading.Timer(
+                    ttl_seconds,
+                    lambda p=ogg_path: (
+                        os.path.exists(p) and os.remove(p)
+                    )
+                )
+                timer.daemon = True
+                timer.start()
 
             except Exception as e:
                 self.log(f"TTS file error: {e}", "ERROR")
