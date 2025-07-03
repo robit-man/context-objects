@@ -169,11 +169,11 @@ class TTSManager:
             piper_exe  = os.path.join(script_dir, "piper", "piper")
             onnx_json  = os.path.join(
                 script_dir,
-                self.config.get("onnx_json", "glados_piper_medium.onnx.json")
+                self.config.get("onnx_json", "overwatch.onnx.json")
             )
             onnx_model = os.path.join(
                 script_dir,
-                self.config.get("onnx_model",  "glados_piper_medium.onnx")
+                self.config.get("onnx_model",  "overwatch.onnx")
             )
 
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
@@ -247,8 +247,8 @@ class TTSManager:
                 # prepare paths
                 script_dir = os.path.dirname(__file__)
                 piper_exe  = os.path.join(script_dir, "piper", "piper")
-                onnx_json  = os.path.join(script_dir, self.config.get("onnx_json", "glados_piper_medium.onnx.json"))
-                onnx_model = os.path.join(script_dir, self.config.get("onnx_model",  "glados_piper_medium.onnx"))
+                onnx_json  = os.path.join(script_dir, self.config.get("onnx_json", "overwatch.onnx.json"))
+                onnx_model = os.path.join(script_dir, self.config.get("onnx_model",  "overwatch.onnx"))
                 out_dir    = self.config.get("ogg_dir", "tts_ogg")
                 os.makedirs(out_dir, exist_ok=True)
 

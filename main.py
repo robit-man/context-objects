@@ -115,8 +115,8 @@ def setup_piper_and_onnx():
     else:
         log_message("Piper already present.", "SUCCESS")
 
-    onnx_json  = os.path.join(script_dir, "glados_piper_medium.onnx.json")
-    onnx_model = os.path.join(script_dir, "glados_piper_medium.onnx")
+    onnx_json  = os.path.join(script_dir, "overwatch.onnx.json")
+    onnx_model = os.path.join(script_dir, "overwatch.onnx")
     if not os.path.isfile(onnx_json):
         log_message("Downloading ONNX JSON…", "PROCESS")
         subprocess.check_call([

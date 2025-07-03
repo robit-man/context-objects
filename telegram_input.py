@@ -22,7 +22,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
-
+from context import HybridContextRepository
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -32,7 +32,7 @@ from assembler import Assembler
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
-from context import ContextObject        # ← import the ContextObject factory
+from context import ContextObject, _locked
 
 import whisper
 _WHISPER = whisper.load_model("base")  # load once
@@ -88,6 +88,25 @@ async def _send_long_text_async(
             text=part,
             reply_to_message_id=reply_to
         )
+
+def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridContextRepository:
+    """
+    Ensure the JSONL is clean, then return a HybridContextRepository
+    that shards context_<chat_id>.jsonl + context_<chat_id>.db.
+    """
+    jsonl_path  = f"context_{chat_id}.jsonl"
+    sqlite_path = f"context_{chat_id}.db"
+
+    # sanitize JSONL before we use it
+    from context import sanitize_jsonl
+    sanitize_jsonl(jsonl_path)
+
+    # build the hybrid repository
+    return HybridContextRepository(
+        jsonl_path=jsonl_path,
+        sqlite_path=sqlite_path,
+        archive_max_mb=archive_max_mb,
+    )
 
 # ────────────────────────────────────────────────────────────────────────
 # Factory for per-stage status callback
@@ -190,14 +209,21 @@ def telegram_input(asm: Assembler):
         # 2) Instantiate Assembler for this chat if needed
         chat_asm = assemblers.get(chat_id)
         if chat_asm is None:
+            # — build a per-chat context repo that auto-sanitizes & shards —
+            repo = make_per_chat_repo(chat_id)
+
+            # — set up TTS as before —
             tts = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
             tts.set_mode("file")
+
+            # — pass repo into the Assembler —
             chat_asm = Assembler(
                 context_path     = f"context_{chat_id}.jsonl",
                 config_path      = "config.json",
                 lookback_minutes = 60,
                 top_k            = 5,
                 tts_manager      = tts,
+                repo              = repo,
             )
             assemblers[chat_id] = chat_asm
         chat_asm._chat_contexts.add(chat_id)

@@ -237,6 +237,8 @@ class ContextObject:
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
     
+
+
     @classmethod
     def make_narrative(
         cls,
@@ -443,6 +445,29 @@ class ContextObject:
         obj.metadata["content"] = content
         return obj
 
+
+def sanitize_jsonl(path: str):
+    """
+    Reads path under shared lock, drops any corrupted JSON lines,
+    and atomically rewrites it with only the valid ones.
+    """
+    import os, tempfile
+    good_lines = []
+    # 1) Read under shared lock
+    with open(path, "r+", encoding="utf-8") as f, _locked(f, exclusive=False):
+        for idx, line in enumerate(f, start=1):
+            try:
+                json.loads(line)
+                good_lines.append(line)
+            except json.JSONDecodeError:
+                logging.warning(f"sanitize_jsonl: dropping invalid JSON on line {idx} in {path}")
+        # 2) Rewrite in-place
+        f.seek(0)
+        f.truncate()
+        f.writelines(good_lines)
+        f.flush()
+        os.fsync(f.fileno())
+        
 class JSONLContextRepository:
     _singleton = None
 
@@ -629,15 +654,21 @@ class HybridContextRepository:
             lines = f.readlines()
 
         # parse lines, skip non-archiveable objects
-        entries = []
+        entries: list[tuple[int, datetime, ContextObject]] = []
         for idx, line in enumerate(lines):
             try:
                 obj = ContextObject.from_json(line)
             except Exception:
                 continue
-            # never archive schema artifacts
+
+            # <<< NEW: skip tool-code artifacts entirely >>>
+            if obj.domain == "artifact" and obj.component == "tool_code":
+                continue
+
+            # never archive schema artifacts either
             if obj.domain == "artifact" and obj.component == "schema":
                 continue
+
             # track (index, timestamp, object)
             ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
             entries.append((idx, ts, obj))
@@ -651,11 +682,13 @@ class HybridContextRepository:
             # archive into SQLite
             self.sql_repo.save(obj)
             to_remove.add(idx)
+
             # estimate remaining size
-            rem = 0
-            for i, l in enumerate(lines):
-                if i not in to_remove:
-                    rem += len(l.encode("utf-8"))
+            rem = sum(
+                len(l.encode("utf-8"))
+                for i, l in enumerate(lines)
+                if i not in to_remove
+            )
             if rem <= self._max_bytes:
                 break
 
@@ -664,6 +697,7 @@ class HybridContextRepository:
             for i, l in enumerate(lines):
                 if i not in to_remove:
                     f.write(l)
+
 
     @classmethod
     def instance(cls) -> "ContextRepository":

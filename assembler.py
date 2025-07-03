@@ -15,7 +15,7 @@ import difflib
 from ollama import chat, embed
 from tts_service import TTSManager
 from audio_service import AudioService
-from context import ContextObject, ContextRepository, MemoryManager, default_clock
+from context import ContextObject, ContextRepository, HybridContextRepository, MemoryManager, default_clock
 from tools import TOOL_SCHEMAS, Tools
 from datetime import datetime
 from collections import deque
@@ -341,27 +341,29 @@ class Assembler:
         config_path:      str = "config.json",
         lookback_minutes: int = 60,
         top_k:            int = 10,
-        tts_manager:      TTSManager | None    = None,
-        engine:           Any | None           = None,
-        rl_controller:    RLController | None  = None,
+        tts_manager:      Any | None    = None,
+        engine:           Any | None    = None,
+        rl_controller:    Any | None    = None,
+        repo:             ContextRepository | None = None,
     ):
         # 1) Remember your store paths
         self.context_path = context_path
         self.config_path  = config_path
+
         # — load or init config —
         try:
             self.cfg = json.load(open(config_path))
         except FileNotFoundError:
             self.cfg = {}
-            
-        # New pruning & window parameters, with sane defaults
+
+        # New pruning & window parameters
         self.context_ttl_days   = self.cfg.get("context_ttl_days",    7)
         self.max_history_items  = self.cfg.get("max_history_items",  10)
         self.max_semantic_items = self.cfg.get("max_semantic_items", 10)
         self.max_memory_items   = self.cfg.get("max_memory_items",   10)
         self.max_tool_outputs   = self.cfg.get("max_tool_outputs",   10)
 
-        # 4) Models & lookback
+        # Models & lookback
         self.primary_model   = self.cfg.get("primary_model",   "gemma3:4b")
         self.secondary_model = self.cfg.get("secondary_model", self.primary_model)
         self.lookback        = self.cfg.get("lookback_minutes", lookback_minutes)
@@ -419,27 +421,49 @@ class Assembler:
         )
         self.critic_prompt = self.cfg.get(
             "critic_prompt",
-            "You have an array of content at your disposal which must be analyzed and responded to accordingly.  "
-            "You’ll see:\n"
-            "  • Their original question\n"
-            "  • The plan of tool calls we ran\n"
-            "  • Your initial draft reply\n"
-            "  • All raw tool outputs\n\n"
-            "Make it engaging and human-sounding—feel free to vary phrasing and inject warmth—"
-            "but be accurate and grounded in those outputs.  Return just the final polished answer."
+            "Alright, detective, here’s your raw evidence:\n"
+            "  • The user’s question\n"
+            "  • The plan you executed, flagged with successes and failures\n"
+            "  • Your first draft—warts and all\n"
+            "  • Every raw tool output, including error dumps\n\n"
+            "Now, dissect each failure:\n"
+            "  - Pinpoint the exact call and its error message\n"
+            "  - Explain how that slip-up skewed your response\n"
+            "  - Propose a no-nonsense fix or fallback—no excuses\n\n"
+            "Then, grudgingly piece together a final answer that:\n"
+            "  • Owns up to any gaps caused by failures\n"
+            "  • Delivers razor-sharp accuracy and brevity\n"
+            "  • Milk every success for all it’s worth\n\n"
+            "Return only the final answer text."
         )
         self.narrative_mull_prompt = self.cfg.get(
             "narrative_mull_prompt",
-            "You are an autonomous meta-reasoner reflecting on your own "
-            "narrative and system prompts.\n\n"
-            "List up to three improvement areas.  For each, supply:\n"
-            '  { "area": "<short-name>", "question": "<self-reflection question>" }\n'
-            "Return ONLY valid JSON of the form:\n"
-            '{ "issues": [ … ] }'
+            "You are an autonomous meta-reasoner performing deep introspection on your own pipeline execution.  "
+            "You will be provided with:\n"
+            "  • The rolling narrative so far (conversation history + assistant actions)\n"
+            "  • The current system prompts and any dynamic prompt patches\n"
+            "  • The pipeline architecture (STAGES, optional_stages, RL weights)\n"
+            "  • Recent tool outputs, including errors and exceptions\n\n"
+            "Your task:\n"
+            "  1. Identify up to three distinct improvement areas.\n"
+            "  2. For each area, produce a JSON object with these keys:\n"
+            "     - \"area\":    a brief identifier (e.g. \"prompt_clarity\", \"error_handling\")\n"
+            "     - \"question\":a focused self-reflection question to probe why the issue occurred\n"
+            "     - \"recommendation\": a concise, actionable suggestion to address it\n"
+            "     - \"plan_calls\": optional array of tool calls (e.g. [\"toolX(param=…)\"]) if you can automate a fix\n\n"
+            "Return **only** valid JSON in this exact shape:\n"
+            "{\n"
+            "  \"issues\": [\n"
+            "    {\n"
+            "      \"area\": \"<short-name>\",\n"
+            "      \"question\": \"<self-reflection question>\",\n"
+            "      \"recommendation\": \"<concise suggestion>\",\n"
+            "      \"plan_calls\": [\"toolA(arg=…)\", …]\n"
+            "    },\n"
+            "    …\n"
+            "  ]\n"
+            "}"
         )
-
-
-        # — persist defaults back to config file if they changed —
         defaults = {
             "primary_model":    self.primary_model,
             "secondary_model":  self.secondary_model,
@@ -450,9 +474,18 @@ class Assembler:
         if any(defaults[k] != self.cfg.get(k) for k in defaults):
             json.dump({**self.cfg, **defaults}, open(self.config_path, "w"), indent=2)
 
-
         # — init context store & memory manager —
-        self.repo   = ContextRepository(context_path)
+        if repo is not None:
+            # use the injected per-chat repository
+            self.repo = repo
+        else:
+            # fallback: shard JSONL + SQLite alongside context_path
+            sqlite_path = context_path.replace(".jsonl", ".db")
+            self.repo = HybridContextRepository(
+                jsonl_path=context_path,
+                sqlite_path=sqlite_path,
+                archive_max_mb=self.cfg.get("archive_max_mb", 10.0),
+            )
         self.memman = MemoryManager(self.repo)
 
         # — setup embedding engine —
@@ -475,22 +508,22 @@ class Assembler:
         # — text-to-speech manager —
         self.tts = tts_manager
         self._chat_contexts: set[int] = set()
-        self._telegram_bot = None  # will be set by telegram_input
+        self._telegram_bot = None
+
+        # Self-review background thread control
+        import threading
+        self._stop_self_review    = threading.Event()
+        self._self_review_thread  = None
 
         # — auto-discover any _stage_<name>() methods as “optional” —
         all_methods = {name for name, _ in inspect.getmembers(self, inspect.ismethod)}
-
-        # include core STAGES + all three meta-stages
         discovered = [
             s for s in self.STAGES
                 + ["curiosity_probe", "system_prompt_refine", "narrative_mull"]
             if f"_stage_{s}" in all_methods
         ]
-
-        # allow config override, else use discovered
         self._optional_stages = self.cfg.get("rl_optional", discovered)
 
-        # on-disk RL controller now knows about your meta-stages too
         self.rl = rl_controller or RLController(
             stages=[
                 "curiosity_probe",
@@ -1125,83 +1158,107 @@ class Assembler:
     
     def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
         """
-        RL-gated self-mutation of prompts & policies, with full rollback
-        on any failure.
+        RL-gated self-mutation of prompts & policies, with full visibility
+        into narrative, architecture, and tool outcomes.
 
         • Chooses ONE tiny change (add / remove) per invocation.
-        • Creates a backup of the context store before mutating.
-        • Restores the original store if any exception occurs.
+        • Backups & rollbacks on failure.
         """
         import json, textwrap, os, shutil
         from datetime import datetime
+        import io, contextlib
 
-        # 1️  Recall-feature for RL gate
+        # — Helpers to pull in extra context —
+        def _arch_dump() -> str:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.dump_architecture()
+            return buf.getvalue()
+
+        # 1) Compute RL recall feature
         recall_ids = state.get("recent_ids", [])
-        counts: list[int] = []
+        counts = []
         for cid in recall_ids:
             try:
-                cobj = self.repo.get(cid)
-                counts.append(cobj.metadata.get("recall_stats", {}).get("count", 0))
+                counts.append(self.repo.get(cid).metadata.get("recall_stats", {}).get("count", 0))
             except KeyError:
-                continue
-        rf = (sum(counts) / len(counts)) if counts else 0.0
+                pass
+        rf = sum(counts) / len(counts) if counts else 0.0
 
-        # 2️  RL gate – maybe skip
+        # 2) RL-gate: maybe skip
         if not self.rl.should_run("system_prompt_refine", rf):
             return None
 
-        # 3️  Snapshot current static prompts (skip dynamic)
-        rows = self.repo.query(
+        # 3) Snapshot static prompts/policies
+        rows = list(self.repo.query(
             lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
-        )
+        ))
         rows.sort(key=lambda c: c.timestamp)
-        current_prompts = [
-            c.metadata.get("prompt") or c.metadata.get("policy") or "" for c in rows
-        ]
+        prompt_block = "\n".join(
+            f"- {textwrap.shorten(c.metadata.get('prompt', c.metadata.get('policy','')), 80)}"
+            for c in rows
+        ) or "(none)"
 
-        # 4A  Build metrics block
+        # 4A) Metrics & diagnostics
         metrics = {
             "errors":         len(state.get("errors", [])),
             "curiosity_used": state.get("curiosity_used", [])[-5:],
             "recall_mean":    rf,
         }
-
-        # 4B  Build diagnostics block
         rl_snapshot = {
             stage: round(self.rl.Q.get(stage, 0.0), 3)
             for stage in ("curiosity_probe", "system_prompt_refine", "narrative_mull")
         }
-        rl_baseline = round(self.rl.R_bar, 3)
-        total_objs = len(list(self.repo.query(lambda _: True)))
-        ephemeral_objs = len(list(self.repo.query(
-            lambda c: c.component in {"segment","tool_output","narrative","knowledge","stage_performance"}
-        )))
         diagnostics = {
-            "rl_Q":       rl_snapshot,
-            "rl_R_bar":   rl_baseline,
-            "repo_total": total_objs,
-            "repo_ephemeral": ephemeral_objs,
+            "rl_Q":         rl_snapshot,
+            "rl_R_bar":     round(self.rl.R_bar, 3),
+            "repo_total":   sum(1 for _ in self.repo.query(lambda _: True)),
+            "repo_ephemeral": sum(
+                1 for c in self.repo.query(lambda c: c.component in {
+                    "segment","tool_output","narrative","knowledge","stage_performance"
+                })
+            ),
         }
 
-        prompt_block = "\n".join(
-            f"- {textwrap.shorten(p, 60)}" for p in current_prompts
-        ) or "(none)"
+        # 4B) Running narrative
+        narr_ctx = self._load_narrative_context()
+        full_narr = narr_ctx.metadata.get("history_text", narr_ctx.summary or "(empty)")
 
-        # 4C  Assemble full refine prompt
+        # 4C) Last round of tool contexts
+        tool_ctxs = state.get("tool_ctxs", [])
+        tools_summary = json.dumps([
+            {
+            "call":   t.metadata.get("call", "<unknown>"),
+            "result": t.output.get("result", "<no result>"),
+            "error":  t.output.get("error", False)
+            }
+            for t in tool_ctxs
+        ], indent=2)
+
+        # 5) Build the refine prompt
+        arch       = _arch_dump()
         refine_prompt = (
-            "You are a self-optimising agent.\n\n"
-            "### Active Prompts / Policies ###\n"
+            "You are a self-optimising agent, reflecting on your entire run.\n\n"
+            "### Active System Prompts & Policies ###\n"
             f"{prompt_block}\n\n"
-            "### Recent Metrics ###\n"
-            f"{json.dumps(metrics, indent=2)}\n\n"
-            "### Diagnostics ###\n"
+            "### Running Narrative History ###\n"
+            f"{textwrap.shorten(full_narr, width=2000, placeholder='…')}\n\n"
+            "### Architecture Snapshot ###\n"
+            f"{textwrap.shorten(arch, width=2000, placeholder='…')}\n\n"
+            "### Recent Tool Activity ###\n"
+            f"{tools_summary}\n\n"
+            "### Metrics & Diagnostics ###\n"
+            f"{json.dumps(metrics, indent=2)}\n"
             f"{json.dumps(diagnostics, indent=2)}\n\n"
-            "Propose exactly **one** minimal change and return ONLY valid JSON:\n"
-            '{"action":"add","prompt":"<text>"} or '
-            '{"action":"remove","prompt":"<substring>"}'
+            "Propose **exactly one** minimal change and return ONLY JSON:\n"
+            '  {"action":"add","prompt":"<text>"}\n'
+            'OR\n'
+            '  {"action":"remove","prompt":"<substring>"}\n\n'
+            "Your change should be small, targeted, and improve performance in light"
+            " of the narrative and recent tool outcomes."
         )
 
-        # 5️  Run the model
+        # 6) Invoke the LLM
         try:
             raw = self._stream_and_capture(
                 self.primary_model,
@@ -1209,26 +1266,25 @@ class Assembler:
                 tag="[SysPromptRefine]"
             ).strip()
             plan = json.loads(raw)
-            if not isinstance(plan, dict):
-                return None
-            action = plan.get("action")
-            text   = (plan.get("prompt") or "").strip()
+        except Exception:
+            return None
+        if not isinstance(plan, dict):
+            return None
+
+        action = plan.get("action")
+        text   = (plan.get("prompt") or "").strip()
+
+        # 7) Backup & apply
+        backup = self.context_path + ".bak"
+        try:
+            shutil.copy(self.context_path, backup)
         except Exception:
             return None
 
-        # 6️  Backup context store
-        backup_path = self.context_path + ".bak"
-        try:
-            shutil.copy(self.context_path, backup_path)
-        except Exception as e:
-            print(f"Failed to back up context store: {e}", "ERROR")
-            return None
-
-        # 7️  Apply patch + reseed, with rollback on error
         try:
             if action == "add" and text:
                 patch = ContextObject.make_policy(
-                    label=f"dynamic_prompt_{len(text)}",
+                    label=f"dynamic_prompt_add_{len(text)}",
                     policy_text=text,
                     tags=["dynamic_prompt"],
                 )
@@ -1238,46 +1294,33 @@ class Assembler:
                 for row in rows:
                     blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
                     if text in blob:
-                        try:
-                            self.repo.delete(row.context_id)
-                        except KeyError:
-                            pass
+                        self.repo.delete(row.context_id)
 
             else:
-                # nothing changed: clean up and exit
-                os.remove(backup_path)
+                os.remove(backup)
                 return None
 
-            # re-seed static prompts so context.jsonl stays coherent
+            # Re-seed static prompts so context.jsonl remains coherent
             self._seed_static_prompts()
 
         except Exception as e:
-            # rollback entire store
-            try:
-                shutil.move(backup_path, self.context_path)
-                print(f"Rolled back prompt changes due to error: {e}", "WARNING")
-            except Exception as e2:
-                print(f"Rollback failed: {e2}", "ERROR")
+            # rollback
+            shutil.move(backup, self.context_path)
             return None
 
-        # 8️  On success, remove backup
-        try:
-            os.remove(backup_path)
-        except OSError:
-            pass
+        # 8) Clean up & log
+        try: os.remove(backup)
+        except: pass
 
-        # 9️  Log the decision
         refine_ctx = ContextObject.make_stage(
             "system_prompt_refine",
             [cid for cid in recall_ids if self.repo_exists(cid)],
             {"action": action, "text": text},
         )
         refine_ctx.component = "patch"
-        refine_ctx.touch()
-        self.repo.save(refine_ctx)
+        refine_ctx.touch(); self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
-
 
 
     # Helper used above ---------------------------------------------------
@@ -1303,15 +1346,22 @@ class Assembler:
         • Returns immediately on empty input.
         • Catches unexpected errors and returns a simple apology.
         """
-
         # ① Short-circuit empty or whitespace-only inputs
         if not user_text or not user_text.strip():
             return ""
+
+        # Stop any prior self-review loop
+        self._stop_self_review.set()
+        if self._self_review_thread and self._self_review_thread.is_alive():
+            self._self_review_thread.join(timeout=1.0)
+        # Prepare for new run
+        self._stop_self_review.clear()
 
         try:
             from datetime import datetime
             from collections import deque
             import threading
+
 
             # ── helper: crude complexity metric ──────────────────────────────────
             def _complexity(q: str, notes: str, kws: list[str]) -> float:
@@ -1338,6 +1388,8 @@ class Assembler:
                 "rl_included":    [],
                 "recent_ids":     [],
             }
+            self._last_state = state
+
             answer: str | None = None
             self._last_errors = False
 
@@ -1550,6 +1602,12 @@ class Assembler:
             # RL reward update
             self.rl.update(state["rl_included"], 1.0 if not state["errors"] else 0.0)
             self.curiosity_used = state["curiosity_used"]
+            # Launch background self-review thread
+            if not self._self_review_thread or not self._self_review_thread.is_alive():
+                self._self_review_thread = threading.Thread(
+                    target=self._background_self_review, daemon=True
+                )
+                self._self_review_thread.start()
 
             # ── final output via status_cb ─────────────────────────────────────
             final_text = (answer or state.get("final", "")).strip()
@@ -1565,6 +1623,19 @@ class Assembler:
             return apology
 
 
+    def _background_self_review(self):
+        import time
+        while not self._stop_self_review.is_set():
+            try:
+                # make a copy so we don’t mutate the live state
+                state = getattr(self, "_last_state", {}).copy()
+                # run the two meta-stages continuously
+                self._stage_system_prompt_refine(state)
+                self._stage_narrative_mull(state)
+            except Exception:
+                pass
+            # wait before next self-talk cycle
+            time.sleep(10)
 
 
     def _stage1_record_input(self, user_text: str) -> ContextObject:
@@ -3034,122 +3105,164 @@ class Assembler:
         return f"pruned {deleted} items (ttl={self.context_ttl_days}d, cap={cap})"
 
 
-
-
-    # ---------------------------------------------------------------------
-    #  Async self-reflection stage (robust, non-blocking)
-    # ---------------------------------------------------------------------
     def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
         """
-        Fire-and-forget background task that:
-        1) Reads the running narrative & current prompts
-        2) Asks the LLM for ≤3 improvement areas + questions
-        3) Stores each Q-and-A as ContextObjects
-        4) Emits a dynamic_prompt_patch for every answer
-
-        Never blocks the user-facing pipeline.
+        Async “self-talk” that:
+          1. Gathers narrative, prompts, architecture.
+          2. Pulls last-turn stage metrics & tool failures.
+          3. Asks the LLM for ≤3 improvement items (diagnosis + questions + patches + mini-plans).
+          4. Records Q&A, applies prompt patches, executes any plan_calls via normal pipeline.
         """
-        import threading
+        import threading, io, contextlib, json, textwrap, datetime
+
+        def _arch_dump() -> str:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.dump_architecture()
+            return buf.getvalue()
+
+        def _collect_metrics() -> str:
+            # fetch all stage_performance objects from repo
+            perf_rows = list(self.repo.query(lambda c: c.component=="stage_performance"))
+            data = [
+                {
+                    "stage": r.metadata["stage"],
+                    "duration": round(r.metadata["duration"],3),
+                    "error": r.metadata["error"]
+                }
+                for r in perf_rows[-20:]  # last 20 entries
+            ]
+            return json.dumps(data, indent=2)
+
+        def _collect_tool_failures() -> str:
+            failures = []
+            for ctx in state.get("tool_ctxs", []):
+                if ctx.output.get("result", "").startswith("ERROR"):
+                    failures.append({
+                        "call": ctx.metadata.get("call"),
+                        "error": ctx.output["result"]
+                    })
+            return json.dumps(failures, indent=2)
 
         def _worker():
-            import json, textwrap
-            from datetime import datetime
-
-            # 1️  Get the full narrative text
-            narr_ctx = self._load_narrative_context()                 # singleton
-            full_narr = narr_ctx.metadata.get("narrative", narr_ctx.summary or "")
-
-            # 2️  Snapshot active prompts / policies (skip previous patches)
-            prompt_rows = self.repo.query(
-                lambda c: c.component in ("prompt", "policy") and "dynamic_prompt" not in c.tags
-            )
-            prompt_rows.sort(key=lambda c: c.timestamp)
-            prompt_block = "\n".join(
-                f"{textwrap.shorten(c.summary or '', width=120, placeholder='…')}"
-                for c in prompt_rows
-            ) or "(none)"
-
-            # 3️  Build the meta-prompt
-            meta_prompt = (
-                self._get_prompt("narrative_mull_prompt")
-                + "\n\n### Narrative ###\n"    + full_narr
-                + "\n\n### Active Prompts & Policies ###\n" + prompt_block
-            )
-
-            # 4️  Call the LLM
             try:
-                raw  = self._stream_and_capture(
+                # 1) narrative + prompts + arch
+                narr = self._load_narrative_context()
+                full_narr = narr.metadata.get("history_text", narr.summary or "")
+
+                prompts = self.repo.query(
+                    lambda c: c.component in ("prompt","policy") and "dynamic_prompt" not in c.tags
+                )
+                prompts.sort(key=lambda c: c.timestamp)
+                prompt_block = "\n".join(
+                    f"- {textwrap.shorten(p.summary or '', 80)}"
+                    for p in prompts
+                ) or "(none)"
+
+                arch = _arch_dump()
+                metrics = _collect_metrics()
+                fails  = _collect_tool_failures()
+
+                # 2) assemble meta-prompt
+                meta = (
+                    self._get_prompt("narrative_mull_prompt")
+                    + "\n\n### Narrative ###\n" + full_narr
+                    + "\n\n### Prompts ###\n" + prompt_block
+                    + "\n\n### Architecture ###\n" + arch
+                    + "\n\n### Recent Stage Metrics ###\n" + metrics
+                    + "\n\n### Tool Failures ###\n" + fails
+                )
+
+                raw = self._stream_and_capture(
                     self.primary_model,
-                    [{"role": "system", "content": meta_prompt}],
+                    [{"role":"system","content": meta}],
                     tag="[NarrativeMull]"
                 ).strip()
                 data = json.loads(raw)
                 issues = data.get("issues", [])
                 if not isinstance(issues, list):
                     return
-            except Exception:
-                return   # silently bail on bad JSON / API failure
 
-            # 5️  Persist each Q & A pair
+            except Exception:
+                return  # abort silently
+
+            # 3) process each issue
             for idx, item in enumerate(issues, 1):
                 if not isinstance(item, dict):
                     continue
-                area     = item.get("area", f"area_{idx}")
-                question = (item.get("question") or "").strip()
-                if not question:
-                    continue
+                area      = item.get("area", f"area_{idx}")
+                diag      = item.get("diagnosis","").strip()
+                q_text    = item.get("question","").strip()
+                patch     = item.get("prompt_patch","").strip()
+                plan_calls= item.get("plan_calls", [])
 
-                # QUESTION object
+                # record question
                 q_ctx = ContextObject.make_stage(
-                    stage_name="narrative_question",
-                    input_refs=[narr_ctx.context_id],
-                    output={"question": question},
+                    "narrative_question",
+                    [narr.context_id],
+                    {"area": area, "diagnosis": diag, "question": q_text}
                 )
-                q_ctx.component      = "narrative"
-                q_ctx.semantic_label = f"narrative_question_{idx}"
-                q_ctx.tags.append("narrative")
+                q_ctx.component="narrative"; q_ctx.tags.append("narrative")
                 q_ctx.touch(); self.repo.save(q_ctx)
 
-                # ANSWER from the model
-                answer = self._stream_and_capture(
-                    self.primary_model,
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are the same meta-reasoner.  Answer the following "
-                                "self-reflection question **only** from the narrative & prompts."
-                            ),
-                        },
-                        {"role": "user", "content": question},
-                    ],
-                    tag=f"[NarrativeAnswer_{idx}]"
-                ).strip()
+                # get answer
+                answer = ""
+                if q_text:
+                    answer = self._stream_and_capture(
+                        self.primary_model,
+                        [
+                            {"role":"system","content":
+                                "You are the same meta-reasoner; answer only from the given data, be concise."},
+                            {"role":"user","content": q_text}
+                        ],
+                        tag=f"[NarrativeAnswer_{idx}]"
+                    ).strip()
 
-                # ANSWER object
+                # record answer
                 a_ctx = ContextObject.make_stage(
-                    stage_name="narrative_answer",
-                    input_refs=[q_ctx.context_id],
-                    output={"answer": answer},
+                    "narrative_answer",
+                    [q_ctx.context_id],
+                    {"answer": answer}
                 )
-                a_ctx.component      = "narrative"
-                a_ctx.semantic_label = f"narrative_answer_{idx}"
-                a_ctx.tags.append("narrative")
+                a_ctx.component="narrative"; a_ctx.tags.append("narrative")
                 a_ctx.touch(); self.repo.save(a_ctx)
 
-                # Dynamic prompt patch
-                patch_text = (
-                    f"// {datetime.utcnow().isoformat(timespec='seconds')}Z\n"
-                    f"Issue: {area}\nQ: {question}\nA: {answer}\n"
-                )
-                patch = ContextObject.make_policy(
-                    label="dynamic_prompt_patch",
-                    policy_text=patch_text,
-                    tags=["dynamic_prompt"],
-                )
-                patch.touch(); self.repo.save(patch)
+                # apply prompt patch
+                if patch:
+                    txt = (
+                        f"// {datetime.datetime.utcnow().isoformat()}Z\n"
+                        f"Issue:{area}\nDiag:{diag}\nQ:{q_text}\nA:{answer}\nPATCH:{patch}\n"
+                    )
+                    dyn = ContextObject.make_policy(
+                        "dynamic_prompt_patch", policy_text=txt, tags=["dynamic_prompt"]
+                    )
+                    dyn.touch(); self.repo.save(dyn)
 
-        # Launch the mull on a daemon thread and return immediately
+                # run plan_calls via real pipeline
+                if plan_calls:
+                    try:
+                        plan_obj = {"tasks":[
+                            {"call":c.split("(",1)[0], "tool_input":{}, "subtasks": []}
+                            for c in plan_calls
+                        ]}
+                        pj = json.dumps(plan_obj)
+                        p_ctx = ContextObject.make_stage("internal_plan",[a_ctx.context_id],{"plan":plan_obj})
+                        p_ctx.touch(); self.repo.save(p_ctx)
+
+                        tools = self._stage6_prepare_tools()
+                        fixed,_,_ = self._stage7b_plan_validation(p_ctx,pj,tools)
+                        tc, calls, schemas = self._stage8_tool_chaining(p_ctx,"\n".join(fixed),tools)
+                        self._stage9_invoke_with_retries(
+                            raw_calls=calls, plan_output="\n".join(fixed),
+                            selected_schemas=schemas,
+                            user_text="(self-review)", clar_metadata={}
+                        )
+                    except Exception as e:
+                        err = ContextObject.make_failure(
+                            f"narrative_mull plan error: {e}", refs=[a_ctx.context_id]
+                        )
+                        err.touch(); self.repo.save(err)
+
+        # start thread
         threading.Thread(target=_worker, daemon=True).start()
         return "(narrative mull dispatched)"
-
