@@ -1160,9 +1160,6 @@ class Assembler:
         """
         RL-gated self-mutation of prompts & policies, with full visibility
         into narrative, architecture, and tool outcomes.
-
-        • Chooses ONE tiny change (add / remove) per invocation.
-        • Backups & rollbacks on failure.
         """
         import json, textwrap, os, shutil
         from datetime import datetime
@@ -1228,9 +1225,13 @@ class Assembler:
         tool_ctxs = state.get("tool_ctxs", [])
         tools_summary = json.dumps([
             {
-            "call":   t.metadata.get("call", "<unknown>"),
-            "result": t.output.get("result", "<no result>"),
-            "error":  t.output.get("error", False)
+                "call":   t.metadata.get("call", "<unknown>"),
+                "result": t.metadata.get("output", {}).get("result", "<no result>")
+                         if isinstance(t.metadata.get("output"), dict)
+                         else t.metadata.get("output", "<no result>"),
+                "error":  t.metadata.get("output", {}).get("error", False)
+                         if isinstance(t.metadata.get("output"), dict)
+                         else False
             }
             for t in tool_ctxs
         ], indent=2)
@@ -1254,8 +1255,7 @@ class Assembler:
             '  {"action":"add","prompt":"<text>"}\n'
             'OR\n'
             '  {"action":"remove","prompt":"<substring>"}\n\n'
-            "Your change should be small, targeted, and improve performance in light"
-            " of the narrative and recent tool outcomes."
+            "Your change should be small, targeted, and improve performance."
         )
 
         # 6) Invoke the LLM
@@ -1300,11 +1300,9 @@ class Assembler:
                 os.remove(backup)
                 return None
 
-            # Re-seed static prompts so context.jsonl remains coherent
             self._seed_static_prompts()
 
-        except Exception as e:
-            # rollback
+        except Exception:
             shutil.move(backup, self.context_path)
             return None
 
@@ -1321,6 +1319,7 @@ class Assembler:
         refine_ctx.touch(); self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
+
 
 
     # Helper used above ---------------------------------------------------

@@ -5,8 +5,6 @@ __pycache__
 context.jsonl
 captures
 .setup_complete
-glados_piper_medium.onnx
-glados_piper_medium.onnx.json
 piper_linux_x86_64.tar.gz
 piper
 workspace
