@@ -825,7 +825,8 @@ class Assembler:
 
         narr_objs = self.repo.query(lambda c: c.component == "narrative")
         narr_objs.sort(key=lambda c: c.timestamp)
-        keeper.metadata["narrative"] = "\n".join(n.summary for n in narr_objs)
+        # coerce None→"" so join never fails
+        keeper.metadata["narrative"] = "\n".join((n.summary or "") for n in narr_objs)
         keeper.summary = keeper.metadata["narrative"] or "(no narrative yet)"
         keeper.references = [n.context_id for n in narr_objs]
         keeper.touch()
@@ -1203,7 +1204,8 @@ class Assembler:
     def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
         """
         RL-gated self-mutation of prompts & policies, with full visibility
-        into narrative, architecture, and tool outcomes.
+        into narrative, architecture, tool outcomes—and now a window of past
+        evaluation events.
         """
         import json, textwrap, os, shutil
         from datetime import datetime
@@ -1259,11 +1261,22 @@ class Assembler:
             for c in rows
         ) or "(none)"
 
+        # ── 3B) Pull in last 10 evaluation events ────────────────────────
+        eval_rows = list(self.repo.query(
+            lambda c: c.component == "stage_performance"
+        ))
+        eval_rows.sort(key=lambda c: c.timestamp)
+        recent_evals = eval_rows[-10:]
+        eval_block = "\n".join(
+            f"[{e.timestamp}] { (e.summary or '').replace(chr(10), ' ') }"
+            for e in recent_evals
+        ) or "(no prior evaluations)"
+
         # 4A) Metrics & diagnostics
         metrics = {
-            "errors":       len(state.get("errors", [])),
-            "curiosity_used": state.get("curiosity_used", [])[-5:],
-            "recall_mean":  rf,
+            "errors":          len(state.get("errors", [])),
+            "curiosity_used":  state.get("curiosity_used", [])[-5:],
+            "recall_mean":     rf,
         }
         rl_snapshot = {
             stage: round(self.rl.Q.get(stage, 0.0), 3)
@@ -1299,12 +1312,14 @@ class Assembler:
             for t in tool_ctxs
         ], indent=2)
 
-        # 5) Build the refine prompt
+        # 5) Build the refine prompt (now including eval block)—
         arch = _arch_dump()
         refine_prompt = (
             "You are a self-optimising agent, reflecting on your entire run.\n\n"
             "### Active System Prompts & Policies ###\n"
             f"{prompt_block}\n\n"
+            "### Recent Evaluation History ###\n"
+            f"{eval_block}\n\n"
             "### Running Narrative History ###\n"
             f"{textwrap.shorten(full_narr, width=2000, placeholder='…')}\n\n"
             "### Architecture Snapshot ###\n"
@@ -1337,7 +1352,7 @@ class Assembler:
         action = plan.get("action")
         text   = (plan.get("prompt") or "").strip()
 
-        # 7) Backup & apply
+        # 7) Backup & apply (unchanged)
         backup = self.context_path + ".bak"
         try:
             shutil.copy(self.context_path, backup)
@@ -1359,7 +1374,6 @@ class Assembler:
                     blob = row.metadata.get("prompt") or row.metadata.get("policy") or ""
                     if text in blob:
                         self.repo.delete(row.context_id)
-
             else:
                 os.remove(backup)
                 return None
@@ -1370,7 +1384,7 @@ class Assembler:
             shutil.move(backup, self.context_path)
             return None
 
-        # 8) Clean up & log
+        # 8) Clean up & record
         try:
             os.remove(backup)
         except:
@@ -1386,7 +1400,6 @@ class Assembler:
         self.repo.save(refine_ctx)
 
         return f"{action}:{text or '(none)'}"
-
 
 
 
