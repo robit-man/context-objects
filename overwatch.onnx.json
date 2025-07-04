@@ -1,8 +1,8 @@
 {
-    "dataset": "datasets",
+    "dataset": "output",
     "audio": {
         "sample_rate": 22050,
-        "quality": "output"
+        "quality": "overwatch"
     },
     "espeak": {
         "voice": "en-us"
