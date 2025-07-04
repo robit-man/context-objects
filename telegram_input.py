@@ -387,8 +387,10 @@ def telegram_input(asm: Assembler):
                     chat_asm.tts.set_mode("file")
                     final = await asyncio.to_thread(
                         chat_asm.run_with_meta_context,
-                        request_text, status_cb, chat_id, placeholder_id
+                        request_text,
+                        status_cb
                     )
+
                     stop_status()
 
                     # text response

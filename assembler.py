@@ -1417,38 +1417,37 @@ class Assembler:
         self,
         user_text: str,
         status_cb: Callable[[str, Any], None] = lambda *a: None,
-        chat_id:  Optional[int]               = None,
-        msg_id:   Optional[int]               = None,
     ) -> str:
         """
         End-to-end orchestrator with retry logic and JSONL sanitization.
 
         • First prunes old/overflow contexts.
         • Returns immediately on empty input.
-        • Drives each stage in sequence, reporting progress via status_cb(stage, summary).
+        • Drives each stage in sequence, reporting progress via
+          status_cb(stage, summary).
         • At the end, returns the final answer string.
         """
         from context import sanitize_jsonl
         from datetime import datetime
 
-        # ① short-circuit empty
+        # short-circuit empty
         if not user_text or not user_text.strip():
+            status_cb("output", "")
             return ""
 
-        # clean up JSONL
+        # sanitize JSONL store
         repo_root = getattr(self.repo, "json_repo", self.repo)
         sanitize_jsonl(repo_root.path)
 
         state: Dict[str, Any] = {
-            "user_text": user_text,
-            "errors":    [],
-            "tool_ctxs": [],
+            "user_text":  user_text,
+            "errors":     [],
+            "tool_ctxs":  [],
             "recent_ids": [],
         }
 
         def _record_perf(stage: str, summary: str, ok: bool, ctx: ContextObject = None):
-            """Helper to record timing + error and notify via status_cb."""
-            # record the performance object
+            # record performance object and callback
             duration = (datetime.utcnow() - t0).total_seconds()
             refs = [state["user_ctx"].context_id] if "user_ctx" in state else []
             perf = ContextObject.make_stage(
@@ -1456,8 +1455,8 @@ class Assembler:
                 refs,
                 {"stage": stage, "duration": duration, "error": not ok}
             )
-            perf.touch(); self.repo.save(perf)
-            # only two args here
+            perf.touch()
+            self.repo.save(perf)
             status_cb(stage, summary)
 
         # ─── Stage 1: record_input ───────────────────────────────────────
@@ -1552,9 +1551,11 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
-                state["plan_ctx"], "\n".join(state.get("fixed_calls", [])), state["tools_list"]
+                state["plan_ctx"],
+                "\n".join(state.get("fixed_calls", [])),
+                state["tools_list"]
             )
-            state.update({"tc_ctx":tc_ctx, "raw_calls":raw_calls, "schemas":schemas})
+            state.update({"tc_ctx": tc_ctx, "raw_calls": raw_calls, "schemas": schemas})
             _record_perf("tool_chaining", f"{len(raw_calls)} calls", True, tc_ctx)
         except Exception as e:
             _record_perf("tool_chaining", str(e), False)
@@ -1593,7 +1594,7 @@ class Assembler:
         try:
             rp = self._stage9b_reflection_and_replan(
                 state["tool_ctxs"],
-                state.get("plan_output",""),
+                state.get("plan_output", ""),
                 user_text,
                 state["clar_ctx"].metadata
             )
@@ -1617,7 +1618,7 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             final = self._stage10b_response_critique_and_safety(
-                state.get("draft",""), user_text, state.get("tool_ctxs",[])
+                state.get("draft", ""), user_text, state.get("tool_ctxs", [])
             )
             state["final"] = final
             _record_perf("response_critique", "(polished)", True)
@@ -1628,26 +1629,23 @@ class Assembler:
         # ─── Stage 11: memory_writeback ───────────────────────────────
         t0 = datetime.utcnow()
         try:
-            self._stage11_memory_writeback(state.get("final",""), state.get("tool_ctxs",[]))
+            self._stage11_memory_writeback(state.get("final", ""), state.get("tool_ctxs", []))
             _record_perf("memory_writeback", "(queued)", True)
         except Exception as e:
             _record_perf("memory_writeback", str(e), False)
             state["errors"].append(("memory_writeback", str(e)))
 
-        # ─── Single self-review & narrative-mull ──────────────────────
-        try:
-            self._stage_system_prompt_refine(state)
-        except:
-            pass
-        try:
-            self._stage_narrative_mull(state)
-        except:
-            pass
+        # one-off self-review & narrative-mull
+        try:    self._stage_system_prompt_refine(state)
+        except: pass
+        try:    self._stage_narrative_mull(state)
+        except: pass
 
-        # ─── final output ──────────────────────────────────────────────
-        out = state.get("final","").strip()
+        # final output
+        out = state.get("final", "").strip()
         status_cb("output", out)
         return out
+
 
 
     def _background_self_review(self):
