@@ -20,7 +20,8 @@ from tools import TOOL_SCHEMAS, Tools
 from datetime import datetime
 from collections import deque
 import inspect
-import threading
+from threading import Lock, Thread, Event
+from queue import Queue, Empty
 import ast, json, re
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
@@ -1411,8 +1412,7 @@ class Assembler:
             return True
         except KeyError:
             return False
-        
-        
+                
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1424,11 +1424,12 @@ class Assembler:
         • First prunes old/overflow contexts.
         • Returns immediately on empty input.
         • Drives each stage in sequence, reporting progress via
-          status_cb(stage, summary).
+        status_cb(stage, summary).
         • At the end, returns the final answer string.
         """
         from context import sanitize_jsonl
         from datetime import datetime
+        import logging
 
         # short-circuit empty
         if not user_text or not user_text.strip():
@@ -1511,6 +1512,17 @@ class Assembler:
         except Exception as e:
             _record_perf("external_knowledge", str(e), False)
             state["errors"].append(("external_knowledge", str(e)))
+            # ensure know_ctx is always present for planning
+            dummy = ContextObject.make_stage(
+                "external_knowledge_retrieval",
+                state["clar_ctx"].references if "clar_ctx" in state else [],
+                {"snippets": []}
+            )
+            dummy.stage_id = "external_knowledge_retrieval"
+            dummy.summary = "(no snippets)"
+            dummy.touch()
+            self.repo.save(dummy)
+            state["know_ctx"] = dummy
 
         # ─── Stage 6: prepare_tools ────────────────────────────────────
         t0 = datetime.utcnow()
@@ -1525,8 +1537,12 @@ class Assembler:
         # ─── Stage 7: planning_summary ──────────────────────────────────
         t0 = datetime.utcnow()
         try:
+            logging.debug("Planning with tools: %s", [t["name"] for t in state.get("tools_list", [])])
             ctx7, plan_out = self._stage7_planning_summary(
-                state["clar_ctx"], state["know_ctx"], state["tools_list"], user_text
+                state.get("clar_ctx"),
+                state.get("know_ctx"),
+                state.get("tools_list", []),
+                user_text
             )
             state["plan_ctx"]    = ctx7
             state["plan_output"] = plan_out
@@ -1539,7 +1555,7 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             _, _, fixed = self._stage7b_plan_validation(
-                state["plan_ctx"], state["plan_output"], state["tools_list"]
+                state["plan_ctx"], state["plan_output"], state.get("tools_list", [])
             )
             state["fixed_calls"] = fixed
             _record_perf("plan_validation", f"{len(fixed)} calls", True)
@@ -1553,7 +1569,7 @@ class Assembler:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
                 "\n".join(state.get("fixed_calls", [])),
-                state["tools_list"]
+                state.get("tools_list", [])
             )
             state.update({"tc_ctx": tc_ctx, "raw_calls": raw_calls, "schemas": schemas})
             _record_perf("tool_chaining", f"{len(raw_calls)} calls", True, tc_ctx)
