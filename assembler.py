@@ -501,8 +501,9 @@ class Assembler:
                 return np.zeros(768, dtype=float)
 
         self.engine = ContextQueryEngine(self.repo, lambda t: embed_text(t))
-
-        # — seed all schemas & static prompts —
+        
+        from context import sanitize_jsonl
+        sanitize_jsonl(self.context_path)
         self._seed_tool_schemas()
         self._seed_static_prompts()
 
@@ -624,11 +625,8 @@ class Assembler:
            lambda t: embed_text(t)  # Use your custom embedding function
         )
 
-                
-        self._seed_tool_schemas()
-        self._seed_static_prompts()
-        self.tts = tts_manager
-                
+
+
 
     def _seed_tool_schemas(self) -> None:
         """
@@ -1413,32 +1411,96 @@ class Assembler:
         except KeyError:
             return False
                 
+    def filter_callback(self, user_text: str) -> bool:
+        """
+        Decide—via a YES/NO LLM query over the last several turns—whether
+        we should continue running the full pipeline and reply.
+        """
+        import re
+        from ollama import chat
+
+        # 1) Fetch the last 8 user_input/assistant segments for context
+        segs = [
+            c for c in self.repo.query(
+                lambda c: c.domain    == "segment"
+                          and c.semantic_label in ("user_input", "assistant")
+            )
+        ]
+        segs.sort(key=lambda c: c.timestamp)
+        recent = segs[-8:]  # last 8 turns
+
+        # 2) Build a mini‐conversation history block
+        convo = ""
+        for c in recent:
+            speaker = "User" if c.semantic_label == "user_input" else "Assistant"
+            convo += f"{speaker}: {c.summary}\n"
+
+        # 3) Prepare a richer decision prompt
+        system_msg = (
+            "You are an **attentive meta-reasoner** with limited attention.  "
+            "Your job is to decide whether the assistant should interject **now**, "
+            "based on the **flow**, **relevance**, and **tone** of the conversation.  "
+            "Consider how the new message builds on or deviates from recent context.  "
+            "Answer *only* 'YES' or 'NO'."
+        )
+        user_msg = (
+            "=== Recent Conversation ===\n"
+            f"{convo}\n"
+            f"=== New Message ===\n{user_text}\n\n"
+            "Should the assistant respond at this point?"
+        )
+
+        # 4) Stream the model’s YES/NO answer
+        resp = ""
+        for part in chat(
+            model=self.secondary_model,
+            messages=[
+                {"role": "system",  "content": system_msg},
+                {"role": "user",    "content": user_msg}
+            ],
+            stream=True
+        ):
+            resp += part["message"]["content"]
+
+        # 5) Record the decision Q&A into memory
+        q_ctx = ContextObject.make_stage(
+            "decision_question",
+            [], {"prompt": user_msg}
+        )
+        q_ctx.component      = "decision"
+        q_ctx.semantic_label = "question"
+        q_ctx.touch()
+        self.repo.save(q_ctx)
+
+        a_ctx = ContextObject.make_stage(
+            "decision_answer",
+            [q_ctx.context_id], {"answer": resp.strip()}
+        )
+        a_ctx.component      = "decision"
+        a_ctx.semantic_label = "answer"
+        a_ctx.touch()
+        self.repo.save(a_ctx)
+
+        # 6) Return True if we got a 'YES'
+        return bool(re.search(r"\byes\b", resp, re.I))
+
+
     def run_with_meta_context(
         self,
         user_text: str,
         status_cb: Callable[[str, Any], None] = lambda *a: None,
     ) -> str:
-        """
-        End-to-end orchestrator with retry logic and JSONL sanitization.
-
-        • First prunes old/overflow contexts.
-        • Returns immediately on empty input.
-        • Drives each stage in sequence, reporting progress via
-        status_cb(stage, summary).
-        • At the end, returns the final answer string.
-        """
         from context import sanitize_jsonl
         from datetime import datetime
         import logging
+
+        # sanitize JSONL store
+        sanitize_jsonl(self.context_path)
 
         # short-circuit empty
         if not user_text or not user_text.strip():
             status_cb("output", "")
             return ""
-
-        # sanitize JSONL store
-        repo_root = getattr(self.repo, "json_repo", self.repo)
-        sanitize_jsonl(repo_root.path)
 
         state: Dict[str, Any] = {
             "user_text":  user_text,
@@ -1448,7 +1510,6 @@ class Assembler:
         }
 
         def _record_perf(stage: str, summary: str, ok: bool, ctx: ContextObject = None):
-            # record performance object and callback
             duration = (datetime.utcnow() - t0).total_seconds()
             refs = [state["user_ctx"].context_id] if "user_ctx" in state else []
             perf = ContextObject.make_stage(
@@ -1459,6 +1520,19 @@ class Assembler:
             perf.touch()
             self.repo.save(perf)
             status_cb(stage, summary)
+
+        # ─── Stage 0: decision_to_respond ────────────────────────────────
+        t0 = datetime.utcnow()
+        try:
+            should = self.filter_callback(user_text)
+            state["should_respond"] = should
+            _record_perf("decision_to_respond", str(should), True)
+            if not should:
+                status_cb("output", "")
+                return ""
+        except Exception as e:
+            _record_perf("decision_to_respond", str(e), False)
+            # if the decision stage fails, proceed anyway
 
         # ─── Stage 1: record_input ───────────────────────────────────────
         t0 = datetime.utcnow()
@@ -1512,16 +1586,14 @@ class Assembler:
         except Exception as e:
             _record_perf("external_knowledge", str(e), False)
             state["errors"].append(("external_knowledge", str(e)))
-            # ensure know_ctx is always present for planning
             dummy = ContextObject.make_stage(
                 "external_knowledge_retrieval",
-                state["clar_ctx"].references if "clar_ctx" in state else [],
+                state["clar_ctx"].references,
                 {"snippets": []}
             )
             dummy.stage_id = "external_knowledge_retrieval"
-            dummy.summary = "(no snippets)"
-            dummy.touch()
-            self.repo.save(dummy)
+            dummy.summary  = "(no snippets)"
+            dummy.touch(); self.repo.save(dummy)
             state["know_ctx"] = dummy
 
         # ─── Stage 6: prepare_tools ────────────────────────────────────
@@ -1580,9 +1652,7 @@ class Assembler:
         # ─── Stage 8.5: user_confirmation ──────────────────────────────
         t0 = datetime.utcnow()
         try:
-            confirmed = self._stage8_5_user_confirmation(
-                state.get("raw_calls", []), user_text
-            )
+            confirmed = self._stage8_5_user_confirmation(state.get("raw_calls", []), user_text)
             state["confirmed_calls"] = confirmed
             _record_perf("user_confirmation", "(auto-approved)", True)
         except Exception as e:
@@ -1663,7 +1733,6 @@ class Assembler:
         return out
 
 
-
     def _background_self_review(self):
         import time
         while not self._stop_self_review.is_set():
@@ -1691,7 +1760,8 @@ class Assembler:
 
     def _stage2_load_system_prompts(self) -> ContextObject:
         return self._load_system_prompts()
-        
+    
+    
     def _stage3_retrieve_and_merge_context(
         self,
         user_text: str,
@@ -1701,17 +1771,16 @@ class Assembler:
         recall_ids: List[str] = None
     ) -> Dict[str, Any]:
         """
-        Merge together, in chronological order:
+        Merge together, in a human-like interleaving with recency and semantic falloff:
         • system prompts
-        • narrative
+        • a slice of recent narrative entries
         • recent raw segments (user/assistant)
         • any explicit chat_history (extra_ctx)
-        • semantic retrieval (RL-gated)
-        • associative memory via spread-activation (RL-gated)
+        • semantic retrieval (RL-gated, tag-prioritized)
+        • associative memory via spread-activation (RL-gated, narrative-driven seeding, tag-prioritized)
         • recent tool outputs (RL-gated)
         """
-
-        from datetime import timedelta, datetime
+        from datetime import timedelta
 
         # ① compute RL “recall feature” from prior recalls
         rf = 0.0
@@ -1719,8 +1788,7 @@ class Assembler:
             counts = []
             for cid in recall_ids:
                 try:
-                    st = self.repo.get(cid).recall_stats.get("count", 0)
-                    counts.append(st)
+                    counts.append(self.repo.get(cid).recall_stats.get("count", 0))
                 except KeyError:
                     continue
             rf = sum(counts) / len(counts) if counts else 0.0
@@ -1730,10 +1798,17 @@ class Assembler:
         past = now - timedelta(minutes=self.lookback)
         tr   = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
 
-        # ③ load narrative
-        narr_ctx = self._load_narrative_context()
+        # ③ load and slice recent narrative entries
+        full_narr_ctx = self._load_narrative_context()
+        all_narr = self.repo.query(lambda c: c.component=="narrative")
+        all_narr.sort(key=lambda c: c.timestamp, reverse=True)
+        recent_narr_objs = list(reversed(all_narr[:5]))  # last 5 narrative entries
+        sliced_summary = "\n".join(n.summary for n in recent_narr_objs)
+        # override summary for this turn only
+        full_narr_ctx.summary = sliced_summary
+        narr_ctx = full_narr_ctx
 
-        # ④ raw history segments
+        # ④ raw history segments (interlaced user/assistant)
         segments = self.repo.query(
             lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
         )
@@ -1742,7 +1817,8 @@ class Assembler:
         if extra_ctx:
             history.extend(extra_ctx)
 
-        # ⑤ semantic retrieval (unchanged)
+        # ⑤ semantic retrieval (RL-gated + tag-based prioritization)
+        priority_tags = ("important", "decision_point")
         if self.rl.should_run("semantic_retrieval", rf):
             recent = self.engine.query(
                 stage_id="recent_retrieval",
@@ -1754,20 +1830,23 @@ class Assembler:
                 ),
                 top_k=self.top_k
             )
+            # bump any high-priority tags to front
+            recent.sort(
+                key=lambda c: not any(t in c.tags for t in priority_tags)
+            )
         else:
             recent = []
 
-        # ⑥ associative memory via cascade activation
+        # ⑥ associative memory via narrative-driven seeding
         if self.rl.should_run("memory_retrieval", rf):
-            # run 3-hop spread, with decay
+            seed_ids = [user_ctx.context_id, narr_ctx.context_id]
             scores = self.memman.spread_activation(
-                seed_ids=[user_ctx.context_id],
+                seed_ids=seed_ids,
                 hops=3,
                 decay=0.6,
                 assoc_weight=1.0,
                 recency_weight=1.0
             )
-            # pick top-k IDs
             top_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[: self.top_k]
 
             assoc: List[ContextObject] = []
@@ -1779,18 +1858,19 @@ class Assembler:
 
                 # stamp retrieval metadata
                 cobj.retrieval_score    = scores[cid]
-                cobj.retrieval_metadata = {"seed_ids":[user_ctx.context_id]}
-
-                # record recall event
+                cobj.retrieval_metadata = {"seed_ids": seed_ids}
                 cobj.record_recall(
                     stage_id="memory_retrieval",
-                    coactivated_with=[user_ctx.context_id],
+                    coactivated_with=seed_ids,
                     retrieval_score=scores[cid]
                 )
-
-                # persist
                 self.repo.save(cobj)
                 assoc.append(cobj)
+
+            # bump high-priority tags in memory
+            assoc.sort(
+                key=lambda c: not any(t in c.tags for t in priority_tags)
+            )
         else:
             assoc = []
 
@@ -1802,25 +1882,30 @@ class Assembler:
         else:
             recent_tools = []
 
-        # ⑧ merge & dedupe
+        # ⑧ interleave buckets for falloff of relevance
         merged: List[ContextObject] = []
         seen = set()
-        for bucket in ([narr_ctx], history, recent, assoc, recent_tools):
-            for c in (bucket if isinstance(bucket,list) else [bucket]):
-                if c.context_id not in seen:
-                    merged.append(c)
-                    seen.add(c.context_id)
-
+        # include sliced narrative singleton first
+        merged.append(narr_ctx); seen.add(narr_ctx.context_id)
+        lists = [history, recent, assoc, recent_tools]
+        maxlen = max(len(lst) for lst in lists)
+        for i in range(maxlen):
+            for lst in lists:
+                if i < len(lst):
+                    c = lst[i]
+                    if c.context_id not in seen:
+                        merged.append(c)
+                        seen.add(c.context_id)
         merged_ids = [c.context_id for c in merged]
 
         # ⑨ debug-print
         self._print_stage_context("recent_retrieval", {
-            "system_prompts":[sys_ctx.summary],
-            "narrative":[narr_ctx.summary],
-            "history":[f"{c.semantic_label}: {c.summary}" for c in history],
-            "semantic":[f"{c.semantic_label}: {c.summary}" for c in recent],
-            "memory":[f"{c.semantic_label}: {c.summary}" for c in assoc],
-            "tool_outputs":[f"{c.semantic_label}: {c.summary}" for c in recent_tools],
+            "system_prompts":   [sys_ctx.summary],
+            "narrative":        sliced_summary.splitlines(),
+            "history":          [f"{c.semantic_label}: {c.summary}" for c in history],
+            "semantic":         [f"{c.semantic_label}: {c.summary}" for c in recent],
+            "memory":           [f"{c.semantic_label}: {c.summary}" for c in assoc],
+            "tool_outputs":     [f"{c.semantic_label}: {c.summary}" for c in recent_tools],
         })
 
         return {
