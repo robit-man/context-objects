@@ -10,41 +10,42 @@ Features
 • Streams exactly ONE .ogg voice reply
 • Accepts **voice notes** – they’re run through Whisper, then processed as text
 • Maintains a SQLite-backed user registry for DM’ing users by username
+• **Pins** each bot reply for cross-bot notification, then **un-pins** it
+• Listens for **pin** events to ingest other bots’ outputs as context
 """
 
 from __future__ import annotations
-
 import asyncio
 import os
 import queue as _queue
 import tempfile
 import subprocess
 import uuid
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
-from context import HybridContextRepository
+
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
+from context import HybridContextRepository, ContextObject, _locked, sanitize_jsonl
 from assembler import Assembler
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
-from context import ContextObject, _locked
-import logging
-from datetime import datetime
 
-# configure basic logging once at module top
+import whisper
+_WHISPER = whisper.load_model("base")  # load once
+
+# basic logging
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-import whisper
-_WHISPER = whisper.load_model("base")  # load once
-
 
 # chat_id → dedicated Assembler instance
 assemblers: dict[int, Assembler] = {}
@@ -91,11 +92,19 @@ async def _send_long_text_async(
         chunks.append(buffer)
 
     for part in chunks:
-        await bot.send_message(
+        # send the chunk
+        msg = await bot.send_message(
             chat_id=chat_id,
             text=part,
             reply_to_message_id=reply_to
         )
+        # auto-pin & unpin so other bots see it
+        try:
+            await bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id)
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=msg.message_id)
+        except Exception as e:
+            logger.warning(f"pin/unpin failed for msg {msg.message_id}: {e}")
+
 
 def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridContextRepository:
     """
@@ -104,17 +113,13 @@ def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridCont
     """
     jsonl_path  = f"context_{chat_id}.jsonl"
     sqlite_path = f"context_{chat_id}.db"
-
-    # sanitize JSONL before we use it
-    from context import sanitize_jsonl
     sanitize_jsonl(jsonl_path)
-
-    # build the hybrid repository
     return HybridContextRepository(
         jsonl_path=jsonl_path,
         sqlite_path=sqlite_path,
         archive_max_mb=archive_max_mb,
     )
+
 
 # ────────────────────────────────────────────────────────────────────────
 # Factory for per-stage status callback
@@ -181,6 +186,41 @@ def _make_status_cb(
 
     return status_cb, stop_cb
 
+
+# ────────────────────────────────────────────────────────────────────────
+# Handler for ANY pinned message in any chat
+# ────────────────────────────────────────────────────────────────────────
+async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.pinned_message:
+        return
+
+    chat_id = update.effective_chat.id
+    pinned = msg.pinned_message
+
+    pinner = (msg.from_user.username or str(msg.from_user.id)).lower()
+    author = (pinned.from_user.username or str(pinned.from_user.id)).lower()
+    text   = pinned.text or pinned.caption or "<non-text content>"
+
+    # Only ingest pins created by bots
+    if not msg.from_user.is_bot:
+        return
+
+    seg = ContextObject.make_segment(
+        semantic_label="bot_pinned",
+        content_refs=[],
+        tags=["bot_message", "pinned", f"pinner:{pinner}", f"author:{author}"],
+        metadata={"pinner":pinner, "author":author, "text":text}
+    )
+    seg.summary  = text
+    seg.stage_id = "telegram_pinned"
+    seg.touch()
+
+    asm = assemblers.get(chat_id)
+    if asm:
+        asm.repo.save(seg)
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Main entry-point: launch the Telegram bot
 # ────────────────────────────────────────────────────────────────────────
@@ -198,6 +238,18 @@ def telegram_input(asm: Assembler):
     running: dict[int, asyncio.Task] = {}
     asm._chat_contexts = set()
 
+    # register the pin‐event listener
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, _on_pin),
+        group=0
+    )
+    from telegram.ext import MessageHandler, filters as _filt
+
+    # register the pin‐listener
+    app.add_handler(
+    MessageHandler(_filt.StatusUpdate.PINNED_MESSAGE, _on_pin),
+    )
+
     async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id   = update.effective_chat.id
         chat_type = update.effective_chat.type
@@ -213,10 +265,8 @@ def telegram_input(asm: Assembler):
         if not msg:
             return
 
-        # 2) Figure out the “kind” and raw data
-        kind = "other"
-        data = None
-
+        # 2) Determine kind & raw data for logging & memory
+        kind, data = "other", None
         if msg.text:
             kind, data = "text", msg.text
         elif msg.photo:
@@ -237,11 +287,10 @@ def telegram_input(asm: Assembler):
         else:
             kind, data = "other", repr(msg.to_dict())
 
-        # 3) Console‐log timestamp, kind, and data
         now = datetime.utcnow().isoformat() + "Z"
         logger.info(f"[{now}] Incoming update — chat_id={chat_id} kind={kind} data={data!r}")
 
-        # 4) Record user & group in registries
+        # 3) Record user & group in registries
         user = update.effective_user
         if user and user.username:
             _REG.add(user.username, user.id)
@@ -249,7 +298,7 @@ def telegram_input(asm: Assembler):
             title = update.effective_chat.title or f"chat_{chat_id}"
             _GREG.add(title, chat_id)
 
-        # 5) Instantiate per-chat Assembler if needed
+        # 4) Instantiate per-chat Assembler if needed
         chat_asm = assemblers.get(chat_id)
         if chat_asm is None:
             repo = make_per_chat_repo(chat_id)
@@ -266,7 +315,7 @@ def telegram_input(asm: Assembler):
             assemblers[chat_id] = chat_asm
         chat_asm._chat_contexts.add(chat_id)
 
-        # 6) Record *every* update into memory
+        # 5) Record *every* update into memory
         tags = ["telegram_update", kind]
         tags.append("group" if chat_type in ("group","supergroup") else "private")
         seg = ContextObject.make_segment(
@@ -280,7 +329,7 @@ def telegram_input(asm: Assembler):
         seg.touch()
         chat_asm.repo.save(seg)
 
-        # 7) Extract or transcribe text if any
+        # 6) Extract or transcribe text if any
         text = (msg.text or "").strip()
         if msg.voice and not text:
             try:
@@ -290,7 +339,7 @@ def telegram_input(asm: Assembler):
                 wav = raw_ogg + ".wav"
                 subprocess.run(
                     ["ffmpeg","-y","-loglevel","error",
-                    "-i",raw_ogg,"-ac","1","-ar","16000",wav],
+                     "-i",raw_ogg,"-ac","1","-ar","16000",wav],
                     check=True
                 )
                 result = _WHISPER.transcribe(wav, language="en")
@@ -307,7 +356,7 @@ def telegram_input(asm: Assembler):
                         try: os.unlink(p)
                         except: pass
 
-        # 8) Handle private slash-commands
+        # 7) Handle private slash-commands
         if chat_type == "private" and text.startswith("/"):
             parts = text.split(None, 2)
             cmd = parts[0].lower()
@@ -356,7 +405,7 @@ def telegram_input(asm: Assembler):
                     )
                 return
 
-        # 9) Decide whether to run inference
+        # 8) Decide whether to run inference
         wants_reply = False
         if text:
             try:
@@ -371,7 +420,7 @@ def telegram_input(asm: Assembler):
             or any(
                 ent.type == "mention"
                 and msg.text[ent.offset:ent.offset+ent.length]
-                    .lstrip("@").lower() == bot_name
+                       .lstrip("@").lower() == bot_name
                 for ent in (msg.entities or [])
             )
             or (msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id)
@@ -379,7 +428,7 @@ def telegram_input(asm: Assembler):
         if not do_infer:
             return
 
-        # 10) Build prompt & enqueue
+        # 9) Build prompt & enqueue
         sender    = user.username or user.first_name
         user_text = f"{sender}: {text}"
         trigger_id = msg.message_id
@@ -394,6 +443,9 @@ def telegram_input(asm: Assembler):
             await queue.put((user_text, trigger_id))
             return
 
+        # ────────────────────────────────────────────────────────────────
+        # helper to kick off a runner, pinning/unpinning replies
+        # ────────────────────────────────────────────────────────────────
         async def start_runner(request_text: str, reply_to_id: int):
             placeholder = await context.bot.send_message(
                 chat_id=chat_id,
@@ -423,23 +475,53 @@ def telegram_input(asm: Assembler):
                     )
                     stop_status()
 
-                    # text response
+                    # send final text
+                    sent = None
                     if final and len(final) < 4000:
-                        await context.bot.edit_message_text(
+                        sent = await context.bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=placeholder_id,
                             text=final
                         )
                     else:
                         try:
-                            await context.bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                            await context.bot.delete_message(
+                                chat_id=chat_id,
+                                message_id=placeholder_id
+                            )
                         except:
                             pass
                         await _send_long_text_async(
-                            context.bot, chat_id, final or "(no response)", reply_to=reply_to_id
+                            context.bot,
+                            chat_id,
+                            final or "(no response)",
+                            reply_to=reply_to_id
                         )
+                        # fetch the last message we sent
+                        updates = await context.bot.get_updates(timeout=1, limit=1)
+                        if updates and updates[-1].message:
+                            sent = updates[-1].message
 
-                    # voice response
+                    # ─── PIN it for 1 second, then UNPIN ────────────────────────
+                    if sent:
+                        try:
+                            # pin the assistant's reply (silent)
+                            await context.bot.pin_chat_message(
+                                chat_id=chat_id,
+                                message_id=sent.message_id,
+                                disable_notification=True
+                            )
+                            # hold it pinned for 1 second
+                            await asyncio.sleep(1)
+                            # unpin *that* message explicitly
+                            await context.bot.unpin_chat_message(
+                                chat_id=chat_id,
+                                message_id=sent.message_id
+                            )
+                        except Exception as e:
+                            logger.warning(f"pin/unpin failed for {sent.message_id}: {e}")
+
+                    # now send the voice reply as before...
                     chat_asm.tts.enqueue(final or "")
                     await asyncio.to_thread(chat_asm.tts._file_q.join)
                     oggs: List[str] = []
@@ -455,11 +537,14 @@ def telegram_input(asm: Assembler):
                         if len(oggs) == 1:
                             with open(oggs[0], "rb") as vf:
                                 await context.bot.send_voice(
-                                    chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id
+                                    chat_id=chat_id,
+                                    voice=vf,
+                                    reply_to_message_id=reply_to_id
                                 )
                         else:
                             combined = os.path.join(
-                                tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg"
+                                tempfile.gettempdir(),
+                                f"combined_{uuid.uuid4().hex}.ogg"
                             )
                             ins     = sum([["-i", p] for p in oggs], [])
                             streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
@@ -472,7 +557,9 @@ def telegram_input(asm: Assembler):
                             )
                             with open(combined, "rb") as vf:
                                 await context.bot.send_voice(
-                                    chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id
+                                    chat_id=chat_id,
+                                    voice=vf,
+                                    reply_to_message_id=reply_to_id
                                 )
 
                 except asyncio.CancelledError:
@@ -487,7 +574,9 @@ def telegram_input(asm: Assembler):
 
                 except Exception as e:
                     await context.bot.send_message(
-                        chat_id=chat_id, text=f"❌ Error: {e}", reply_to_message_id=reply_to_id
+                        chat_id=chat_id,
+                        text=f"❌ Error: {e}",
+                        reply_to_message_id=reply_to_id
                     )
 
                 finally:
@@ -498,12 +587,52 @@ def telegram_input(asm: Assembler):
                         return
                     await start_runner(nxt, nxt_id)
 
+            # schedule it the same way as before:
             running[chat_id] = loop.create_task(runner())
 
+
+        # start it!
         await start_runner(user_text, trigger_id)
-        
+
+    async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg or not msg.pinned_message:
+            return
+
+        chat_id = update.effective_chat.id
+        pinned = msg.pinned_message
+
+        # who performed the pin?
+        pinner = (msg.from_user.username or str(msg.from_user.id)).lower()
+        # who originally sent the pinned message?
+        author = (pinned.from_user.username or str(pinned.from_user.id)).lower()
+        text   = pinned.text or pinned.caption or "<non-text content>"
+
+        # only ingest bot pins
+        if not msg.from_user.is_bot:
+            return
+
+        seg = ContextObject.make_segment(
+            semantic_label="bot_pinned",
+            content_refs=[],
+            tags=["bot_message","pinned",f"pinner:{pinner}",f"author:{author}"],
+            metadata={"pinner":pinner,"author":author,"text":text}
+        )
+        seg.summary  = text
+        seg.stage_id = "telegram_pinned"
+        seg.touch()
+
+        asm = assemblers.get(chat_id)
+        if asm:
+            asm.repo.save(seg)
+
+    # then register it on your `app`:
+    from telegram.ext import MessageHandler, filters
+
+    # primary message handler
     app.add_handler(
-        MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, _handle)
+        MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, _handle),
+        group=1
     )
 
     loop.run_until_complete(app.initialize())
