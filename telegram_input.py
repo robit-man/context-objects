@@ -133,6 +133,7 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
+    from typing import List, Any
     history: List[str] = []
     last_edit_at: float = 0.0
     pending_handle: asyncio.TimerHandle | None = None
@@ -142,12 +143,16 @@ def _make_status_cb(
         nonlocal last_edit_at, pending_handle
         if disabled:
             return
-        text = "🛠️ Processing…\n" + "\n".join(history[-max_lines:])
+        # Show the JSONL file being updated, then the recent stage updates
+        header = f"`context_{chat_id}.jsonl` updating...\n"
+        body = "\n".join(history[-max_lines:])
+        text = header + body
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=text
+                text=text,
+                parse_mode='Markdown'
             )
         except:
             pass
@@ -174,7 +179,8 @@ def _make_status_cb(
         snippet = str(output).replace("\n", " ")
         if len(snippet) > 1000:
             snippet = snippet[:997] + "…"
-        history.append(f"• {stage}: {snippet}")
+        # Bold the stage name
+        history.append(f"• *{stage}*: {snippet}")
         _schedule_edit()
 
     def stop_cb():
@@ -185,6 +191,7 @@ def _make_status_cb(
             pending_handle = None
 
     return status_cb, stop_cb
+
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -235,19 +242,14 @@ def telegram_input(asm: Assembler):
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
     app = ApplicationBuilder().token(token).request(req).build()
 
-    running: dict[int, asyncio.Task] = {}
+    running: dict[tuple[int,int], asyncio.Task] = {}
+    _pending: dict[tuple[int,int], asyncio.Queue[Tuple[str,int]]] = {}
     asm._chat_contexts = set()
 
     # register the pin‐event listener
     app.add_handler(
         MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, _on_pin),
         group=0
-    )
-    from telegram.ext import MessageHandler, filters as _filt
-
-    # register the pin‐listener
-    app.add_handler(
-    MessageHandler(_filt.StatusUpdate.PINNED_MESSAGE, _on_pin),
     )
 
     async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,15 +320,32 @@ def telegram_input(asm: Assembler):
         # 5) Record *every* update into memory
         tags = ["telegram_update", kind]
         tags.append("group" if chat_type in ("group","supergroup") else "private")
+        # 5) Record *every* update into memory
         seg = ContextObject.make_segment(
             semantic_label=f"tg_{kind}",
             content_refs=[],
             tags=tags,
-            metadata={"data": data}
+            metadata={
+                "data": data,
+                "telegram_message_id": msg.message_id
+            }
         )
         seg.summary  = str(data)
         seg.stage_id = "telegram_update"
         seg.touch()
+
+        # if this Telegram message was a reply, link back to the original ContextObject
+        if msg.reply_to_message:
+            orig = next(
+                (c for c in chat_asm.repo.query(
+                    lambda c: c.metadata.get("telegram_message_id") 
+                              == msg.reply_to_message.message_id
+                )),
+                None
+            )
+            if orig:
+                seg.references.append(orig.context_id)
+
         chat_asm.repo.save(seg)
 
         # 6) Extract or transcribe text if any
@@ -427,14 +446,20 @@ def telegram_input(asm: Assembler):
         )
         if not do_infer:
             return
-
-        # 9) Build prompt & enqueue
+        # 9) Build prompt & enqueue (per-user in group)
         sender    = user.username or user.first_name
         user_text = f"{sender}: {text}"
         trigger_id = msg.message_id
-        queue = _pending.setdefault(chat_id, asyncio.Queue())
 
-        if (prev := running.get(chat_id)) and not prev.done():
+        # use a (chat_id, user_id) tuple so each user has its own queue
+        user_id = user.id
+        key     = (chat_id, user_id)
+
+        # grab or create that user’s queue
+        queue = _pending.setdefault(key, asyncio.Queue())
+
+        # if they’re already running an inference, enqueue
+        if (prev := running.get(key)) and not prev.done():
             await context.bot.send_message(
                 chat_id,
                 "⚠️ I’m still working on your previous request—I’ll handle this one next.",
@@ -449,7 +474,7 @@ def telegram_input(asm: Assembler):
         async def start_runner(request_text: str, reply_to_id: int):
             placeholder = await context.bot.send_message(
                 chat_id=chat_id,
-                text="🛠️ Processing…",
+                text=f"init reply to chat id {reply_to_id}...",
                 reply_to_message_id=reply_to_id
             )
             placeholder_id = placeholder.message_id
@@ -475,14 +500,36 @@ def telegram_input(asm: Assembler):
                     )
                     stop_status()
 
-                    # send final text
-                    sent = None
-                    if final and len(final) < 4000:
+                    # If there's absolutely no response, just delete the placeholder and bail
+                    if not final or not final.strip():
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=chat_id,
+                                message_id=placeholder_id
+                            )
+                        except:
+                            pass
+                        return
+
+                    # Small reply: edit placeholder, then pin & unpin
+                    if len(final) < 4000:
                         sent = await context.bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=placeholder_id,
                             text=final
                         )
+                        await context.bot.pin_chat_message(
+                            chat_id=chat_id,
+                            message_id=sent.message_id,
+                            disable_notification=True
+                        )
+                        await asyncio.sleep(1)
+                        await context.bot.unpin_chat_message(
+                            chat_id=chat_id,
+                            message_id=sent.message_id
+                        )
+
+                    # Large reply: drop placeholder, stream chunks (each chunk pins/unpins)
                     else:
                         try:
                             await context.bot.delete_message(
@@ -494,35 +541,12 @@ def telegram_input(asm: Assembler):
                         await _send_long_text_async(
                             context.bot,
                             chat_id,
-                            final or "(no response)",
+                            final,
                             reply_to=reply_to_id
                         )
-                        # fetch the last message we sent
-                        updates = await context.bot.get_updates(timeout=1, limit=1)
-                        if updates and updates[-1].message:
-                            sent = updates[-1].message
 
-                    # ─── PIN it for 1 second, then UNPIN ────────────────────────
-                    if sent:
-                        try:
-                            # pin the assistant's reply (silent)
-                            await context.bot.pin_chat_message(
-                                chat_id=chat_id,
-                                message_id=sent.message_id,
-                                disable_notification=True
-                            )
-                            # hold it pinned for 1 second
-                            await asyncio.sleep(1)
-                            # unpin *that* message explicitly
-                            await context.bot.unpin_chat_message(
-                                chat_id=chat_id,
-                                message_id=sent.message_id
-                            )
-                        except Exception as e:
-                            logger.warning(f"pin/unpin failed for {sent.message_id}: {e}")
-
-                    # now send the voice reply as before...
-                    chat_asm.tts.enqueue(final or "")
+                    # Now the voice reply as before...
+                    chat_asm.tts.enqueue(final)
                     await asyncio.to_thread(chat_asm.tts._file_q.join)
                     oggs: List[str] = []
                     while True:
@@ -587,47 +611,14 @@ def telegram_input(asm: Assembler):
                         return
                     await start_runner(nxt, nxt_id)
 
-            # schedule it the same way as before:
+            # schedule it exactly as before:
             running[chat_id] = loop.create_task(runner())
+
 
 
         # start it!
         await start_runner(user_text, trigger_id)
 
-    async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = update.message
-        if not msg or not msg.pinned_message:
-            return
-
-        chat_id = update.effective_chat.id
-        pinned = msg.pinned_message
-
-        # who performed the pin?
-        pinner = (msg.from_user.username or str(msg.from_user.id)).lower()
-        # who originally sent the pinned message?
-        author = (pinned.from_user.username or str(pinned.from_user.id)).lower()
-        text   = pinned.text or pinned.caption or "<non-text content>"
-
-        # only ingest bot pins
-        if not msg.from_user.is_bot:
-            return
-
-        seg = ContextObject.make_segment(
-            semantic_label="bot_pinned",
-            content_refs=[],
-            tags=["bot_message","pinned",f"pinner:{pinner}",f"author:{author}"],
-            metadata={"pinner":pinner,"author":author,"text":text}
-        )
-        seg.summary  = text
-        seg.stage_id = "telegram_pinned"
-        seg.touch()
-
-        asm = assemblers.get(chat_id)
-        if asm:
-            asm.repo.save(seg)
-
-    # then register it on your `app`:
-    from telegram.ext import MessageHandler, filters
 
     # primary message handler
     app.add_handler(
