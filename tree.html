@@ -156,14 +156,14 @@
         // CONFIG
         //////////////////////////////////////////////////////////////////////
         const LAYOUT_CONFIG = {
-            msPerUnit: 1000 * 60,   // 1 min realtime = 1 Y-unit
+            msPerUnit: 1000 * 6,   // 1 min realtime = 1 Y-unit
             maxXZRadius: 500,
             minSphereY: 0
         };
         const DISPLAY_CONFIG = {
             sphereRadius: 5,
             sphereSegments: 3,
-            lineBaseOpacity: 0.05,
+            lineBaseOpacity: 0.1,
             hoverHighlightOpacity: 0.5,
             chainDelay: 2,
             maxChainDepth: 3,
@@ -199,9 +199,12 @@
 
         // ←── Add this so instMesh is visible everywhere ──→
         let instMesh = null;
+        let instEdge = null;
         let hovered = null;
         let hoveredIdx = null;
-
+        let yScrollOffset = 0;
+        // last time we applied that drift
+        let lastDriftT = Date.now();
 
         // ←── PICKABLE INSTANCES SETUP ──→
         pickableMeshes.length = 0;
@@ -276,6 +279,7 @@
             for (let i = 0; i < objects.length; i += chunkSize) {
                 const batch = objects.slice(i, i + chunkSize);
                 addNodes(batch);
+                rebuildEdges();
                 // let the browser breathe
                 await new Promise(r => requestAnimationFrame(r));
             }
@@ -283,111 +287,67 @@
         }
 
         function addNodes(objs) {
-            const now = Date.now(),
-                maxConn = computeMaxConnectivity();
+            const now = Date.now();
 
-            // ------------------------------------------------------------------
-            // Build ONE InstancedMesh the first time we enter this function.
-            // Every subsequent batch just re-uses the same mesh.
-            // ------------------------------------------------------------------
+            // 1) Create the instanced sphere mesh once
             if (!instMesh) {
-                const sphereGeo = new THREE.SphereGeometry(
+                const geo = new THREE.SphereGeometry(
                     DISPLAY_CONFIG.sphereRadius,
                     DISPLAY_CONFIG.sphereSegments,
                     DISPLAY_CONFIG.sphereSegments
                 );
+                const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+                instMesh = new THREE.InstancedMesh(geo, mat, MAX_NODES);
 
-                const sphereMat = new THREE.MeshLambertMaterial({
-                    vertexColors: true,
-                    emissive: 0x000000,
-                    emissiveIntensity: 1
-                });
-
-                instMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, MAX_NODES);
-                instMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-
-                // colour buffer (one per instance)
-                const colorAttr = new THREE.InstancedBufferAttribute(
-                    new Float32Array(MAX_NODES * 3),
-                    3
+                const cAttr = new THREE.InstancedBufferAttribute(
+                    new Float32Array(MAX_NODES * 3), 3
                 );
-                colorAttr.setUsage(THREE.DynamicDrawUsage);
-                instMesh.geometry.setAttribute('color', colorAttr);
-                instMesh.instanceColor = colorAttr;
-
-                scene.add(instMesh);
-
-                // so the rest of the code can find the mesh later
-                nodeMap.forEach(n => (n.mesh = instMesh));
+                instMesh.geometry.setAttribute('color', cAttr);
+                instMesh.instanceColor = cAttr;
+                graphGroup.add(instMesh);
             }
-            // 1) compute positions & connectivity
+
+            // 2) Ingest all new objects into nodeMap
             objs.forEach(o => {
-                if (nodeMap.has(o.context_id)) return;
+                if (nodeMap.has(o.context_id)) return;  // skip duplicates
+
                 const conn = (o.references?.length || 0)
                     + Object.keys(o.association_strengths || {}).length;
+
+                // Compute position (Y = age, XZ random scatter by connectivity)
                 const pos = new THREE.Vector3();
-                pos.y = Math.max(
-                    LAYOUT_CONFIG.minSphereY,
-                    (now - parseTimestamp(o.timestamp).getTime())
-                    / LAYOUT_CONFIG.msPerUnit
-                );
-                const norm = 1 - (conn / maxConn),
-                    radius = norm * LAYOUT_CONFIG.maxXZRadius,
-                    angle = Math.random() * Math.PI * 2;
-                pos.x = Math.cos(angle) * radius;
-                pos.z = Math.sin(angle) * radius;
-                nodeMap.set(o.context_id, { data: o, pos, connectivity: conn, mesh: null });
+                const age = now - parseTimestamp(o.timestamp).getTime();
+                pos.y = Math.max(LAYOUT_CONFIG.minSphereY, age / LAYOUT_CONFIG.msPerUnit);
+                const rNorm = 1 - conn / 1;
+                const r = rNorm * LAYOUT_CONFIG.maxXZRadius;
+                const a = Math.random() * Math.PI * 2;
+                pos.x = Math.cos(a) * r;
+                pos.z = Math.sin(a) * r;
+
+                nodeMap.set(o.context_id, {
+                    data: o,
+                    pos,
+                    connectivity: conn,
+                    mesh: instMesh
+                });
             });
 
-            // — Build hue map before using it —
-            const compsLocal = [
-                ...new Set(
-                    [...nodeMap.values()].map(n => n.data.component)
-                )
-            ];
-            const hueMapLocal = Object.fromEntries(
-                compsLocal.map((c, i) => [c, compsLocal.length > 0 ? i / compsLocal.length : 0])
+            // 3) Recompute stats for coloring
+            maxConnCurrent = Math.max(
+                1, ...[...nodeMap.values()].map(n => n.connectivity)
             );
-            hueMapCurrent = hueMapLocal;
-            maxConnCurrent = maxConn;
-            // 2) Sphere instanced mesh
-            const sphereGeo = new THREE.SphereGeometry(
-                DISPLAY_CONFIG.sphereRadius,
-                DISPLAY_CONFIG.sphereSegments,
-                DISPLAY_CONFIG.sphereSegments
-            );
-            const sphereMat = new THREE.MeshLambertMaterial({
-                vertexColors: true,
-                emissive: 0x000000,   // start dark
-                emissiveIntensity: 1
-            });
-            instMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, MAX_NODES);
-            instMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            const comps = [...new Set([...nodeMap.values()].map(n => n.data.component))];
+            hueMapCurrent = Object.fromEntries(comps.map((c, i) => [c, i / comps.length]));
 
-            // allocate one big InstancedBufferAttribute…
-            const colorAttr = new THREE.InstancedBufferAttribute(
-                new Float32Array(MAX_NODES * 3),
-                3
-            );
-            colorAttr.setUsage(THREE.DynamicDrawUsage);
-            // …and bind it as the 'color' attribute so the material picks it up
-            instMesh.geometry.setAttribute('color', colorAttr);
-            // keep a reference so the rest of your code that does setXYZ works unchanged:
-            instMesh.instanceColor = colorAttr;
-
-            scene.add(instMesh);
-
-            // let applyFilters() work
-            nodeMap.forEach(n => n.mesh = instMesh);
-
-            // 3) Populate spheres
+            // 4) Rewrite all instance matrices & colors
             const color = new THREE.Color();
             let idx = 0;
             nodeMap.forEach(n => {
                 if (idx >= MAX_NODES) return;
-                instMesh.setMatrixAt(idx, new THREE.Matrix4().setPosition(n.pos));
-
-                const hue = hueMapLocal[n.data.component] || 0;
+                instMesh.setMatrixAt(idx, new THREE.Matrix4().setPosition(
+                    n.pos.x, n.pos.y, n.pos.z
+                ));
+                const hue = hueMapCurrent[n.data.component] || 0;
                 const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
                 instMesh.instanceColor.setXYZ(
                     idx,
@@ -396,61 +356,12 @@
                 n._instanceIndex = idx;
                 idx++;
             });
+            instMesh.count = idx;
             instMesh.instanceMatrix.needsUpdate = true;
             instMesh.instanceColor.needsUpdate = true;
 
-            // 4) Raycastable list & override colors
-            pickableMeshes.length = 0;
-            let pickIdx = 0;
-            nodeMap.forEach(n => {
-                if (pickIdx >= MAX_NODES) return;
-                n._instanceIndex = pickIdx;
-                pickableMeshes.push(instMesh);
-                const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
-                const [r, g, b] = new THREE.Color()
-                    .setHSL(hueMapCurrent[n.data.component] || 0, sat, 0.5)
-                    .toArray();
-                instMesh.instanceColor.setXYZ(pickIdx, r, g, b);
-                pickIdx++;
-            });
-            instMesh.instanceColor.needsUpdate = true;
-            instMesh.instanceMatrix.needsUpdate = true;
-
-            // 5) Efficiently batch edges into your single LineSegments
-            edges.length = 0;
-            let posOffset = 0, alphaOffset = 0, segIndex = 0;
-            nodeMap.forEach((n, sourceId) => {
-                const conns = new Map();
-                (n.data.references || []).forEach(rid => conns.set(rid, 1));
-                Object.entries(n.data.association_strengths || {})
-                    .forEach(([rid, w]) =>
-                        conns.set(rid, Math.max(conns.get(rid) || 0, w))
-                    );
-                conns.forEach((w, targetId) => {
-                    const tgt = nodeMap.get(targetId);
-                    if (!tgt) return;
-                    const baseAlpha = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, w);
-                    // position pair
-                    edgePosArray[posOffset++] = n.pos.x;
-                    edgePosArray[posOffset++] = n.pos.y;
-                    edgePosArray[posOffset++] = n.pos.z;
-                    edgePosArray[posOffset++] = tgt.pos.x;
-                    edgePosArray[posOffset++] = tgt.pos.y;
-                    edgePosArray[posOffset++] = tgt.pos.z;
-                    // alpha pair
-                    edgeAlphaArray[alphaOffset++] = baseAlpha;
-                    edgeAlphaArray[alphaOffset++] = baseAlpha;
-                    edges.push({
-                        source: sourceId,
-                        target: targetId,
-                        weight: Math.min(1, w),
-                        index: segIndex++
-                    });
-                });
-            });
-            edgeGeometry.attributes.position.needsUpdate = true;
-            edgeGeometry.attributes.alpha.needsUpdate = true;
-            edgeGeometry.setDrawRange(0, posOffset / 3);
+            // 5) Rebuild edges into the instanced edge mesh
+            rebuildEdges();
         }
 
         // recompute max connectivity once per batch
@@ -464,9 +375,12 @@
         // initial full load with verbose logging
         async function loadGraph() {
             console.log('[loadGraph] starting full graph load from', getContextFileUrl(false));
-            clearScene();            // << already existed, keep
-            hovered = hoveredIdx = null;   // << add this line
+
+            clearScene();
+            initEdges();          // must be defined *after* you create edgeMaterial
+            hovered = hoveredIdx = null;
             prevCount = 0;
+
             try {
                 const res = await fetch(getContextFileUrl(true));
                 const txt = await res.text();
@@ -475,23 +389,21 @@
                 prevCount = lines.length;
 
                 const objs = lines.map((l, i) => {
-                    try {
-                        return JSON.parse(l);
-                    } catch (err) {
-                        console.error(`[loadGraph] JSON.parse error at line ${i}:`, err, l);
-                        return null;
-                    }
+                    try { return JSON.parse(l); }
+                    catch (e) { console.error(`JSON.parse error line ${i}`, e); return null; }
                 }).filter(Boolean);
-                console.log('[loadGraph] parsed objects:', objs);
 
-                await batchAddNodes(objs);
-                populateTypeFilter([...nodeMap.values()].map(n => n.data));
+                await batchAddNodes(objs); // calls addNodes() → rebuildEdges()
+                rebuildEdges();
+
+                populateTypeFilter(Array.from(nodeMap.values(), n => n.data));
                 applyFilters();
-                console.log('[loadGraph] batchAddNodes complete');
+                console.log('[loadGraph] done');
             } catch (err) {
                 console.error('[loadGraph] error loading graph:', err);
             }
         }
+
 
         // incremental updater with verbose logging and dynamic scene update
         async function pollForNew() {
@@ -499,43 +411,38 @@
             try {
                 const res = await fetch(getContextFileUrl(true), { cache: 'no-store' });
                 const txt = await res.text();
-                const lines = txt.trim().split(/\r?\n/);
-                console.log(`[pollForNew] total lines: ${lines.length}, prevCount: ${prevCount}`);
+                const all = txt.trim().split(/\r?\n/);
+                console.log(`[pollForNew] ${all.length} total lines, prevCount=${prevCount}`);
 
-                if (lines.length > prevCount && !isBuilding) {
-                    const newLines = lines.slice(prevCount);
-                    console.log(`[pollForNew] detected ${newLines.length} new line(s)`);
+                if (all.length > prevCount && !isBuilding) {
+                    const newLines = all.slice(prevCount);
+                    console.log(`[pollForNew] ${newLines.length} new line(s)`);
 
                     const added = newLines.map((l, i) => {
-                        try {
-                            const obj = JSON.parse(l);
-                            console.log(`[pollForNew] parsed new object ${i}:`, obj);
-                            return obj;
-                        } catch (err) {
-                            console.error(`[pollForNew] parse error for new line ${i}:`, err, l);
+                        try { return JSON.parse(l); }
+                        catch {
+                            console.error(`[pollForNew] parse error on new line ${i}`);
                             return null;
                         }
                     }).filter(Boolean);
 
-                    prevCount = lines.length;
-                    console.log('[pollForNew] calling batchAddNodes with new objects');
-                    await batchAddNodes(added);
+                    prevCount = all.length;
+                    await batchAddNodes(added);   // this calls addNodes() → rebuildEdges()
+
+                    // update UI
                     populateTypeFilter([...nodeMap.values()].map(n => n.data));
                     applyFilters();
-                    console.log('[pollForNew] batchAddNodes complete');
 
-                    // refresh filters & highlight newest
-                    applyFilters();
-                    if (added.length) {
-                        console.log('[pollForNew] triggering chain on', added[added.length - 1].context_id);
-                        triggerChain(added[added.length - 1].context_id, 0);
-                    }
+                    // highlight newest
+                    if (added.length) triggerChain(added[added.length - 1].context_id, 0);
+                    console.log('[pollForNew] done');
                 }
             } catch (err) {
-                console.error('[pollForNew] fetch or parse error:', err);
+                console.error('[pollForNew] error:', err);
             }
         }
-        setInterval(pollForNew, 5000);
+
+        setInterval(pollForNew, 1000);
 
         // ─── BUILD SCENE ──────────────────────────────────────────────────
         function buildScene(objects) {
@@ -571,47 +478,72 @@
                 n.pos.z = Math.sin(a) * r;
             });
 
+
+            // 1) At initialization (once):
+
+            {
+                const lineGeo = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(0, 1, 0)
+                ]);
+
+                instEdge = new THREE.InstancedMesh(lineGeo, edgeMaterial, MAX_EDGES);
+                instEdge.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+                instEdge.geometry.setAttribute(
+                    'alpha',
+                    new THREE.InstancedBufferAttribute(new Float32Array(MAX_EDGES), 1)
+                        .setUsage(THREE.DynamicDrawUsage)
+                );
+
+                graphGroup.add(instEdge);
+            }
+
+
+            let ei = 0;
             nodeMap.forEach((n, id) => {
+                // gather all connections
                 const conns = new Map();
                 (n.data.references || []).forEach(rid => conns.set(rid, 1));
-                Object.entries(n.data.association_strengths || {}).forEach(([rid, w]) => {
-                    conns.set(rid, Math.max(conns.get(rid) || 0, w));
-                });
+                Object.entries(n.data.association_strengths || {}).forEach(([rid, w]) =>
+                    conns.set(rid, Math.max(conns.get(rid) || 0, w))
+                );
+
                 conns.forEach((w, oid) => {
                     const tgt = nodeMap.get(oid);
                     if (!tgt) return;
-                    const mat = new THREE.LineBasicMaterial({
-                        color: 0xffffff,
-                        transparent: true,
-                        opacity: DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, w)
-                    });
-                    const geo = new THREE.BufferGeometry().setFromPoints([n.pos, tgt.pos]);
-                    const line = new THREE.Line(geo, mat);
-                    line.visible = false;
-                    scene.add(line);
-                    edges.push({ line, source: id, target: oid, weight: Math.min(1, w) });
+
+                    // compute direction vector and length
+                    const dir = new THREE.Vector3().subVectors(tgt.pos, n.pos);
+                    const length = dir.length();
+                    const quat = new THREE.Quaternion().setFromUnitVectors(
+                        new THREE.Vector3(0, 1, 0),
+                        dir.normalize()
+                    );
+
+                    // build the instance transform
+                    const matrix = new THREE.Matrix4().compose(
+                        n.pos,                         // translation
+                        quat,                          // orientation
+                        new THREE.Vector3(1, length, 1) // scale (stretch line to length)
+                    );
+
+                    instEdge.setMatrixAt(ei, matrix);
+                    instEdge.geometry.attributes.alpha.setX(
+                        ei,
+                        DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, w)
+                    );
+                    ei++;
                 });
             });
 
-            // ←── BUFFERED LINESEGMENTS UPDATE ──→
-            edges.forEach((e, i) => {
-                const a = nodeMap.get(e.source).pos;
-                const b = nodeMap.get(e.target).pos;
-                const idx3 = i * 6;  // two vertices × 3 floats
-                const idx1 = i * 2;  // two alpha values
-                edgePosArray.set([a.x, a.y, a.z, b.x, b.y, b.z], idx3);
-                edgeAlphaArray.set([e.weight, e.weight], idx1);
-            });
-            edgeGeometry.attributes.position.needsUpdate = true;
-            edgeGeometry.attributes.alpha.needsUpdate = true;
+            // finalize instance count and upload updates
+            instEdge.count = ei;
+            instEdge.geometry.attributes.alpha.needsUpdate = true;
 
-            // ←──────────────────────────────────→
-
-            // refresh filters/UI
+            // refresh UI filters if needed…
             populateTypeFilter(objects);
             applyFilters();
         }
-
         // ─── INITIALIZE ──────────────────────────────────────────────────
         fileSelector.addEventListener('change', () => loadGraph());
         ageSel.addEventListener('change', applyFilters);
@@ -624,71 +556,109 @@
 
         populateFileSelector()
             .then(() => loadGraph());
-
-        //////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////////
         // THREE.JS SETUP
-        //////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////////
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x111111);
-        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2e6);
+
+        const camera = new THREE.PerspectiveCamera(
+            60,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            2e6
+        );
         camera.position.set(0, 500, 500);
+
         const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(innerWidth, innerHeight);
+        renderer.setSize(window.innerWidth, window.innerHeight);
         document.body.appendChild(renderer.domElement);
+
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
+
         const raycaster = new THREE.Raycaster();
         const pointer = new THREE.Vector2();
+
         scene.add(new THREE.AmbientLight(0xffffff, 0.5));
         const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
         keyLight.position.set(1, 1, 1);
         scene.add(keyLight);
 
+        const graphGroup = new THREE.Group();
+        scene.add(graphGroup);
 
-        // —— EDGE INSTANCED LINESEGMENTS SETUP ——
-        const MAX_EDGES = 20000;
-        const edgePosArray = new Float32Array(MAX_EDGES * 2 * 3);
-        const edgeAlphaArray = new Float32Array(MAX_EDGES * 2);
+        //////////////////////////////////////////////////////////////////////////
+        // EDGE INSTANCED MESH SETUP (skinny box)
+        //////////////////////////////////////////////////////////////////////////
+        const MAX_EDGES = 20_000;
 
-        const edgeGeometry = new THREE.BufferGeometry();
-        edgeGeometry.setAttribute('position', new THREE.BufferAttribute(edgePosArray, 3));
-        edgeGeometry.setAttribute('alpha', new THREE.BufferAttribute(edgeAlphaArray, 1));
+        function initEdges() {
+            if (instEdge) return; // already done
 
-        // NOTE: Three.js expects ShaderMaterials to have a standard set of uniforms
-        // (opacity, diffuse, emissive, map, lightMap, specularMap, alphaMap, envMap).
-        // Here we stub them all out so nothing is ever undefined.
+            // 0.1×1×0.1 box, base at Y=0 so scaling in Y stretches from node A to B naturally
+            const edgeGeo = new THREE.BoxGeometry(0.1, 1, 0.1);
+            edgeGeo.translate(0, 0.5, 0);
 
-        const edgeMaterial = new THREE.ShaderMaterial({
-            transparent: true,
-            // stub out the full set of common uniforms Three.js expects
-            uniforms: {
-                opacity: { value: DISPLAY_CONFIG.lineBaseOpacity },
-                diffuse: { value: new THREE.Color(1, 1, 1) },
-                emissive: { value: new THREE.Color(0, 0, 0) },
-                map: { value: null },
-                lightMap: { value: null },
-                specularMap: { value: null },
-                alphaMap: { value: null },
-                envMap: { value: null }
-            },
-            vertexShader: /* glsl */`
-    attribute float alpha;
-    varying float vAlpha;
-    void main() {
-      vAlpha = alpha;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }`,
-            fragmentShader: /* glsl */`
-    varying float vAlpha;
-    void main() {
-      gl_FragColor = vec4(1.0, 1.0, 1.0, vAlpha);
-    }`
-        });
+            const edgeMat = new THREE.MeshBasicMaterial({
+                color: 0xffffff,
+                transparent: true,
+                opacity: DISPLAY_CONFIG.lineBaseOpacity
+            });
 
-        const edgeMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-        scene.add(edgeMesh);
-        edgeMesh.visible = true;
+            instEdge = new THREE.InstancedMesh(edgeGeo, edgeMat, MAX_EDGES);
+            instEdge.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 
+            graphGroup.add(instEdge);
+        }
+
+        function rebuildEdges() {
+            initEdges();
+            let ei = 0;
+            nodeMap.forEach((n, srcId) => {
+                // gather all connections
+                const links = new Map();
+                (n.data.references || []).forEach(r => links.set(r, 1));
+                Object.entries(n.data.association_strengths || {})
+                    .forEach(([r, w]) => links.set(r, Math.max(links.get(r) || 0, w)));
+
+                links.forEach((w, tgtId) => {
+                    const tgt = nodeMap.get(tgtId);
+                    if (!tgt || ei >= MAX_EDGES) return;
+
+                    // compute direction & length
+                    const dir = new THREE.Vector3().subVectors(tgt.pos, n.pos);
+                    const len = dir.length();
+                    if (len === 0) return;
+
+                    // rotate unit‐box Y-axis into this direction
+                    const quat = new THREE.Quaternion().setFromUnitVectors(
+                        new THREE.Vector3(0, 1, 0),
+                        dir.clone().normalize()
+                    );
+
+                    // compose TRS: translate → n.pos, rotate → quat, scale Y → len
+                    const m = new THREE.Matrix4().compose(
+                        n.pos,                    // translation
+                        quat,                     // rotation
+                        new THREE.Vector3(1, len, 1) // scale
+                    );
+
+                    instEdge.setMatrixAt(ei, m);
+                    ei++;
+                });
+            });
+
+            instEdge.count = ei;
+            instEdge.instanceMatrix.needsUpdate = true;              // push new transforms
+        }
+
+        //////////////////////////////////////////////////////////////////////////
+        // USAGE—call these once at startup, then whenever nodeMap changes:
+        //////////////////////////////////////////////////////////////////////////
+        initEdges();
+        // …after you load or add nodes:
+        rebuildEdges();
 
         //////////////////////////////////////////////////////////////////////
         // HELPERS
@@ -701,28 +671,27 @@
         function unixNow() { return Date.now(); }
 
         function clearScene() {
-            // ── remove **all** InstancedMeshes that might still be in the scene
-            scene.children
-                .filter(o => o.isInstancedMesh)
-                .forEach(m => {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                });
-            instMesh = null;
+            // ── remove all meshes (nodes & edges) under graphGroup
+            graphGroup.children.slice().forEach(child => {
+                graphGroup.remove(child);
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) child.material.dispose();
+            });
 
-            // ── reset the shared edge LineSegments buffer
-            edgeGeometry.setDrawRange(0, 0);
-            edgeGeometry.attributes.position.needsUpdate = true;
-            edgeGeometry.attributes.alpha.needsUpdate = true;
+            // reset references to instanced meshes
+            instMesh = null;
+            instEdge = null;
+
+            // reset group transform so next load starts at y = 0
+            graphGroup.position.set(0, 0, 0);
+            yScrollOffset = 0;
+            lastDriftT = Date.now();
 
             // ── wipe JS-side state
             nodeMap.clear();
             edges.length = 0;
             pickableMeshes.length = 0;
-            hovered = null;
-            hoveredIdx = null;
-            selectedId = null;
+            hovered = hoveredIdx = selectedId = null;
             prevCount = 0;
 
             // ── clear UI
@@ -752,74 +721,76 @@
         function applyFilters() {
             const now = unixNow();
             const ageMax = ({ h1: 3600e3, d1: 86400e3, w1: 86400e3 * 7, m1: 86400e3 * 30 }[ageSel.value]) || 0;
-            const pickVal = typeSel.value;        // "all" or "tag:foo" / "domain:bar" / "component:baz"
+            const pickVal = typeSel.value;
             const color = new THREE.Color();
 
-            let writeIdx = 0;                     // next slot in the InstancedMesh
-            const liveIds = new Set();       // survives age-filter
-            const selectedIds = new Set();       // also matches type / tag
+            let writeIdx = 0;
+            const liveIds = new Set();
+            const selectedIds = new Set();
 
-            // pass ① — write *every* age-visible node, marking selected vs dim
+            // ── update node mesh ───────────────────────────────────────────────
             nodeMap.forEach((n, ctxId) => {
-                // ❶ age filter (nodes too old are *hidden*)
+                // age filter
                 if (ageMax) {
                     const age = now - parseTimestamp(n.data.timestamp).getTime();
-                    if (age > ageMax) return;               // skip entirely
+                    if (age > ageMax) return;
                 }
-
-                // node survives age filter
                 liveIds.add(ctxId);
 
-                // ❷ does it satisfy the drop-down?
-                let isPick = true;
+                // type/tag filter
+                let ok = true;
                 if (pickVal !== 'all') {
                     const [k, v] = pickVal.split(':');
-                    if (k === 'domain') isPick = n.data.domain === v;
-                    if (k === 'component') isPick = n.data.component === v;
-                    if (k === 'tag') isPick = (n.data.tags || []).includes(v);
+                    if (k === 'domain') ok = n.data.domain === v;
+                    if (k === 'component') ok = n.data.component === v;
+                    if (k === 'tag') ok = (n.data.tags || []).includes(v);
                 }
-                if (isPick) selectedIds.add(ctxId);
+                if (ok) selectedIds.add(ctxId);
 
-                // ❸ write instance (matrix unchanged)
+                // write instance
                 instMesh.setMatrixAt(writeIdx, new THREE.Matrix4().setPosition(n.pos));
-
-                // primary colour
                 const hue = hueMapCurrent[n.data.component] || 0;
                 const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
-                const lightness = isPick ? 0.5 : 0.25;           // 100 % vs 50 %
+                const light = ok ? 0.5 : 0.25;
                 instMesh.instanceColor.setXYZ(
                     writeIdx,
-                    ...color.setHSL(hue, sat, lightness).toArray()
+                    ...color.setHSL(hue, sat, light).toArray()
                 );
-
                 n._instanceIndex = writeIdx;
                 writeIdx++;
             });
 
-            instMesh.count = writeIdx;                 // draw only what we rewrote
+            instMesh.count = writeIdx;
             instMesh.instanceMatrix.needsUpdate = true;
             instMesh.instanceColor.needsUpdate = true;
 
-            // pass ② — edge alpha: hide if age-filtered, dim if non-selected
-            edges.forEach(e => {
-                const bothLive = liveIds.has(e.source) && liveIds.has(e.target);
-                const bothSelected = selectedIds.has(e.source) && selectedIds.has(e.target);
-                const off = e.index * 2;
-                const alpha =
-                    !bothLive ? 0 :                             // completely hidden
-                        bothSelected ? DISPLAY_CONFIG.lineBaseOpacity * e.weight :   // full
-                            DISPLAY_CONFIG.lineBaseOpacity * e.weight * 0.5; // 50 %
-                edgeAlphaArray[off] = alpha;
-                edgeAlphaArray[off + 1] = alpha;
-            });
-            edgeGeometry.attributes.alpha.needsUpdate = true;
+            // ── update edge alphas on instanced edge mesh ───────────────────────
+            if (instEdge && instEdge.geometry.attributes.alpha) {
+                const aAttr = instEdge.geometry.attributes.alpha;
 
-            // pass ③ — reset hover if it just became invisible
+                edges.forEach(e => {
+                    const bothLive = liveIds.has(e.source) && liveIds.has(e.target);
+                    const bothSelected = selectedIds.has(e.source) && selectedIds.has(e.target);
+
+                    const alpha = !bothLive
+                        ? 0
+                        : bothSelected
+                            ? DISPLAY_CONFIG.lineBaseOpacity * e.weight
+                            : DISPLAY_CONFIG.lineBaseOpacity * e.weight * 0.5;
+
+                    aAttr.setX(e.index, alpha);
+                });
+
+                aAttr.needsUpdate = true;
+            }
+
+            // ── reset hover if it just became invisible ────────────────────────
             if (hovered && !liveIds.has(hovered)) {
                 hovered = hoveredIdx = null;
                 selPane.textContent = '// Hover or click a node…';
             }
         }
+
 
 
 
@@ -888,37 +859,31 @@
         //////////////////////////////////////////////////////////////////////
         // CHAIN REACTION
         //////////////////////////////////////////////////////////////////////
+        function pulseEdge(i, baseAlpha) {
+            const attr = instEdge.geometry.attributes.alpha;
+            attr.setX(i, DISPLAY_CONFIG.hoverHighlightOpacity);   // brighten
+            attr.needsUpdate = true;
+
+            setTimeout(() => {                                    // restore
+                attr.setX(i, baseAlpha);
+                attr.needsUpdate = true;
+            }, DISPLAY_CONFIG.fadeOutDuration * 1000);
+        }
+
         function triggerChain(nodeId, depth = 0) {
             if (!nodeId || depth > DISPLAY_CONFIG.maxChainDepth) return;
 
             edges.forEach(e => {
-                // figure out if this edge touches our node
                 const nbr = e.source === nodeId ? e.target
                     : e.target === nodeId ? e.source
                         : null;
                 if (!nbr) return;
 
-                // schedule the “pulse”
-                const delayMs = DISPLAY_CONFIG.chainDelay * 1000 * (depth + 1);
-                setTimeout(() => {
-                    // highlight in the alpha buffer
-                    const off = e.index * 2;
-                    edgeAlphaArray[off] = DISPLAY_CONFIG.hoverHighlightOpacity;
-                    edgeAlphaArray[off + 1] = DISPLAY_CONFIG.hoverHighlightOpacity;
-                    edgeGeometry.attributes.alpha.needsUpdate = true;
+                const delay = DISPLAY_CONFIG.chainDelay * 1000 * (depth + 1);
+                const base = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, e.weight);
 
-                    // reset after fadeOutDuration
-                    setTimeout(() => {
-                        const base = DISPLAY_CONFIG.lineBaseOpacity * e.weight;
-                        edgeAlphaArray[off] = base;
-                        edgeAlphaArray[off + 1] = base;
-                        edgeGeometry.attributes.alpha.needsUpdate = true;
-                    }, DISPLAY_CONFIG.fadeOutDuration * 1000);
-                }, delayMs);
-
-                // recurse to next depth
-                setTimeout(() => triggerChain(nbr, depth + 1),
-                    DISPLAY_CONFIG.chainDelay * 1000 * (depth + 1));
+                setTimeout(() => pulseEdge(e.index, base), delay);
+                setTimeout(() => triggerChain(nbr, depth + 1), delay);
             });
         }
 
@@ -1042,19 +1007,33 @@
         fileSelector.addEventListener('change', () => loadGraph());
         ageSel.addEventListener('change', applyFilters);
         typeSel.addEventListener('change', applyFilters);
+
+        /********************************************************************
+         *  Animation loop  (COMPLETE, NO OMISSIONS)
+         *******************************************************************/
         function animate() {
             requestAnimationFrame(animate);
             controls.update();
 
-            // 1) camera tween
+            // ── global upward drift ──────────────────────────────────────────
+            const nowDrift = Date.now();
+            const dt = nowDrift - lastDriftT;
+            yScrollOffset += dt / LAYOUT_CONFIG.msPerUnit;
+            lastDriftT = nowDrift;
+            graphGroup.position.y = yScrollOffset;
+
+            // ── camera tween ────────────────────────────────────────────────
             if (cameraTween) {
-                const t = Math.min((performance.now() - cameraTween.start) / cameraTween.duration, 1);
+                const t = Math.min((performance.now() - cameraTween.start) /
+                    cameraTween.duration, 1);
                 camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, t);
-                controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, t);
+                controls.target.lerpVectors(cameraTween.fromTarget,
+                    cameraTween.toTarget, t);
                 if (t >= 1) cameraTween = null;
             }
 
-            if (instMesh && typeof hoveredIdx !== 'undefined') {
+            // ── hover handling ──────────────────────────────────────────────
+            if (instMesh) {
                 raycaster.setFromCamera(pointer, camera);
                 const hit = raycaster.intersectObject(instMesh, false)[0];
 
@@ -1063,33 +1042,29 @@
                     if (hoveredIdx !== newIdx) {
                         hoveredIdx = newIdx;
 
-                        // safely look up the entry
                         const found = [...nodeMap.entries()]
                             .find(([, n]) => n._instanceIndex === newIdx);
+
                         if (!found) {
-                            // nothing matched, clear state
                             hoveredIdx = null;
                             hovered = null;
-                            return;
+                        } else {
+                            const [ctxId, node] = found;
+                            hovered = ctxId;
+
+                            // JSON preview
+                            selPane.textContent = JSON.stringify(node.data, null, 2);
+
+                            // node emissive flash
+                            const mat = node.mesh.material;
+                            mat.emissive = new THREE.Color(0xffffff);
+                            mat.emissiveIntensity = 1;
+                            setTimeout(() => mat.emissiveIntensity = 0,
+                                DISPLAY_CONFIG.fadeOutDuration * 1000);
+
+                            // edge pulse chain
+                            triggerChain(ctxId, 0);
                         }
-
-                        const [ctxId, node] = found;
-                        hovered = ctxId;
-
-                        // update hover pane
-                        selPane.textContent = JSON.stringify(node.data, null, 2);
-
-                        // flash emissive
-                        const mat = node.mesh.material;
-                        mat.emissive = new THREE.Color(0xffffff);
-                        mat.emissiveIntensity = 1;
-                        setTimeout(
-                            () => mat.emissiveIntensity = 0,
-                            DISPLAY_CONFIG.fadeOutDuration * 1000
-                        );
-
-                        // pulse chain
-                        triggerChain(ctxId, 0);
                     }
                 } else {
                     hoveredIdx = null;
@@ -1097,43 +1072,15 @@
                 }
             }
 
-
-
-            // 3) update edge alphas in a single pass
-            edges.forEach(e => {
-                const base = DISPLAY_CONFIG.lineBaseOpacity * e.weight;
-                const off = e.index * 2;
-                edgeAlphaArray[off] = base;
-                edgeAlphaArray[off + 1] = base;
-            });
-            if (hovered) {
-                edges.forEach(e => {
-                    if (e.source === hovered || e.target === hovered) {
-                        const off = e.index * 2;
-                        edgeAlphaArray[off] = DISPLAY_CONFIG.hoverHighlightOpacity;
-                        edgeAlphaArray[off + 1] = DISPLAY_CONFIG.hoverHighlightOpacity;
-                    }
-                });
-            }
-            edgeGeometry.attributes.alpha.needsUpdate = true;
-
-            // 4) emissive flash on actual hover *change*
+            // ── hovered-change emissive reset (re-safety) ───────────────────
             if (hovered !== previousHoveredId) {
                 previousHoveredId = hovered;
                 nodeMap.forEach(n => {
-                    n.mesh.material.emissiveIntensity = 0;
+                    if (n.mesh) n.mesh.material.emissiveIntensity = 0;
                 });
-                if (hovered) {
-                    const m = nodeMap.get(hovered).mesh;
-                    m.material.emissive = new THREE.Color(0xffffff);
-                    m.material.emissiveIntensity = 1;
-                    setTimeout(() => m.material.emissiveIntensity = 0,
-                        DISPLAY_CONFIG.fadeOutDuration * 1000);
-                    triggerChain(hovered, 0);
-                }
             }
 
-            // 5) final render
+            // ── final render ────────────────────────────────────────────────
             renderer.render(scene, camera);
         }
         // poll for new lines
