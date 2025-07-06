@@ -200,6 +200,19 @@ if updated:
         json.dump(config, f, indent=2)
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
 
+# ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
+for model in (config.get("primary_model"), config.get("secondary_model")):
+    try:
+        existing = subprocess.check_output(["ollama", "list"], text=True)
+        if model not in existing:
+            log_message(f"Model '{model}' not found locally—pulling with Ollama...", "PROCESS")
+            subprocess.check_call(["ollama", "pull", model])
+            log_message(f"Successfully pulled Ollama model '{model}'.", "SUCCESS")
+        else:
+            log_message(f"Ollama model '{model}' already present.", "INFO")
+    except subprocess.CalledProcessError as e:
+        log_message(f"Error pulling model '{model}': {e}", "WARNING")
+
 # ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
 def setup_piper_and_onnx():
     script_dir   = os.path.dirname(os.path.abspath(__file__))
