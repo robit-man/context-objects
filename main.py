@@ -59,20 +59,29 @@ def create_and_activate_venv():
 
     # 1) Find or install python3.10 on Debian/Ubuntu
     py310 = shutil.which("python3.10")
-    if not py310 and platform.system()=="Linux" and shutil.which("apt-get"):
-        log_message("python3.10 not found—adding Deadsnakes PPA & installing...", "PROCESS")
-        try:
-            subprocess.check_call(["sudo","apt-get","update"])
-            subprocess.check_call(["sudo","apt-get","install","-y","software-properties-common"])
-            subprocess.check_call(["sudo","add-apt-repository","-y","ppa:deadsnakes/ppa"])
-            subprocess.check_call(["sudo","apt-get","update"])
-            subprocess.check_call([
-                "sudo","apt-get","install","-y",
-                "python3.10","python3.10-venv","python3.10-distutils"
-            ])
-            py310 = shutil.which("python3.10")
-        except subprocess.CalledProcessError as e:
-            log_message(f"Failed to install python3.10: {e}", "ERROR")
+    if not py310:
+        if platform.system() == "Linux" and shutil.which("apt-get"):
+            log_message("python3.10 not found—adding Deadsnakes PPA & installing...", "PROCESS")
+            try:
+                subprocess.check_call(["sudo","apt-get","update"])
+                subprocess.check_call(["sudo","apt-get","install","-y","software-properties-common"])
+                subprocess.check_call(["sudo","add-apt-repository","-y","ppa:deadsnakes/ppa"])
+                subprocess.check_call(["sudo","apt-get","update"])
+                subprocess.check_call([
+                    "sudo","apt-get","install","-y",
+                    "python3.10","python3.10-venv","python3.10-distutils"
+                ])
+                py310 = shutil.which("python3.10")
+            except subprocess.CalledProcessError as e:
+                log_message(f"Failed to install python3.10: {e}", "ERROR")
+        elif platform.system() == "Darwin" and shutil.which("brew"):
+            log_message("python3.10 not found—installing via Homebrew...", "PROCESS")
+            try:
+                subprocess.check_call(["brew","update"])
+                subprocess.check_call(["brew","install","python@3.10"])
+                py310 = shutil.which("python3.10")
+            except subprocess.CalledProcessError as e:
+                log_message(f"Failed to install python3.10 via Homebrew: {e}", "ERROR")
 
     # 2) Fallback to current interpreter if still missing
     if not py310:
@@ -111,10 +120,18 @@ if not os.path.exists(SETUP_MARKER):
     log_message("Installing system & Python deps…", "PROCESS")
     # System packages on Debian/Ubuntu
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
+        log_message("Installing system packages via apt-get...", "PROCESS")
         subprocess.check_call(["sudo","apt-get","update"])
         subprocess.check_call([
             "sudo","apt-get","install","-y",
             "libsqlite3-dev","ffmpeg","wget","unzip"
+        ])
+    elif sys.platform == "darwin" and shutil.which("brew"):
+        log_message("Installing system packages via Homebrew...", "PROCESS")
+        subprocess.check_call(["brew","update"])
+        subprocess.check_call([
+            "brew","install",
+            "sqlite3","ffmpeg","wget","unzip"
         ])
     # Python packages
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
@@ -157,8 +174,8 @@ DEFAULT_CFG = {
     "piper_release_windows":      "piper_windows_amd64.zip",
 
     # ONNX assets: point at your *local* filenames here
-    "onnx_json_filename":  "combine_soldier.onnx.json",
-    "onnx_model_filename": "combine_soldier.onnx",
+    "onnx_json_filename":  "glados_piper_medium.onnx.json",
+    "onnx_model_filename": "glados_piper_medium.onnx",
     # …but also keep the URLs so we can download if missing…
     "onnx_json_url":  "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json",
     "onnx_model_url": "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx",
