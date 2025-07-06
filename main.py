@@ -188,6 +188,29 @@ if os.path.exists(CONFIG_FILE):
 else:
     config = {}
 
+# ──────────── CHECK / CREATE .env ─────────────────────────────
+ENV_FILE = ".env"
+if not os.path.exists(ENV_FILE):
+    # 1) create .env with placeholder
+    with open(ENV_FILE, "w") as f:
+        f.write("BOT_TOKEN=\n")
+    # 2) prompt user to obtain & enter token
+    print("Please obtain a Telegram bot token from BotFather:")
+    print("https://telegram.me/BotFather")
+    token = input("Paste your BOT_TOKEN here: ").strip()
+    # 3) write the real token back into .env
+    with open(ENV_FILE, "w") as f:
+        f.write(f"BOT_TOKEN={token}\n")
+    # 4) store in config for runtime use
+    config["bot_token"] = token
+else:
+    # load existing token if present
+    with open(ENV_FILE) as f:
+        for line in f:
+            if line.startswith("BOT_TOKEN="):
+                config["bot_token"] = line.strip().split("=", 1)[1]
+                break
+
 # fill in any missing defaults
 updated = False
 for k, v in DEFAULT_CFG.items():
