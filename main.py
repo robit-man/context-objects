@@ -250,6 +250,7 @@ if not in_virtualenv():
 SETUP_MARKER = os.path.join(os.path.dirname(__file__), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
     log_message("Installing system & Python deps…", "PROCESS")
+
     # System packages on Debian/Ubuntu
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
         log_message("Installing system packages via apt-get...", "PROCESS")
@@ -258,6 +259,7 @@ if not os.path.exists(SETUP_MARKER):
             "sudo", "apt-get", "install", "-y",
             "libsqlite3-dev", "ffmpeg", "wget", "unzip"
         ])
+
     # System packages on macOS
     elif sys.platform == "darwin" and shutil.which("brew"):
         log_message("Installing system packages via Homebrew...", "PROCESS")
@@ -266,26 +268,45 @@ if not os.path.exists(SETUP_MARKER):
             "brew", "install",
             "sqlite3", "ffmpeg", "wget", "unzip"
         ])
+
+    # System packages on Windows
+    elif sys.platform == "win32":
+        log_message("Installing system packages on Windows...", "PROCESS")
+        if shutil.which("choco"):
+            subprocess.check_call([
+                "choco", "install", "-y",
+                "sqlite", "ffmpeg", "wget", "unzip"
+            ])
+        else:
+            log_message("Chocolatey not found; skipping system package installation on Windows", "WARNING")
+
+    else:
+        log_message("No recognized system package manager; skipping system package installation", "WARNING")
+
     # Python packages
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-    # Prepare dependency list (skip third-party asyncio on macOS)
     deps = [
-        "sounddevice", "numpy", "scipy", "openai-whisper", "ollama",
-        "python-dotenv", "beautifulsoup4", "html5lib", "psutil",
-        "noisereduce", "denoiser", "pillow", "opencv-python",
-        "mss", "networkx", "pandas", "selenium", "webdriver-manager",
-        "flask_cors", "flask", "tiktoken", "python-telegram-bot",
-        "nest-asyncio", "sentence-transformers", "telegram", "num2words"
+        "sounddevice","numpy","scipy","openai-whisper","ollama",
+        "python-dotenv","beautifulsoup4","html5lib","psutil",
+        "noisereduce","denoiser","pillow","opencv-python",
+        "mss","networkx","pandas","selenium","webdriver-manager",
+        "flask_cors","flask","tiktoken","python-telegram-bot",
+        "nest-asyncio","sentence-transformers","telegram","num2words"
     ]
-    # on Linux only, also install the separate 'asyncio' package
+    # on Linux or Windows, also install the separate 'asyncio' package
     if sys.platform.startswith("linux"):
         deps.append("asyncio")
     subprocess.check_call([sys.executable, "-m", "pip", "install"] + deps)
-    # mark setup complete and restart
+
+    # mark setup complete and restart under the same interpreter
     with open(SETUP_MARKER, "w") as f:
         f.write("done")
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # ──────────── LOAD / GENERATE config.json ────────────────────────────────────
 CONFIG_FILE = "config.json"
@@ -340,8 +361,6 @@ if not os.path.exists(ENV_FILE):
     # 3) write the real token back into .env
     with open(ENV_FILE, "w") as f:
         f.write(f"BOT_TOKEN={token}\n")
-    # 4) store in config for runtime use
-    config["bot_token"] = token
 else:
     # load existing token if present
     with open(ENV_FILE) as f:
