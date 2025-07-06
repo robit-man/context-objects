@@ -156,7 +156,7 @@ def in_virtualenv() -> bool:
 def create_and_activate_venv():
     venv_dir = os.path.join(os.getcwd(), ".venv")
 
-    # 1) Find or install python3.10 on Debian/Ubuntu, macOS, or accept any Python ≥3.10 on Windows
+    # 1) Find or install python3.10 on Debian/Ubuntu, macOS, or accept any Python >=3.10 on Windows
     py310 = shutil.which("python3.10")
     if not py310:
         if platform.system() == "Linux" and shutil.which("apt-get"):
@@ -184,11 +184,13 @@ def create_and_activate_venv():
                 log_message(f"Failed to install python3.10 via Homebrew: {e}", "ERROR")
 
         elif platform.system().startswith("Win"):
-            log_message("python3.10 not found—checking ‘python’ for version ≥3.10...", "PROCESS")
+            log_message("python3.10 not found - checking 'python' for version >=3.10...", "PROCESS")
             candidate = shutil.which("python") or shutil.which("python3")
             if candidate:
                 try:
-                    out = subprocess.check_output([candidate, "--version"], stderr=subprocess.STDOUT, text=True).strip()
+                    out = subprocess.check_output([candidate, "--version"],
+                                                  stderr=subprocess.STDOUT,
+                                                  text=True).strip()
                     _, version = out.split()
                     major, minor, *_ = version.split(".")
                     if int(major) == 3 and int(minor) >= 10:
@@ -199,7 +201,7 @@ def create_and_activate_venv():
                 except Exception as e:
                     log_message(f"Failed to check {candidate} version: {e}", "ERROR")
             if not py310:
-                log_message("No acceptable Python ≥3.10 found on Windows—falling back to current Python", "WARNING")
+                log_message("No acceptable Python >=3.10 found on Windows—falling back to current Python", "WARNING")
 
     # 2) Fallback to current interpreter if still missing
     if not py310:
@@ -236,6 +238,7 @@ def create_and_activate_venv():
 
 if not in_virtualenv():
     create_and_activate_venv()
+
 
 # ──────────── FIRST-RUN DEPENDENCIES ─────────────────────────────────────────
 
