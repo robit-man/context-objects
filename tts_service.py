@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 import shutil
+import time
 import numpy as np
 import re
 
@@ -191,9 +192,11 @@ class TTSManager:
             if shutil.which("aplay"):
                 cmd_play = ["aplay", "-r", "22050", "-f", "S16_LE"]
             elif shutil.which("ffplay"):
+                # drop '-ac' which ffplay v7 doesn't recognize
                 cmd_play = [
                     "ffplay", "-autoexit", "-nodisp",
-                    "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0"
+                    "-f", "s16le", "-ar", "22050",
+                    "-i", "pipe:0"
                 ]
             else:
                 raise RuntimeError(
