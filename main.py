@@ -34,7 +34,7 @@ if sys.version_info < (3, 10):
     # 2) if not found, install based on platform
     if not python_exec:
         if sys.platform.startswith("linux") and shutil.which("apt-get"):
-            log_message("Installing Python 3.10 via apt-get…", "PROCESS")
+            print("Installing Python 3.10 via apt-get…", "PROCESS")
             subprocess.check_call(["sudo", "apt-get", "update"])
             subprocess.check_call([
                 "sudo", "apt-get", "install", "-y",
@@ -42,16 +42,16 @@ if sys.version_info < (3, 10):
             ])
             python_exec = shutil.which("python3.10")
         elif sys.platform == "darwin" and shutil.which("brew"):
-            log_message("Installing Python 3.10 via Homebrew…", "PROCESS")
+            print("Installing Python 3.10 via Homebrew…", "PROCESS")
             subprocess.check_call(["brew", "update"])
             subprocess.check_call(["brew", "install", "python@3.10"])
             python_exec = shutil.which("python3.10")
     # 3) re-exec under the new interpreter or fail
     if python_exec:
-        log_message(f"Re-launching under {os.path.basename(python_exec)}…", "PROCESS")
+        print(f"Re-launching under {os.path.basename(python_exec)}…", "PROCESS")
         os.execv(python_exec, [python_exec] + sys.argv)
     else:
-        log_message("Failed to install Python 3.10 or newer.", "ERROR")
+        print("Failed to install Python 3.10 or newer.", "ERROR")
         sys.exit(1)
 
 
