@@ -133,6 +133,14 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
+    # On Windows, disable in-place edits entirely
+    if os.name == "nt":
+        def _noop_status(stage: str, output: Any):
+            pass
+        def _noop_stop():
+            pass
+        return _noop_status, _noop_stop
+
     from typing import List, Any
     history: List[str] = []
     last_edit_at: float = 0.0
@@ -143,7 +151,6 @@ def _make_status_cb(
         nonlocal last_edit_at, pending_handle
         if disabled:
             return
-        # Show the JSONL file being updated, then the recent stage updates
         header = f"`context_{chat_id}.jsonl` updating...\n"
         body = "\n".join(history[-max_lines:])
         text = header + body
@@ -152,7 +159,7 @@ def _make_status_cb(
                 chat_id=chat_id,
                 message_id=msg_id,
                 text=text,
-                parse_mode='Markdown'
+                parse_mode="Markdown"
             )
         except:
             pass
@@ -179,7 +186,6 @@ def _make_status_cb(
         snippet = str(output).replace("\n", " ")
         if len(snippet) > 1000:
             snippet = snippet[:997] + "…"
-        # Bold the stage name
         history.append(f"• *{stage}*: {snippet}")
         _schedule_edit()
 
