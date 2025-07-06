@@ -325,7 +325,7 @@ class Tools:
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
     @staticmethod
-    def parse_tool_call(text: str) -> str | None:
+    def parse_tool_call(text: str) -> Optional[str]:
         """
         Extract a tool call from:
           1) A fenced ```tool_code```, ```python``` or ```py``` block
