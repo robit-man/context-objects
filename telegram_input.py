@@ -133,60 +133,14 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-    # On Windows: send detailed Ollama+endpoint+logs debug via Telegram
+    # On Windows: do nothing (we’ll send fresh messages instead)
     if os.name == "nt":
-        import os, shutil, socket, asyncio, platform, sys
-
-        def _win_status(stage: str, output: Any):
-            # 1) CLI path
-            cli_path = shutil.which("ollama") or shutil.which("ollama.exe")
-
-            # 2) HTTP override
-            api_url = os.environ.get("OLLAMA_API_URL", "<unset>")
-
-            # 3) TCP connect test
-            try:
-                conn = socket.create_connection(("127.0.0.1", 11434), timeout=0.5)
-                conn.close()
-                tcp_status = "OK"
-            except Exception as e:
-                tcp_status = f"FAIL: {e}"
-
-            # 4) Event loop policy
-            loop_pol = type(asyncio.get_event_loop()).__name__
-
-            # 5) Last 10 log lines
-            recent_logs = list(_LOG_HISTORY)[-10:]
-            logs_block = "\n".join(recent_logs) if recent_logs else "(no logs yet)"
-
-            # Build the debug message
-            msg = "\n".join([
-                f"🖥️ OS: {platform.system()} {platform.release()}",
-                f"🐍 Python: {sys.executable.split(os.sep)[-1]} ({sys.version.split()[0]})",
-                f"🔄 Loop: {loop_pol}",
-                "",
-                "🔍 Ollama CLI discovery:",
-                f"  which():           {cli_path!r}",
-                f"  OLLAMA_API_URL:    {api_url!r}",
-                f"  TCP 127.0.0.1:11434 → {tcp_status}",
-                "",
-                f"• *{stage}*: {output}",
-                "",
-                "📝 Recent log tail:",
-                f"```{logs_block}```"
-            ])
-
-            # Send as a new Telegram message
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
-                loop
-            )
-
-        def _win_stop():
+        def _noop_status(stage: str, output: Any):
+            # no-op on Windows
             return
-
-        return _win_status, _win_stop
-
+        def _noop_stop():
+            return
+        return _noop_status, _noop_stop
 
     # POSIX path: keep editing in-place
     from typing import List, Any
@@ -632,21 +586,15 @@ def telegram_input(asm: Assembler):
                     chat_asm.tts.enqueue(final)
                     await asyncio.to_thread(chat_asm.tts._file_q.join)
         
-                    # 7) Send .ogg back (skip any missing files)
+                    # 7) Send .ogg back
                     oggs: List[str] = []
                     while True:
                         try:
                             p = chat_asm.tts._ogg_q.get_nowait()
-                        except _queue.Empty:
-                            break
-
-                        # skip files that have vanished
-                        try:
                             if os.path.getsize(p) > 0:
                                 oggs.append(p)
-                        except FileNotFoundError:
-                            print(f"Warning: missing OGG file, skipping: {p}", "WARNING")
-                            continue
+                        except _queue.Empty:
+                            break
         
                     if oggs:
                         if len(oggs) == 1:
