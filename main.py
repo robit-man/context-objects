@@ -19,7 +19,7 @@ import sys
 if sys.platform == "win32":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
+
 import time
 import json
 import shutil
@@ -316,6 +316,7 @@ DEFAULT_CFG = {
     # core LLM models
     "primary_model":   "gemma3:4b",
     "secondary_model": "gemma3:4b",
+    "decision_model": "gemma3:1b",
 
     # audio thresholds
     "sample_rate":         16000,

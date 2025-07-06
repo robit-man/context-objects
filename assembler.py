@@ -367,6 +367,7 @@ class Assembler:
         # Models & lookback
         self.primary_model   = self.cfg.get("primary_model",   "gemma3:4b")
         self.secondary_model = self.cfg.get("secondary_model", self.primary_model)
+        self.decision_model = self.cfg.get("decision_model", self.secondary_model)
         self.lookback        = self.cfg.get("lookback_minutes", lookback_minutes)
         self.top_k           = self.cfg.get("top_k",            top_k)
         self.hist_k          = self.cfg.get("history_turns",    5)
@@ -468,6 +469,7 @@ class Assembler:
         defaults = {
             "primary_model":    self.primary_model,
             "secondary_model":  self.secondary_model,
+            "decision_model":  self.decision_model,
             "lookback_minutes": self.lookback,
             "top_k":            self.top_k,
             "history_turns":    self.hist_k,
@@ -1410,80 +1412,85 @@ class Assembler:
         except KeyError:
             return False
                 
-    def filter_callback(self, user_text: str) -> bool:
-        """
-        Decide—via a YES/NO LLM query over the last several turns—whether
-        we should continue running the full pipeline and reply.
-        """
-        import re
-        from ollama import chat
 
-        # 1) Fetch the last 8 user_input/assistant segments for context
-        segs = [
-            c for c in self.repo.query(
-                lambda c: c.domain    == "segment"
-                          and c.semantic_label in ("user_input", "assistant")
-            )
-        ]
-        segs.sort(key=lambda c: c.timestamp)
-        recent = segs[-8:]  # last 8 turns
+    def decision_callback(
+        self,
+        user_text: str,
+        options: List[str],
+        system_template: str,
+        history_size: int,
+        var_names: List[str]
+    ) -> str:
+        # 1) Build the mapping correctly with “:”
+        mapping = {vn: opt for vn, opt in zip(var_names, options)}
 
-        # 2) Build a mini‐conversation history block
-        convo = ""
-        for c in recent:
-            speaker = "User" if c.semantic_label == "user_input" else "Assistant"
-            convo += f"{speaker}: {c.summary}\n"
+        # 2) Format the system prompt
+        system_msg = system_template.format(**mapping)
 
-        # 3) Prepare a richer decision prompt
-        system_msg = (
-            "You are an **attentive meta-reasoner** with limited attention.  "
-            "Your job is to decide whether the assistant should interject **now**, "
-            "based on the **flow**, **relevance**, and **tone** of the conversation.  "
-            "Consider how the new message builds on or deviates from recent context.  "
-            "Answer *only* 'YES' or 'NO'."
+        # 3) Gather recent conversation
+        segs = sorted(
+            [c for c in self.repo.query(lambda c: c.domain=="segment"
+                                       and c.semantic_label in ("user_input","assistant"))],
+            key=lambda c: c.timestamp
+        )[-history_size:]
+        convo = "\n".join(
+            ("User: " if c.semantic_label=="user_input" else "Assistant: ")
+            + c.summary
+            for c in segs
         )
-        user_msg = (
-            "=== Recent Conversation ===\n"
-            f"{convo}\n"
-            f"=== New Message ===\n{user_text}\n\n"
-            "Should the assistant respond at this point?"
-        )
+        user_msg = f"=== Recent Conversation ===\n{convo}\n\n=== New Message ===\n{user_text}"
 
-        # 4) Stream the model’s YES/NO answer
+        # 4) Call the model
         resp = ""
         for part in chat(
-            model=self.secondary_model,
+            model=self.decision_model,
             messages=[
-                {"role": "system",  "content": system_msg},
-                {"role": "user",    "content": user_msg}
+                {"role":"system","content":system_msg},
+                {"role":"user",  "content":user_msg}
             ],
             stream=True
         ):
             resp += part["message"]["content"]
 
-        # 5) Record the decision Q&A into memory
-        q_ctx = ContextObject.make_stage(
-            "decision_question",
-            [], {"prompt": user_msg}
+        # 5) Record Q&A
+        q = ContextObject.make_stage("decision_question", [], {"prompt": system_msg+"\n\n"+user_msg})
+        q.component = "decision"; q.semantic_label = "question"; q.touch(); self.repo.save(q)
+        a = ContextObject.make_stage("decision_answer", [q.context_id], {"answer": resp.strip()})
+        a.component = "decision"; a.semantic_label = "answer"; a.touch(); self.repo.save(a)
+
+        # 6) Return the first matching option
+        for opt in options:
+            if re.search(rf"\b{re.escape(opt)}\b", resp, re.I):
+                return opt
+        return resp.strip()
+    
+    def filter_callback(self, user_text: str) -> bool:
+        choice = self.decision_callback(
+            user_text=user_text,
+            options=["YES","NO"],
+            system_template=(
+                "You are an attentive meta-reasoner.  Decide whether to respond now.  "
+                "Answer exactly {arg1} or {arg2}."
+            ),
+            history_size=8,
+            var_names=["arg1","arg2"]
         )
-        q_ctx.component      = "decision"
-        q_ctx.semantic_label = "question"
-        q_ctx.touch()
-        self.repo.save(q_ctx)
+        return choice.upper() == "YES"
 
-        a_ctx = ContextObject.make_stage(
-            "decision_answer",
-            [q_ctx.context_id], {"answer": resp.strip()}
+
+    def tools_callback(self, user_text: str) -> bool:
+        choice = self.decision_callback(
+            user_text=user_text,
+            options=["TOOLS","NO_TOOLS"],
+            system_template=(
+                "You are a lightweight judge.  Decide if external tools or searches are required.  "
+                "Answer exactly {arg1} or {arg2}."
+            ),
+            history_size=6,
+            var_names=["arg1","arg2"]
         )
-        a_ctx.component      = "decision"
-        a_ctx.semantic_label = "answer"
-        a_ctx.touch()
-        self.repo.save(a_ctx)
-
-        # 6) Return True if we got a 'YES'
-        return bool(re.search(r"\byes\b", resp, re.I))
-
-
+        return choice.upper() == "TOOLS"
+    
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1531,7 +1538,34 @@ class Assembler:
                 return ""
         except Exception as e:
             _record_perf("decision_to_respond", str(e), False)
-            # if the decision stage fails, proceed anyway
+            # proceed anyway if this fails
+
+        # ─── Stage 0.5: decide if we need tool calls / planning ───────────
+        t0 = datetime.utcnow()
+        try:
+            use_tools = self.tools_callback(user_text)
+            state["use_tools"] = use_tools
+            _record_perf("decide_tool_usage", str(use_tools), True)
+        except Exception as e:
+            state["use_tools"] = True        # default to full pipeline
+            _record_perf("decide_tool_usage", str(e), False)
+
+        # ─── Fast‐path when tools not needed ──────────────────────────────
+        if not state["use_tools"]:
+            # build a minimal context for a one‐shot reply
+            recent = self.repo.query(lambda c: c.domain=="segment")[-10:]
+            history = [{"role":"user" if c.semantic_label=="user_input" else "assistant",
+                        "content":c.summary} for c in recent]
+            # append the new user_text
+            history.append({"role":"user","content":user_text})
+            # one‐shot inference
+            from ollama import chat
+            reply = ""
+            for chunk in chat(model=self.primary_model, messages=history, stream=True):
+                reply += chunk["message"]["content"]
+                status_cb("fast_reply", reply)
+            status_cb("output", reply)
+            return reply
 
         # ─── Stage 1: record_input ───────────────────────────────────────
         t0 = datetime.utcnow()
@@ -1769,7 +1803,6 @@ class Assembler:
     def _stage2_load_system_prompts(self) -> ContextObject:
         return self._load_system_prompts()
     
-    
     def _stage3_retrieve_and_merge_context(
         self,
         user_text: str,
@@ -1779,141 +1812,227 @@ class Assembler:
         recall_ids: List[str] = None
     ) -> Dict[str, Any]:
         """
-        Merge together, in a human-like interleaving with recency and semantic falloff:
-        • system prompts
-        • a slice of recent narrative entries
-        • recent raw segments (user/assistant)
-        • any explicit chat_history (extra_ctx)
-        • semantic retrieval (RL-gated, tag-prioritized)
-        • associative memory via spread-activation (RL-gated, narrative-driven seeding, tag-prioritized)
-        • recent tool outputs (RL-gated)
+        Merge system prompts, narrative, dynamic chat history,
+        semantic/memory/tool contexts — with three user‐driven decisions for:
+          • how many history entries to include
+          • how far back in time to look
+          • which tags to use for similarity search
+        Falls back to at least the last 5 minutes, last 10 interactions,
+        and default high-priority tags if decisions fail.
         """
+        import re
         from datetime import timedelta
+        import concurrent.futures
 
-        # ① compute RL “recall feature” from prior recalls
+        now = default_clock()
+
+        # ── Step A: dynamically decide context parameters via decision_callback ──
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            fut_count = executor.submit(
+                self.decision_callback,
+                user_text,
+                ["5", "10", "20", "50"],
+                "Choose how many recent chat entries to include: {arg1}, {arg2}, {arg3}, or {arg4}.",
+                timeout=2.0,
+                arg_names=["arg1","arg2","arg3","arg4"]
+            )
+            fut_window = executor.submit(
+                self.decision_callback,
+                user_text,
+                ["5 minutes", "30 minutes", "1 hour", "6 hours", "1 day"],
+                "Choose a time window for context: {arg1}, {arg2}, {arg3}, {arg4}, or {arg5}.",
+                timeout=2.0,
+                arg_names=["arg1","arg2","arg3","arg4","arg5"]
+            )
+            fut_tags = executor.submit(
+                self.decision_callback,
+                user_text,
+                ["important", "decision_point", "task", "question"],
+                "Choose relevance tags (comma-separated) from: {arg1}, {arg2}, {arg3}, {arg4}.",
+                timeout=2.0,
+                arg_names=["arg1","arg2","arg3","arg4"]
+            )
+
+            # parse number of entries, fallback to 10
+            try:
+                cnt = fut_count.result()
+                num_entries = max(1, int(re.search(r"\d+", cnt).group()))
+            except Exception:
+                num_entries = 10
+
+            # parse time window, fallback to 5 minutes
+            try:
+                window = fut_window.result()
+                m = re.match(r"(\d+)\s*(minute|hour|day)s?", window)
+                if m:
+                    val, unit = int(m.group(1)), m.group(2)
+                    delta = {
+                        "minute": timedelta(minutes=val),
+                        "hour":   timedelta(hours=val),
+                        "day":    timedelta(days=val),
+                    }[unit]
+                else:
+                    delta = timedelta(minutes=5)
+            except Exception:
+                delta = timedelta(minutes=5)
+
+            # parse similarity tags, fallback to high-priority defaults
+            try:
+                tags = fut_tags.result()
+                sim_tags = [t.strip() for t in tags.split(",") if t.strip()]
+            except Exception:
+                sim_tags = ["important", "decision_point"]
+
+        # ── Step B: compute recall feature for RL gating ─────────────────────
         rf = 0.0
         if recall_ids:
-            counts = []
-            for cid in recall_ids:
-                try:
-                    counts.append(self.repo.get(cid).recall_stats.get("count", 0))
-                except KeyError:
-                    continue
+            counts = [
+                self.repo.get(cid).recall_stats.get("count", 0)
+                for cid in recall_ids
+                if cid and self.repo.get(cid)
+            ]
             rf = sum(counts) / len(counts) if counts else 0.0
 
-        # ② time-window for semantic retrieval
-        now  = default_clock()
-        past = now - timedelta(minutes=self.lookback)
-        tr   = (past.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%dT%H%M%SZ"))
+        # ── Step C: load & slice recent narrative entries ────────────────────
+        full_narr = self._load_narrative_context()
+        all_narr = sorted(
+            [c for c in self.repo.query(lambda c: c.component=="narrative")],
+            key=lambda c: c.timestamp, reverse=True
+        )[:5]
+        all_narr.reverse()
+        full_narr.summary = "\n".join(n.summary for n in all_narr)
+        narr_ctx = full_narr
 
-        # ③ load and slice recent narrative entries
-        full_narr_ctx = self._load_narrative_context()
-        all_narr = self.repo.query(lambda c: c.component=="narrative")
-        all_narr.sort(key=lambda c: c.timestamp, reverse=True)
-        recent_narr_objs = list(reversed(all_narr[:5]))  # last 5 narrative entries
-        sliced_summary = "\n".join(n.summary for n in recent_narr_objs)
-        # override summary for this turn only
-        full_narr_ctx.summary = sliced_summary
-        narr_ctx = full_narr_ctx
+        # ── Step D: harvest working memory (raw segments & final inferences) ─
+        WM = 5
+        raw_segments = sorted(
+            [c for c in self.repo.query(
+                lambda c: c.domain=="segment"
+                          and c.semantic_label in ("user_input","assistant")
+            )],
+            key=lambda c: c.timestamp
+        )[-WM:]
+        inferences = sorted(
+            [c for c in self.repo.query(
+                lambda c: c.semantic_label=="final_inference"
+            )],
+            key=lambda c: c.timestamp
+        )[-WM:]
+        # extract summaries
+        wm_segments = [c.summary for c in raw_segments]
+        wm_infers   = [c.summary for c in inferences]
 
-        # ④ raw history segments (interlaced user/assistant)
-        segments = self.repo.query(
-            lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+        # ── Step E: time-+-count-filtered chat history ───────────────────────
+        cutoff = now - delta
+        recent_segs = sorted(
+            [c for c in self.repo.query(
+                lambda c: c.domain=="segment"
+                          and c.semantic_label in ("user_input","assistant")
+                          and c.timestamp >= cutoff
+            )],
+            key=lambda c: c.timestamp
         )
-        segments.sort(key=lambda c: c.timestamp)
-        history = segments[-(self.hist_k*2):]
+        history = recent_segs[-num_entries:]
         if extra_ctx:
             history.extend(extra_ctx)
 
-        # ⑤ semantic retrieval (RL-gated + tag-based prioritization)
-        priority_tags = ("important", "decision_point")
+        # ── Step F: semantic retrieval using sim_tags ───────────────────────
+        tr = (
+            (now - delta).strftime("%Y%m%dT%H%M%SZ"),
+            now.strftime("%Y%m%dT%H%M%SZ")
+        )
         if self.rl.should_run("semantic_retrieval", rf):
             recent = self.engine.query(
                 stage_id="recent_retrieval",
                 time_range=tr,
                 similarity_to=user_text,
-                exclude_tags=(
-                    self.STAGES +
-                    ["tool_schema","tool_output","assistant","system_prompt"]
-                ),
+                include_tags=sim_tags,
+                exclude_tags=self.STAGES + ["tool_schema","tool_output","assistant","system_prompt"],
                 top_k=self.top_k
-            )
-            # bump any high-priority tags to front
-            recent.sort(
-                key=lambda c: not any(t in c.tags for t in priority_tags)
             )
         else:
             recent = []
 
-        # ⑥ associative memory via narrative-driven seeding
+        # ── Step G: associative memory via spread-activation ───────────────
         if self.rl.should_run("memory_retrieval", rf):
-            seed_ids = [user_ctx.context_id, narr_ctx.context_id]
+            seeds = [user_ctx.context_id, narr_ctx.context_id]
             scores = self.memman.spread_activation(
-                seed_ids=seed_ids,
-                hops=3,
-                decay=0.6,
-                assoc_weight=1.0,
-                recency_weight=1.0
+                seed_ids=seeds,
+                hops=3, decay=0.6,
+                assoc_weight=1.0, recency_weight=1.0
             )
-            top_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[: self.top_k]
-
-            assoc: List[ContextObject] = []
+            top_ids = sorted(scores, key=scores.get, reverse=True)[:self.top_k]
+            assoc = []
             for cid in top_ids:
                 try:
                     cobj = self.repo.get(cid)
+                    cobj.retrieval_score = scores[cid]
+                    cobj.retrieval_metadata = {"seed_ids": seeds}
+                    cobj.record_recall(
+                        stage_id="memory_retrieval",
+                        coactivated_with=seeds,
+                        retrieval_score=scores[cid]
+                    )
+                    self.repo.save(cobj)
+                    assoc.append(cobj)
                 except KeyError:
                     continue
-
-                # stamp retrieval metadata
-                cobj.retrieval_score    = scores[cid]
-                cobj.retrieval_metadata = {"seed_ids": seed_ids}
-                cobj.record_recall(
-                    stage_id="memory_retrieval",
-                    coactivated_with=seed_ids,
-                    retrieval_score=scores[cid]
-                )
-                self.repo.save(cobj)
-                assoc.append(cobj)
-
-            # bump high-priority tags in memory
-            assoc.sort(
-                key=lambda c: not any(t in c.tags for t in priority_tags)
-            )
         else:
             assoc = []
 
-        # ⑦ recent tool outputs (unchanged)
-        tools = self.repo.query(lambda c: c.component=="tool_output")
-        tools.sort(key=lambda c: c.timestamp)
-        if self.rl.should_run("tool_output_retrieval", rf):
-            recent_tools = tools[-self.top_k:]
-        else:
-            recent_tools = []
+        # ── Step H: recent tool outputs ────────────────────────────────────
+        tools = sorted(
+            [c for c in self.repo.query(lambda c: c.component=="tool_output")],
+            key=lambda c: c.timestamp
+        )
+        recent_tools = tools[-self.top_k:] if self.rl.should_run("tool_output_retrieval", rf) else []
 
-        # ⑧ interleave buckets for falloff of relevance
+        # ── Step I: interleave all buckets into merged list ────────────────
         merged: List[ContextObject] = []
         seen = set()
-        # include sliced narrative singleton first
-        merged.append(narr_ctx); seen.add(narr_ctx.context_id)
-        lists = [history, recent, assoc, recent_tools]
-        maxlen = max(len(lst) for lst in lists)
-        for i in range(maxlen):
-            for lst in lists:
-                if i < len(lst):
-                    c = lst[i]
-                    if c.context_id not in seen:
-                        merged.append(c)
-                        seen.add(c.context_id)
+        # 1) system prompt
+        for c in (sys_ctx,):
+            merged.append(c); seen.add(c.context_id)
+        # 2) narrative
+        if narr_ctx.context_id not in seen:
+            merged.append(narr_ctx); seen.add(narr_ctx.context_id)
+        # 3) working memory segments
+        for c in raw_segments:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+        # 4) working memory inferences
+        for c in inferences:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+        # 5) filtered history
+        for c in history:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+        # 6) semantic retrieval
+        for c in recent:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+        # 7) associative memory
+        for c in assoc:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+        # 8) tool outputs
+        for c in recent_tools:
+            if c.context_id not in seen:
+                merged.append(c); seen.add(c.context_id)
+
         merged_ids = [c.context_id for c in merged]
 
-        # ⑨ debug-print
-        self._print_stage_context("recent_retrieval", {
-            "system_prompts":   [sys_ctx.summary],
-            "narrative":        sliced_summary.splitlines(),
-            "history":          [f"{c.semantic_label}: {c.summary}" for c in history],
-            "semantic":         [f"{c.semantic_label}: {c.summary}" for c in recent],
-            "memory":           [f"{c.semantic_label}: {c.summary}" for c in assoc],
-            "tool_outputs":     [f"{c.semantic_label}: {c.summary}" for c in recent_tools],
+        # ── Step J: debug print of all context buckets ─────────────────────
+        self._print_stage_context("context_merge", {
+            "system":    [sys_ctx.summary],
+            "narrative": [n.summary for n in all_narr],
+            "working_segments": wm_segments,
+            "working_inferences": wm_infers,
+            "history":   [f"{c.semantic_label}: {c.summary}" for c in history],
+            "semantic":  [f"[Tags:{','.join(c.tags)}] {c.summary}" for c in recent],
+            "memory":    [f"[Score:{getattr(c,'retrieval_score',0):.2f}] {c.summary}" for c in assoc],
+            "tool_outputs": [c.summary for c in recent_tools],
         })
 
         return {
@@ -1923,6 +2042,7 @@ class Assembler:
             "assoc":         assoc,
             "recent_ids":    merged_ids,
         }
+
 
 
     # ── Stage 4: Intent Clarification ─────────────────────────────────────
@@ -1986,94 +2106,120 @@ class Assembler:
         ctx.touch()
         self.repo.save(ctx)
         return ctx
-
-
     def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
         import json
-        from datetime import timedelta, datetime
+        import concurrent.futures
+        from datetime import datetime, timedelta
 
-        # ── 0) Prune stale/overflow contexts to keep a rolling memory ───────
-        # (we pass an empty dict because _stage_prune_context_store ignores state contents)
+        now = default_clock()
+
+        # ── 0) Prune stale/overflow contexts ──────────────────────────────────
         prune_summary = self._stage_prune_context_store({})
 
-        # Build a “working memory” from the survivors
-        EPHEMERAL = {"segment", "tool_output", "knowledge", "narrative", "stage_performance"}
-        # fetch all remaining ephemeral contexts
-        survivors = [
-            c for c in self.repo.query(lambda c: c.component in EPHEMERAL)
-        ]
-        # sort newest first
-        survivors.sort(
-            key=lambda c: datetime.fromisoformat(
-                c.timestamp.rstrip("Z") if isinstance(c.timestamp, str) else datetime.utcnow().isoformat()
-            ),
-            reverse=True
-        )
-        # take up to top_k and reverse so oldest appear first
-        working_memory = [f"(WM) {c.summary}" for c in reversed(survivors[: self.top_k])]
-
-        snippets: list[str] = []
-        # seed with working memory
-        snippets.extend(working_memory)
-
-        # ── 1) External Web/snippet lookup ————————————————————————
-        for kw in clar_ctx.metadata.get("keywords", []):
-            hits = self.engine.query(
-                stage_id="external_knowledge_retrieval",
-                similarity_to=kw,
-                top_k=self.top_k
+        # ── 1) In parallel, gather:
+        #    A) recent segments (user_input/assistant)
+        #    B) recent final_inference stages
+        #    C) similarity hits on clarifier keywords
+        #    D) local summary‐match hits
+        with concurrent.futures.ThreadPoolExecutor() as exec:
+            fut_seg = exec.submit(
+                lambda: sorted(
+                    [c for c in self.repo.query(
+                        lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+                    )],
+                    key=lambda c: c.timestamp, reverse=True
+                )[: self.top_k]
             )
-            snippets.extend(h.summary for h in hits)
-
-        # ── 2) Local memory lookup —————————————————————————
-        now = default_clock()
-        start = (now - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
-        for kw in clar_ctx.metadata.get("keywords", []):
-            raw = Tools.context_query(
-                time_range=[start, now.strftime("%Y%m%dT%H%M%SZ")],
-                query=kw,
-                top_k=self.top_k
+            fut_inf = exec.submit(
+                lambda: sorted(
+                    [c for c in self.repo.query(
+                        lambda c: c.semantic_label=="final_inference"
+                    )],
+                    key=lambda c: c.timestamp, reverse=True
+                )[: self.top_k]
             )
-            try:
-                results = json.loads(raw).get("results", [])
-                for r in results:
-                    snippets.append(f"(MEM) {r.get('summary','')}")
-            except json.JSONDecodeError:
-                continue
+            fut_sim = exec.submit(
+                lambda: [
+                    h for kw in clar_ctx.metadata.get("keywords", [])
+                    for h in self.engine.query(
+                        stage_id="external_knowledge_retrieval",
+                        similarity_to=kw,
+                        top_k=self.top_k
+                    )
+                ]
+            )
+            fut_loc = exec.submit(
+                lambda: [
+                    c for c in self.repo.query(
+                        lambda c: (
+                            c.semantic_label in ("user_input","assistant","final_inference")
+                            and datetime.fromisoformat(c.timestamp.rstrip("Z")) >= now - timedelta(hours=1)
+                            and any(kw.lower() in (c.summary or "").lower() for kw in clar_ctx.metadata.get("keywords", []))
+                        )
+                    )
+                ]
+            )
 
-        # ── 3) Fallback to recent chat if still empty ——————————————
-        if not snippets:
-            recent = self._get_history()[-5:]
-            for ctx in recent:
-                snippets.append(f"(HIST) {ctx.summary}")
+        segs = fut_seg.result(timeout=2.0) if fut_seg else []
+        infs = fut_inf.result(timeout=2.0) if fut_inf else []
+        sims = fut_sim.result(timeout=2.0) if fut_sim else []
+        locs = fut_loc.result(timeout=2.0) if fut_loc else []
 
-        # dedupe while preserving order
-        seen = set()
-        unique_snips = []
-        for s in snippets:
+        # ── 2) Build working memory entries
+        working_memory = []
+        for c in reversed(segs):
+            working_memory.append(f"(WM) [{c.semantic_label}] {c.summary}")
+        for c in reversed(infs):
+            working_memory.append(f"(WM) [{c.semantic_label}] {c.summary}")
+
+        # ── 3) Build similarity snippets
+        sim_snips = [f"(EXT) [{','.join(h.tags)}] {h.summary}" for h in sims]
+
+        # ── 4) Build local‐match snippets
+        loc_snips = []
+        for c in locs:
+            tag = "SEG" if c.domain=="segment" else "INF"
+            loc_snips.append(f"(LOC-{tag}) [{c.semantic_label}] {c.summary}")
+
+        # ── 5) Fallback to last 5 segments if nothing collected
+        if not (working_memory or sim_snips or loc_snips):
+            fallback = sorted(
+                [c for c in self.repo.query(
+                    lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+                )],
+                key=lambda c: c.timestamp, reverse=True
+            )[:5]
+            for c in reversed(fallback):
+                working_memory.append(f"(FB) [{c.semantic_label}] {c.summary}")
+
+        # ── 6) Combine and dedupe, preserving order
+        all_snips = working_memory + sim_snips + loc_snips
+        seen = set(); unique = []
+        for s in all_snips:
             if s not in seen:
-                seen.add(s)
-                unique_snips.append(s)
+                seen.add(s); unique.append(s)
 
-        # ── 4) Persist and return —————————————————————————————
+        # ── 7) Persist and return
         ctx = ContextObject.make_stage(
             "external_knowledge_retrieval",
             clar_ctx.references,
-            {"snippets": unique_snips}
+            {"snippets": unique}
         )
         ctx.stage_id = "external_knowledge_retrieval"
-        ctx.summary  = "\n".join(unique_snips) or "(none)"
+        ctx.summary  = "\n".join(unique) or "(none)"
         ctx.touch()
         self.repo.save(ctx)
 
-        # for debugging
+        # ── 8) Debug print
         self._print_stage_context("external_knowledge_retrieval", {
-            "pruned":        prune_summary,
+            "pruned":         prune_summary,
             "working_memory": working_memory or ["(none)"],
-            "snippets":      unique_snips or ["(none)"]
+            "similarity":     sim_snips or ["(none)"],
+            "local_matches":  loc_snips or ["(none)"],
         })
 
         return ctx
+
 
     # ────────────────────────────────────────────────────────────────────────────────
     # Stage 6: Gather & Dedupe Tool Schemas
