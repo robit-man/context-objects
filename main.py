@@ -243,6 +243,7 @@ for model in (config.get("primary_model"), config.get("secondary_model")):
     except subprocess.CalledProcessError as e:
         log_message(f"Error pulling model '{model}': {e}", "WARNING")
 
+        
 # ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
 def setup_piper_and_onnx():
     script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -272,12 +273,24 @@ def setup_piper_and_onnx():
         log_message(f"Unsupported OS: {os_name}", "ERROR")
         sys.exit(1)
 
+    # download utility: use wget if present, otherwise curl
+    def _dl(url: str, dest: str):
+        if shutil.which("wget"):
+            cmd = ["wget", "-O", dest, url]
+        elif shutil.which("curl"):
+            cmd = ["curl", "-L", "-o", dest, url]
+        else:
+            log_message("Neither wget nor curl found; cannot download files.", "ERROR")
+            sys.exit(1)
+        subprocess.check_call(cmd)
+
     # download & unpack Piper if missing
     if not os.path.isfile(piper_exe):
         url     = config["piper_base_url"] + release
         archive = os.path.join(script_dir, release)
         log_message(f"Downloading Piper: {release}", "PROCESS")
-        subprocess.check_call(["wget", "-O", archive, url])
+        _dl(url, archive)
+
         os.makedirs(piper_folder, exist_ok=True)
         if release.endswith(".tar.gz"):
             subprocess.check_call(["tar", "-xzvf", archive, "-C", piper_folder, "--strip-components=1"])
@@ -291,7 +304,7 @@ def setup_piper_and_onnx():
     onnx_json = os.path.join(script_dir, config["onnx_json_filename"])
     if not os.path.isfile(onnx_json):
         log_message("Downloading ONNX JSON…", "PROCESS")
-        subprocess.check_call(["wget", "-O", onnx_json, config["onnx_json_url"]])
+        _dl(config["onnx_json_url"], onnx_json)
     else:
         log_message(f"Found ONNX JSON: {config['onnx_json_filename']}", "SUCCESS")
 
@@ -299,12 +312,13 @@ def setup_piper_and_onnx():
     onnx_model = os.path.join(script_dir, config["onnx_model_filename"])
     if not os.path.isfile(onnx_model):
         log_message("Downloading ONNX model…", "PROCESS")
-        subprocess.check_call(["wget", "-O", onnx_model, config["onnx_model_url"]])
+        _dl(config["onnx_model_url"], onnx_model)
     else:
         log_message(f"Found ONNX model: {config['onnx_model_filename']}", "SUCCESS")
 
 # finally, run it
 setup_piper_and_onnx()
+
 
 
 

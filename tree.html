@@ -133,10 +133,9 @@
             <option value="m1">Last 30 days</option>
         </select>
 
-        <label for="typeFilter">Type / Tag:</label>
-        <select id="typeFilter">
-            <option value="all">All</option>
-        </select>
+        <select id="domainFilter"></select>
+        <select id="componentFilter"></select>
+        <select id="semanticFilter"></select>
 
         <button id="timeToggle">Time Mode</button>
     </div>
@@ -176,7 +175,12 @@
         const fileSelector = document.getElementById('fileSelector');
 
         const ageSel = document.getElementById('ageFilter');
-        const typeSel = document.getElementById('typeFilter');
+        const domainSel = document.getElementById('domainFilter');
+        const componentSel = document.getElementById('componentFilter');
+        const semanticSel = document.getElementById('semanticFilter');
+
+        // we'll keep a master list of all objects
+        let allData = [];
         const timeToggle = document.getElementById('timeToggle');
         const selPane = document.getElementById('selectednode');
         const detailPanel = document.getElementById('detailPanel');
@@ -466,36 +470,43 @@
         }
 
 
+        // === UPDATED pickPosition ===
         function pickPosition(o) {
-            /* how many other nodes this one touches */
+            // 1️⃣  compute connectivity
             const conn = (o.references?.length || 0) +
                 Object.keys(o.association_strengths || {}).length;
-
-            /* track highest connectivity so radius stays nicely normalised */
             maxConnCurrent = Math.max(maxConnCurrent, conn);
 
-            /* Y = age  (newest at the bottom) */
+            // 2️⃣  compute global Y by age
             const now = Date.now();
             const ageMs = now - parseTimestamp(o.timestamp).getTime();
-            const yPos = Math.max(LAYOUT_CONFIG.minSphereY,
-                ageMs / LAYOUT_CONFIG.msPerUnit);
+            const globalY = ageMs / LAYOUT_CONFIG.msPerUnit;
+            // never go below the configured floor
+            const desiredGlobalY = Math.max(LAYOUT_CONFIG.minSphereY, globalY);
 
-            /* XZ radius shrinks with connectivity (dense nodes nearer the centre) */
-            const rNorm = 1 - (conn / maxConnCurrent);             // 0‥1
+            // 3️⃣  subtract group’s upward drift to get local Y
+            const localY = desiredGlobalY - graphGroup.position.y;
+            // still enforce the floor in local coords
+            const yPos = Math.max(LAYOUT_CONFIG.minSphereY, localY);
+
+            // 4️⃣  scatter in XZ by connectivity
+            const rNorm = 1 - (conn / maxConnCurrent);
             const r = rNorm * LAYOUT_CONFIG.maxXZRadius;
             const ang = Math.random() * Math.PI * 2;
 
             const pos = new THREE.Vector3(
                 Math.cos(ang) * r,
                 yPos,
-                Math.sin(ang) * r);
+                Math.sin(ang) * r
+            );
 
-            /* stash so the edge-builder can re-use it without recomputing */
+            // 5️⃣  stash coords + metadata
             o.pos = pos;
             o.connectivity = conn;
 
             return pos;
         }
+
         function ensureSphereMesh() {
             if (instMesh) return;
 
@@ -896,7 +907,13 @@
             await batchAddNodes(objs);   // spheres
             addEdges(objs);              // edges
 
-            populateTypeFilter([...nodeMap.values()].map(n => n.data));
+            allData = [...nodeMap.values()].map(n => n.data);
+
+            // initial population
+            populateDomainFilter(allData);
+            populateComponentFilter(allData, '');
+            populateSemanticFilter(allData, '', '');
+
             applyFilters();
             prevLineCount = objs.length;
             initialLoadDone = true;
@@ -1235,7 +1252,20 @@
         // ─── INITIALIZE ──────────────────────────────────────────────────
         fileSelector.addEventListener('change', () => loadGraph());
         ageSel.addEventListener('change', applyFilters);
-        typeSel.addEventListener('change', applyFilters);
+        domainSel.addEventListener('change', () => {
+            populateComponentFilter(allData, domainSel.value);
+            populateSemanticFilter(allData, domainSel.value, componentSel.value);
+            applyFilters();
+        });
+
+        componentSel.addEventListener('change', () => {
+            populateSemanticFilter(allData, domainSel.value, componentSel.value);
+            applyFilters();
+        });
+
+        semanticSel.addEventListener('change', () => {
+            applyFilters();
+        });
         timeToggle.addEventListener('click', () => {
             timeMode = !timeMode;
             timeToggle.textContent = timeMode ? 'Dolly ON' : 'Time Mode';
@@ -1448,82 +1478,108 @@
         //////////////////////////////////////////////////////////////////////
         // FILTERS
         //////////////////////////////////////////////////////////////////////
-        function populateTypeFilter(objs) {
-            const bucket = new Set();
-            objs.forEach(o => {
-                bucket.add('domain:' + o.domain);
-                bucket.add('component:' + o.component);
-                (o.tags || []).forEach(t => bucket.add('tag:' + t));
-            });
-            typeSel.innerHTML = '<option value="all">All</option>';
-            [...bucket].sort().forEach(k => {
-                const opt = document.createElement('option');
-                opt.value = k; opt.textContent = k;
-                typeSel.appendChild(opt);
-            });
+        function populateDomainFilter(data) {
+            const domains = [...new Set(data.map(o => o.domain))].sort();
+            domainSel.innerHTML =
+                '<option value="">All domains</option>' +
+                domains.map(d => `<option value="${d}">${d}</option>`).join('');
         }
 
-        // ——— applyFilters() for the single InstancedMesh + edge visibility ———
+        function populateComponentFilter(data, domain) {
+            const comps = [...new Set(
+                data
+                    .filter(o => !domain || o.domain === domain)
+                    .map(o => o.component)
+            )].sort();
+            componentSel.innerHTML =
+                '<option value="">All components</option>' +
+                comps.map(c => `<option value="${c}">${c}</option>`).join('');
+        }
+
+        function populateSemanticFilter(data, domain, component) {
+            const labels = [...new Set(
+                data
+                    .filter(o =>
+                        (!domain || o.domain === domain) &&
+                        (!component || o.component === component)
+                    )
+                    .map(o => o.semantic_label)     // adjust if your field is named differently
+                    .filter(l => !!l)
+            )].sort();
+            semanticSel.innerHTML =
+                '<option value="">All labels</option>' +
+                labels.map(l => `<option value="${l}">${l}</option>`).join('');
+        }
+
         function applyFilters() {
             const now = unixNow();
             const ageMax = ({
                 h1: 3600e3, d1: 86400e3, w1: 86400e3 * 7,
                 m1: 86400e3 * 30
             }[ageSel.value]) || 0;
-            const pickVal = typeSel.value;
+
+            // new cascading filters
+            const selDomain = domainSel.value;
+            const selComponent = componentSel.value;
+            const selSemantic = semanticSel.value;
+
             const color = new THREE.Color();
 
-            /* **************************************************************
-             * 1️⃣  NODES  (update position + per-instance colour)
-             **************************************************************/
+            /* 1️⃣  NODES */
             let writeIdx = 0;
-            const liveIds = new Set();   // passes age filter
-            const selectedIds = new Set();   // passes age   + type/tag filter
+            const liveIds = new Set();
+            const selectedIds = new Set();
 
             nodeMap.forEach((n, ctxId) => {
-                /* ─ age-window filter ─ */
+                const o = n.data;
+
+                // age filter
                 if (ageMax) {
-                    const age = now - parseTimestamp(n.data.timestamp).getTime();
-                    if (age > ageMax) return;              // skip (too old)
+                    const age = now - parseTimestamp(o.timestamp).getTime();
+                    if (age > ageMax) return;
                 }
                 liveIds.add(ctxId);
 
-                /* ─ type / tag filter ─ */
-                let isSelected = true;
-                if (pickVal !== 'all') {
-                    const [k, v] = pickVal.split(':');
-                    if (k === 'domain') isSelected = n.data.domain === v;
-                    if (k === 'component') isSelected = n.data.component === v;
-                    if (k === 'tag') isSelected = (n.data.tags || []).includes(v);
-                }
-                if (isSelected) selectedIds.add(ctxId);
+                // domain filter
+                if (selDomain && o.domain !== selDomain) return;
 
-                /* ─ position ─ */
+                // component filter
+                if (selComponent && o.component !== selComponent) return;
+
+                // semantic_label filter
+                if (selSemantic && o.semantic_label !== selSemantic) return;
+
+                selectedIds.add(ctxId);
+
+                // position
                 instMesh.setMatrixAt(writeIdx,
                     new THREE.Matrix4().setPosition(n.pos));
 
-                /* ─ colour ─ */
+                // colour
                 if (ctxId === selectedId) {
-                    /* clicked -- stay bright white */
+                    // clicked – stay white
                     instMesh.instanceColor.setXYZ(writeIdx, 1, 1, 1);
-                } else if (pickVal === 'all') {
-                    /* default palette (50 % lightness) */
-                    const hue = hueMapCurrent[n.data.component] || 0;
+                } else if (!selDomain && !selComponent && !selSemantic) {
+                    // only age filter active
+                    const hue = hueMapCurrent[o.component] || 0;
                     const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
                     instMesh.instanceColor.setXYZ(
                         writeIdx, ...color.setHSL(hue, sat, 0.5).toArray());
-                } else if (isSelected) {
-                    /* highlighted by filter */
-                    instMesh.instanceColor.setXYZ(writeIdx, 1, 1, 1);
                 } else {
-                    /* dimmed */
-                    const hue = hueMapCurrent[n.data.component] || 0;
-                    const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
-                    instMesh.instanceColor.setXYZ(
-                        writeIdx, ...color.setHSL(hue, sat, 0.25).toArray());
+                    // cascading filters active
+                    if (selectedIds.has(ctxId)) {
+                        // passes all selected filters
+                        instMesh.instanceColor.setXYZ(writeIdx, 1, 1, 1);
+                    } else {
+                        // filtered out → dim
+                        const hue = hueMapCurrent[o.component] || 0;
+                        const sat = 0.5 + 0.5 * (n.connectivity / maxConnCurrent);
+                        instMesh.instanceColor.setXYZ(
+                            writeIdx, ...color.setHSL(hue, sat, 0.25).toArray());
+                    }
                 }
 
-                n._instanceIndex = writeIdx;      // reverse lookup
+                n._instanceIndex = writeIdx;
                 writeIdx++;
             });
 
@@ -1531,45 +1587,35 @@
             instMesh.instanceMatrix.needsUpdate = true;
             instMesh.instanceColor.needsUpdate = true;
 
-            /* **************************************************************
-             * 2️⃣  EDGES  (show/hide + grey vs. half-grey)
-             **************************************************************/
-            if (!instEdge) return;                       // nothing to do yet
-
-            ensureEdgeAlphaAttr();                       // makes alpha buffer if missing
+            /* 2️⃣  EDGES */
+            if (!instEdge) return;
+            ensureEdgeAlphaAttr();
             const aAttr = instEdge.geometry.attributes.alpha;
-            const cAttr = instEdge.instanceColor;       // grey levels live here
+            const cAttr = instEdge.instanceColor;
 
             edges.forEach(e => {
-                /* visibility */
                 const live = liveIds.has(e.source) && liveIds.has(e.target);
                 aAttr.setX(e.index, live ? 1 : 0);
-                if (!live) return;                         // hidden → no colour work
+                if (!live) return;
 
-                /* colour = current source-node colour */
                 const srcNode = nodeMap.get(e.source);
-                const srcIdx = srcNode?._instanceIndex;
-                if (srcIdx !== undefined) {
-                    cAttr.setXYZ(
-                        e.index,
-                        instMesh.instanceColor.getX(srcIdx),
-                        instMesh.instanceColor.getY(srcIdx),
-                        instMesh.instanceColor.getZ(srcIdx)
-                    );
-                }
+                const srcIdx = srcNode._instanceIndex;
+                cAttr.setXYZ(
+                    e.index,
+                    instMesh.instanceColor.getX(srcIdx),
+                    instMesh.instanceColor.getY(srcIdx),
+                    instMesh.instanceColor.getZ(srcIdx)
+                );
             });
             aAttr.needsUpdate = true;
             cAttr.needsUpdate = true;
 
-            /* **************************************************************
-             * 3️⃣  hover housekeeping
-             **************************************************************/
+            /* 3️⃣  hover housekeeping */
             if (hovered && !liveIds.has(hovered)) {
                 hovered = hoveredIdx = null;
                 selPane.textContent = '// Hover or click a node…';
             }
         }
-
 
 
 
@@ -1799,21 +1845,6 @@
             pathIndex = 0;
         }
 
-        window.addEventListener('keydown', e => {
-            if (e.key === 'ArrowLeft') {
-                typeSel.selectedIndex = Math.max(0, typeSel.selectedIndex - 1);
-                applyFilters();
-            } else if (e.key === 'ArrowRight') {
-                typeSel.selectedIndex = Math.min(typeSel.options.length - 1, typeSel.selectedIndex + 1);
-                applyFilters();
-            } else if (e.key === 'ArrowUp' && traversalPath.length) {
-                pathIndex = Math.max(0, pathIndex - 1);
-                tweenToNode(traversalPath[pathIndex]);
-            } else if (e.key === 'ArrowDown' && traversalPath.length) {
-                pathIndex = Math.min(traversalPath.length - 1, pathIndex + 1);
-                tweenToNode(traversalPath[pathIndex]);
-            }
-        });
 
         timeToggle.addEventListener('click', () => {
             timeMode = !timeMode;
@@ -1823,7 +1854,6 @@
 
         fileSelector.addEventListener('change', () => loadGraph());
         ageSel.addEventListener('change', applyFilters);
-        typeSel.addEventListener('change', applyFilters);
 
         /********************************************************************
          *  Animation loop  (COMPLETE, SELF-CONTAINED)
