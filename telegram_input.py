@@ -32,7 +32,11 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from telegram.request import HTTPXRequest
 
 from context import HybridContextRepository, ContextObject, _locked, sanitize_jsonl
+from typing import Any, Callable, List, Optional, Tuple
 from assembler import Assembler
+# Keep a reference to the “master” Assembler so that pin events can lazy-init new ones
+_default_asm: Optional[Assembler] = None
+
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
@@ -210,36 +214,71 @@ async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.pinned_message:
         return
 
+    # Only ingest pins created by bots
+    if not msg.from_user.is_bot:
+        return
+
     chat_id = update.effective_chat.id
-    pinned = msg.pinned_message
+    pinned  = msg.pinned_message
 
     pinner = (msg.from_user.username or str(msg.from_user.id)).lower()
     author = (pinned.from_user.username or str(pinned.from_user.id)).lower()
     text   = pinned.text or pinned.caption or "<non-text content>"
 
-    # Only ingest pins created by bots
-    if not msg.from_user.is_bot:
-        return
+    # ── lazy-init per-chat Assembler if needed ─────────────────────────────────
+    chat_asm = assemblers.get(chat_id)
+    if not chat_asm and _default_asm:
+        repo = make_per_chat_repo(chat_id)
+        tts  = TTSManager(
+            logger=_default_asm.tts.log,
+            cfg=_default_asm.cfg,
+            audio_service=None
+        )
+        tts.set_mode("file")
+        chat_asm = Assembler(
+            context_path     = f"context_{chat_id}.jsonl",
+            config_path      = "config.json",
+            lookback_minutes = 60,
+            top_k            = 5,
+            tts_manager      = tts,
+            repo             = repo,
+        )
+        assemblers[chat_id] = chat_asm
+        chat_asm._chat_contexts.add(chat_id)
 
+    # ── build and save the pinned-message ContextObject ───────────────────────
     seg = ContextObject.make_segment(
         semantic_label="bot_pinned",
         content_refs=[],
-        tags=["bot_message", "pinned", f"pinner:{pinner}", f"author:{author}"],
-        metadata={"pinner":pinner, "author":author, "text":text}
+        tags=[
+            "bot_message",
+            "pinned",
+            f"pinner:{pinner}",
+            f"author:{author}",
+            f"msgid:{pinned.message_id}"
+        ],
+        metadata={
+            "pinner": pinner,
+            "author": author,
+            "text": text,
+            "telegram_message_id": pinned.message_id
+        }
     )
     seg.summary  = text
     seg.stage_id = "telegram_pinned"
     seg.touch()
 
-    asm = assemblers.get(chat_id)
-    if asm:
-        asm.repo.save(seg)
+    if chat_asm:
+        chat_asm.repo.save(seg)
 
 
 # ────────────────────────────────────────────────────────────────────────
 # Main entry-point: launch the Telegram bot
 # ────────────────────────────────────────────────────────────────────────
 def telegram_input(asm: Assembler):
+    global _default_asm
+    _default_asm = asm
+
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
