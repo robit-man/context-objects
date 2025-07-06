@@ -24,30 +24,17 @@ import time
 import threading
 from datetime import datetime
 
-# ── Ensure Python 3.10+ is available; install automatically if missing ──
-if sys.version_info < (3, 10):
-    # 1) Try versioned executables
-    python_exec = None
-    for ver in ("3.10", "3.11", "3.12"):
-        exe = shutil.which(f"python{ver}")
-        if exe:
-            python_exec = exe
-            break
-
-    # 2) Locate Homebrew explicitly if 'brew' isn't on PATH
-    brew = shutil.which("brew")
-    if not brew:
-        if os.path.exists("/opt/homebrew/bin/brew"):
-            brew = "/opt/homebrew/bin/brew"
-        elif os.path.exists("/usr/local/bin/brew"):
-            brew = "/usr/local/bin/brew"
-
-    # DEBUG – show why brew may not be picked up
-    print(f"DEBUG: sys.platform={sys.platform}, brew={brew}")
-
-    # 3) Install if still missing
-    if not python_exec:
-        if sys.platform.startswith("linux") and shutil.which("apt-get"):
+# ─── RE-LAUNCH IF NOT PYTHON 3.10+ ────────────────────────────────────────────
+if sys.platform.startswith("linux"):
+    # Linux: ensure Python 3.10+
+    if sys.version_info < (3, 10):
+        python_exec = None
+        for ver in ("3.10", "3.11", "3.12"):
+            exe = shutil.which(f"python{ver}")
+            if exe:
+                python_exec = exe
+                break
+        if not python_exec:
             print("PROCESS: Installing Python 3.10 via apt-get…")
             subprocess.check_call(["sudo", "apt-get", "update"])
             subprocess.check_call([
@@ -55,32 +42,54 @@ if sys.version_info < (3, 10):
                 "python3.10", "python3.10-venv", "python3.10-distutils"
             ])
             python_exec = shutil.which("python3.10")
-        elif sys.platform == "darwin" and brew:
-            print("PROCESS: Installing Python 3.10 via Homebrew…")
-            subprocess.check_call([brew, "update"])
-            subprocess.check_call([brew, "install", "python@3.10"])
-            python_exec = shutil.which("python3.10")
+        if python_exec:
+            print(f"PROCESS: Re-launching under {os.path.basename(python_exec)}…")
+            os.execv(python_exec, [python_exec] + sys.argv)
+        else:
+            print("ERROR: Failed to install or locate Python 3.10+ on Linux.")
+            sys.exit(1)
 
-    # 4) Fallback to generic python3 if it’s already ≥3.10
-    if not python_exec:
-        candidate = shutil.which("python3")
-        if candidate:
-            try:
-                out = subprocess.check_output([candidate, "--version"], text=True).strip()
-                _, version = out.split()
-                major, minor, *_ = version.split(".")
-                if int(major) == 3 and int(minor) >= 10:
-                    python_exec = candidate
-            except Exception:
-                pass
+elif sys.platform == "darwin":
+    # macOS: ensure Python 3.10+
+    if sys.version_info < (3, 10):
+        python_exec = None
+        for ver in ("3.10", "3.11", "3.12"):
+            exe = shutil.which(f"python{ver}")
+            if exe:
+                python_exec = exe
+                break
+        if not python_exec:
+            # locate brew explicitly if it's not on PATH
+            brew = shutil.which("brew")
+            if not brew:
+                if os.path.exists("/opt/homebrew/bin/brew"):
+                    brew = "/opt/homebrew/bin/brew"
+                elif os.path.exists("/usr/local/bin/brew"):
+                    brew = "/usr/local/bin/brew"
+            if brew:
+                print("PROCESS: Installing Python 3.10 via Homebrew…")
+                subprocess.check_call([brew, "update"])
+                subprocess.check_call([brew, "install", "python@3.10"])
+                python_exec = shutil.which("python3.10")
+        # fallback to generic python3 if already ≥3.10
+        if not python_exec:
+            candidate = shutil.which("python3")
+            if candidate:
+                try:
+                    out = subprocess.check_output([candidate, "--version"], text=True).strip()
+                    _, version = out.split()
+                    major, minor, *_ = version.split(".")
+                    if int(major) == 3 and int(minor) >= 10:
+                        python_exec = candidate
+                except Exception:
+                    pass
+        if python_exec:
+            print(f"PROCESS: Re-launching under {os.path.basename(python_exec)}…")
+            os.execv(python_exec, [python_exec] + sys.argv)
+        else:
+            print("ERROR: Failed to install or locate Python 3.10+ on macOS.")
+            sys.exit(1)
 
-    # 5) Re-exec under the selected interpreter or exit on failure
-    if python_exec:
-        print(f"PROCESS: Re-launching under {os.path.basename(python_exec)}…")
-        os.execv(python_exec, [python_exec] + sys.argv)
-    else:
-        print("ERROR: Failed to install or locate Python 3.10+.")
-        sys.exit(1)
 
 
 # CTRL-C handler

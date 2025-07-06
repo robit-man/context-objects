@@ -627,7 +627,6 @@ class Assembler:
 
 
 
-
     def _seed_tool_schemas(self) -> None:
         """
         Guarantee exactly one ContextObject per tool in TOOL_SCHEMAS:
