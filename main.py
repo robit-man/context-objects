@@ -15,6 +15,11 @@ Also integrates:
 
 import os
 import sys
+
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
 import time
 import json
 import shutil
@@ -304,9 +309,6 @@ if not os.path.exists(SETUP_MARKER):
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-if sys.platform == "win32":
-    import asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # ──────────── LOAD / GENERATE config.json ────────────────────────────────────
 CONFIG_FILE = "config.json"
