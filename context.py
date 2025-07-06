@@ -14,18 +14,15 @@ import sqlite3
 from threading import Lock
 from json import JSONDecodeError
 
-if os.name == "nt":                # Windows ─ use msvcrt
-    import msvcrt
 
+if os.name == "nt":
     @contextlib.contextmanager
     def _locked(f, exclusive: bool):
-        mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_NBLCK
-        try:
-            msvcrt.locking(f.fileno(), mode, 1)
-            yield f
-        finally:
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-
+        """
+        No-op file lock on Windows. We rely on the in-process threading.Lock
+        to serialize JSONL writes, and avoid msvcrt.locking permission errors.
+        """
+        yield f
 else:                              # POSIX ─ use fcntl
     import fcntl
 
