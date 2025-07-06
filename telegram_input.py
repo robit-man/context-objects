@@ -133,48 +133,50 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-     # On Windows: send CLI + HTTP endpoint debug + recent error logs
+    # On Windows: send detailed Ollama+endpoint+logs debug via Telegram
     if os.name == "nt":
         import os, shutil, socket, asyncio, platform, sys
 
         def _win_status(stage: str, output: Any):
             # 1) CLI path
-            cli = shutil.which("ollama") or shutil.which("ollama.exe")
-            # 2) HTTP endpoint override
+            cli_path = shutil.which("ollama") or shutil.which("ollama.exe")
+
+            # 2) HTTP override
             api_url = os.environ.get("OLLAMA_API_URL", "<unset>")
-            # 3) TCP check
+
+            # 3) TCP connect test
             try:
-                s = socket.create_connection(("127.0.0.1", 11434), timeout=0.5)
-                s.close()
-                tcp = "OK"
+                conn = socket.create_connection(("127.0.0.1", 11434), timeout=0.5)
+                conn.close()
+                tcp_status = "OK"
             except Exception as e:
-                tcp = f"FAIL: {e}"
-            # 4) Loop policy
-            loop_policy = type(asyncio.get_event_loop()).__name__
+                tcp_status = f"FAIL: {e}"
 
-            # 5) Grab the last few log entries
-            logs = "\n".join(list(_LOG_HISTORY)[-10:])
-            if not logs:
-                logs = "(no recent log entries)"
+            # 4) Event loop policy
+            loop_pol = type(asyncio.get_event_loop()).__name__
 
-            # Build the message
+            # 5) Last 10 log lines
+            recent_logs = list(_LOG_HISTORY)[-10:]
+            logs_block = "\n".join(recent_logs) if recent_logs else "(no logs yet)"
+
+            # Build the debug message
             msg = "\n".join([
                 f"🖥️ OS: {platform.system()} {platform.release()}",
                 f"🐍 Python: {sys.executable.split(os.sep)[-1]} ({sys.version.split()[0]})",
-                f"🔄 EventLoop: {loop_policy}",
+                f"🔄 Loop: {loop_pol}",
                 "",
-                "🔍 Ollama CLI:",
-                f"  which():       {cli!r}",
-                f"  OLLAMA_API_URL:{api_url!r}",
-                f"  TCP 127.0.0.1:11434 → {tcp}",
+                "🔍 Ollama CLI discovery:",
+                f"  which():           {cli_path!r}",
+                f"  OLLAMA_API_URL:    {api_url!r}",
+                f"  TCP 127.0.0.1:11434 → {tcp_status}",
                 "",
                 f"• *{stage}*: {output}",
                 "",
                 "📝 Recent log tail:",
-                f"```{logs}```"
+                f"```{logs_block}```"
             ])
 
-            # Send via Telegram
+            # Send as a new Telegram message
             asyncio.run_coroutine_threadsafe(
                 bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
                 loop
@@ -184,6 +186,7 @@ def _make_status_cb(
             return
 
         return _win_status, _win_stop
+
 
     # POSIX path: keep editing in-place
     from typing import List, Any
