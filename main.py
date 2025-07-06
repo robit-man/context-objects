@@ -24,6 +24,37 @@ import time
 import threading
 from datetime import datetime
 
+
+# ── Ensure we’re running under Python 3.10+ ──
+if sys.version_info < (3, 10):
+    # 1) look for any suitable python3.x on PATH
+    python_exec = (shutil.which("python3.10")
+                or shutil.which("python3.11")
+                or shutil.which("python3.12"))
+    # 2) if not found, install based on platform
+    if not python_exec:
+        if sys.platform.startswith("linux") and shutil.which("apt-get"):
+            log_message("Installing Python 3.10 via apt-get…", "PROCESS")
+            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call([
+                "sudo", "apt-get", "install", "-y",
+                "python3.10", "python3.10-venv", "python3.10-distutils"
+            ])
+            python_exec = shutil.which("python3.10")
+        elif sys.platform == "darwin" and shutil.which("brew"):
+            log_message("Installing Python 3.10 via Homebrew…", "PROCESS")
+            subprocess.check_call(["brew", "update"])
+            subprocess.check_call(["brew", "install", "python@3.10"])
+            python_exec = shutil.which("python3.10")
+    # 3) re-exec under the new interpreter or fail
+    if python_exec:
+        log_message(f"Re-launching under {os.path.basename(python_exec)}…", "PROCESS")
+        os.execv(python_exec, [python_exec] + sys.argv)
+    else:
+        log_message("Failed to install Python 3.10 or newer.", "ERROR")
+        sys.exit(1)
+
+
 # CTRL-C handler
 def _exit_on_sigint(signum, frame):
     print("\nInterrupted. Shutting down.")
@@ -243,7 +274,7 @@ for model in (config.get("primary_model"), config.get("secondary_model")):
     except subprocess.CalledProcessError as e:
         log_message(f"Error pulling model '{model}': {e}", "WARNING")
 
-        
+
 # ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
 def setup_piper_and_onnx():
     script_dir   = os.path.dirname(os.path.abspath(__file__))
