@@ -1575,7 +1575,16 @@ class Assembler:
         except Exception as e:
             _record_perf("intent_clarification", str(e), False)
             state["errors"].append(("intent_clarification", str(e)))
-
+            # ── Minimal fallback so clar_ctx always exists ────────────
+            dummy = ContextObject.make_stage(
+                "intent_clarification_failed",
+                [ state["user_ctx"].context_id ] if "user_ctx" in state else [],
+                {"summary": ""}
+            )
+            dummy.touch()
+            self.repo.save(dummy)
+            state["clar_ctx"] = dummy
+            
         # ─── Stage 5: external_knowledge ────────────────────────────────
         t0 = datetime.utcnow()
         try:
