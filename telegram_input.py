@@ -64,6 +64,16 @@ assemblers: dict[int, Assembler] = {}
 _pending: dict[int, asyncio.Queue[Tuple[str,int]]] = {}
 
 # ────────────────────────────────────────────────────────────────────────
+# Helper to unpin in the background so other bots see the pin event first
+# ────────────────────────────────────────────────────────────────────────
+async def _delayed_unpin(bot, chat_id: int, message_id: int, delay: float = 2.0):
+    await asyncio.sleep(delay)
+    try:
+        await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+# ────────────────────────────────────────────────────────────────────────
 # Helper to split & send long text (async), with optional reply_to
 # ────────────────────────────────────────────────────────────────────────
 async def _send_long_text_async(
@@ -110,11 +120,23 @@ async def _send_long_text_async(
         )
         # auto-pin & unpin so other bots see it
         try:
-            await bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id)
-            await bot.unpin_chat_message(chat_id=chat_id, message_id=msg.message_id)
+            # pin without blocking
+            await bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                disable_notification=True
+            )
+            # schedule unpin so other bots see it
+            asyncio.create_task(
+                _delayed_unpin(
+                    bot,
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    delay=2.0
+                )
+            )
         except Exception as e:
-            logger.warning(f"pin/unpin failed for msg {msg.message_id}: {e}")
-
+            logger.warning(f"pin scheduling failed for msg {msg.message_id}: {e}")
 
 def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridContextRepository:
     """
@@ -694,10 +716,14 @@ def telegram_input(asm: Assembler):
                                     message_id=sent.message_id,
                                     disable_notification=True
                                 )
-                                await asyncio.sleep(1)
-                                await context.bot.unpin_chat_message(
-                                    chat_id=chat_id,
-                                    message_id=sent.message_id
+                                # schedule unpin in background so other bots see the pin event
+                                asyncio.create_task(
+                                    _delayed_unpin(
+                                        context.bot,
+                                        chat_id,
+                                        sent.message_id,
+                                        delay=2.0
+                                    )
                                 )
                             except:
                                 pass
@@ -713,12 +739,14 @@ def telegram_input(asm: Assembler):
                                 message_id=sent.message_id,
                                 disable_notification=True
                             )
-                            await asyncio.sleep(1)
-                            await context.bot.unpin_chat_message(
-                                chat_id=chat_id,
-                                message_id=sent.message_id
+                            asyncio.create_task(
+                                _delayed_unpin(
+                                    context.bot,
+                                    chat_id=chat_id,
+                                    message_id=sent.message_id,
+                                    delay=2.0
+                                )
                             )
-        
                     # 5) Long reply: chunk & stream
                     else:
                         try:
@@ -727,8 +755,7 @@ def telegram_input(asm: Assembler):
                                 message_id=placeholder_id
                             )
                         except:
-                            pass
-                        await _send_long_text_async(
+                            pass                        await _send_long_text_async(
                             context.bot,
                             chat_id,
                             final,
