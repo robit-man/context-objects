@@ -24,6 +24,11 @@ import threading
 import subprocess
 from datetime import datetime
 
+if platform.system().startswith("Win"):
+    # switch the console to UTF-8 so we can print arrows, en-dashes, etc.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+  
 # ─── RE-LAUNCH IF NOT PYTHON 3.10+ ────────────────────────────────────────────
 if sys.platform.startswith("linux"):
     # Linux: ensure Python 3.10+
