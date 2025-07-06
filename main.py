@@ -13,15 +13,15 @@ Also integrates:
 # ──────────── VIRTUALENV BOOTSTRAP & FIRST-RUN DEPENDENCIES ─────────────────────────
 
 
-import sys
 import os
-import subprocess
-import platform
-import shutil
-import json
-import signal
+import sys
 import time
+import json
+import shutil
+import signal
+import platform
 import threading
+import subprocess
 from datetime import datetime
 
 # ─── RE-LAUNCH IF NOT PYTHON 3.10+ ────────────────────────────────────────────
@@ -114,7 +114,14 @@ elif sys.platform == "darwin":
         else:
             print("ERROR: Failed to install or locate Python 3.10+ on macOS.")
             sys.exit(1)
-
+elif sys.platform.startswith("win"):
+    # Windows: require Python 3.10+, but no auto-relaunch
+    if sys.version_info < (3, 10):
+        print(
+            "ERROR: Python 3.10 or later is required on Windows.\n"
+            "Please download and install it from https://www.python.org/downloads/windows/"
+        )
+        sys.exit(1)
 
 # CTRL-C handler
 def _exit_on_sigint(signum, frame):
@@ -149,7 +156,7 @@ def in_virtualenv() -> bool:
 def create_and_activate_venv():
     venv_dir = os.path.join(os.getcwd(), ".venv")
 
-    # 1) Find or install python3.10 on Debian/Ubuntu
+    # 1) Find or install python3.10 on Debian/Ubuntu, macOS, or accept any Python ≥3.10 on Windows
     py310 = shutil.which("python3.10")
     if not py310:
         if platform.system() == "Linux" and shutil.which("apt-get"):
@@ -166,6 +173,7 @@ def create_and_activate_venv():
                 py310 = shutil.which("python3.10")
             except subprocess.CalledProcessError as e:
                 log_message(f"Failed to install python3.10: {e}", "ERROR")
+
         elif platform.system() == "Darwin" and shutil.which("brew"):
             log_message("python3.10 not found—installing via Homebrew...", "PROCESS")
             try:
@@ -175,31 +183,55 @@ def create_and_activate_venv():
             except subprocess.CalledProcessError as e:
                 log_message(f"Failed to install python3.10 via Homebrew: {e}", "ERROR")
 
+        elif platform.system().startswith("Win"):
+            log_message("python3.10 not found—checking ‘python’ for version ≥3.10...", "PROCESS")
+            candidate = shutil.which("python") or shutil.which("python3")
+            if candidate:
+                try:
+                    out = subprocess.check_output([candidate, "--version"], stderr=subprocess.STDOUT, text=True).strip()
+                    _, version = out.split()
+                    major, minor, *_ = version.split(".")
+                    if int(major) == 3 and int(minor) >= 10:
+                        py310 = candidate
+                        log_message(f"Using {candidate} (version {version})", "PROCESS")
+                    else:
+                        log_message(f"{candidate} is Python {version}, which is <3.10", "WARNING")
+                except Exception as e:
+                    log_message(f"Failed to check {candidate} version: {e}", "ERROR")
+            if not py310:
+                log_message("No acceptable Python ≥3.10 found on Windows—falling back to current Python", "WARNING")
+
     # 2) Fallback to current interpreter if still missing
     if not py310:
         log_message("python3.10 unavailable—falling back to current Python", "WARNING")
         py310 = sys.executable
 
-    python_bin = os.path.join(venv_dir, "bin", "python")
-    pip_bin    = os.path.join(venv_dir, "bin", "pip")
+    # 3) Determine python & pip paths inside the venv
+    if platform.system().startswith("Win"):
+        python_bin = os.path.join(venv_dir, "Scripts", "python.exe")
+        pip_bin    = os.path.join(venv_dir, "Scripts", "pip.exe")
+    else:
+        python_bin = os.path.join(venv_dir, "bin", "python")
+        pip_bin    = os.path.join(venv_dir, "bin", "pip")
 
-    # 3) Create venv if needed
+    # 4) Create venv if needed
     if not os.path.isdir(venv_dir):
         log_message(f"Creating virtualenv in .venv/ with {os.path.basename(py310)}", "PROCESS")
         subprocess.check_call([py310, "-m", "venv", venv_dir])
         log_message("Upgrading pip in venv…", "PROCESS")
         subprocess.check_call([pip_bin, "install", "--upgrade", "pip"])
 
-    # 4) Re-exec into the venv
+    # 5) Re-exec into the venv
     log_message("Re-launching under virtualenv…", "PROCESS")
+    new_env = os.environ.copy()
+    new_env["VIRTUAL_ENV"] = venv_dir
+    if not platform.system().startswith("Win"):
+        new_env["PATH"] = f"{venv_dir}/bin:{new_env.get('PATH','')}"
+
     os.execve(
         python_bin,
         [python_bin] + sys.argv,
-        {
-            **os.environ,
-            "VIRTUAL_ENV": venv_dir,
-            "PATH":        f"{venv_dir}/bin:{os.environ.get('PATH','')}"
-        },
+        new_env
     )
 
 if not in_virtualenv():
