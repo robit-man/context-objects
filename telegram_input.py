@@ -133,57 +133,14 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-    # On Windows: send quick Ollama‐discovery debug on every stage
+    # On Windows: do nothing (we’ll send fresh messages instead)
     if os.name == "nt":
-        import os, shutil, socket, asyncio, platform, sys
-
-        def _win_status(stage: str, output: Any):
-            # 1) Binary on PATH
-            which_exe = shutil.which("ollama") or shutil.which("ollama.exe")
-            exists_which = bool(which_exe and os.path.exists(which_exe))
-
-            # 2) Env‐override
-            api_url = os.environ.get("OLLAMA_API_URL")
-            env_ok = bool(api_url)
-
-            # 3) Default HTTP endpoint
-            default_url = "http://127.0.0.1:11434"
-            # 4) Test TCP connect
-            try:
-                sock = socket.create_connection(("127.0.0.1", 11434), timeout=0.5)
-                sock.close()
-                conn_ok = "success"
-            except Exception as e:
-                conn_ok = f"fail: {e}"
-
-            # 5) Loop info
-            loop_policy = type(asyncio.get_event_loop()).__name__
-
-            # Build and send message
-            lines = [
-                f"🖥️ OS: {platform.system()} {platform.release()}",
-                f"🐍 Python: {sys.executable.split(os.sep)[-1]} ({sys.version.split()[0]})",
-                f"🔄 EventLoop: {loop_policy}",
-                "",
-                "🔍 Ollama discovery:",
-                f"  which():        {which_exe!r}  exists={exists_which}",
-                f"  OLLAMA_API_URL: {api_url!r}  set={env_ok}",
-                f"  default_url:    {default_url!r}",
-                f"  TCP 127.0.0.1:11434 → {conn_ok}",
-                "",
-                f"• *{stage}*: {output}"
-            ]
-            msg = "\n".join(lines)
-
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
-                loop
-            )
-
-        def _win_stop():
+        def _noop_status(stage: str, output: Any):
+            # no-op on Windows
             return
-
-        return _win_status, _win_stop
+        def _noop_stop():
+            return
+        return _noop_status, _noop_stop
 
     # POSIX path: keep editing in-place
     from typing import List, Any
