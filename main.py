@@ -53,25 +53,37 @@ elif sys.platform == "darwin":
     # macOS: ensure Python 3.10+
     if sys.version_info < (3, 10):
         python_exec = None
+
+        # 1) Try existing python3.x executables
         for ver in ("3.10", "3.11", "3.12"):
             exe = shutil.which(f"python{ver}")
             if exe:
                 python_exec = exe
                 break
+
+        # 2) If missing, install via Homebrew
         if not python_exec:
-            # locate brew explicitly if it's not on PATH
+            # locate brew if it’s in a non-standard location
             brew = shutil.which("brew")
             if not brew:
-                if os.path.exists("/opt/homebrew/bin/brew"):
-                    brew = "/opt/homebrew/bin/brew"
-                elif os.path.exists("/usr/local/bin/brew"):
-                    brew = "/usr/local/bin/brew"
-            if brew:
+                brew = "/opt/homebrew/bin/brew" if os.path.exists("/opt/homebrew/bin/brew") else "/usr/local/bin/brew"
+            print(f"DEBUG: brew executable at {brew}")
+            if brew and os.path.exists(brew):
                 print("PROCESS: Installing Python 3.10 via Homebrew…")
                 subprocess.check_call([brew, "update"])
                 subprocess.check_call([brew, "install", "python@3.10"])
-                python_exec = shutil.which("python3.10")
-        # fallback to generic python3 if already ≥3.10
+                # use brew --prefix to find the exact python3.10 binary
+                try:
+                    prefix = subprocess.check_output([brew, "--prefix", "python@3.10"], text=True).strip()
+                    candidate = os.path.join(prefix, "bin", "python3.10")
+                    if os.path.exists(candidate):
+                        python_exec = candidate
+                except subprocess.CalledProcessError:
+                    pass
+            else:
+                print("DEBUG: Homebrew not found; skipping install step")
+
+        # 3) Fallback: accept generic python3 if already ≥3.10
         if not python_exec:
             candidate = shutil.which("python3")
             if candidate:
@@ -83,6 +95,8 @@ elif sys.platform == "darwin":
                         python_exec = candidate
                 except Exception:
                     pass
+
+        # 4) Re-exec under the selected interpreter or exit
         if python_exec:
             print(f"PROCESS: Re-launching under {os.path.basename(python_exec)}…")
             os.execv(python_exec, [python_exec] + sys.argv)
