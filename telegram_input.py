@@ -135,12 +135,25 @@ def _make_status_cb(
 ):
     # On Windows: do nothing (we’ll send fresh messages instead)
     if os.name == "nt":
-        def _noop_status(stage: str, output: Any):
-            # no-op on Windows
+        import shutil
+        import asyncio
+
+        def _win_status(stage: str, output: Any):
+            # build debug message
+            msg = (
+                f"DEBUG: ollama at {shutil.which('ollama')}\n"
+                f"• *{stage}*: {output}"
+            )
+            # send as a new message
+            asyncio.run_coroutine_threadsafe(
+                bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
+                loop
+            )
+
+        def _win_stop():
             return
-        def _noop_stop():
-            return
-        return _noop_status, _noop_stop
+
+        return _win_status, _win_stop
 
     # POSIX path: keep editing in-place
     from typing import List, Any
@@ -586,15 +599,21 @@ def telegram_input(asm: Assembler):
                     chat_asm.tts.enqueue(final)
                     await asyncio.to_thread(chat_asm.tts._file_q.join)
         
-                    # 7) Send .ogg back
+                    # 7) Send .ogg back (skip any missing files)
                     oggs: List[str] = []
                     while True:
                         try:
                             p = chat_asm.tts._ogg_q.get_nowait()
-                            if os.path.getsize(p) > 0:
-                                oggs.append(p)
                         except _queue.Empty:
                             break
+
+                        # skip files that have vanished
+                        try:
+                            if os.path.getsize(p) > 0:
+                                oggs.append(p)
+                        except FileNotFoundError:
+                            print(f"Warning: missing OGG file, skipping: {p}", "WARNING")
+                            continue
         
                     if oggs:
                         if len(oggs) == 1:
