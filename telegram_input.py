@@ -520,13 +520,13 @@ def telegram_input(asm: Assembler):
                     # Small reply: edit placeholder, then pin & unpin
                     if len(final) < 4000:
                         if os.name == "nt":
-                            # On Windows, skip editing and send a fresh message
+                            # Windows: send a fresh message instead of editing
                             sent = await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=final,
                                 reply_to_message_id=reply_to_id
                             )
-                            # pin & unpin so other bots see it
+                            # pin & unpin so other bots see it (optional)
                             try:
                                 await context.bot.pin_chat_message(
                                     chat_id=chat_id,
@@ -538,10 +538,10 @@ def telegram_input(asm: Assembler):
                                     chat_id=chat_id,
                                     message_id=sent.message_id
                                 )
-                            except Exception:
+                            except:
                                 pass
                         else:
-                            # On non-Windows, edit the placeholder as usual
+                            # POSIX: edit the placeholder in place
                             sent = await context.bot.edit_message_text(
                                 chat_id=chat_id,
                                 message_id=placeholder_id,
@@ -557,7 +557,6 @@ def telegram_input(asm: Assembler):
                                 chat_id=chat_id,
                                 message_id=sent.message_id
                             )
-
                     # Large reply: drop placeholder, stream chunks (each chunk pins/unpins)
                     else:
                         try:
