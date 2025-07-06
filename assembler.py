@@ -1821,19 +1821,10 @@ class Assembler:
         and default high-priority tags if decisions fail.
         """
         import re
-        from datetime import timedelta, datetime as _dt
+        from datetime import timedelta
         import concurrent.futures
 
         now = default_clock()
-
-        def _to_dt(ts):
-            # Parses an ISO-string or returns datetime unchanged
-            if isinstance(ts, str):
-                try:
-                    return _dt.fromisoformat(ts.replace("Z", "+00:00"))
-                except Exception:
-                    return now
-            return ts
 
         # ── Step A: dynamically decide context parameters via decision_callback ──
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -1906,7 +1897,7 @@ class Assembler:
         full_narr = self._load_narrative_context()
         all_narr = sorted(
             [c for c in self.repo.query(lambda c: c.component=="narrative")],
-            key=lambda c: _to_dt(c.timestamp), reverse=True
+            key=lambda c: c.timestamp, reverse=True
         )[:5]
         all_narr.reverse()
         full_narr.summary = "\n".join(n.summary for n in all_narr)
@@ -1919,13 +1910,13 @@ class Assembler:
                 lambda c: c.domain=="segment"
                           and c.semantic_label in ("user_input","assistant")
             )],
-            key=lambda c: _to_dt(c.timestamp)
+            key=lambda c: c.timestamp
         )[-WM:]
         inferences = sorted(
             [c for c in self.repo.query(
                 lambda c: c.semantic_label=="final_inference"
             )],
-            key=lambda c: _to_dt(c.timestamp)
+            key=lambda c: c.timestamp
         )[-WM:]
         # extract summaries
         wm_segments = [c.summary for c in raw_segments]
@@ -1937,9 +1928,9 @@ class Assembler:
             [c for c in self.repo.query(
                 lambda c: c.domain=="segment"
                           and c.semantic_label in ("user_input","assistant")
-                          and _to_dt(c.timestamp) >= cutoff
+                          and c.timestamp >= cutoff
             )],
-            key=lambda c: _to_dt(c.timestamp)
+            key=lambda c: c.timestamp
         )
         history = recent_segs[-num_entries:]
         if extra_ctx:
@@ -1992,7 +1983,7 @@ class Assembler:
         # ── Step H: recent tool outputs ────────────────────────────────────
         tools = sorted(
             [c for c in self.repo.query(lambda c: c.component=="tool_output")],
-            key=lambda c: _to_dt(c.timestamp)
+            key=lambda c: c.timestamp
         )
         recent_tools = tools[-self.top_k:] if self.rl.should_run("tool_output_retrieval", rf) else []
 
@@ -2032,7 +2023,7 @@ class Assembler:
 
         merged_ids = [c.context_id for c in merged]
         wm_ids = [c.context_id for c in raw_segments + inferences]
-
+        
         # ── Step J: debug print of all context buckets ─────────────────────
         self._print_stage_context("context_merge", {
             "system":    [sys_ctx.summary],
@@ -2053,7 +2044,6 @@ class Assembler:
             "recent_ids":    merged_ids,
             "wm_ids":        wm_ids,
         }
-
 
     # ── Stage 4: Intent Clarification ─────────────────────────────────────
     def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
