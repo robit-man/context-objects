@@ -133,14 +133,16 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-    # On Windows, disable in-place edits entirely
+    # On Windows: do nothing (we’ll send fresh messages instead)
     if os.name == "nt":
         def _noop_status(stage: str, output: Any):
-            pass
+            # no-op on Windows
+            return
         def _noop_stop():
-            pass
+            return
         return _noop_status, _noop_stop
 
+    # POSIX path: keep editing in-place
     from typing import List, Any
     history: List[str] = []
     last_edit_at: float = 0.0
@@ -487,26 +489,32 @@ def telegram_input(asm: Assembler):
             status_cb, stop_status = _make_status_cb(
                 loop, context.bot, chat_id, placeholder_id
             )
-
+        
             async def runner():
                 try:
-                    # clear old TTS queues
+                    # 1) clear old TTS queues
                     for qobj in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
                         while True:
                             try:
                                 qobj.get_nowait()
                             except _queue.Empty:
                                 break
-
+        
+                    # 2) run inference and swallow any internal errors
                     chat_asm.tts.set_mode("file")
-                    final = await asyncio.to_thread(
-                        chat_asm.run_with_meta_context,
-                        request_text,
-                        status_cb
-                    )
-                    stop_status()
-
-                    # If there's absolutely no response, just delete the placeholder and bail
+                    try:
+                        final = await asyncio.to_thread(
+                            chat_asm.run_with_meta_context,
+                            request_text,
+                            status_cb
+                        )
+                    except Exception:
+                        logger.exception("run_with_meta_context failed, swallowing")
+                        final = ""
+                    finally:
+                        stop_status()
+        
+                    # 3) if empty result, just delete placeholder
                     if not final or not final.strip():
                         try:
                             await context.bot.delete_message(
@@ -516,17 +524,17 @@ def telegram_input(asm: Assembler):
                         except:
                             pass
                         return
-
-                    # Small reply: edit placeholder, then pin & unpin
+        
+                    # 4) Short reply (<4000 chars)
                     if len(final) < 4000:
                         if os.name == "nt":
-                            # Windows: send a fresh message instead of editing
+                            # Windows: send fresh message instead of editing
                             sent = await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=final,
                                 reply_to_message_id=reply_to_id
                             )
-                            # pin & unpin so other bots see it (optional)
+                            # optional pin/unpin for cross-bot visibility
                             try:
                                 await context.bot.pin_chat_message(
                                     chat_id=chat_id,
@@ -541,7 +549,7 @@ def telegram_input(asm: Assembler):
                             except:
                                 pass
                         else:
-                            # POSIX: edit the placeholder in place
+                            # POSIX: edit placeholder in-place
                             sent = await context.bot.edit_message_text(
                                 chat_id=chat_id,
                                 message_id=placeholder_id,
@@ -557,7 +565,8 @@ def telegram_input(asm: Assembler):
                                 chat_id=chat_id,
                                 message_id=sent.message_id
                             )
-                    # Large reply: drop placeholder, stream chunks (each chunk pins/unpins)
+        
+                    # 5) Long reply: chunk & stream
                     else:
                         try:
                             await context.bot.delete_message(
@@ -572,10 +581,12 @@ def telegram_input(asm: Assembler):
                             final,
                             reply_to=reply_to_id
                         )
-
-                    # Now the voice reply as before...
+        
+                    # 6) Enqueue for voice reply
                     chat_asm.tts.enqueue(final)
                     await asyncio.to_thread(chat_asm.tts._file_q.join)
+        
+                    # 7) Send .ogg back
                     oggs: List[str] = []
                     while True:
                         try:
@@ -584,7 +595,7 @@ def telegram_input(asm: Assembler):
                                 oggs.append(p)
                         except _queue.Empty:
                             break
-
+        
                     if oggs:
                         if len(oggs) == 1:
                             with open(oggs[0], "rb") as vf:
@@ -594,6 +605,7 @@ def telegram_input(asm: Assembler):
                                     reply_to_message_id=reply_to_id
                                 )
                         else:
+                            # concat multiple oggs into one
                             combined = os.path.join(
                                 tempfile.gettempdir(),
                                 f"combined_{uuid.uuid4().hex}.ogg"
@@ -603,8 +615,8 @@ def telegram_input(asm: Assembler):
                             filt    = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
                             subprocess.run(
                                 ["ffmpeg","-y","-loglevel","error", *ins,
-                                "-filter_complex", filt,
-                                "-c:a","libopus","-b:a","48k", combined],
+                                 "-filter_complex", filt,
+                                 "-c:a","libopus","-b:a","48k", combined],
                                 check=True
                             )
                             with open(combined, "rb") as vf:
@@ -613,8 +625,9 @@ def telegram_input(asm: Assembler):
                                     voice=vf,
                                     reply_to_message_id=reply_to_id
                                 )
-
+        
                 except asyncio.CancelledError:
+                    # cancellation: update placeholder if possible
                     try:
                         await context.bot.edit_message_text(
                             chat_id=chat_id,
@@ -623,24 +636,22 @@ def telegram_input(asm: Assembler):
                         )
                     except:
                         pass
-
-                except Exception as e:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Error: {e}",
-                        reply_to_message_id=reply_to_id
-                    )
-
+        
+                # never bubble tool or clarification errors to user
+                except Exception:
+                    logger.exception("Unexpected error in Telegram runner; swallowing")
+        
                 finally:
-                    running.pop(chat_id, None)
+                    # dequeue next if any
+                    running.pop((chat_id, context.bot.id), None)
                     try:
-                        nxt, nxt_id = queue.get_nowait()
-                    except asyncio.QueueEmpty:
+                        nxt, nxt_id = _pending[(chat_id, context.bot.id)].get_nowait()
+                    except Exception:
                         return
                     await start_runner(nxt, nxt_id)
-
-            # schedule it exactly as before:
-            running[chat_id] = loop.create_task(runner())
+        
+            # schedule it
+            running[(chat_id, context.bot.id)] = loop.create_task(runner())
 
 
 
