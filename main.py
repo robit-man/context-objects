@@ -49,6 +49,7 @@ if sys.platform.startswith("linux"):
             print("ERROR: Failed to install or locate Python 3.10+ on Linux.")
             sys.exit(1)
 
+            
 elif sys.platform == "darwin":
     # macOS: ensure Python 3.10+
     if sys.version_info < (3, 10):
@@ -73,19 +74,23 @@ elif sys.platform == "darwin":
                 print("PROCESS: Installing Python 3.10 via Homebrew…")
                 subprocess.check_call([brew, "update"])
                 subprocess.check_call([brew, "install", "python@3.10"])
-                # link keg-only formula so python3.10 appears in /opt/homebrew/bin
-                subprocess.call([brew, "link", "--overwrite", "--force", "python@3.10"])
-                # locate the real binary via brew --prefix and adjust PATH
+                # force-link so /opt/homebrew/bin/python3.10 appears
+                subprocess.check_call([brew, "link", "--overwrite", "--force", "python@3.10"])
+
+                # Now explicitly add Homebrew bins to PATH
                 try:
                     prefix = subprocess.check_output([brew, "--prefix", "python@3.10"], text=True).strip()
-                    libexec = os.path.join(prefix, "libexec", "bin")
-                    os.environ["PATH"] = libexec + os.pathsep + os.environ.get("PATH", "")
-                    candidate = os.path.join(libexec, "python3.10")
-                    if os.path.exists(candidate):
-                        python_exec = candidate
-                    else:
-                        # fallback to which now that brew linked
-                        python_exec = shutil.which("python3.10")
+                    brew_bins = [
+                        os.path.join(prefix, "bin"),
+                        os.path.join(prefix, "libexec", "bin"),
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                    ]
+                    for p in brew_bins:
+                        if os.path.isdir(p):
+                            os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
+                    # retry locating python3.10
+                    python_exec = shutil.which("python3.10")
                 except subprocess.CalledProcessError:
                     pass
 
@@ -94,8 +99,9 @@ elif sys.platform == "darwin":
             candidate = shutil.which("python3")
             if candidate:
                 try:
-                    ver = subprocess.check_output([candidate, "--version"], text=True).strip().split()[1]
-                    major, minor, *_ = ver.split(".")
+                    out = subprocess.check_output([candidate, "--version"], text=True).strip()
+                    _, version = out.split()
+                    major, minor, *_ = version.split(".")
                     if int(major) == 3 and int(minor) >= 10:
                         python_exec = candidate
                 except Exception:
