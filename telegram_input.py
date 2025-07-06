@@ -30,6 +30,12 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
+# ────────────────────────────────────────────────────────────────────────
+# Add these imports *at the top* of telegram_input.py, alongside your others
+# ────────────────────────────────────────────────────────────────────────
+# We’ll keep separate queues/tasks for pin-driven inferences:
+_pending_pin: dict[tuple[int,int], asyncio.Queue[tuple[str,int]]] = {}
+_running_pin: dict[tuple[int,int], asyncio.Task] = {}
 
 from context import HybridContextRepository, ContextObject, _locked, sanitize_jsonl
 from typing import Any, Callable, List, Optional, Tuple
@@ -125,6 +131,7 @@ def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridCont
     )
 
 
+
 # ────────────────────────────────────────────────────────────────────────
 # Factory for per-stage status callback
 # ────────────────────────────────────────────────────────────────────────
@@ -204,10 +211,92 @@ def _make_status_cb(
 
     return status_cb, stop_cb
 
+# ────────────────────────────────────────────────────────────────────────
+# Add this helper *below* your existing _make_status_cb / _send_long_text_async
+# ────────────────────────────────────────────────────────────────────────
+async def _start_runner_for_pin(
+    chat_asm: Assembler,
+    bot,
+    chat_id: int,
+    request_text: str,
+    reply_to_id: int
+):
+    # Reuse your status‐callback machinery, but we have no placeholder message_id,
+    # so pass msg_id=None and skip live edits.
+    loop = asyncio.get_event_loop()
+    status_cb, stop_status = _make_status_cb(loop, bot, chat_id, msg_id=None)
 
+    try:
+        # Run inference
+        final = await asyncio.to_thread(
+            chat_asm.run_with_meta_context,
+            request_text,
+            status_cb
+        )
+    except Exception:
+        final = ""
+    finally:
+        stop_status()
+
+    if not final or not final.strip():
+        return
+
+    # Send short text reply
+    await bot.send_message(
+        chat_id=chat_id,
+        text=final,
+        reply_to_message_id=reply_to_id
+    )
+
+    # (Optional) enqueue for TTS/voice exactly as in your runner…
+    chat_asm.tts.enqueue(final)
+    await asyncio.to_thread(chat_asm.tts._file_q.join)
+
+    # Send back .ogg if present
+    oggs = []
+    while True:
+        try:
+            p = chat_asm.tts._ogg_q.get_nowait()
+            if os.path.getsize(p) > 0:
+                oggs.append(p)
+        except _queue.Empty:
+            break
+
+    if oggs:
+        # reuse your existing concat or single-file logic
+        if len(oggs) == 1:
+            with open(oggs[0], "rb") as vf:
+                await bot.send_voice(
+                    chat_id=chat_id,
+                    voice=vf,
+                    reply_to_message_id=reply_to_id
+                )
+        else:
+            combined = os.path.join(
+                tempfile.gettempdir(),
+                f"combined_{uuid.uuid4().hex}.ogg"
+            )
+            ins     = sum([["-i", p] for p in oggs], [])
+            streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
+            filt    = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
+            subprocess.run(
+                ["ffmpeg","-y","-loglevel","error", *ins,
+                 "-filter_complex", filt,
+                 "-c:a","libopus","-b:a","48k", combined],
+                check=True
+            )
+            with open(combined, "rb") as vf:
+                await bot.send_voice(
+                    chat_id=chat_id,
+                    voice=vf,
+                    reply_to_message_id=reply_to_id
+                )
 
 # ────────────────────────────────────────────────────────────────────────
 # Handler for ANY pinned message in any chat
+# ────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# Replace your existing _on_pin entirely with this version:
 # ────────────────────────────────────────────────────────────────────────
 async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -267,9 +356,34 @@ async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seg.summary  = text
     seg.stage_id = "telegram_pinned"
     seg.touch()
+    chat_asm.repo.save(seg)
 
-    if chat_asm:
-        chat_asm.repo.save(seg)
+    # ── now treat that same pinned text as if it were a user input ─────────────
+    fake_input = f"{author}: {text}"
+    try:
+        wants_reply = chat_asm.filter_callback(fake_input)
+    except Exception:
+        wants_reply = False
+
+    if not wants_reply:
+        return
+
+    key   = (chat_id, context.bot.id)
+    queue = _pending_pin.setdefault(key, asyncio.Queue())
+
+    if (prev := _running_pin.get(key)) and not prev.done():
+        await queue.put((fake_input, pinned.message_id))
+    else:
+        task = asyncio.create_task(
+            _start_runner_for_pin(
+                chat_asm,
+                context.bot,
+                chat_id,
+                fake_input,
+                pinned.message_id
+            )
+        )
+        _running_pin[key] = task
 
 
 # ────────────────────────────────────────────────────────────────────────
