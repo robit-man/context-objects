@@ -414,64 +414,121 @@ class Tools:
         similarity_to: Optional[str]        = None,
         query: Optional[str]                = None,
         top_k: int                          = 5,
+        wm_only: bool                       = False,
+        wm_type: Optional[str]              = None,
+        window: Optional[str]               = None,
+        max_entries: Optional[int]          = None,
     ) -> str:
         """
-        Query your context.jsonl store.
+        Query the context store with flexible filters and retrieval options.
 
-        Args:
-          time_range:       [start_ts, end_ts] in "YYYYmmddTHHMMSSZ"
-          tags:             include any ContextObjects with ≥1 of these tags
-          exclude_tags:     drop any with ≥1 of these tags
-          domain:           filter by c.domain
-          component:        filter by c.component
-          semantic_label:   filter by c.semantic_label
-          summary_regex:    regex match on c.summary
-          similarity_to:    fuzzy match on summary (higher = more similar)
-          query:            alias for similarity_to
-          top_k:            max results
+        Positional arguments (all optional):
+        - time_range:     A two-element list [start_ts, end_ts] where each timestamp is in ISO format
+                            or "YYYYmmddTHHMMSSZ". Filters objects whose .timestamp falls within the range.
+        - tags:           List of tags; only objects containing ≥1 of these tags will be included.
+        - exclude_tags:   List of tags; objects containing ≥1 of these tags will be excluded.
+        - domain:         List of domain names to include (e.g. ["segment", "tool_output"]).
+        - component:      List of component names to include (e.g. ["memory", "analysis"]).
+        - semantic_label: List of semantic_label values to include (e.g. ["user_input", "final_inference"]).
+        - summary_regex:  A regular expression; only objects whose .summary matches (case-insensitive) will be kept.
+        - similarity_to:  A string; performs a similarity search. If available, uses your vector engine (engine.query),
+                            otherwise falls back to fuzzy matching via difflib. Alias: query.
+        - query:          Alias for similarity_to.
+        - top_k:          Maximum number of results to return (default 5).
+        - wm_only:        If True, restricts to the “working memory” buckets (raw segments + inferences).
+        - wm_type:        If "segments", only include raw segment entries; if "infers", only final_inference entries.
+        - window:         A human-readable duration (e.g. "5 minutes", "1 hour", "1 day"); filters to items newer
+                            than now minus that duration.
+        - max_entries:    After all other filters and ranking, keep only the last N items (oldest→newest).
 
         Returns:
-          JSON string:
-            {"results":[
-               {
-                 "context_id":…,
-                 "timestamp":…,
-                 "domain":…,
-                 "component":…,
-                 "semantic_label":…,
-                 "summary":…
-               }, … ]}
+        A JSON-formatted string:
+            {
+            "results": [
+                {
+                "context_id":     <str>,
+                "timestamp":      <str>,
+                "domain":         <str>,
+                "component":      <str>,
+                "semantic_label": <str>,
+                "summary":        <str>
+                },
+                ...
+            ]
+            }
+
+        Usage examples:
+
+        # 1) Get the last 10 working memory segments:
+        context_query(wm_type="segments", max_entries=10)
+
+        # 2) Get up to 20 items from the past hour, filtered by tag:
+        context_query(window="1 hour", max_entries=20, tags=["important"])
+
+        # 3) Perform a similarity search against your vector engine:
+        context_query(similarity_to="project deadline", top_k=5)
+
+        # 4) Combine time_range + domain + regex:
+        context_query(
+            time_range=["20250705T000000Z","20250706T235959Z"],
+            domain=["segment","tool_output"],
+            summary_regex="error"
+        )
         """
+        import os, json, re, difflib
+        from datetime import datetime, timedelta
+        from typing import Any, Dict, List, Tuple
+        # adjust import path as needed:
+        from context_repository import ContextRepository
+
         # alias
-        if query is not None and similarity_to is None:
+        if query and not similarity_to:
             similarity_to = query
 
-        # load everything
-        repo = ContextRepository(os.path.join(os.getcwd(), "context.jsonl"))
+        repo    = ContextRepository(os.path.join(os.getcwd(), "context.jsonl"))
         all_ctx = repo.query(lambda c: True)
 
-        # timestamp parser
-        def _parse_ts(ts: str) -> datetime:
+        # ───── WM shortcuts ─────────────────────────────────────────
+        if wm_only:
+            all_ctx = [
+                c for c in all_ctx
+                if (c.domain=="segment" and c.semantic_label in ("user_input","assistant"))
+                or c.semantic_label=="final_inference"
+            ]
+        if wm_type == "segments":
+            all_ctx = [
+                c for c in all_ctx
+                if c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+            ]
+        if wm_type == "infers":
+            all_ctx = [c for c in all_ctx if c.semantic_label=="final_inference"]
+
+        # ───── Timestamp parser ───────────────────────────────────────
+        def _parse(ts: str) -> datetime:
             try:
                 return datetime.fromisoformat(ts)
             except ValueError:
                 return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
 
-        # 1) time window
-        if time_range and len(time_range) == 2:
-            start_dt, end_dt = _parse_ts(time_range[0]), _parse_ts(time_range[1])
-            all_ctx = [
-                c for c in all_ctx
-                if start_dt <= _parse_ts(c.timestamp) <= end_dt
-            ]
+        # ───── Time‐window filter ─────────────────────────────────────
+        if window:
+            m = re.match(r"(\d+)\s*(\w+)", window)
+            if m:
+                val, unit = int(m.group(1)), m.group(2).lower().rstrip("s")
+                delta_map = {
+                    "minute": timedelta(minutes=val),
+                    "hour":   timedelta(hours=val),
+                    "day":    timedelta(days=val),
+                }
+                delta = delta_map.get(unit, timedelta())
+                cutoff = datetime.utcnow() - delta
+                all_ctx = [c for c in all_ctx if _parse(c.timestamp) >= cutoff]
 
-        # 2) tag filters
+        # ───── Tag / domain / component / semantic_label filters ─────
         if tags:
             all_ctx = [c for c in all_ctx if set(tags) & set(c.tags)]
         if exclude_tags:
             all_ctx = [c for c in all_ctx if not (set(exclude_tags) & set(c.tags))]
-
-        # 3) domain / component / semantic_label
         if domain:
             all_ctx = [c for c in all_ctx if c.domain in domain]
         if component:
@@ -479,30 +536,48 @@ class Tools:
         if semantic_label:
             all_ctx = [c for c in all_ctx if c.semantic_label in semantic_label]
 
-        # 4) regex on summary
+        # ───── Summary‐regex filter ───────────────────────────────────
         if summary_regex:
             pat = re.compile(summary_regex, re.IGNORECASE)
             all_ctx = [c for c in all_ctx if c.summary and pat.search(c.summary)]
 
-        # 5) similarity ranking (fuzzy on text)
+        # ───── Similarity / recency ranking ──────────────────────────
+        selected: List[Any] = []
         if similarity_to:
-            key = similarity_to.lower()
-            scored: List[Tuple[float, ContextObject]] = []
-            for c in all_ctx:
-                txt = c.summary or ""
-                ratio = difflib.SequenceMatcher(None, key, txt.lower()).ratio()
-                scored.append((ratio, c))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            selected = [c for _, c in scored[:top_k]]
+            try:
+                # Vector‐search hook: replace with your engine API
+                results = engine.query(
+                    similarity_to=similarity_to,
+                    include_tags=tags,
+                    exclude_tags=exclude_tags,
+                    time_range=time_range,
+                    top_k=top_k
+                )
+                selected = [repo.get(r.context_id) for r in results]
+            except NameError:
+                # fallback fuzzy match
+                scored: List[Tuple[float, Any]] = []
+                key = similarity_to.lower()
+                for c in all_ctx:
+                    txt = (c.summary or "").lower()
+                    score = difflib.SequenceMatcher(None, key, txt).ratio()
+                    scored.append((score, c))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                selected = [c for _, c in scored[:top_k]]
         else:
-            # 6) otherwise sort by recency
-            all_ctx.sort(key=lambda c: _parse_ts(c.timestamp), reverse=True)
+            # recency sort
+            all_ctx.sort(key=lambda c: _parse(c.timestamp), reverse=True)
             selected = all_ctx[:top_k]
 
-        # 7) format
-        results: List[Dict[str, Any]] = []
+        # ───── Cap by max_entries ────────────────────────────────────
+        if max_entries is not None:
+            # keep the last `max_entries` from selected
+            selected = selected[-max_entries:]
+
+        # ───── Format output ──────────────────────────────────────────
+        out: List[Dict[str, Any]] = []
         for c in selected:
-            results.append({
+            out.append({
                 "context_id":     c.context_id,
                 "timestamp":      c.timestamp,
                 "domain":         c.domain,
@@ -511,7 +586,7 @@ class Tools:
                 "summary":        c.summary or ""
             })
 
-        return json.dumps({"results": results}, indent=2)
+        return json.dumps({"results": out}, indent=2)
 
 
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.

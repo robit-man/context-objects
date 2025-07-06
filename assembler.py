@@ -2022,7 +2022,8 @@ class Assembler:
                 merged.append(c); seen.add(c.context_id)
 
         merged_ids = [c.context_id for c in merged]
-
+        wm_ids = [c.context_id for c in raw_segments + inferences]
+        
         # ── Step J: debug print of all context buckets ─────────────────────
         self._print_stage_context("context_merge", {
             "system":    [sys_ctx.summary],
@@ -2041,6 +2042,7 @@ class Assembler:
             "recent":        recent,
             "assoc":         assoc,
             "recent_ids":    merged_ids,
+            "wm_ids":        wm_ids,
         }
 
 
@@ -3041,6 +3043,7 @@ class Assembler:
 
         _maybe_add("user_ctx")
         _maybe_add("sys_ctx")
+        refs.extend(state.get("wm_ids", []))
         refs.extend(state.get("recent_ids", []))
         _maybe_add("clar_ctx")
         _maybe_add("know_ctx")
