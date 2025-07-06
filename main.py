@@ -121,28 +121,35 @@ if not os.path.exists(SETUP_MARKER):
     # System packages on Debian/Ubuntu
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
         log_message("Installing system packages via apt-get...", "PROCESS")
-        subprocess.check_call(["sudo","apt-get","update"])
+        subprocess.check_call(["sudo", "apt-get", "update"])
         subprocess.check_call([
-            "sudo","apt-get","install","-y",
-            "libsqlite3-dev","ffmpeg","wget","unzip"
+            "sudo", "apt-get", "install", "-y",
+            "libsqlite3-dev", "ffmpeg", "wget", "unzip"
         ])
+    # System packages on macOS
     elif sys.platform == "darwin" and shutil.which("brew"):
         log_message("Installing system packages via Homebrew...", "PROCESS")
-        subprocess.check_call(["brew","update"])
+        subprocess.check_call(["brew", "update"])
         subprocess.check_call([
-            "brew","install",
-            "sqlite3","ffmpeg","wget","unzip"
+            "brew", "install",
+            "sqlite3", "ffmpeg", "wget", "unzip"
         ])
     # Python packages
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install"] + [
-        "sounddevice","numpy","scipy","openai-whisper","ollama",
-        "python-dotenv","beautifulsoup4","html5lib","psutil",
-        "noisereduce","denoiser","pillow","opencv-python",
-        "mss","networkx","pandas","selenium","webdriver-manager",
-        "flask_cors","flask","tiktoken","python-telegram-bot",
-        "asyncio","nest-asyncio","sentence-transformers","telegram","num2words"
-    ])
+    # Prepare dependency list (skip third-party asyncio on macOS)
+    deps = [
+        "sounddevice", "numpy", "scipy", "openai-whisper", "ollama",
+        "python-dotenv", "beautifulsoup4", "html5lib", "psutil",
+        "noisereduce", "denoiser", "pillow", "opencv-python",
+        "mss", "networkx", "pandas", "selenium", "webdriver-manager",
+        "flask_cors", "flask", "tiktoken", "python-telegram-bot",
+        "nest-asyncio", "sentence-transformers", "telegram", "num2words"
+    ]
+    # on Linux only, also install the separate 'asyncio' package
+    if sys.platform.startswith("linux"):
+        deps.append("asyncio")
+    subprocess.check_call([sys.executable, "-m", "pip", "install"] + deps)
+    # mark setup complete and restart
     with open(SETUP_MARKER, "w") as f:
         f.write("done")
     log_message("Dependencies installed. Restarting…", "SUCCESS")
