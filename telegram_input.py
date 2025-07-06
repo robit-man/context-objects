@@ -519,21 +519,44 @@ def telegram_input(asm: Assembler):
 
                     # Small reply: edit placeholder, then pin & unpin
                     if len(final) < 4000:
-                        sent = await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=placeholder_id,
-                            text=final
-                        )
-                        await context.bot.pin_chat_message(
-                            chat_id=chat_id,
-                            message_id=sent.message_id,
-                            disable_notification=True
-                        )
-                        await asyncio.sleep(1)
-                        await context.bot.unpin_chat_message(
-                            chat_id=chat_id,
-                            message_id=sent.message_id
-                        )
+                        if os.name == "nt":
+                            # On Windows, skip editing and send a fresh message
+                            sent = await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=final,
+                                reply_to_message_id=reply_to_id
+                            )
+                            # pin & unpin so other bots see it
+                            try:
+                                await context.bot.pin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=sent.message_id,
+                                    disable_notification=True
+                                )
+                                await asyncio.sleep(1)
+                                await context.bot.unpin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=sent.message_id
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            # On non-Windows, edit the placeholder as usual
+                            sent = await context.bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=placeholder_id,
+                                text=final
+                            )
+                            await context.bot.pin_chat_message(
+                                chat_id=chat_id,
+                                message_id=sent.message_id,
+                                disable_notification=True
+                            )
+                            await asyncio.sleep(1)
+                            await context.bot.unpin_chat_message(
+                                chat_id=chat_id,
+                                message_id=sent.message_id
+                            )
 
                     # Large reply: drop placeholder, stream chunks (each chunk pins/unpins)
                     else:
