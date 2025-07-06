@@ -135,44 +135,61 @@ def _make_status_cb(
 ):
     # On Windows: send rich debug info + stage output via Telegram
     if os.name == "nt":
-        import shutil, asyncio, os, platform, sys
+        import shutil, asyncio, os, platform, sys, socket
 
         def _win_status(stage: str, output: Any):
-            # 1) Try shutil.which()
+            # 1) Locate ollama via PATH
             which_exe = shutil.which("ollama") or shutil.which("ollama.exe")
+            exists_which = bool(which_exe and os.path.exists(which_exe))
 
             # 2) Check OLLAMA_PATH env var
             env_path = os.environ.get("OLLAMA_PATH")
+            exists_env = bool(env_path and os.path.exists(env_path))
 
-            # 3) Check default install location under %USERPROFILE%
+            # 3) Default install location under %USERPROFILE%
             default_path = None
-            userprofile = os.environ.get("USERPROFILE")
-            if userprofile:
+            exists_default = False
+            up = os.environ.get("USERPROFILE")
+            if up:
                 default_path = os.path.join(
-                    userprofile, "AppData", "Local", "Programs", "Ollama", "ollama.EXE"
+                    up, "AppData", "Local", "Programs", "Ollama", "ollama.EXE"
                 )
+                exists_default = os.path.exists(default_path)
 
-            # 4) Build diagnostics
-            candidates = {
-                "which()": which_exe,
-                "OLLAMA_PATH": env_path,
-                "default install": default_path,
-            }
-            lines = []
-            for name, path in candidates.items():
-                exists = bool(path and os.path.exists(path))
-                lines.append(f"{name}: {path!r}  exists={exists}")
+            # 4) Check OLLAMA_API_URL (if set)
+            api_url = os.environ.get("OLLAMA_API_URL")
 
+            # 5) Test TCP connect to localhost:11434
+            sock_res = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                sock_res = s.connect_ex(("127.0.0.1", 11434))
+                s.close()
+            except Exception as e:
+                sock_res = f"err:{e}"
+
+            # 6) Gather event loop policy
             loop_policy = type(asyncio.get_event_loop()).__name__
-            header = [
+
+            # Build the debug message
+            lines = [
                 f"🖥️ OS: {platform.system()} {platform.release()}",
                 f"🐍 Python: {sys.executable} ({sys.version.split()[0]})",
                 f"🔄 EventLoop: {loop_policy}",
-                "🔍 Ollama discovery:"
+                "",
+                "🔍 Ollama discovery:",
+                f"  which():         {which_exe!r}  exists={exists_which}",
+                f"  OLLAMA_PATH:     {env_path!r}  exists={exists_env}",
+                f"  default install: {default_path!r}  exists={exists_default}",
+                f"  OLLAMA_API_URL:  {api_url!r}",
+                f"  TCP 127.0.0.1:11434 connect_ex → {sock_res}",
+                "",
+                f"• *{stage}*: {output}"
             ]
-            msg = "\n".join(header + lines + [f"• *{stage}*: {output}"])
+            msg = "\n".join(lines)
 
-            # send as a new Telegram message
+            # Send as a new Telegram message
             asyncio.run_coroutine_threadsafe(
                 bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
                 loop
