@@ -385,7 +385,7 @@ if updated:
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
 
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
-for model in (config.get("primary_model"), config.get("secondary_model")):
+for model in (config.get("primary_model"), config.get("secondary_model"), config.get("decision_model")):
     try:
         existing = subprocess.check_output(["ollama", "list"], text=True)
         if model not in existing:
