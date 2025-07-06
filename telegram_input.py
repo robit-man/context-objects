@@ -133,18 +133,46 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-    # On Windows: do nothing (we’ll send fresh messages instead)
+    # On Windows: send rich debug info + stage output via Telegram
     if os.name == "nt":
-        import shutil
-        import asyncio
+        import shutil, asyncio, os, platform, sys
 
         def _win_status(stage: str, output: Any):
-            # build debug message
-            msg = (
-                f"DEBUG: ollama at {shutil.which('ollama')}\n"
-                f"• *{stage}*: {output}"
-            )
-            # send as a new message
+            # 1) Try shutil.which()
+            which_exe = shutil.which("ollama") or shutil.which("ollama.exe")
+
+            # 2) Check OLLAMA_PATH env var
+            env_path = os.environ.get("OLLAMA_PATH")
+
+            # 3) Check default install location under %USERPROFILE%
+            default_path = None
+            userprofile = os.environ.get("USERPROFILE")
+            if userprofile:
+                default_path = os.path.join(
+                    userprofile, "AppData", "Local", "Programs", "Ollama", "ollama.EXE"
+                )
+
+            # 4) Build diagnostics
+            candidates = {
+                "which()": which_exe,
+                "OLLAMA_PATH": env_path,
+                "default install": default_path,
+            }
+            lines = []
+            for name, path in candidates.items():
+                exists = bool(path and os.path.exists(path))
+                lines.append(f"{name}: {path!r}  exists={exists}")
+
+            loop_policy = type(asyncio.get_event_loop()).__name__
+            header = [
+                f"🖥️ OS: {platform.system()} {platform.release()}",
+                f"🐍 Python: {sys.executable} ({sys.version.split()[0]})",
+                f"🔄 EventLoop: {loop_policy}",
+                "🔍 Ollama discovery:"
+            ]
+            msg = "\n".join(header + lines + [f"• *{stage}*: {output}"])
+
+            # send as a new Telegram message
             asyncio.run_coroutine_threadsafe(
                 bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
                 loop
