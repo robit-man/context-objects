@@ -25,12 +25,16 @@ import threading
 from datetime import datetime
 
 
-# ── Ensure we’re running under Python 3.10+ ──
+# ── Ensure Python 3.10+ is available; install automatically if missing ──
 if sys.version_info < (3, 10):
-    # 1) look for any suitable python3.x on PATH
-    python_exec = (shutil.which("python3.10")
-                or shutil.which("python3.11")
-                or shutil.which("python3.12"))
+    # 1) look for any suitable python3.x on PATH (including possible “python310” alias)
+    python_exec = (
+        shutil.which("python3.10")
+        or shutil.which("python310")
+        or shutil.which("python3.11")
+        or shutil.which("python3.12")
+    )
+
     # 2) if not found, install based on platform
     if not python_exec:
         if sys.platform.startswith("linux") and shutil.which("apt-get"):
@@ -40,19 +44,34 @@ if sys.version_info < (3, 10):
                 "sudo", "apt-get", "install", "-y",
                 "python3.10", "python3.10-venv", "python3.10-distutils"
             ])
-            python_exec = shutil.which("python3.10")
+            python_exec = shutil.which("python3.10") or shutil.which("python310")
         elif sys.platform == "darwin" and shutil.which("brew"):
             print("Installing Python 3.10 via Homebrew…", "PROCESS")
             subprocess.check_call(["brew", "update"])
             subprocess.check_call(["brew", "install", "python@3.10"])
-            python_exec = shutil.which("python3.10")
-    # 3) re-exec under the new interpreter or fail
+            python_exec = shutil.which("python3.10") or shutil.which("python310")
+
+    # 3) as a last resort, accept “python3” if it already is ≥3.10
+    if not python_exec:
+        candidate = shutil.which("python3")
+        if candidate:
+            try:
+                out = subprocess.check_output([candidate, "--version"], text=True).strip()
+                _, version = out.split()
+                major, minor, *_ = version.split(".")
+                if int(major) == 3 and int(minor) >= 10:
+                    python_exec = candidate
+            except Exception:
+                pass
+
+    # 4) re-exec under the new interpreter or exit on failure
     if python_exec:
         print(f"Re-launching under {os.path.basename(python_exec)}…", "PROCESS")
         os.execv(python_exec, [python_exec] + sys.argv)
     else:
-        print("Failed to install Python 3.10 or newer.", "ERROR")
+        print("Failed to install or locate Python 3.10+.", "ERROR")
         sys.exit(1)
+
 
 
 # CTRL-C handler
