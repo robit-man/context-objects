@@ -479,7 +479,7 @@ class Tools:
         from datetime import datetime, timedelta
         from typing import Any, Dict, List, Tuple
         # adjust import path as needed:
-        from context_repository import ContextRepository
+        from context import ContextRepository
 
         # alias
         if query and not similarity_to:
