@@ -133,18 +133,48 @@ def _make_status_cb(
     max_lines: int = 10,
     min_interval: float = 5,
 ):
-    # On Windows: do nothing (we’ll send fresh messages instead)
+     # On Windows: send CLI + HTTP endpoint debug + recent error logs
     if os.name == "nt":
-        import shutil
-        import asyncio
+        import os, shutil, socket, asyncio, platform, sys
 
         def _win_status(stage: str, output: Any):
-            # build debug message
-            msg = (
-                f"DEBUG: ollama at {shutil.which('ollama')}\n"
-                f"• *{stage}*: {output}"
-            )
-            # send as a new message
+            # 1) CLI path
+            cli = shutil.which("ollama") or shutil.which("ollama.exe")
+            # 2) HTTP endpoint override
+            api_url = os.environ.get("OLLAMA_API_URL", "<unset>")
+            # 3) TCP check
+            try:
+                s = socket.create_connection(("127.0.0.1", 11434), timeout=0.5)
+                s.close()
+                tcp = "OK"
+            except Exception as e:
+                tcp = f"FAIL: {e}"
+            # 4) Loop policy
+            loop_policy = type(asyncio.get_event_loop()).__name__
+
+            # 5) Grab the last few log entries
+            logs = "\n".join(list(_LOG_HISTORY)[-10:])
+            if not logs:
+                logs = "(no recent log entries)"
+
+            # Build the message
+            msg = "\n".join([
+                f"🖥️ OS: {platform.system()} {platform.release()}",
+                f"🐍 Python: {sys.executable.split(os.sep)[-1]} ({sys.version.split()[0]})",
+                f"🔄 EventLoop: {loop_policy}",
+                "",
+                "🔍 Ollama CLI:",
+                f"  which():       {cli!r}",
+                f"  OLLAMA_API_URL:{api_url!r}",
+                f"  TCP 127.0.0.1:11434 → {tcp}",
+                "",
+                f"• *{stage}*: {output}",
+                "",
+                "📝 Recent log tail:",
+                f"```{logs}```"
+            ])
+
+            # Send via Telegram
             asyncio.run_coroutine_threadsafe(
                 bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown"),
                 loop
