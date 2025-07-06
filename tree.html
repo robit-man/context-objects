@@ -155,12 +155,20 @@
         // CONFIG
         //////////////////////////////////////////////////////////////////////
         const LAYOUT_CONFIG = {
-            msPerUnit: 1 * 60 * 60,   // 1 min realtime = 1 Y-unit
-            maxXZRadius: 1000,
+            // 60000 ms = 1 minute → 1 Y-unit
+            msPerUnit: 10 * 1000,
+
+            // you can speed up spawning independently of drift
+            spawnFactor: 1.0,
+
+            // you can speed up (or slow down) drift separately
+            driftFactor: 1.0,
+
+            maxXZRadius: 200,
             minSphereY: 0
         };
         const DISPLAY_CONFIG = {
-            sphereRadius: 10,
+            sphereRadius: 5,
             sphereSegments: 5,
             lineBaseOpacity: 0.1,
             hoverHighlightOpacity: 0.5,
@@ -470,40 +478,35 @@
         }
 
 
-        // === UPDATED pickPosition ===
         function pickPosition(o) {
-            // 1️⃣  compute connectivity
-            const conn = (o.references?.length || 0) +
-                Object.keys(o.association_strengths || {}).length;
+            const conn = (o.references?.length || 0)
+                + Object.keys(o.association_strengths || {}).length;
             maxConnCurrent = Math.max(maxConnCurrent, conn);
 
-            // 2️⃣  compute global Y by age
+            // compute age in ms
             const now = Date.now();
             const ageMs = now - parseTimestamp(o.timestamp).getTime();
-            const globalY = ageMs / LAYOUT_CONFIG.msPerUnit;
-            // never go below the configured floor
-            const desiredGlobalY = Math.max(LAYOUT_CONFIG.minSphereY, globalY);
 
-            // 3️⃣  subtract group’s upward drift to get local Y
-            const localY = desiredGlobalY - graphGroup.position.y;
-            // still enforce the floor in local coords
-            const yPos = Math.max(LAYOUT_CONFIG.minSphereY, localY);
+            // map to world-space Y
+            const globalY = (ageMs * LAYOUT_CONFIG.spawnFactor) / LAYOUT_CONFIG.msPerUnit;
+            const desiredY = Math.max(LAYOUT_CONFIG.minSphereY, globalY);
 
-            // 4️⃣  scatter in XZ by connectivity
+            // convert to local by subtracting current drift
+            const localY = desiredY - graphGroup.position.y;
+
+            // scatter around XZ
             const rNorm = 1 - (conn / maxConnCurrent);
             const r = rNorm * LAYOUT_CONFIG.maxXZRadius;
             const ang = Math.random() * Math.PI * 2;
 
             const pos = new THREE.Vector3(
                 Math.cos(ang) * r,
-                yPos,
+                localY,
                 Math.sin(ang) * r
             );
 
-            // 5️⃣  stash coords + metadata
             o.pos = pos;
             o.connectivity = conn;
-
             return pos;
         }
 
@@ -536,6 +539,7 @@
                 geo,
                 new THREE.MeshBasicMaterial({ vertexColors: true }),
                 START_CAP * 4 /* edges usually >> nodes */);
+            instEdge.frustumCulled = false;       // ← ADD THIS LINE
 
             const cAttr = new THREE.InstancedBufferAttribute(
                 new Float32Array(instEdge.instanceCount * 3), 3);
@@ -807,6 +811,7 @@
             });
 
             /* commit to GPU */
+            instEdge.frustumCulled = false;       // ← ADD THIS HERE, too
             instEdge.count = ei;
             instEdge.instanceMatrix.needsUpdate = true;
             colAttr.needsUpdate = true;
@@ -1868,7 +1873,7 @@
             {
                 const now = Date.now();
                 const dt = now - lastDriftT;
-                yScrollOffset += dt / LAYOUT_CONFIG.msPerUnit;
+                yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / LAYOUT_CONFIG.msPerUnit;
                 lastDriftT = now;
                 graphGroup.position.y = yScrollOffset;
             }

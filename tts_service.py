@@ -6,6 +6,7 @@ import subprocess
 import json
 import os
 import uuid
+import shutil
 import numpy as np
 import re
 
@@ -185,7 +186,19 @@ class TTSManager:
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
                 cmd_piper.insert(3, "--debug")
-            cmd_aplay = ["aplay", "-r", "22050", "-f", "S16_LE"]
+
+            # ─── Choose playback command ─────────────────────────────────────────
+            if shutil.which("aplay"):
+                cmd_play = ["aplay", "-r", "22050", "-f", "S16_LE"]
+            elif shutil.which("ffplay"):
+                cmd_play = [
+                    "ffplay", "-autoexit", "-nodisp",
+                    "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0"
+                ]
+            else:
+                raise RuntimeError(
+                    "No suitable audio playback command found; install 'aplay' or 'ffplay'."
+                )
 
             payload = json.dumps({
                 "text":   text,
@@ -202,7 +215,7 @@ class TTSManager:
                     stdout=subprocess.PIPE,
                     stderr=(subprocess.PIPE if self.debug else subprocess.DEVNULL)
                 )
-                p2 = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
+                p2 = subprocess.Popen(cmd_play, stdin=subprocess.PIPE)
 
             # send text to Piper
             p1.stdin.write(payload)
