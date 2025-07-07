@@ -2161,25 +2161,23 @@ class Tools:
         Launch Chrome/Chromium on x86-64 **and** ARM.
         Tries Selenium-Manager → system chromedriver → webdriver-manager.
         """
-        import os, platform, random, shutil
+        import os, random, shutil, subprocess
         from selenium import webdriver
+        from selenium.common.exceptions import WebDriverException
         from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.chrome.options import Options
         from webdriver_manager.chrome import ChromeDriverManager
 
+        # Reuse or tear down existing driver if requested
         if force_new and getattr(Tools, "_driver", None):
-            try:
-                Tools._driver.quit()
-            except Exception:
-                pass
+            try: Tools._driver.quit()
+            except: pass
             Tools._driver = None
 
         if getattr(Tools, "_driver", None):
             return "Browser already open"
 
-        arch = platform.machine().lower()
-        log_message(f"[open_browser] Detected CPU arch = {arch}", "DEBUG")
-
+        # Find the browser binary
         chrome_bin = (
             os.getenv("CHROME_BIN")
             or shutil.which("google-chrome")
@@ -2187,6 +2185,7 @@ class Tools:
             or "/usr/bin/chromium"
         )
 
+        # Build Chrome options
         opts = Options()
         opts.binary_location = chrome_bin
         if headless:
@@ -2196,76 +2195,51 @@ class Tools:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--remote-allow-origins=*")
-        opts.add_argument(f"--remote-debugging-port={random.randint(45000, 65000)}")
+        opts.add_argument(f"--remote-debugging-port={random.randint(45000,65000)}")
 
-        # 1️⃣  Selenium-Manager (Chrome ≥115 ships its own driver)
+        # 1️⃣ Selenium-Manager (bundled driver for Chrome ≥115)
         try:
-            log_message("[open_browser] Trying Selenium-Manager auto-driver…", "DEBUG")
+            log_message("[open_browser] Trying Selenium-Manager…", "DEBUG")
             Tools._driver = webdriver.Chrome(options=opts)
             log_message("[open_browser] Launched via Selenium-Manager.", "SUCCESS")
             return "Browser launched (selenium-manager)"
-        except WebDriverException as e_mgr:
-            log_message(f"[open_browser] Selenium-Manager failed: {e_mgr}", "WARNING")
+        except WebDriverException as e:
+            log_message(f"[open_browser] Selenium-Manager failed: {e}", "WARNING")
 
-        # 2️⃣  system-wide chromedriver?
-        sys_drv = Tools._find_system_chromedriver() if hasattr(Tools, "_find_system_chromedriver") else None
+        # 2️⃣ system-wide chromedriver
+        sys_drv = shutil.which("chromedriver")
         if sys_drv:
             try:
                 log_message(f"[open_browser] Trying system chromedriver at {sys_drv}", "DEBUG")
                 Tools._driver = webdriver.Chrome(service=Service(sys_drv), options=opts)
                 log_message("[open_browser] Launched via system chromedriver.", "SUCCESS")
                 return "Browser launched (system chromedriver)"
-            except WebDriverException as e_sys:
-                log_message(f"[open_browser] System chromedriver failed: {e_sys}", "WARNING")
+            except WebDriverException as e:
+                log_message(f"[open_browser] System chromedriver failed: {e}", "WARNING")
+
+        # 3️⃣ webdriver-manager fallback
+        try:
+            # detect installed browser major version
+            raw = subprocess.check_output([chrome_bin, "--version"]).decode().strip()
+            browser_major = raw.split()[1].split(".")[0]
+        except Exception:
+            browser_major = "latest"
 
         try:
-            # ── figure out which driver we need ───────────────────────────────
-            # 1) detect CPU architecture
-            arch_alias = {
-                "aarch64": "arm64",
-                "arm64":   "arm64",
-                "armv8l":  "arm64",
-                "armv7l":  "arm",            # 32-bit
-            }
-            wdm_arch = arch_alias.get(arch)          # None on x86-64
-
-            # 2) detect the *installed* Chrome/Chromium major version
-            try:
-                raw_ver = (
-                    subprocess.check_output([chrome_bin, "--version"])
-                    .decode()
-                    .strip()
-                )                       # e.g. "Chromium 136.0.7103.92"
-                browser_major = raw_ver.split()[1].split(".")[0]
-            except Exception:
-                browser_major = ""      # let webdriver-manager pick “latest”
-
-            # 3) ask webdriver-manager for the matching driver
-            from webdriver_manager.chrome import ChromeDriverManager
-
             log_message(
-                f"[open_browser] Requesting ChromeDriver {browser_major or 'latest'} "
-                f"for arch={wdm_arch or 'x86_64'}",
-                "DEBUG",
+                f"[open_browser] Installing ChromeDriver {browser_major}", "DEBUG"
             )
-
-            drv_path = ChromeDriverManager(
-                driver_version=browser_major or "latest",
-                arch=wdm_arch,
-                os_type="linux",
-            ).install()
-
+            drv_path = ChromeDriverManager(driver_version=browser_major).install()
             log_message(f"[open_browser] webdriver-manager driver at {drv_path}", "DEBUG")
             Tools._driver = webdriver.Chrome(service=Service(drv_path), options=opts)
             log_message("[open_browser] Launched via webdriver-manager.", "SUCCESS")
             return "Browser launched (webdriver-manager)"
-
-        except Exception as e_wdm:
-            log_message(f"[open_browser] webdriver-manager failed: {e_wdm}", "ERROR")
+        except Exception as e:
+            log_message(f"[open_browser] webdriver-manager failed: {e}", "ERROR")
             raise RuntimeError(
                 "All driver acquisition strategies failed. "
                 "Install a matching chromedriver and set PATH or CHROME_BIN."
-            ) from e_wdm
+            ) from e
 
     # This static method closes the currently open browser session, if any. It attempts to quit the WebDriver instance and handles exceptions gracefully, returning a message indicating whether the browser was closed or if there was no browser to close.
     @staticmethod
