@@ -3009,7 +3009,7 @@ class Assembler:
         """
         import json
         from context import ContextObject  # adjust import as needed
-        log_message(
+        print(
             "[assemble_and_infer] tool_ctxs = "
             + ", ".join(f"{t.stage_id}:{t.metadata.get('output')!r}" for t in state.get("tool_ctxs", [])),
             "DEBUG"
