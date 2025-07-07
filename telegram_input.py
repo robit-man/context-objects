@@ -149,16 +149,104 @@ def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridCont
 
 async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    cfg_path = "config.json"
+    user_id = update.effective_user.id
+
+    # load config.json
     try:
-        with open(cfg_path, "r") as f:
+        with open("config.json", "r") as f:
             cfg = json.load(f)
     except FileNotFoundError:
         cfg = {}
+
+    current_admin = cfg.get("admin_chat_id")
+    # if an admin is already set, only they may reassign
+    if current_admin is not None and user_id != current_admin:
+        await update.message.reply_text("❌ You are not authorized to set admin.")
+        return
+
+    # set new admin
     cfg["admin_chat_id"] = chat_id
-    with open(cfg_path, "w") as f:
+    with open("config.json", "w") as f:
         json.dump(cfg, f, indent=2)
+
     await update.message.reply_text(f"✅ This chat ({chat_id}) is now the admin for alerts.")
+
+async def set_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dm true|false
+    Only the admin (from config.json["admin_chat_id"]) may run this.
+    Enables or disables DMs by setting config.json["allow_private"].
+    """
+    user_id = update.effective_user.id
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    admin_id = cfg.get("admin_chat_id")
+    if user_id != admin_id:
+        await update.message.reply_text("❌ You are not authorized to use /dm.")
+        return
+
+    if not context.args or context.args[0].lower() not in ("true", "false"):
+        await update.message.reply_text("Usage: /dm true|false")
+        return
+
+    enabled = context.args[0].lower() == "true"
+    cfg["allow_private"] = enabled
+    with open("config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    await update.message.reply_text(
+        f"✔️ DMs have been {'enabled' if enabled else 'disabled'}."
+    )
+
+async def blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /blacklist @username
+    Only the configured admin (via /setadmin) may run this.
+    Adds the target user’s Telegram ID to config.json["blacklist_user_ids"].
+    """
+    user = update.effective_user
+    # load config.json
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+
+    admin_id = cfg.get("admin_chat_id")
+    # only admin can blacklist
+    if user.id != admin_id:
+        await update.message.reply_text("❌ You are not authorized to use /blacklist.")
+        return
+
+    # require @username argument
+    if not context.args or not context.args[0].startswith("@"):
+        await update.message.reply_text("Usage: /blacklist @username")
+        return
+
+    target_username = context.args[0].lstrip("@").lower()
+    # resolve username → user_id
+    from user_registry import _REG
+    target_id = _REG.id_for(target_username)
+    if not target_id:
+        await update.message.reply_text(f"❌ User @{target_username} not found.")
+        return
+
+    # update blacklist_user_ids in config
+    bl = set(cfg.get("blacklist_user_ids", []))
+    if target_id in bl:
+        await update.message.reply_text(f"⚠️ @{target_username} is already blacklisted.")
+        return
+
+    bl.add(target_id)
+    cfg["blacklist_user_ids"] = sorted(bl)
+    with open("config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    await update.message.reply_text(f"✔️ Blacklisted @{target_username} (ID: {target_id}).")
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
@@ -460,6 +548,9 @@ def telegram_input(asm):
 
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, _on_pin), group=0)
     app.add_handler(CommandHandler("setadmin", set_admin), group=0)
+    app.add_handler(CommandHandler("blacklist", blacklist), group=0)
+    app.add_handler(CommandHandler("dm", set_dm), group=0)
+
     app.add_error_handler(error_handler)
 
     if Assembler:
@@ -467,6 +558,22 @@ def telegram_input(asm):
             chat_id   = update.effective_chat.id
             chat_type = update.effective_chat.type
             bot_name  = context.bot.username.lower()
+            try:
+                with open("config.json", "r") as f:
+                    cfg = json.load(f)
+            except FileNotFoundError:
+                cfg = {}
+
+            group_only    = cfg.get("group_only", False)
+            allow_private = cfg.get("allow_private", True)
+
+            # ── Enforce “group only” mode ──────────────────────────────────────────
+            if chat_type == "private" and group_only:
+                return
+
+            # ── Enforce DM enable/disable ──────────────────────────────────────────
+            if chat_type == "private" and not allow_private:
+                return
             msg = (
                 update.message
                 or update.edited_message
