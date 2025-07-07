@@ -2174,13 +2174,13 @@ class Tools:
         import shutil
         import subprocess
         import platform
-
+    
         from selenium import webdriver
         from selenium.common.exceptions import WebDriverException
         from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.chrome.options import Options
         from webdriver_manager.chrome import ChromeDriverManager
-
+    
         # 0️⃣ Tear down any existing driver if requested
         if force_new and Tools._driver:
             try:
@@ -2188,10 +2188,10 @@ class Tools:
             except Exception:
                 pass
             Tools._driver = None
-
+    
         if Tools._driver:
             return "Browser already open"
-
+    
         # 1️⃣ Locate your Chrome/Chromium binary
         chrome_bin = (
             os.getenv("CHROME_BIN")
@@ -2199,7 +2199,7 @@ class Tools:
             or shutil.which("chromium")
             or "/usr/bin/chromium"
         )
-
+    
         # 2️⃣ Build ChromeOptions
         opts = Options()
         opts.binary_location = chrome_bin
@@ -2214,7 +2214,7 @@ class Tools:
         # isolate profile to avoid "in use" errors
         tmp_profile = f"/tmp/chrome_profile_{random.getrandbits(64)}"
         opts.add_argument(f"--user-data-dir={tmp_profile}")
-
+    
         # 3️⃣ Selenium-Manager (bundled driver for Chrome ≥115)
         try:
             log_message("[open_browser] Trying Selenium-Manager…", "DEBUG")
@@ -2223,7 +2223,7 @@ class Tools:
             return "Browser launched (selenium-manager)"
         except WebDriverException as e:
             log_message(f"[open_browser] Selenium-Manager failed: {e}", "WARNING")
-
+    
         # 4️⃣ Try known chromedriver binaries in order
         candidates = [
             "/snap/chromium/current/usr/lib/chromium-browser/chromedriver",  # snap
@@ -2241,8 +2241,8 @@ class Tools:
                     return f"Browser launched (chromedriver at {drv})"
                 except WebDriverException as e:
                     log_message(f"[open_browser] chromedriver at {drv} failed: {e}", "WARNING")
-
-        # 5️⃣ Fallback: retry with snap chromium binary if available
+    
+        # 7️⃣ Fallback: retry with snap chromium binary if available
         snap_bin = "/snap/bin/chromium"
         if os.path.exists(snap_bin) and os.getenv("CHROME_BIN") != snap_bin:
             os.environ["CHROME_BIN"] = snap_bin
@@ -2265,8 +2265,8 @@ class Tools:
                     return "Browser launched (chromedriver via snap PATH)"
                 except WebDriverException as e:
                     log_message(f"[open_browser] chromedriver via snap PATH failed: {e}", "WARNING")
-
-        # 6️⃣ ARM64 auto-download & install if on ARM
+    
+        # 8️⃣ ARM64 auto-download & install if on ARM
         arch = platform.machine().lower()
         if arch in ("aarch64", "arm64", "armv8l", "armv7l"):
             try:
@@ -2290,8 +2290,8 @@ class Tools:
                 return "Browser launched (downloaded ARM64 chromedriver)"
             except Exception as e:
                 log_message(f"[open_browser] ARM64 download/install failed: {e}", "WARNING")
-
-        # 7️⃣ webdriver-manager fallback on x86_64
+    
+        # 9️⃣ webdriver-manager fallback on x86_64
         if arch in ("x86_64", "amd64"):
             try:
                 raw = subprocess.check_output([chrome_bin, "--version"]).decode().strip()
@@ -2313,12 +2313,13 @@ class Tools:
                 raise RuntimeError(
                     "webdriver-manager failed on x86_64; install matching chromedriver or set CHROME_BIN/PATH."
                 ) from e
-
+    
         # ❌ If we reach here, no driver worked
         raise RuntimeError(
             "No usable chromedriver found. On ARM64, ensure download/install succeeded; "
             "on x86_64, install a matching chromedriver or set CHROME_BIN/PATH."
         )
+
 
 
 
