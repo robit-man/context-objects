@@ -1732,17 +1732,7 @@ class Assembler:
             _record_perf("reflection_and_replan", str(e), False)
             state["errors"].append(("reflection_and_replan", str(e)))
         
-        # ─── Stage 10: assemble_and_infer ─────────────────────────────
-        t0 = datetime.utcnow()
-        try:
-            draft = self._stage10_assemble_and_infer(user_text, state)
-            state["draft"] = draft
-            _record_perf("assemble_and_infer", "(drafted)", True)
-        except Exception as e:
-            _record_perf("assemble_and_infer", str(e), False)
-            state["errors"].append(("assemble_and_infer", str(e)))
-
-        # ─── Stage 10: assemble_and_infer ─────────────────────────────
+        # ─── Stage 10: initial assemble + optional critique ───────────────
         t0 = datetime.utcnow()
         try:
             draft = self._stage10_assemble_and_infer(user_text, state)
@@ -1753,26 +1743,29 @@ class Assembler:
             state["errors"].append(("assemble_and_infer", str(e)))
             state["draft"] = ""
 
-        # Decide whether to run the critic or just use the draft
         if state.get("errors"):
-            # ─── Stage 10b: response_critique_and_safety ───────────────────
             t0 = datetime.utcnow()
             try:
-                polished = self._stage10b_response_critique_and_safety(
+                patched = self._stage10b_response_critique_and_safety(
                     state["draft"],
                     user_text,
                     state.get("tool_ctxs", [])
                 )
-                # if critic returns None or empty, fall back to draft
-                state["final"] = polished.strip() if polished and polished.strip() else state["draft"]
-                _record_perf("response_critique", "(polished)", True)
+                state["draft"] = patched.strip() or state["draft"]
+                _record_perf("response_critique", "(patched)", True)
             except Exception as e:
                 _record_perf("response_critique", str(e), False)
                 state["errors"].append(("response_critique", str(e)))
-                state["final"] = state["draft"]
-        else:
-            # no errors → skip critique
-            state["final"] = state["draft"]
+
+        # ─── Stage 10b: true final-inference ─────────────────────────────
+        t0 = datetime.utcnow()
+        try:
+            final = self._stage10_assemble_and_infer(user_text, state)
+            state["final"] = final
+            _record_perf("final_inference", "(completed)", True)
+        except Exception as e:
+            _record_perf("final_inference", str(e), False)
+            state["final"] = state.get("draft", "")
 
         # ─── Stage 11: memory_writeback ───────────────────────────────
         t0 = datetime.utcnow()

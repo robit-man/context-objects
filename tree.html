@@ -208,13 +208,19 @@
 
 
         const MAX_INSTANCES_HARD = 0xFFFF;
-        const HARD_MAX_NODES = 4000;
+        const HARD_MAX_NODES = 1000;
         let prevCount = 0;
         let remoteSize = 0;
         let prevLineCount = 0;
-        const LAST_KB = 128;
-        const WANT_LINES = 150;
-
+        const LAST_KB = 16;
+const WANT_LINES       = 120;          // how many recent JSON-lines we care about
+const RANGE_KB_MIN     = 64;           // 1st attempt → 64 KB tail
+const RANGE_KB_MAX     = 512;          // hard ceiling for the tail window
+let   tailKB           = RANGE_KB_MIN; // grows when we miss, shrinks when we hit
+        let lastContextId = null;
+        let lastOffset = 0;
+        let leftover   = "";    // carry over any partial line
+        const OVERLAP = 1024;   // bytes to rewind so you don't cut a JSON in half
 
         let nodeMap = new Map();
         let edges = [];
@@ -320,17 +326,17 @@
         /** called with *only* brand-new parsed objects */
         // ─── UPDATED appendNodesFast ──────────────────────────────────────────
         function appendNodesFast(newObjs, flashWhite = false) {
-            // 0️⃣  Filter out duplicates
+            // 0️⃣ Filter out duplicates
             const fresh = newObjs.filter(o => !nodeMap.has(o.context_id));
             if (!fresh.length) return;
 
-            // 1️⃣  Ensure mesh exists & has room
+            // 1️⃣ Ensure mesh exists & has room
             ensureSphereMesh();
             while (freeNodeIx + fresh.length > instMesh.countCapacity) {
                 growMeshCapacity(instMesh);
             }
 
-            // 2️⃣  Update palette & connectivity ceiling
+            // 2️⃣ Update palette & connectivity ceiling
             const comps = new Set([...nodeMap.values()].map(n => n.data.component));
             fresh.forEach(o => comps.add(o.component));
             hueMapCurrent = Object.fromEntries(
@@ -344,27 +350,38 @@
                 )
             );
 
-            // 3️⃣  Append each newcomer
+            // 3️⃣ Append each newcomer
             const mat = new THREE.Matrix4();
             const clr = new THREE.Color();
             const now = Date.now();
+            const groupY = graphGroup.position.y; // current drift
+
             for (const o of fresh) {
                 const idx = freeNodeIx++;
 
-                // position = age-on-Y + scatter-on-XZ
+                // compute connectivity
                 const conn = (o.references?.length || 0)
                     + Object.keys(o.association_strengths || {}).length;
+
+                // 1) global age‐based Y
                 const ageMs = now - parseTimestamp(o.timestamp).getTime();
-                const yPos = Math.max(LAYOUT_CONFIG.minSphereY, ageMs / LAYOUT_CONFIG.msPerUnit);
+                const globalY = Math.max(
+                    LAYOUT_CONFIG.minSphereY,
+                    ageMs / LAYOUT_CONFIG.msPerUnit
+                );
+
+                // 2) convert to local Y by subtracting group drift
+                const localY = globalY - groupY;
+
+                // 3) scatter XZ
                 const rNorm = 1 - (conn / maxConnCurrent);
                 const r = rNorm * LAYOUT_CONFIG.maxXZRadius;
                 const ang = Math.random() * Math.PI * 2;
-                const pos = new THREE.Vector3(
-                    Math.cos(ang) * r,
-                    yPos,
-                    Math.sin(ang) * r
-                );
-                instMesh.setMatrixAt(idx, mat.makeTranslation(pos.x, pos.y, pos.z));
+                const x = Math.cos(ang) * r;
+                const z = Math.sin(ang) * r;
+
+                // 4) set instance matrix
+                instMesh.setMatrixAt(idx, mat.makeTranslation(x, localY, z));
 
                 // colour = HSL palette or flash white
                 const hue = hueMapCurrent[o.component] ?? 0;
@@ -385,10 +402,10 @@
                     );
                 }
 
-                // 4️⃣  Bookkeeping: same schema as addNodes
+                // 5️⃣ Bookkeeping
                 nodeMap.set(o.context_id, {
                     data: o,
-                    pos,
+                    pos: new THREE.Vector3(x, localY, z),
                     connectivity: conn,
                     mesh: instMesh,
                     _instanceIndex: idx
@@ -396,12 +413,13 @@
                 console.info('[spawn]', o.context_id, '→ instance', idx);
             }
 
-            // 5️⃣  Commit GPU updates & rebuild edges incrementally
+            // 6️⃣ Commit GPU updates & rebuild edges incrementally
             instMesh.count = freeNodeIx;
             instMesh.instanceMatrix.needsUpdate = true;
             instMesh.instanceColor.needsUpdate = true;
             rebuildEdgesIncremental(fresh.map(o => o.context_id));
         }
+
 
         /** super-fast colour setter used by both add + later filter tweaks */
         function colourNode(idx, obj) {
@@ -417,55 +435,44 @@
             const mat = new THREE.Matrix4();
             const yAxis = new THREE.Vector3(0, 1, 0);
 
-            // calculate how many new instances we'll need
-            const newEdgesNeeded = srcObjs.reduce((sum, o) => {
-                const refs = o.references?.length || 0;
-                const assocs = Object.keys(o.association_strengths || {}).length;
-                return sum + refs + assocs;
-            }, 0);
-
-            // grow capacity if we’ll overflow
-            while (freeEdgeIx + newEdgesNeeded > instEdge.countCapacity) {
-                growMeshCapacity(instEdge);
-            }
-
             for (const o of srcObjs) {
-                // look up the full node entry you stored in nodeMap
                 const entry = nodeMap.get(o.context_id);
                 if (!entry) continue;
 
-                const srcPos = entry.pos;
+                const srcPos = entry.pos.clone();
                 const cIdx = entry._instanceIndex;
+                const refs = Array.isArray(o.references) ? o.references : [];
+                const assocs = o.association_strengths
+                    ? Object.keys(o.association_strengths)
+                    : [];
+                const targets = [...refs, ...assocs];
 
-                // combine references and association keys
-                const refs = entry.data.references || [];
-                const assocKeys = Object.keys(entry.data.association_strengths || {});
-                const connections = [...refs, ...assocKeys];
-
-                for (const tgtId of connections) {
+                for (const tgtId of targets) {
                     const tgtEntry = nodeMap.get(tgtId);
                     if (!tgtEntry) continue;
 
-                    const dir = new THREE.Vector3().subVectors(tgtEntry.pos, srcPos);
+                    const tgtPos = tgtEntry.pos.clone();
+                    const dir = new THREE.Vector3().subVectors(tgtPos, srcPos);
                     const len = dir.length();
                     if (len === 0) continue;
 
-                    const q = new THREE.Quaternion()
-                        .setFromUnitVectors(yAxis, dir.normalize());
+                    // if we're about to overflow, grow capacity now
+                    if (freeEdgeIx + 1 > instEdge.countCapacity) {
+                        growMeshCapacity(instEdge);
+                    }
 
-                    // write transform for this edge
-                    instEdge.setMatrixAt(
-                        freeEdgeIx,
-                        mat.compose(srcPos, q, new THREE.Vector3(0.2, len, 0.2))
-                    );
+                    // build the edge transform
+                    const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.normalize());
+                    const s = new THREE.Vector3(0.2, len, 0.2);
+                    mat.compose(srcPos, q, s);
 
-                    // colour = same as source node
-                    instEdge.instanceColor.setXYZ(
-                        freeEdgeIx,
-                        instMesh.instanceColor.getX(cIdx),
-                        instMesh.instanceColor.getY(cIdx),
-                        instMesh.instanceColor.getZ(cIdx)
-                    );
+                    instEdge.setMatrixAt(freeEdgeIx, mat);
+
+                    // copy the source node's color
+                    const r = instMesh.instanceColor.getX(cIdx);
+                    const g = instMesh.instanceColor.getY(cIdx);
+                    const b = instMesh.instanceColor.getZ(cIdx);
+                    instEdge.instanceColor.setXYZ(freeEdgeIx, r, g, b);
 
                     freeEdgeIx++;
                 }
@@ -476,6 +483,7 @@
             instEdge.instanceMatrix.needsUpdate = true;
             instEdge.instanceColor.needsUpdate = true;
         }
+
 
 
         function pickPosition(o) {
@@ -1084,76 +1092,117 @@
                 }
             }
         }
-        async function pollForNew() {
-            const fileURL = getContextFileUrl(false);
+       async function pollForNew() {
+  const url = getContextFileUrl();
+  console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
 
-            /* -------- 1. cheap HEAD  -------- */
-            let head;
-            try {
-                head = await fetch(fileURL, { method: 'HEAD', cache: 'no-store' });
-            } catch (e) { console.warn('[poll] HEAD failed:', e); return; }
+  /* 1️⃣  Attempt tail-range fetch (fast path) */
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Range: `bytes=-${LAST_KB * 1024}` },
+      cache  : "no-store"
+    });
+    console.debug("HTTP", res.status, res.statusText);
+  } catch (e) {
+    console.warn("fetch failed", e);
+    console.groupEnd();
+    return;
+  }
 
-            const size = Number(head.headers.get('Content-Length') || 0);
-            const etag = head.headers.get('ETag') || '';
+  if (!res.body || !res.body.getReader) {   // really old browser / CORS?
+    console.warn("no readable stream");
+    console.groupEnd();
+    return;
+  }
 
-            /* nothing new? */
-            if (size === lastSize && etag === lastETag) return;
+  /* 2️⃣  RANGE honoured → tiny body, easy */
+  if (res.status === 206) {
+    const tailText = await res.text();
+    injectFresh(parseFreshLines(tailText));
+    console.groupEnd();
+    return;
+  }
 
-            /* file rotated (shrunk)? → reset pointer */
-            if (size < lastSize) lastSize = 0;
+  /* 3️⃣  RANGE ignored (status 200) → stream & skip until sentinel */
+  const rdr = res.body.getReader();
+  const dec = new TextDecoder();
 
-            /* -------- 2. full GET but we’ll abort early -------- */
-            const bust = fileURL + (fileURL.includes('?') ? '&' : '?') + '_=' + Date.now();
-            let res;
-            try {
-                res = await fetch(bust, { cache: 'no-store' });
-            } catch (e) { console.warn('[poll] GET failed:', e); return; }
+  let buf = "";
+  const lines = [];
+  let seenSentinel = lastContextId === null;     // first run ⇒ collect from start
 
-            const rdr = res.body?.getReader?.();
-            if (!rdr) { console.warn('[poll] no stream support'); return; }
+  try {
+    while (true) {
+      const { value, done } = await rdr.read();
+      if (done) break;
 
-            const dec = new TextDecoder();
-            let buffer = '';
-            const lines = [];
-            let bytesSeen = 0, tailBytesTarget = LAST_KB * 1024;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop();                          // keep incomplete tail
 
-            while (true) {
-                const { value, done } = await rdr.read();
-                if (done) break;
+      for (const ln of parts) {
+        if (!ln) continue;
 
-                bytesSeen += value.length;
-                buffer += dec.decode(value, { stream: true });
-
-                /* keep only the very end of the growing buffer */
-                if (buffer.length > tailBytesTarget * 2)
-                    buffer = buffer.slice(-tailBytesTarget * 2);
-
-                /* once we read ≥ tailBytesTarget from the END of the file → cancel */
-                if (size - (lastSize + bytesSeen) < tailBytesTarget) {
-                    try { rdr.cancel(); } catch { /**/ }
-                    break;
-                }
-            }
-            buffer += dec.decode();                // flush decoder
-            const rawLines = (buffer.trim().split(/\r?\n/)).slice(-WANT_LINES);
-
-            /* -------- 3. parse, dedupe, add -------- */
-            const fresh = rawLines
-                .map(l => { try { return JSON.parse(l); } catch { return null; } })
-                .filter(o => o && !seenIds.has(o.context_id));
-            if (!fresh.length) {
-                lastSize = size; lastETag = etag; return;
-            }
-
-            fresh.forEach(o => seenIds.add(o.context_id));
-            appendNodesFast(fresh, true);
-            appendEdgesFast(fresh);
-
-            /* commit checkpoint */
-            lastSize = size;
-            lastETag = etag;
+        if (!seenSentinel) {
+          if (ln.includes(lastContextId)) {
+            console.debug("↳ found lastContextId, start collecting AFTER this line");
+            seenSentinel = true;
+            continue;  // skip the sentinel line itself
+          }
+          continue;    // still skipping old content
         }
 
+        // From here on we're after the sentinel → keep these lines
+        lines.push(ln);
+        if (lines.length >= WANT_LINES) {
+          console.debug(`↳ grabbed ${lines.length} fresh lines → abort reader`);
+          await rdr.cancel();
+          break;
+        }
+      }
+
+      if (lines.length >= WANT_LINES) break;
+    }
+
+    // flush remainder if any
+    if (buf && seenSentinel) lines.push(buf);
+
+  } catch (e) {
+    console.warn("stream error", e);
+    try { await rdr.cancel(); } catch {}
+  }
+
+  injectFresh(parseFreshLines(lines.join("\n")));
+  console.groupEnd();
+}
+
+/* ──────────────────────────────────────────────────────────────── */
+/* Helpers                                                          */
+/* ──────────────────────────────────────────────────────────────── */
+function parseFreshLines(tailText) {
+  const fresh = [];
+  tailText.split(/\r?\n/).forEach(ln => {
+    if (!ln.trim()) return;
+    try {
+      const o = JSON.parse(ln);
+      if (o.context_id && !seenIds.has(o.context_id)) {
+        seenIds.add(o.context_id);
+        fresh.push(o);
+      }
+    } catch { /* ignore malformed */ }
+  });
+  console.debug("parsed", fresh.length, "fresh objects");
+  return fresh;
+}
+
+function injectFresh(fresh) {
+  if (!fresh.length) return;
+  appendNodesFast(fresh, true);
+  appendEdgesFast(fresh);
+  lastContextId = fresh[fresh.length - 1].context_id;
+  console.debug("lastContextId ⇢", lastContextId);
+}
         // ─── BUILD SCENE ──────────────────────────────────────────────────
         function buildScene(objects) {
             // sort by timestamp (newest first)
@@ -1941,12 +1990,20 @@
         animate();                             // begin render loop
 
         populateFileSelector()
-            .then(loadGraph)                     // full load once dropdown is ready
-            .then(() => { setInterval(pollForNew, 1000); })   // poll every second
+            .then(loadGraph)
+            .then(() => {
+                // after your initial loadGraph, seed lastContextId:
+                if (allData.length) {
+                    lastContextId = allData[allData.length - 1].context_id;
+                }
+                setInterval(pollForNew, POLL_INTERVAL);
+            })
             .catch(err => {
                 console.error(err);
-                /* fallback: still attempt to load & poll */
-                loadGraph().then(() => setInterval(pollForNew, 1000));
+                loadGraph().then(() => {
+                    if (allData.length) lastContextId = allData[allData.length - 1].context_id;
+                    setInterval(pollForNew, POLL_INTERVAL);
+                });
             });
         // handle resize
         window.addEventListener('resize', () => {
