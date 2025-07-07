@@ -1419,15 +1419,15 @@ class Assembler:
         options: List[str],
         system_template: str,
         history_size: int,
-        var_names: List[str]
+        var_names: List[str],
+        record: bool = True         # ← new parameter, defaulting to True
     ) -> str:
-        # 1) Build the mapping correctly with “:”
+        import re
+        # 1) Build mapping
         mapping = {vn: opt for vn, opt in zip(var_names, options)}
-
-        # 2) Format the system prompt
         system_msg = system_template.format(**mapping)
 
-        # 3) Gather recent conversation
+        # 2) Gather recent conversation
         segs = sorted(
             [c for c in self.repo.query(lambda c: c.domain=="segment"
                                        and c.semantic_label in ("user_input","assistant"))],
@@ -1440,30 +1440,39 @@ class Assembler:
         )
         user_msg = f"=== Recent Conversation ===\n{convo}\n\n=== New Message ===\n{user_text}"
 
-        # 4) Call the model
+        # 3) Call the model
         resp = ""
         for part in chat(
             model=self.decision_model,
             messages=[
                 {"role":"system","content":system_msg},
-                {"role":"user",  "content":user_msg}
+                {"role":"user","content":user_msg}
             ],
             stream=True
         ):
             resp += part["message"]["content"]
 
-        # 5) Record Q&A
-        q = ContextObject.make_stage("decision_question", [], {"prompt": system_msg+"\n\n"+user_msg})
-        q.component = "decision"; q.semantic_label = "question"; q.touch(); self.repo.save(q)
-        a = ContextObject.make_stage("decision_answer", [q.context_id], {"answer": resp.strip()})
-        a.component = "decision"; a.semantic_label = "answer"; a.touch(); self.repo.save(a)
+        # 4) Optionally record Q&A
+        if record:
+            q = ContextObject.make_stage("decision_question", [], {
+                "prompt": system_msg + "\n\n" + user_msg
+            })
+            q.component = "decision"; q.semantic_label = "question"; q.touch()
+            self.repo.save(q)
 
-        # 6) Return the first matching option
+            a = ContextObject.make_stage("decision_answer", [q.context_id], {
+                "answer": resp.strip()
+            })
+            a.component = "decision"; a.semantic_label = "answer"; a.touch()
+            self.repo.save(a)
+
+        # 5) Return matching option (or raw text)
         for opt in options:
             if re.search(rf"\b{re.escape(opt)}\b", resp, re.I):
                 return opt
         return resp.strip()
-    
+
+
     def filter_callback(self, user_text: str) -> bool:
         choice = self.decision_callback(
             user_text=user_text,
@@ -1474,9 +1483,10 @@ class Assembler:
             ),
             history_size=8,
             var_names=["arg1", "arg2"],
-            record=False    # ← don’t save this Q&A into your repo
+            record=False      # ← don’t persist this check
         )
         return choice.upper() == "YES"
+
 
     def tools_callback(self, user_text: str) -> bool:
         choice = self.decision_callback(
@@ -1488,9 +1498,10 @@ class Assembler:
             ),
             history_size=6,
             var_names=["arg1", "arg2"],
-            record=False    # ← don’t save this Q&A into your repo
+            record=False      # ← don’t persist this check
         )
         return choice.upper() == "TOOLS"
+    
 
     def run_with_meta_context(
         self,
