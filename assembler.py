@@ -2958,6 +2958,7 @@ class Assembler:
                 except StopIteration:
                     refs = []
                 ctx = ContextObject.make_stage("tool_output", refs, res)
+                ctx.metadata["tool_call"] = original  # <-- add this
                 ctx.stage_id = f"tool_output_{name}"
                 ctx.summary = str(res.get("output")) if ok else f"ERROR: {err}"
                 ctx.metadata.update(res)
@@ -2979,7 +2980,20 @@ class Assembler:
                 tracker.metadata["status"] = "success"
                 tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
                 tracker.touch(); self.repo.save(tracker)
-                return tool_ctxs
+            
+                existing_outputs = []
+                for call in all_calls:
+                    matches = [
+                        c for c in self.repo.query(
+                            lambda c: c.component=="tool_output"
+                                      and c.metadata.get("tool_call")==call
+                        )
+                    ]
+                    if matches:
+                        # take the most recent one
+                        matches.sort(key=lambda c: c.timestamp, reverse=True)
+                        existing_outputs.append(matches[0])
+                return existing_outputs
 
             # otherwise, ask LLM to repair remaining calls
             retry_sys = (
