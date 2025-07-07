@@ -2817,9 +2817,25 @@ class Assembler:
 
         tracker.metadata["attempts"] += 1
         tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-        tracker.touch(); self.repo.save(tracker)
+        tracker.touch()
+        self.repo.save(tracker)
+
+        # — if we've already succeeded, gather and return the previous outputs —
         if tracker.metadata.get("status") == "success":
-            return []
+            existing: List[ContextObject] = []
+            # all_calls was normalized earlier from raw_calls
+            for call in all_calls:
+                matches = [
+                    c for c in self.repo.query(
+                        lambda c: c.component == "tool_output"
+                                  and c.metadata.get("tool_call") == call
+                    )
+                ]
+                if matches:
+                    # pick the most recent one
+                    matches.sort(key=lambda c: c.timestamp, reverse=True)
+                    existing.append(matches[0])
+            return existing
 
         # ── Helpers ─────────────────────────────────────────────────────────
         def _norm(calls: List[Any]) -> List[str]:
@@ -2959,11 +2975,11 @@ class Assembler:
                     refs = []
                 ctx = ContextObject.make_stage("tool_output", refs, res)
                 ctx.metadata["tool_call"] = original
-                self.repo.save(ctx)
+                ctx.metadata.update(res)
                 ctx.stage_id = f"tool_output_{name}"
                 ctx.summary = str(res.get("output")) if ok else f"ERROR: {err}"
-                ctx.metadata.update(res)
-                ctx.touch(); self.repo.save(ctx)
+                ctx.touch();
+                self.repo.save(ctx)
                 tool_ctxs.append(ctx)
 
                 # record success/failure
