@@ -1478,7 +1478,7 @@ class Assembler:
             user_text=user_text,
             options=["YES", "NO"],
             system_template=(
-                "You are an attentive meta-reasoner. Decide whether to respond now. "
+                "You are attentive to the ongoing conversation, and if you should interject or reply. If the user even hints at trying to get your attention in any history please continue to bias towards {arg1}. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=8,
@@ -1493,7 +1493,7 @@ class Assembler:
             user_text=user_text,
             options=["TOOLS", "NO_TOOLS"],
             system_template=(
-                "You are a lightweight judge. Decide if external tools or searches are required. "
+                "You judge a binary decision based on the nature of the most recent message, you must decide whether or not the request might require additional stages to resolve, if there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=6,
