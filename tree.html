@@ -213,13 +213,13 @@
         let remoteSize = 0;
         let prevLineCount = 0;
         const LAST_KB = 16;
-const WANT_LINES       = 120;          // how many recent JSON-lines we care about
-const RANGE_KB_MIN     = 64;           // 1st attempt → 64 KB tail
-const RANGE_KB_MAX     = 512;          // hard ceiling for the tail window
-let   tailKB           = RANGE_KB_MIN; // grows when we miss, shrinks when we hit
+        const WANT_LINES = 120;          // how many recent JSON-lines we care about
+        const RANGE_KB_MIN = 64;           // 1st attempt → 64 KB tail
+        const RANGE_KB_MAX = 512;          // hard ceiling for the tail window
+        let tailKB = RANGE_KB_MIN; // grows when we miss, shrinks when we hit
         let lastContextId = null;
         let lastOffset = 0;
-        let leftover   = "";    // carry over any partial line
+        let leftover = "";    // carry over any partial line
         const OVERLAP = 1024;   // bytes to rewind so you don't cut a JSON in half
 
         let nodeMap = new Map();
@@ -1092,117 +1092,133 @@ let   tailKB           = RANGE_KB_MIN; // grows when we miss, shrinks when we hi
                 }
             }
         }
-       async function pollForNew() {
-  const url = getContextFileUrl();
-  console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
+        async function pollForNew() {
+            const url = getContextFileUrl();
+            console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
 
-  /* 1️⃣  Attempt tail-range fetch (fast path) */
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: { Range: `bytes=-${LAST_KB * 1024}` },
-      cache  : "no-store"
-    });
-    console.debug("HTTP", res.status, res.statusText);
-  } catch (e) {
-    console.warn("fetch failed", e);
-    console.groupEnd();
-    return;
-  }
+            /* ── ①  cheap HEAD to decide whether to GET at all ─────────────────── */
+            let head;
+            try {
+                head = await fetch(url, { method: "HEAD", cache: "no-store" });
+            } catch (e) {
+                console.warn("HEAD failed", e);
+                console.groupEnd();
+                return;
+            }
 
-  if (!res.body || !res.body.getReader) {   // really old browser / CORS?
-    console.warn("no readable stream");
-    console.groupEnd();
-    return;
-  }
+            const size = Number(head.headers.get("Content-Length") || 0);
+            const etag = head.headers.get("ETag") || "";
 
-  /* 2️⃣  RANGE honoured → tiny body, easy */
-  if (res.status === 206) {
-    const tailText = await res.text();
-    injectFresh(parseFreshLines(tailText));
-    console.groupEnd();
-    return;
-  }
+            if (size === lastSize && etag === lastETag) {
+                console.debug("no change – skipping GET");
+                console.groupEnd();
+                return;
+            }
+            /* file rotated (shrunk)?  → reset offset pointer */
+            if (size < lastSize) lastContextId = null;
 
-  /* 3️⃣  RANGE ignored (status 200) → stream & skip until sentinel */
-  const rdr = res.body.getReader();
-  const dec = new TextDecoder();
+            /* ── ②  GET with Range (tail) ──────────────────────────────────────── */
+            const rangeStart = Math.max(0, size - LAST_KB * 1024);
+            let res;
+            try {
+                res = await fetch(url, {
+                    headers: { Range: `bytes=${rangeStart}-` },
+                    cache: "no-store"
+                });
+            } catch (e) {
+                console.warn("GET failed", e);
+                console.groupEnd();
+                return;
+            }
 
-  let buf = "";
-  const lines = [];
-  let seenSentinel = lastContextId === null;     // first run ⇒ collect from start
+            const rangeHonoured = res.status === 206;
+            console.debug(`GET ${res.status} (Range honoured? ${rangeHonoured})`);
 
-  try {
-    while (true) {
-      const { value, done } = await rdr.read();
-      if (done) break;
+            let tailText = "";
 
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split(/\r?\n/);
-      buf = parts.pop();                          // keep incomplete tail
+            /* ②-A  happy path – server sent only the tail */
+            if (rangeHonoured) {
+                tailText = await res.text();
 
-      for (const ln of parts) {
-        if (!ln) continue;
+                /* ②-B  fallback – server ignored Range (200) → stream & abort early  */
+            } else {
+                if (!res.body || !res.body.getReader) {
+                    console.warn("Stream API not available → bailing");
+                    console.groupEnd();
+                    return;
+                }
 
-        if (!seenSentinel) {
-          if (ln.includes(lastContextId)) {
-            console.debug("↳ found lastContextId, start collecting AFTER this line");
-            seenSentinel = true;
-            continue;  // skip the sentinel line itself
-          }
-          continue;    // still skipping old content
+                const rdr = res.body.getReader();
+                const dec = new TextDecoder();
+                let buf = "";
+                const lines = [];
+                let seenSentinel = lastContextId === null;
+
+                try {
+                    while (true) {
+                        const { value, done } = await rdr.read();
+                        if (done) break;
+
+                        buf += dec.decode(value, { stream: true });
+                        const parts = buf.split(/\r?\n/);
+                        buf = parts.pop();
+
+                        for (const ln of parts) {
+                            if (!ln) continue;
+
+                            /* ①  wait until we bump into the sentinel row */
+                            if (!seenSentinel) {
+                                if (lastContextId === null || ln.includes(lastContextId)) {
+                                    seenSentinel = true;             // ← got it
+                                }
+                                continue;                          // keep reading; nothing to store yet
+                            }
+
+                            /* ②  after sentinel → collect new rows */
+                            lines.push(ln);
+
+                            /* ③  now we’re allowed to stop once we have enough */
+                            if (lines.length >= WANT_LINES) {
+                                console.debug(`early abort after ${lines.length} NEW lines`);
+                                await rdr.cancel();
+                                break;
+                            }
+                        }
+                        if (lines.length >= WANT_LINES) break;
+                    }
+                    if (buf && seenSentinel) lines.push(buf);    // flush tail
+                    tailText = lines.join("\n");
+                } catch (e) {
+                    console.warn("stream error", e);
+                    try { await rdr.cancel(); } catch { }
+                }
+            }
+
+            /* ── ③  parse, dedupe, inject ─────────────────────────────────────── */
+            const fresh = [];
+            tailText.split(/\r?\n/).forEach(ln => {
+                if (!ln.trim()) return;
+                try {
+                    const o = JSON.parse(ln);
+                    if (o.context_id && !seenIds.has(o.context_id)) {
+                        seenIds.add(o.context_id);
+                        fresh.push(o);
+                    }
+                } catch { /* ignore malformed */ }
+            });
+
+            console.debug("fresh objects:", fresh.length);
+            if (fresh.length) {
+                appendNodesFast(fresh, true);
+                appendEdgesFast(fresh);
+                lastContextId = fresh[fresh.length - 1].context_id;
+            }
+
+            /* ── ④  remember state for next tick ───────────────────────────────── */
+            lastSize = size;
+            lastETag = etag;
+            console.groupEnd();
         }
-
-        // From here on we're after the sentinel → keep these lines
-        lines.push(ln);
-        if (lines.length >= WANT_LINES) {
-          console.debug(`↳ grabbed ${lines.length} fresh lines → abort reader`);
-          await rdr.cancel();
-          break;
-        }
-      }
-
-      if (lines.length >= WANT_LINES) break;
-    }
-
-    // flush remainder if any
-    if (buf && seenSentinel) lines.push(buf);
-
-  } catch (e) {
-    console.warn("stream error", e);
-    try { await rdr.cancel(); } catch {}
-  }
-
-  injectFresh(parseFreshLines(lines.join("\n")));
-  console.groupEnd();
-}
-
-/* ──────────────────────────────────────────────────────────────── */
-/* Helpers                                                          */
-/* ──────────────────────────────────────────────────────────────── */
-function parseFreshLines(tailText) {
-  const fresh = [];
-  tailText.split(/\r?\n/).forEach(ln => {
-    if (!ln.trim()) return;
-    try {
-      const o = JSON.parse(ln);
-      if (o.context_id && !seenIds.has(o.context_id)) {
-        seenIds.add(o.context_id);
-        fresh.push(o);
-      }
-    } catch { /* ignore malformed */ }
-  });
-  console.debug("parsed", fresh.length, "fresh objects");
-  return fresh;
-}
-
-function injectFresh(fresh) {
-  if (!fresh.length) return;
-  appendNodesFast(fresh, true);
-  appendEdgesFast(fresh);
-  lastContextId = fresh[fresh.length - 1].context_id;
-  console.debug("lastContextId ⇢", lastContextId);
-}
         // ─── BUILD SCENE ──────────────────────────────────────────────────
         function buildScene(objects) {
             // sort by timestamp (newest first)
