@@ -1467,30 +1467,31 @@ class Assembler:
     def filter_callback(self, user_text: str) -> bool:
         choice = self.decision_callback(
             user_text=user_text,
-            options=["YES","NO"],
+            options=["YES", "NO"],
             system_template=(
-                "You are an attentive meta-reasoner.  Decide whether to respond now.  "
+                "You are an attentive meta-reasoner. Decide whether to respond now. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=8,
-            var_names=["arg1","arg2"]
+            var_names=["arg1", "arg2"],
+            record=False    # ← don’t save this Q&A into your repo
         )
         return choice.upper() == "YES"
-
 
     def tools_callback(self, user_text: str) -> bool:
         choice = self.decision_callback(
             user_text=user_text,
-            options=["TOOLS","NO_TOOLS"],
+            options=["TOOLS", "NO_TOOLS"],
             system_template=(
-                "You are a lightweight judge.  Decide if external tools or searches are required.  "
+                "You are a lightweight judge. Decide if external tools or searches are required. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=6,
-            var_names=["arg1","arg2"]
+            var_names=["arg1", "arg2"],
+            record=False    # ← don’t save this Q&A into your repo
         )
         return choice.upper() == "TOOLS"
-    
+
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1833,243 +1834,183 @@ class Assembler:
         recall_ids: List[str] = None
     ) -> Dict[str, Any]:
         """
-        Merge system prompts, narrative, dynamic chat history,
-        semantic/memory/tool contexts — with three user‐driven decisions for:
-          • how many history entries to include
-          • how far back in time to look
-          • which tags to use for similarity search
-        Falls back to at least the last 5 minutes, last 10 interactions,
-        and default high-priority tags if decisions fail.
+        Merge system prompt, narrative (episodic memory), working memory (short-term),
+        semantic retrieval (long-term memory), associative recall (spreading activation),
+        and recent tool outputs — using human-inspired capacities and decay.
         """
         import re
-        from datetime import timedelta, datetime as _dt
+        from datetime import datetime as _dt, timedelta
         import concurrent.futures
 
+        # ——— Helpers —————————————————————————————————————————————————————————————
         now = default_clock()
 
         def _to_dt(ts):
-            # Parses an ISO-string or returns datetime unchanged
             if isinstance(ts, str):
                 try:
                     return _dt.fromisoformat(ts.replace("Z", "+00:00"))
-                except Exception:
+                except:
                     return now
             return ts
 
-        # ── Step A: dynamically decide context parameters via decision_callback ──
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            fut_count = executor.submit(
-                self.decision_callback,
-                user_text,
-                ["5", "10", "20", "50"],
-                "Choose how many recent chat entries to include: {arg1}, {arg2}, {arg3}, or {arg4}.",
-                timeout=2.0,
-                arg_names=["arg1","arg2","arg3","arg4"]
-            )
-            fut_window = executor.submit(
-                self.decision_callback,
-                user_text,
-                ["5 minutes", "30 minutes", "1 hour", "6 hours", "1 day"],
-                "Choose a time window for context: {arg1}, {arg2}, {arg3}, {arg4}, or {arg5}.",
-                timeout=2.0,
-                arg_names=["arg1","arg2","arg3","arg4","arg5"]
-            )
-            fut_tags = executor.submit(
-                self.decision_callback,
-                user_text,
-                ["important", "decision_point", "task", "question"],
-                "Choose relevance tags (comma-separated) from: {arg1}, {arg2}, {arg3}, {arg4}.",
-                timeout=2.0,
-                arg_names=["arg1","arg2","arg3","arg4"]
-            )
+        def _dedupe(objs):
+            seen = set()
+            unique = []
+            for c in objs:
+                if c.summary not in seen:
+                    unique.append(c)
+                    seen.add(c.summary)
+            return unique
 
-            # parse number of entries, fallback to 10
-            try:
-                cnt = fut_count.result()
-                num_entries = max(1, int(re.search(r"\d+", cnt).group()))
-            except Exception:
-                num_entries = 10
+        # Human-style capacity limits
+        WM_CAPACITY = 5       # working memory slots
+        ST_CAPACITY = 10      # short-term history slots
+        LT_K = self.top_k     # long-term retrieval slots
 
-            # parse time window, fallback to 5 minutes
-            try:
-                window = fut_window.result()
-                m = re.match(r"(\d+)\s*(minute|hour|day)s?", window)
-                if m:
-                    val, unit = int(m.group(1)), m.group(2)
-                    delta = {
-                        "minute": timedelta(minutes=val),
-                        "hour":   timedelta(hours=val),
-                        "day":    timedelta(days=val),
-                    }[unit]
-                else:
-                    delta = timedelta(minutes=5)
-            except Exception:
-                delta = timedelta(minutes=5)
+        # ——— Step A: decide context window size & tags —————————————————————
+        with concurrent.futures.ThreadPoolExecutor() as ex:
+            f_count = ex.submit(self.decision_callback, user_text,
+                                ["5","10","20","50"],
+                                "How many recent turns to keep? {arg1}, {arg2}, {arg3}, or {arg4}.",
+                                history_size=0, var_names=["arg1","arg2","arg3","arg4"])
+            f_window = ex.submit(self.decision_callback, user_text,
+                                 ["5m","30m","1h","6h","1d"],
+                                 "Time window for memory: {arg1}, {arg2}, {arg3}, {arg4}, or {arg5}.",
+                                 history_size=0, var_names=["arg1","arg2","arg3","arg4","arg5"])
+            f_tags = ex.submit(self.decision_callback, user_text,
+                               ["important","task","decision_point","question"],
+                               "Salient tags to boost: {arg1}, {arg2}, {arg3}, or {arg4}.",
+                               history_size=0, var_names=["arg1","arg2","arg3","arg4"])
+        # parse count
+        try:
+            n = int(re.search(r"\d+", f_count.result()).group())
+            ST_CAPACITY = min(max(n, 1), 50)
+        except:
+            pass
+        # parse window
+        try:
+            w = f_window.result()
+            num, unit = re.match(r"(\d+)([mhd])", w).groups()
+            delta = {"m":60, "h":3600, "d":86400}[unit]
+            time_cutoff = now - timedelta(seconds=int(num)*delta)
+        except:
+            time_cutoff = now - timedelta(minutes=5)
+        # parse tags
+        try:
+            sim_tags = [t.strip() for t in f_tags.result().split(",") if t.strip()]
+        except:
+            sim_tags = ["important", "decision_point"]
 
-            # parse similarity tags, fallback to high-priority defaults
-            try:
-                tags = fut_tags.result()
-                sim_tags = [t.strip() for t in tags.split(",") if t.strip()]
-            except Exception:
-                sim_tags = ["important", "decision_point"]
-
-        # ── Step B: compute recall feature for RL gating ─────────────────────
-        rf = 0.0
-        if recall_ids:
-            counts = [
-                self.repo.get(cid).recall_stats.get("count", 0)
-                for cid in recall_ids
-                if cid and self.repo.get(cid)
-            ]
-            rf = sum(counts) / len(counts) if counts else 0.0
-
-        # ── Step C: load & slice recent narrative entries ────────────────────
-        full_narr = self._load_narrative_context()
+        # ——— Step B: episodic memory (keep just the most recent narrative event) —
         all_narr = sorted(
             [c for c in self.repo.query(lambda c: c.component=="narrative")],
             key=lambda c: _to_dt(c.timestamp), reverse=True
-        )[:5]
-        all_narr.reverse()
-        full_narr.summary = "\n".join(n.summary for n in all_narr)
-        narr_ctx = full_narr
+        )
+        narr_ctx = all_narr[0] if all_narr else self._load_narrative_context()
 
-        # ── Step D: harvest working memory (raw segments & final inferences) ─
-        WM = 5
-        raw_segments = sorted(
+        # ——— Step C: working memory ——————————————————————————————————————
+        segments = sorted(
             [c for c in self.repo.query(
-                lambda c: c.domain=="segment"
-                          and c.semantic_label in ("user_input","assistant")
+                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
             )],
             key=lambda c: _to_dt(c.timestamp)
-        )[-WM:]
+        )[-WM_CAPACITY:]
         inferences = sorted(
-            [c for c in self.repo.query(
-                lambda c: c.semantic_label=="final_inference"
-            )],
+            [c for c in self.repo.query(lambda c: c.semantic_label=="final_inference")],
             key=lambda c: _to_dt(c.timestamp)
-        )[-WM:]
-        # extract summaries
-        wm_segments = [c.summary for c in raw_segments]
-        wm_infers   = [c.summary for c in inferences]
+        )[-WM_CAPACITY:]
+        segments = _dedupe(segments)
+        inferences = _dedupe(inferences)
 
-        # ── Step E: time-+-count-filtered chat history ───────────────────────
-        cutoff = now - delta
-        recent_segs = sorted(
+        # ——— Step D: short-term memory (recent conversation) ——————————————————
+        recent = sorted(
             [c for c in self.repo.query(
                 lambda c: c.domain=="segment"
                           and c.semantic_label in ("user_input","assistant")
-                          and _to_dt(c.timestamp) >= cutoff
+                          and _to_dt(c.timestamp) >= time_cutoff
             )],
             key=lambda c: _to_dt(c.timestamp)
-        )
-        history = recent_segs[-num_entries:]
+        )[-ST_CAPACITY:]
         if extra_ctx:
-            history.extend(extra_ctx)
+            extra_ctx = _dedupe(extra_ctx)
+            recent.extend(extra_ctx)
+        recent = _dedupe(recent)
 
-        # ── Step F: semantic retrieval using sim_tags ───────────────────────
-        tr = (
-            (now - delta).strftime("%Y%m%dT%H%M%SZ"),
-            now.strftime("%Y%m%dT%H%M%SZ")
-        )
-        if self.rl.should_run("semantic_retrieval", rf):
-            recent = self.engine.query(
+        # ——— Step E: semantic (long-term) retrieval ——————————————————————
+        if self.rl.should_run("semantic_retrieval", 0.0):
+            tr = ( (now - timedelta(seconds=(now - time_cutoff).total_seconds())).strftime("%Y%m%dT%H%M%SZ"),
+                   now.strftime("%Y%m%dT%H%M%SZ") )
+            semantic = self.engine.query(
                 stage_id="recent_retrieval",
                 time_range=tr,
                 similarity_to=user_text,
                 include_tags=sim_tags,
                 exclude_tags=self.STAGES + ["tool_schema","tool_output","assistant","system_prompt"],
-                top_k=self.top_k
+                top_k=LT_K
             )
         else:
-            recent = []
+            semantic = []
 
-        # ── Step G: associative memory via spread-activation ───────────────
-        if self.rl.should_run("memory_retrieval", rf):
+        # ——— Step F: associative recall (spreading activation with decay) —————
+        assoc = []
+        if self.rl.should_run("memory_retrieval", 0.0):
             seeds = [user_ctx.context_id, narr_ctx.context_id]
             scores = self.memman.spread_activation(
                 seed_ids=seeds,
-                hops=3, decay=0.6,
+                hops=3, decay=0.7,
                 assoc_weight=1.0, recency_weight=1.0
             )
-            top_ids = sorted(scores, key=scores.get, reverse=True)[:self.top_k]
-            assoc = []
-            for cid in top_ids:
+            for cid in sorted(scores, key=scores.get, reverse=True)[:LT_K]:
                 try:
                     cobj = self.repo.get(cid)
                     cobj.retrieval_score = scores[cid]
-                    cobj.retrieval_metadata = {"seed_ids": seeds}
-                    cobj.record_recall(
-                        stage_id="memory_retrieval",
-                        coactivated_with=seeds,
-                        retrieval_score=scores[cid]
-                    )
-                    self.repo.save(cobj)
                     assoc.append(cobj)
                 except KeyError:
                     continue
-        else:
-            assoc = []
 
-        # ── Step H: recent tool outputs ────────────────────────────────────
+        # ——— Step G: recent tool outputs ——————————————————————————————
         tools = sorted(
             [c for c in self.repo.query(lambda c: c.component=="tool_output")],
             key=lambda c: _to_dt(c.timestamp)
         )
-        recent_tools = tools[-self.top_k:] if self.rl.should_run("tool_output_retrieval", rf) else []
+        recent_tools = tools[-LT_K:] if self.rl.should_run("tool_output_retrieval", 0.0) else []
 
-        # ── Step I: interleave all buckets into merged list ────────────────
-        merged: List[ContextObject] = []
+        # ——— Step H: merge in human-inspired priority order —————————————
+        merged = []
         seen = set()
-        # 1) system prompt
-        for c in (sys_ctx,):
-            merged.append(c); seen.add(c.context_id)
-        # 2) narrative
-        if narr_ctx.context_id not in seen:
-            merged.append(narr_ctx); seen.add(narr_ctx.context_id)
-        # 3) working memory segments
-        for c in raw_segments:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
-        # 4) working memory inferences
-        for c in inferences:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
-        # 5) filtered history
-        for c in history:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
-        # 6) semantic retrieval
-        for c in recent:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
-        # 7) associative memory
-        for c in assoc:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
-        # 8) tool outputs
-        for c in recent_tools:
-            if c.context_id not in seen:
-                merged.append(c); seen.add(c.context_id)
+        def _add(bucket):
+            for c in bucket:
+                if c.summary not in seen:
+                    merged.append(c)
+                    seen.add(c.summary)
+
+        # priority: system → user input → working memory → short-term → semantic → associative → tool
+        _add([sys_ctx])
+        _add([user_ctx])
+        _add(segments + inferences)
+        _add(recent)
+        _add(semantic)
+        _add(assoc)
+        _add(recent_tools)
 
         merged_ids = [c.context_id for c in merged]
-        wm_ids = [c.context_id for c in raw_segments + inferences]
+        wm_ids     = [c.context_id for c in segments + inferences]
 
-        # ── Step J: debug print of all context buckets ─────────────────────
+        # ——— Debug print —————————————————————————————————————————————————
         self._print_stage_context("context_merge", {
             "system":    [sys_ctx.summary],
-            "narrative": [n.summary for n in all_narr],
-            "working_segments": wm_segments,
-            "working_inferences": wm_infers,
-            "history":   [f"{c.semantic_label}: {c.summary}" for c in history],
-            "semantic":  [f"[Tags:{','.join(c.tags)}] {c.summary}" for c in recent],
-            "memory":    [f"[Score:{getattr(c,'retrieval_score',0):.2f}] {c.summary}" for c in assoc],
-            "tool_outputs": [c.summary for c in recent_tools],
+            "narrative": [narr_ctx.summary],
+            "working":   [c.summary for c in segments + inferences],
+            "recent":    [c.summary for c in recent],
+            "semantic":  [c.summary for c in semantic],
+            "assoc":     [f"{c.summary} (score={getattr(c,'retrieval_score',0):.2f})" for c in assoc],
+            "tools":     [c.summary for c in recent_tools],
         })
 
         return {
             "narrative_ctx": narr_ctx,
-            "history":       history,
-            "recent":        recent,
+            "history":       recent,
+            "recent":        semantic,
             "assoc":         assoc,
             "recent_ids":    merged_ids,
             "wm_ids":        wm_ids,
