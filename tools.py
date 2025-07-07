@@ -2162,10 +2162,12 @@ class Tools:
           1) Selenium-Manager
           2) Snap’s bundled chromedriver
           3) Debian/Ubuntu ELF chromedriver
-          4) System chromedriver (PATH)
-          5) Fallback: retry with snap chromium binary
-          6) Auto-download & install ARM64 chromedriver if on ARM64
-          7) webdriver-manager (x86_64 only)
+          4) /usr/local/bin chromedriver
+          5) /usr/bin chromedriver
+          6) PATH chromedriver
+          7) Fallback: retry with snap chromium binary
+          8) Auto-download & install ARM64 chromedriver if on ARM64
+          9) webdriver-manager (x86_64 only)
         """
         import os
         import random
@@ -2225,8 +2227,10 @@ class Tools:
         # 4️⃣ Try known chromedriver binaries in order
         candidates = [
             "/snap/chromium/current/usr/lib/chromium-browser/chromedriver",  # snap
-            "/usr/lib/chromium-browser/chromedriver",                        # Ubuntu/Debian ELF
-            shutil.which("chromedriver"),                                    # PATH
+            "/usr/lib/chromium-browser/chromedriver",                        # Debian/Ubuntu ELF
+            "/usr/local/bin/chromedriver",                                   # local install
+            "/usr/bin/chromedriver",                                         # distro install
+            shutil.which("chromedriver"),                                    # PATH fallback
         ]
         for drv in candidates:
             if drv and os.path.exists(drv):
@@ -2244,13 +2248,14 @@ class Tools:
             os.environ["CHROME_BIN"] = snap_bin
             opts.binary_location = snap_bin
             log_message("[open_browser] Retrying with CHROME_BIN=/snap/bin/chromium", "DEBUG")
+            # retry Selenium-Manager
             try:
                 Tools._driver = webdriver.Chrome(options=opts)
                 log_message("[open_browser] Launched via Selenium-Manager (snap CHROME_BIN)", "SUCCESS")
                 return "Browser launched (selenium-manager via snap)"
             except WebDriverException as e:
                 log_message(f"[open_browser] Selenium-Manager via snap failed: {e}", "WARNING")
-            # retry PATH again under new CHROME_BIN
+            # retry PATH chromedriver under new CHROME_BIN
             snap_sys = shutil.which("chromedriver")
             if snap_sys:
                 try:
@@ -2314,6 +2319,7 @@ class Tools:
             "No usable chromedriver found. On ARM64, ensure download/install succeeded; "
             "on x86_64, install a matching chromedriver or set CHROME_BIN/PATH."
         )
+
 
 
 
