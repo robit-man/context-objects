@@ -26,6 +26,7 @@ import shutil
 import signal
 import platform
 import threading
+import traceback
 import subprocess
 from datetime import datetime
 
@@ -473,216 +474,234 @@ def setup_piper_and_onnx():
 # finally, run it
 setup_piper_and_onnx()
 
+# globals for pipelines
+audio_svc = None
+tts_audio = None
+asm_audio = None
+# ─────────── globals for pipelines ─────────────────────────────────────────
+audio_svc = None
+tts_audio = None
+asm_audio = None
+tts_cli   = None
+asm_cli   = None
+tts_tele  = None
+asm_tele  = None
 
-
-
-# ─── IMPORT THE CORE CLASSES ──────────────────────────────────────────────
-from assembler     import Assembler
+# ─── IMPORT CORE CLASSES ───────────────────────────────────────────────────
 from audio_service import AudioService
-from tts_service   import TTSManager
-from telegram_input import telegram_input
+from tts_service import TTSManager
+from telegram_input import notify_admin, telegram_input
+
+import traceback
 
 CTX_PATH = "context.jsonl"
 
 # ─── 1) AUDIO PIPELINE ────────────────────────────────────────────────────
-audio_svc = AudioService(
-    sample_rate         = config.get("sample_rate",        16000),
-    rms_threshold       = config.get("rms_threshold",      0.01),
-    silence_duration    = config.get("silence_duration",   0.5),
-    consensus_threshold = config.get("consensus_threshold",0.3),
-    enable_denoise      = config.get("enable_noise_reduction", False),
-    on_transcription    = None,      # set below
-    logger              = log_message,
-    cfg                 = config,
-)
-tts_audio = TTSManager(
-    logger        = log_message,
-    cfg           = config,
-    audio_service = audio_svc,     # live‐playback on speaker
-)
-tts_audio.set_mode("live")
-asm_audio = Assembler(
-    context_path     = CTX_PATH,
-    config_path      = "config.json",
-    lookback_minutes = 60,
-    top_k            = 5,
-    tts_manager      = tts_audio,
-)
+def start_audio_pipeline():
+    global audio_svc, tts_audio, asm_audio
+    try:
+        from assembler import Assembler
 
-# —– **Changed**: catch assembler’s return and enqueue it for live TTS
-def _audio_input_cb(text: str):
-    answer = asm_audio.run_with_meta_context(text)
-    if answer and answer.strip():
-        tts_audio.enqueue(answer)
+        audio_svc = AudioService(
+            sample_rate         = config["sample_rate"],
+            rms_threshold       = config["rms_threshold"],
+            silence_duration    = config["silence_duration"],
+            consensus_threshold = config["consensus_threshold"],
+            enable_denoise      = config["enable_noise_reduction"],
+            on_transcription    = None,
+            logger              = log_message,
+            cfg                 = config,
+        )
+        tts_audio = TTSManager(
+            logger=log_message,
+            cfg=config,
+            audio_service=audio_svc
+        )
+        tts_audio.set_mode("live")
 
-audio_svc.on_transcription = _audio_input_cb
+        asm_audio = Assembler(
+            context_path     = CTX_PATH,
+            config_path      = CONFIG_FILE,
+            lookback_minutes = 60,
+            top_k            = 5,
+            tts_manager      = tts_audio,
+        )
 
-# start audio in its own thread
-threading.Thread(target=audio_svc.start, daemon=True).start()
+        def _audio_input_cb(text: str):
+            try:
+                answer = asm_audio.run_with_meta_context(text)
+                if answer and answer.strip():
+                    tts_audio.enqueue(answer)
+            except Exception:
+                tb = traceback.format_exc()
+                log_message(f"Audio callback error:\n{tb}", "ERROR")
+                notify_admin(f"⚠️ *Audio callback error*:\n```{tb[:1500]}```")
 
+        audio_svc.on_transcription = _audio_input_cb
+        audio_svc.start()
+
+    except Exception:
+        tb = traceback.format_exc()
+        log_message(f"Audio pipeline startup failed:\n{tb}", "ERROR")
+        notify_admin(f"⚠️ *Audio pipeline startup failed*:\n```{tb[:1500]}```")
+
+threading.Thread(
+    target=start_audio_pipeline,
+    daemon=True,
+    name="AudioThread"
+).start()
 
 # ─── 2) CLI PIPELINE ──────────────────────────────────────────────────────
-def cli_loop():
-    tts_cli = TTSManager(
-        logger        = log_message,
-        cfg           = config,
-        audio_service = audio_svc   # also speak on speaker
-    )
-    tts_cli.set_mode("live")
-    asm_cli = Assembler(
-        context_path     = CTX_PATH,
-        config_path      = "config.json",
-        lookback_minutes = 60,
-        top_k            = 5,
-        tts_manager      = tts_cli,
-    )
+def start_cli_pipeline():
+    global tts_cli, asm_cli
+    try:
+        from assembler import Assembler
 
-    print("Ready (CLI): type your message, Ctrl-C to exit.")
-    while True:
-        try:
-            line = input(">> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not line:
-            continue
+        tts_cli = TTSManager(
+            logger=log_message,
+            cfg=config,
+            audio_service=None
+        )
+        tts_cli.set_mode("live")
 
-        # 1) Run the assembler
-        answer = asm_cli.run_with_meta_context(line)
+        asm_cli = Assembler(
+            context_path     = CTX_PATH,
+            config_path      = CONFIG_FILE,
+            lookback_minutes = 60,
+            top_k            = 5,
+            tts_manager      = tts_cli,
+        )
 
-        # 2) Enqueue for live TTS (so you hear it immediately)
-        if answer and answer.strip():
-            tts_cli.enqueue(answer)
+        print("Ready (CLI): type your message, Ctrl-C to exit.")
+        while True:
+            try:
+                line = input(">> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
 
-        # (no print needed; the TTS will speak your response)
-    print("CLI loop exiting…")
+            answer = asm_cli.run_with_meta_context(line)
+            if answer and answer.strip():
+                tts_cli.enqueue(answer)
 
+        print("CLI loop exiting…")
 
-   
-threading.Thread(target=cli_loop, daemon=True).start()
+    except Exception:
+        tb = traceback.format_exc()
+        log_message(f"CLI pipeline startup failed:\n{tb}", "ERROR")
+        notify_admin(f"⚠️ *CLI pipeline startup failed*:\n```{tb[:1500]}```")
 
+threading.Thread(
+    target=start_cli_pipeline,
+    daemon=True,
+    name="CLIThread"
+).start()
 
+# ─── 3) TELEGRAM PIPELINE ─────────────────────────────────────────────────
+def start_telegram_pipeline():
+    global tts_tele, asm_tele
+    try:
+        from assembler import Assembler
 
-# ─── 4) TELEGRAM PIPELINE ─────────────────────────────────────────────────
-try:
-    tts_tele = TTSManager(
-        logger        = log_message,
-        cfg           = config,
-        audio_service = None     # no speaker output
-    )
-    tts_tele.set_mode("file")
-    asm_tele = Assembler(
-        context_path     = CTX_PATH,
-        config_path      = "config.json",
-        lookback_minutes = 60,
-        top_k            = 5,
-        tts_manager      = tts_tele,
-    )
+        tts_tele = TTSManager(
+            logger=log_message,
+            cfg=config,
+            audio_service=None
+        )
+        tts_tele.set_mode("file")
 
-    def _run_telegram():
-        try:
-            telegram_input(asm_tele)
-        except Exception as e:
-            print(f"Telegram thread error: {e}")
+        asm_tele = Assembler(
+            context_path     = CTX_PATH,
+            config_path      = CONFIG_FILE,
+            lookback_minutes = 60,
+            top_k            = 5,
+            tts_manager      = tts_tele,
+        )
 
-    threading.Thread(
-        target=_run_telegram,
-        daemon=True,
-        name="TelegramThread"
-    ).start()
+        # ← previously you had notify_admin(asm_tele) by mistake
+        telegram_input(asm_tele)
 
-except Exception as e:
-    print(f"Error setting up Telegram thread: {e}")
+    except Exception:
+        tb = traceback.format_exc()
+        log_message(f"Telegram pipeline startup failed:\n{tb}", "ERROR")
+        notify_admin(f"⚠️ *Telegram pipeline startup failed*:\n```{tb[:1500]}```")
 
-# ─── CURRENT CODE ────────────────────────────────────────────────────────────
-def _monitor_git_updates(interval: float = 10.0):
-    
+threading.Thread(
+    target=start_telegram_pipeline,
+    daemon=True,
+    name="TelegramThread"
+).start()
 
+# ─── 4) WATCHER FOR FILE CHANGES & GIT ────────────────────────────────────
+def _monitor_git_and_files(interval: float = 5.0):
     def _run(cmd):
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
 
-    # determine repo root (this script’s dir)
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
-    while True:
-        try:
-            # 1) figure out the current branch name
-            branch = _run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
-            # 2) fetch from remote
-            _run(["git", "-C", repo_dir, "fetch"])
-            # 3) check if HEAD is behind origin/<branch>
-            behind = int(_run([
-                "git", "-C", repo_dir,
-                "rev-list", "HEAD..origin/" + branch, "--count"
-            ]))
-            if behind > 0:
-                log_message(f"Remote update detected on branch '{branch}' ({behind} new commit(s)), pulling…", "INFO")
-                pull_out = _run(["git", "-C", repo_dir, "pull", "--ff-only"])
-                log_message(f"Git pull succeeded:\n{pull_out}", "SUCCESS")
-            # else: up-to-date; do nothing
-        except subprocess.CalledProcessError as e:
-            log_message(f"Git-watcher error: {e.output.strip()}", "WARNING")
-        except Exception as ex:
-            log_message(f"Unexpected error in git-watcher: {ex}", "WARNING")
+    def watched():
+        return {
+            os.path.join(repo_dir, f)
+            for f in os.listdir(repo_dir)
+            if f.endswith(".py") or f == CONFIG_FILE
+        }
 
-        time.sleep(interval)
-
-# — spawn the Git-watcher in the background ─────────────────────────────────
-threading.Thread(target=_monitor_git_updates, daemon=True, name="GitWatcher").start()
-
-
-# ─── REPLACE WITH ───────────────────────────────────────────────────────────
-def _monitor_git_updates(interval: float = 10.0):
-
-    def _run(cmd):
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
-
-    # determine repo root (this script’s dir)
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    last = {p: os.path.getmtime(p) for p in watched()}
 
     while True:
+        # file/config changes
+        for path, old in list(last.items()):
+            try:
+                new = os.path.getmtime(path)
+            except OSError:
+                new = None
+            if new != old:
+                log_message(f"Detected change in {os.path.basename(path)}; restarting…", "INFO")
+                notify_admin(f"🔄 *Reload triggered by* `{os.path.basename(path)}`")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        for p in watched() - last.keys():
+            last[p] = os.path.getmtime(p)
+
+        # git updates
         try:
-            # 1) figure out the current branch name
             branch = _run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
-            # 2) fetch from remote
             _run(["git", "-C", repo_dir, "fetch"])
-            # 3) check if HEAD is behind origin/<branch>
             behind = int(_run([
                 "git", "-C", repo_dir,
-                "rev-list", "HEAD..origin/" + branch, "--count"
+                f"rev-list", f"HEAD..origin/{branch}", "--count"
             ]))
             if behind > 0:
-                log_message(f"Remote update detected on branch '{branch}' ({behind} new commit(s)), pulling…", "INFO")
                 pull_out = _run(["git", "-C", repo_dir, "pull", "--ff-only"])
                 log_message(f"Git pull succeeded:\n{pull_out}", "SUCCESS")
-
-                # ── RESTART ON GIT UPDATE ───────────────────────────
-                log_message("Restarting script due to git update...", "INFO")
-                srv = globals().get("_flask_server")
-                if srv:
-                    log_message("Shutting down existing Flask server...", "INFO")
-                    try:
-                        srv.shutdown()
-                    except Exception as e:
-                        log_message(f"Error shutting down Flask server: {e}", "WARNING")
+                notify_admin(f"🔄 *Git update*: `{branch}` +{behind} commits")
                 os.execv(sys.executable, [sys.executable] + sys.argv)
         except subprocess.CalledProcessError as e:
-            log_message(f"Git-watcher error: {e.output.strip()}", "WARNING")
-        except Exception as ex:
-            log_message(f"Unexpected error in git-watcher: {ex}", "WARNING")
+            err = e.output.strip()
+            log_message(f"Git watcher error: {err}", "WARNING")
+            notify_admin(f"⚠️ *Git watcher error*:\n```{err[:1500]}```")
+        except Exception:
+            tb = traceback.format_exc()
+            log_message(f"Watcher exception:\n{tb}", "WARNING")
+            notify_admin(f"⚠️ *Watcher exception*:\n```{tb[:1500]}```")
 
         time.sleep(interval)
 
-# — spawn the Git-watcher in the background ─────────────────────────────────
-threading.Thread(target=_monitor_git_updates, daemon=True, name="GitWatcher").start()
+threading.Thread(
+    target=_monitor_git_and_files,
+    daemon=True,
+    name="GitAndFileWatcher"
+).start()
 
-# ─── WAIT FOR CTRL-C ───────────────────────────────────────────────────────
+# ─── CLEANUP & WAIT ───────────────────────────────────────────────────────
 import atexit
 def _cleanup():
     log_message("Shutting down services…", "INFO")
-    audio_svc.stop()
-    tts_audio.stop()
-    # tts_cli and tts_tele threads will exit automatically
+    try: audio_svc.stop()
+    except: pass
+    try: tts_audio.stop()
+    except: pass
     log_message("Goodbye.", "INFO")
-atexit.register(_cleanup)
 
+atexit.register(_cleanup)
 threading.Event().wait()
