@@ -2162,8 +2162,9 @@ class Tools:
           1) Selenium-Manager
           2) Snap’s bundled chromedriver
           3) System chromedriver (PATH)
-          4) Auto-download & install ARM64 chromedriver if on ARM64
-          5) webdriver-manager (x86_64 only)
+          4) Fallback: retry with snap chromium binary
+          5) Auto-download & install ARM64 chromedriver if on ARM64
+          6) webdriver-manager (x86_64 only)
         """
         import os
         import random
@@ -2239,11 +2240,34 @@ class Tools:
             except WebDriverException as e:
                 log_message(f"[open_browser] System chromedriver failed: {e}", "WARNING")
 
-        # 6️⃣ ARM64 auto-download & install if on ARM
+        # 6️⃣ Fallback: retry with snap chromium binary if available
+        snap_bin = "/snap/bin/chromium"
+        if os.path.exists(snap_bin) and os.getenv("CHROME_BIN") != snap_bin:
+            os.environ["CHROME_BIN"] = snap_bin
+            opts.binary_location = snap_bin
+            log_message("[open_browser] Retrying with CHROME_BIN=/snap/bin/chromium", "DEBUG")
+            # retry Selenium-Manager
+            try:
+                Tools._driver = webdriver.Chrome(options=opts)
+                log_message("[open_browser] Launched via Selenium-Manager (snap CHROME_BIN)", "SUCCESS")
+                return "Browser launched (selenium-manager via snap)"
+            except WebDriverException as e:
+                log_message(f"[open_browser] Selenium-Manager via snap failed: {e}", "WARNING")
+            # retry system chromedriver on PATH (now likely the snap’s chromedriver)
+            snap_sys = shutil.which("chromedriver")
+            if snap_sys:
+                try:
+                    log_message(f"[open_browser] Trying system chromedriver at {snap_sys} (after snap CHROME_BIN)", "DEBUG")
+                    Tools._driver = webdriver.Chrome(service=Service(snap_sys), options=opts)
+                    log_message("[open_browser] Launched via system chromedriver (snap PATH)", "SUCCESS")
+                    return "Browser launched (system chromedriver via snap PATH)"
+                except WebDriverException as e:
+                    log_message(f"[open_browser] System chromedriver via snap PATH failed: {e}", "WARNING")
+
+        # 7️⃣ ARM64 auto-download & install if on ARM
         arch = platform.machine().lower()
         if arch in ("aarch64", "arm64", "armv8l", "armv7l"):
             try:
-                # determine exact Chromium version
                 raw = subprocess.check_output([chrome_bin, "--version"]).decode().strip()
                 ver = raw.split()[1]  # e.g. "138.0.7204.92"
                 url = (
@@ -2269,7 +2293,7 @@ class Tools:
             except Exception as e:
                 log_message(f"[open_browser] ARM64 download/install failed: {e}", "WARNING")
 
-        # 7️⃣ webdriver-manager fallback on x86_64
+        # 8️⃣ webdriver-manager fallback on x86_64
         if arch in ("x86_64", "amd64"):
             try:
                 raw = subprocess.check_output([chrome_bin, "--version"]).decode().strip()
@@ -2297,6 +2321,7 @@ class Tools:
             "No usable chromedriver found. On ARM64, ensure download/install succeeded; "
             "on x86_64, install a matching chromedriver or set CHROME_BIN/PATH."
         )
+
 
     # This static method closes the currently open browser session, if any. It attempts to quit the WebDriver instance and handles exceptions gracefully, returning a message indicating whether the browser was closed or if there was no browser to close.
     @staticmethod
