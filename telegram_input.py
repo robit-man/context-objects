@@ -786,9 +786,14 @@ def telegram_input(asm):
                                 streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
                                 filt    = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
                                 subprocess.run(
-                                    ["ffmpeg","-y","-loglevel","error", *ins,
-                                     "-filter_complex", filt,
-                                     "-c<a","libopus","-b<a","48k", combined],
+                                    [
+                                        "ffmpeg", "-y", "-loglevel", "error",
+                                        *ins,
+                                        "-filter_complex", filt,
+                                        "-c:a", "libopus",
+                                        "-b:a", "48k",
+                                        combined
+                                    ],
                                     check=True
                                 )
                                 with open(combined, "rb") as vf:
