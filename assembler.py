@@ -2774,29 +2774,29 @@ class Assembler:
         user_text: str,
         clar_metadata: Dict[str, Any],
     ) -> List["ContextObject"]:
-        import json, re, hashlib, datetime
+        import json, re, hashlib, datetime, logging
         from typing import Tuple, Any, Dict, List
 
         # ── 0) Tracker init ────────────────────────────────────────────────
         plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
         tracker = next(
             (c for c in self.repo.query(
-                lambda c: c.component=="plan_tracker" and c.semantic_label==plan_sig
+                lambda c: c.component == "plan_tracker" and c.semantic_label == plan_sig
             )),
             None
         )
         if not tracker:
             tracker = ContextObject.make_stage(
                 "plan_tracker", [], {
-                    "plan_id":        plan_sig,
-                    "plan_calls":     raw_calls.copy(),
-                    "total_calls":    len(raw_calls),
-                    "succeeded":      0,
-                    "attempts":       0,
-                    "call_status_map":{},
-                    "errors_by_call": {},
-                    "status":         "in_progress",
-                    "started_at":     datetime.datetime.utcnow().isoformat()+"Z"
+                    "plan_id":           plan_sig,
+                    "plan_calls":        raw_calls.copy(),
+                    "total_calls":       len(raw_calls),
+                    "succeeded":         0,
+                    "attempts":          0,
+                    "call_status_map":   {},
+                    "errors_by_call":    {},
+                    "status":            "in_progress",
+                    "started_at":        datetime.datetime.utcnow().isoformat() + "Z"
                 }
             )
             tracker.semantic_label = plan_sig
@@ -2805,18 +2805,18 @@ class Assembler:
             tracker.touch(); self.repo.save(tracker)
         else:
             meta = tracker.metadata
-            meta.setdefault("plan_calls",     raw_calls.copy())
-            meta.setdefault("total_calls",    len(raw_calls))
-            meta.setdefault("succeeded",      0)
-            meta.setdefault("attempts",       0)
-            meta.setdefault("call_status_map",{})
-            meta.setdefault("errors_by_call", {})
-            meta.setdefault("status",         "in_progress")
-            meta.setdefault("started_at",     datetime.datetime.utcnow().isoformat()+"Z")
+            meta.setdefault("plan_calls",      raw_calls.copy())
+            meta.setdefault("total_calls",     len(raw_calls))
+            meta.setdefault("succeeded",       0)
+            meta.setdefault("attempts",        0)
+            meta.setdefault("call_status_map", {})
+            meta.setdefault("errors_by_call",  {})
+            meta.setdefault("status",          "in_progress")
+            meta.setdefault("started_at",      datetime.datetime.utcnow().isoformat() + "Z")
             tracker.touch(); self.repo.save(tracker)
 
         tracker.metadata["attempts"] += 1
-        tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+        tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
         if tracker.metadata.get("status") == "success":
             return []
@@ -2831,48 +2831,62 @@ class Assembler:
                     out.append(c)
             return out
 
-        def _validate(res: Dict[str,Any]) -> Tuple[bool,str]:
+        def _validate(res: Dict[str, Any]) -> Tuple[bool, str]:
             exc = res.get("exception")
             return (exc is None, exc or "")
 
         def normalize_key(k: str) -> str:
-            return re.sub(r"\W+","",k).lower()
+            return re.sub(r"\W+", "", k).lower()
 
         # ── 1) Initialise pending calls in original order ────────────────
         all_calls   = _norm(raw_calls)
         call_status = tracker.metadata["call_status_map"]
         pending     = [c for c in all_calls if not call_status.get(c, False)]
-        last_results: Dict[str,Any] = {}
+        last_results: Dict[str, Any] = {}
         tool_ctxs: List[ContextObject] = []
 
+        # ── 1b) If nothing to run, return previously-saved outputs ────────
         if not pending:
-            tracker.metadata["status"]       = "success"
-            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+            tracker.metadata["status"] = "success"
+            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
             tracker.touch(); self.repo.save(tracker)
-            return []
+
+            existing: List[ContextObject] = []
+            for call in all_calls:
+                matches = [
+                    c for c in self.repo.query(
+                        lambda c:
+                            c.component == "tool_output"
+                            and c.metadata.get("tool_call") == call
+                    )
+                ]
+                if matches:
+                    matches.sort(key=lambda c: c.timestamp, reverse=True)
+                    existing.append(matches[0])
+            return existing
+
         # ── 2) Retry loop over only pending calls ────────────────────────────
         max_retries = 10
         prev_pending = None
         for attempt in range(1, max_retries + 1):
             errors: List[Tuple[str, str]] = []
 
-            # plateau detection: if the LLM returns the exact same list twice, give up
+            # plateau detection
             if prev_pending is not None and pending == prev_pending:
                 logging.warning(f"[ToolChainRetry] plateau on attempt {attempt}, giving up")
                 break
             prev_pending = pending.copy()
 
-            # shuffle the order to introduce stochasticity
+            import random
             random.shuffle(pending)
 
             for original in list(pending):
                 call_str = original
 
-                # 1) [alias from tool_name] style placeholders
+                # 1) [alias from tool_name] placeholders
                 for ph in re.findall(r"\[([^\]]+)\]", call_str):
                     if " from " in ph:
                         alias, toolname = ph.split(" from ", 1)
-                        alias_key = normalize_key(alias)
                         tool_key = normalize_key(toolname)
                         match = tool_key if tool_key in last_results else None
                     else:
@@ -2884,10 +2898,9 @@ class Assembler:
                             None
                         )
                     if match:
-                        value = last_results[match]
-                        call_str = call_str.replace(f"[{ph}]", repr(value))
+                        call_str = call_str.replace(f"[{ph}]", repr(last_results[match]))
 
-                # 2) {{alias}} style placeholders
+                # 2) {{alias}} placeholders
                 for ph in re.findall(r"\{\{([^}]+)\}\}", call_str):
                     phn = normalize_key(ph)
                     match = next(
@@ -2899,7 +2912,7 @@ class Assembler:
                     if match:
                         call_str = call_str.replace(f"{{{{{ph}}}}}", repr(last_results[match]))
 
-                # 3) inline nested zero-arg calls only if embedded (not top-level)
+                # 3) inline nested zero-arg calls if embedded
                 for inner in re.findall(r"\B([A-Za-z_]\w*)\(\)", call_str):
                     nested = f"{inner}()"
                     if nested in call_str and inner not in last_results:
@@ -2912,7 +2925,6 @@ class Assembler:
                             repr(out_i),
                             call_str
                         )
-                        # persist nested output
                         try:
                             sch_i = next(
                                 s for s in selected_schemas
@@ -2933,7 +2945,7 @@ class Assembler:
                 res = Tools.run_tool_once(call_str)
                 ok, err = _validate(res)
                 tool_key = normalize_key(call_str.split("(", 1)[0])
-                last_results[tool_key] = res["output"]
+                last_results[tool_key] = res.get("output")
 
                 # persist output
                 try:
@@ -2962,14 +2974,14 @@ class Assembler:
                     errors.append((original, err))
                 tracker.touch(); self.repo.save(tracker)
 
-            # if everything succeeded, finish
+            # if all succeeded, finish
             if not pending:
                 tracker.metadata["status"] = "success"
                 tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
                 tracker.touch(); self.repo.save(tracker)
                 return tool_ctxs
 
-            # otherwise ask the LLM to repair only the remaining calls, and show it the errors
+            # otherwise, ask LLM to repair remaining calls
             retry_sys = (
                 self._get_prompt("toolchain_retry_prompt")
                 + "\n\nOriginal question:\n" + user_text
@@ -2992,20 +3004,19 @@ class Assembler:
                 parsed = Tools.parse_tool_call(out)
                 pending = _norm(parsed if isinstance(parsed, list) else [parsed] or pending)
 
-        # ── 3) If we exit the loop with some calls still pending, mark failure ──
+        # ── 3) After max_retries or exit, mark failure ───────────────────────
         if pending:
             tracker.metadata["status"] = "failed"
             tracker.metadata["errors_by_call"].update({c: "unresolved" for c in pending})
             tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
             tracker.touch(); self.repo.save(tracker)
 
-        # ── 3) Give up after max_retries ────────────────────────────────────
-        tracker.metadata["status"]       = "failed"
-        tracker.metadata["last_errors"]  = [e for _,e in errors]
-        
-        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+        tracker.metadata["status"]      = "failed"
+        tracker.metadata["last_errors"] = [e for _, e in errors]
+        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
         return tool_ctxs
+
     
     def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
         """
