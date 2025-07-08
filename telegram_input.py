@@ -585,25 +585,38 @@ def telegram_input(asm):
 
     if Assembler:
         async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            import json
+            import tempfile
+            import subprocess
+            import os
+            import asyncio
+            import uuid
+            from datetime import datetime
+            from telegram.constants import ChatAction
+            from context import ContextObject
+            from tts_service import TTSManager
+            from user_registry import _REG
+            from group_registry import _GREG
+
             chat_id   = update.effective_chat.id
             chat_type = update.effective_chat.type
-            bot_name  = context.bot.username.lower()
+            bot       = context.bot
+            bot_name  = bot.username.lower()
+
+            # ── Load config ───────────────────────────────────────────────────────
             try:
                 with open("config.json", "r") as f:
                     cfg = json.load(f)
             except FileNotFoundError:
                 cfg = {}
-
             group_only    = cfg.get("group_only", False)
             allow_private = cfg.get("allow_private", True)
 
-            # ── Enforce “group only” mode ──────────────────────────────────────────
-            if chat_type == "private" and group_only:
+            # ── Enforce “group only” / DM enable/disable ──────────────────────────
+            if chat_type == "private" and (group_only or not allow_private):
                 return
 
-            # ── Enforce DM enable/disable ──────────────────────────────────────────
-            if chat_type == "private" and not allow_private:
-                return
+            # ── Extract the actual Telegram message ───────────────────────────────
             msg = (
                 update.message
                 or update.edited_message
@@ -613,7 +626,7 @@ def telegram_input(asm):
             if not msg:
                 return
 
-            # 2) Determine kind & raw data
+            # ── Determine kind & raw data ────────────────────────────────────────
             kind, data = "other", None
             if msg.text:
                 kind, data = "text", msg.text
@@ -634,10 +647,21 @@ def telegram_input(asm):
                 kind, data = "poll", msg.poll.question
             else:
                 kind, data = "other", repr(msg.to_dict())
+            
+            image_paths: list[str] = []
+            if kind == "photo":
+                for p in msg.photo:
+                    file = await bot.get_file(p.file_id)
+                    local_path = tempfile.mktemp(suffix=".jpg")
+                    await file.download_to_drive(local_path)
+                    image_paths.append(local_path)
+                # let downstream see “n image(s)” instead of raw file_id
+                data = f"{len(image_paths)} image(s)"
 
             now = datetime.utcnow().isoformat() + "Z"
             logger.info(f"[{now}] Incoming update — chat_id={chat_id} kind={kind} data={data!r}")
 
+            # ── Register user & group ────────────────────────────────────────────
             user = update.effective_user
             if user and user.username:
                 _REG.add(user.username, user.id)
@@ -645,6 +669,7 @@ def telegram_input(asm):
                 title = update.effective_chat.title or f"chat_{chat_id}"
                 _GREG.add(title, chat_id)
 
+            # ── Lazy‐init per‐chat Assembler ──────────────────────────────────────
             chat_asm = assemblers.get(chat_id)
             if chat_asm is None:
                 repo = make_per_chat_repo(chat_id)
@@ -661,7 +686,7 @@ def telegram_input(asm):
                 assemblers[chat_id] = chat_asm
             chat_asm._chat_contexts.add(chat_id)
 
-            # build tags
+            # ── Build tags & metadata for this segment ───────────────────────────
             tags = [
                 "telegram_update",
                 kind,
@@ -670,19 +695,25 @@ def telegram_input(asm):
             ]
             if msg.reply_to_message:
                 tags.append("reply")
+                if msg.reply_to_message.from_user.id == bot.id:
+                    tags.append("reply_to_bot")
 
-            # build metadata
             metadata = {
-                "chat_id": chat_id,
-                "from_user_id": user.id,
-                "from_username": user.username,
-                "message_id": msg.message_id,
-                "text": msg.text or msg.caption or "",
+                "chat_id":                 chat_id,
+                "from_user_id":            user.id,
+                "from_username":           user.username,
+                "message_id":              msg.message_id,
+                "text":                    msg.text or msg.caption or "",
             }
+            if image_paths:
+                metadata["image_paths"] = image_paths
+
             if msg.reply_to_message:
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
+                if msg.reply_to_message.from_user.id == bot.id:
+                    metadata["in_reply_to_bot_message_id"] = msg.reply_to_message.message_id
 
-            # create the segment
+            # ── Create & save the ContextObject segment ──────────────────────────
             seg = ContextObject.make_segment(
                 semantic_label=f"tg_{kind}",
                 content_refs=[],
@@ -693,143 +724,85 @@ def telegram_input(asm):
             seg.stage_id = "telegram_update"
             seg.touch()
 
-            # if this is a reply, link back to the original ContextObject
+            # ── Link replies back to the original ContextObject ────────────────
             if msg.reply_to_message:
                 orig = next(
-                    (
-                        c for c in chat_asm.repo.query(
-                            lambda c: c.metadata.get("message_id")
-                                      == msg.reply_to_message.message_id
-                        )
-                    ),
+                    (c for c in chat_asm.repo.query(
+                        lambda c: c.metadata.get("message_id")
+                                == msg.reply_to_message.message_id
+                    )),
                     None
                 )
                 if orig:
                     seg.references.append(orig.context_id)
 
-            # save into the repo
             chat_asm.repo.save(seg)
 
-
-            # ─── enrich for replies ─────────────────────────────────────
-            if msg.reply_to_message:
-                orig_msg = msg.reply_to_message
-                # resolve original sender
-                orig_user = (
-                    f"@{orig_msg.from_user.username}"
-                    if orig_msg.from_user and orig_msg.from_user.username
-                    else orig_msg.from_user.full_name
-                )
-                # add reply tags & metadata
-                seg.tags.extend([
-                    f"reply_to_user:{orig_user}",
-                    f"reply_to_msg:{orig_msg.message_id}"
-                ])
-                seg.metadata.update({
-                    "reply_to_user":      orig_user,
-                    "reply_to_msg_id":    orig_msg.message_id
-                })
-                # updated summary
-                sender = user.username or user.first_name
-                seg.summary = (
-                    f"{sender} replied to {orig_user} "
-                    f"(msg {orig_msg.message_id}): {data}"
-                )
-            else:
-                # no reply → just the raw text/data
-                seg.summary = str(data)
-
-            seg.stage_id = "telegram_update"
-            seg.touch()
-
-            # ─── reference the original ContextObject if we have it ───
-            if msg.reply_to_message:
-                orig_ctx = next(
-                    (c for c in chat_asm.repo.query(
-                        lambda c: c.metadata.get("telegram_message_id")
-                                  == msg.reply_to_message.message_id
-                    )),
-                    None
-                )
-                if orig_ctx:
-                    seg.references.append(orig_ctx.context_id)
-
-            # ─── finally, persist ───────────────────────────────────────
-            chat_asm.repo.save(seg)
-
+            # ── If voice note, download & transcribe ────────────────────────────
             text = (msg.text or "").strip()
             if msg.voice and not text:
                 try:
                     raw_ogg = tempfile.mktemp(suffix=".oga")
-                    vf = await context.bot.get_file(msg.voice.file_id)
+                    vf = await bot.get_file(msg.voice.file_id)
                     await vf.download_to_drive(raw_ogg)
                     wav = raw_ogg + ".wav"
                     subprocess.run(
-                        ["ffmpeg","-y","-loglevel","error",
-                         "-i",raw_ogg,"-ac","1","-ar","16000",wav],
+                        ["ffmpeg","-y","-loglevel","error","-i",raw_ogg,"-ac","1","-ar","16000",wav],
                         check=True
                     )
                     result = _WHISPER.transcribe(wav, language="en")
                     text = result.get("text","").strip() or text
                 except Exception as ex:
-                    await context.bot.send_message(
-                        chat_id, f"❌ Voice note error: {ex}",
-                        reply_to_message_id=msg.message_id
-                    )
+                    await bot.send_message(chat_id, f"❌ Voice note error: {ex}",
+                                        reply_to_message_id=msg.message_id)
                 finally:
                     for p in (locals().get("raw_ogg"), locals().get("wav")):
                         if p and os.path.exists(p):
                             try: os.unlink(p)
                             except: pass
 
+            # ── Handle slash commands in private chats ───────────────────────────
             if chat_type == "private" and text.startswith("/"):
                 parts = text.split(None, 2)
-                cmd = parts[0].lower()
+                cmd   = parts[0].lower()
                 if cmd == "/list_users":
                     users = _REG.list_all()
-                    await context.bot.send_message(
+                    await bot.send_message(
                         chat_id,
-                        "\n".join(f"@{u['username']} Said: {u['id']}" for u in users) or "(none)"
+                        "\n".join(f"@{u['username']} ⟶ {u['id']}" for u in users) or "(none)"
                     )
                     return
                 if cmd == "/list_groups":
                     groups = _GREG.list_all()
-                    await context.bot.send_message(
+                    await bot.send_message(
                         chat_id,
-                        "\n".join(f"{g['name']}: {g['chat_id']}" for g in groups) or "(none)"
+                        "\n".join(f"{g['name']} ⟶ {g['chat_id']}" for g in groups) or "(none)"
                     )
                     return
                 if cmd == "/dm" and len(parts) == 3:
                     target, body = parts[1], parts[2]
-                    target_id = _REG.id_for(target.lstrip("@").lower())
+                    target_id    = _REG.id_for(target.lstrip("@").lower())
                     if not target_id:
-                        await context.bot.send_message(
-                            chat_id, f"User @{target} not found.",
-                            reply_to_message_id=msg.message_id
-                        )
+                        await bot.send_message(chat_id, f"User @{target} not found.",
+                                            reply_to_message_id=msg.message_id)
                     else:
-                        await context.bot.send_message(target_id, f"DM from @{user.username}: {body}")
-                        await context.bot.send_message(
-                            chat_id, f"✔️ Sent to @{target}",
-                            reply_to_message_id=msg.message_id
-                        )
+                        await bot.send_message(target_id, f"DM from @{user.username}: {body}")
+                        await bot.send_message(chat_id, f"✔️ Sent to @{target}",
+                                            reply_to_message_id=msg.message_id)
                     return
                 if cmd == "/gm" and len(parts) == 3:
                     grp, body = parts[1], parts[2]
-                    grp_id = _GREG.id_for(grp)
+                    grp_id    = _GREG.id_for(grp)
                     if not grp_id:
-                        await context.bot.send_message(
-                            chat_id, f"Group '{grp}' not found.",
-                            reply_to_message_id=msg.message_id
-                        )
+                        await bot.send_message(chat_id, f"Group '{grp}' not found.",
+                                            reply_to_message_id=msg.message_id)
                     else:
-                        await context.bot.send_message(grp_id, f"[Group DM] {body}")
-                        await context.bot.send_message(
-                            chat_id, f"✔️ Sent to group '{grp}'",
-                            reply_to_message_id=msg.message_id
-                        )
+                        await bot.send_message(grp_id, f"[Group DM] {body}")
+                        await bot.send_message(chat_id, f"✔️ Sent to group '{grp}'",
+                                            reply_to_message_id=msg.message_id)
                     return
 
+            # ── Decide whether to run inference ─────────────────────────────────
             wants_reply = False
             if text:
                 try:
@@ -843,23 +816,27 @@ def telegram_input(asm):
                 or wants_reply
                 or any(
                     ent.type == "mention"
-                    and msg.text[ent.offset:ent.offset+ent.length]
-                           .lstrip("@").lower() == bot_name
+                    and msg.text[ent.offset:ent.offset+ent.length].lstrip("@").lower() == bot_name
                     for ent in (msg.entities or [])
                 )
-                or (msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id)
+                or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
             )
             if not do_infer:
                 return
 
-            sender    = user.username or user.first_name
-            user_text = f"{sender}: {text}"
+            sender = user.username or user.first_name
+            if image_paths:
+                img_list = ", ".join(image_paths)
+                user_text = f"{sender} sent image(s): {img_list}"
+            else:
+                user_text = f"{sender}: {text}"
+
             trigger_id = msg.message_id
-            key = (chat_id, user.id)
-            queue = _pending.setdefault(key, asyncio.Queue())
+            key        = (chat_id, user.id)
+            queue      = _pending.setdefault(key, asyncio.Queue())
 
             if (prev := running.get(key)) and not prev.done():
-                await context.bot.send_message(
+                await bot.send_message(
                     chat_id,
                     "⚠️ I’m still working on your previous request—I’ll handle this one next.",
                     reply_to_message_id=trigger_id
@@ -867,67 +844,55 @@ def telegram_input(asm):
                 await queue.put((user_text, trigger_id))
                 return
 
+            # ── Runner that stages “processing…” then delivers text+voice ─────────
             async def start_runner(request_text: str, reply_to_id: int):
-                # ── Load debug flag ─────────────────────────────────────────
+                # Load debug flag
                 try:
-                    with open("config.json", "r") as _f:
+                    with open("config.json","r") as _f:
                         _cfg = json.load(_f)
                 except FileNotFoundError:
                     _cfg = {}
                 debug_enabled = _cfg.get("debug", False)
 
-                placeholder_id: Optional[int] = None
-                typing_task: Optional[asyncio.Task] = None
+                placeholder_id = None
+                typing_task    = None
 
                 if debug_enabled:
-                    # live “processing…” placeholder + staged edits
-                    placeholder = await context.bot.send_message(
+                    placeholder = await bot.send_message(
                         chat_id=chat_id,
-                        text=f"🛠️ Processing...",
+                        text="🛠️ Processing…",
                         reply_to_message_id=reply_to_id
                     )
                     placeholder_id = placeholder.message_id
-                    status_cb, stop_status = _make_status_cb(
-                        loop, context.bot, chat_id, placeholder_id
-                    )
+                    status_cb, stop_status = _make_status_cb(loop, bot, chat_id, placeholder_id)
                 else:
-                    # fallback: send typing actions until done
-                    status_cb = lambda *args, **kwargs: None
+                    status_cb   = lambda *a, **k: None
                     stop_status = lambda: None
-
                     async def _typing_loop():
                         try:
                             while True:
-                                await context.bot.send_chat_action(
-                                    chat_id=chat_id,
-                                    action=ChatAction.TYPING
-                                )
+                                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
                                 await asyncio.sleep(4)
                         except asyncio.CancelledError:
                             return
-
                     typing_task = loop.create_task(_typing_loop())
 
                 async def runner():
                     nonlocal placeholder_id, typing_task
                     try:
-                        # clear any previous audio tasks
+                        # clear any queued audio
                         for qobj in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
                             while True:
-                                try:
-                                    qobj.get_nowait()
-                                except _queue.Empty:
-                                    break
+                                try: qobj.get_nowait()
+                                except _queue.Empty: break
 
                         chat_asm.tts.set_mode("file")
                         try:
                             final = await asyncio.to_thread(
-                                chat_asm.run_with_meta_context,
-                                request_text,
-                                status_cb
+                                chat_asm.run_with_meta_context, request_text, status_cb
                             )
                         except Exception:
-                            logger.exception("run_with_meta_context failed, swallowing")
+                            logger.exception("run_with_meta_context failed")
                             final = ""
                         finally:
                             stop_status()
@@ -935,55 +900,42 @@ def telegram_input(asm):
                                 typing_task.cancel()
 
                         if not final.strip():
-                            # nothing generated; clean up placeholder if any
                             if placeholder_id:
                                 try:
-                                    await context.bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                                except:
-                                    pass
+                                    await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                except: pass
                             return
 
-                        # deliver final text
+                        # deliver text
                         if debug_enabled:
-                            # replace the placeholder
                             if len(final) < 4000:
-                                sent = await context.bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=placeholder_id,
-                                    text=final
+                                sent = await bot.edit_message_text(
+                                    chat_id=chat_id, message_id=placeholder_id, text=final
                                 )
                             else:
-                                # delete old and chunk
-                                await context.bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                                await _send_long_text_async(context.bot, chat_id, final, reply_to=reply_to_id)
+                                await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
                         else:
-                            # always send a fresh message
                             if len(final) < 4000:
-                                sent = await context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=final,
-                                    reply_to_message_id=reply_to_id
+                                sent = await bot.send_message(
+                                    chat_id=chat_id, text=final, reply_to_message_id=reply_to_id
                                 )
                             else:
-                                await _send_long_text_async(context.bot, chat_id, final, reply_to=reply_to_id)
+                                await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
 
-                        # pin/unpin if we have a single 'sent'
+                        # pin/unpin
                         if 'sent' in locals():
                             try:
-                                await context.bot.pin_chat_message(
-                                    chat_id=chat_id,
-                                    message_id=sent.message_id,
-                                    disable_notification=True
+                                await bot.pin_chat_message(
+                                    chat_id=chat_id, message_id=sent.message_id, disable_notification=True
                                 )
-                                asyncio.create_task(_delayed_unpin(context.bot, chat_id, sent.message_id))
-                            except:
-                                pass
+                                asyncio.create_task(_delayed_unpin(bot, chat_id, sent.message_id))
+                            except: pass
 
-                        # now send voice
+                        # deliver voice
                         chat_asm.tts.enqueue(final)
                         await asyncio.to_thread(chat_asm.tts._file_q.join)
-
-                        oggs: List[str] = []
+                        oggs = []
                         while True:
                             try:
                                 p = chat_asm.tts._ogg_q.get_nowait()
@@ -995,47 +947,47 @@ def telegram_input(asm):
                         if oggs:
                             if len(oggs) == 1:
                                 with open(oggs[0], "rb") as vf:
-                                    await context.bot.send_voice(chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id)
+                                    await bot.send_voice(chat_id, vf, reply_to_message_id=reply_to_id)
                             else:
                                 combined = os.path.join(tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg")
                                 ins = sum([["-i", p] for p in oggs], [])
                                 streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
                                 filt = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
                                 subprocess.run(
-                                    ["ffmpeg", "-y", "-loglevel", "error", *ins, "-filter_complex", filt,
-                                     "-c:a", "libopus", "-b:a", "48k", combined],
+                                    ["ffmpeg", "-y", "-loglevel", "error", *ins,
+                                    "-filter_complex", filt,
+                                    "-c:a", "libopus", "-b:a", "48k", combined],
                                     check=True
                                 )
                                 with open(combined, "rb") as vf:
-                                    await context.bot.send_voice(chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id)
+                                    await bot.send_voice(chat_id, vf, reply_to_message_id=reply_to_id)
 
                     except asyncio.CancelledError:
-                        # if runner is cancelled, clean up placeholder
                         if placeholder_id:
                             try:
-                                await context.bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=placeholder_id,
+                                await bot.edit_message_text(
+                                    chat_id=chat_id, message_id=placeholder_id,
                                     text="⚠️ Previous request cancelled."
                                 )
-                            except:
-                                pass
+                            except: pass
+
                     except Exception:
-                        logger.exception("Unexpected error in Telegram runner; swallowing")
+                        logger.exception("Unexpected error in Telegram runner")
+
                     finally:
-                        running.pop((chat_id, context.bot.id), None)
-                        # process any queued requests
+                        running.pop((chat_id, bot.id), None)
+                        # drain queue
                         try:
-                            nxt, nxt_id = _pending[(chat_id, context.bot.id)].get_nowait()
+                            nxt, nxt_id = _pending[(chat_id, bot.id)].get_nowait()
                         except:
                             return
                         await start_runner(nxt, nxt_id)
 
-                running[(chat_id, context.bot.id)] = loop.create_task(runner())
-            
+                running[(chat_id, bot.id)] = loop.create_task(runner())
 
-
+            # ── Kick off first run ─────────────────────────────────────────────
             await start_runner(user_text, trigger_id)
+
 
         running: dict[tuple[int,int], asyncio.Task] = {}
         app.add_handler(
