@@ -661,29 +661,100 @@ def telegram_input(asm):
                 assemblers[chat_id] = chat_asm
             chat_asm._chat_contexts.add(chat_id)
 
-            tags = ["telegram_update", kind]
-            tags.append("group" if chat_type in ("group","supergroup") else "private")
+            # build tags
+            tags = [
+                "telegram_update",
+                kind,
+                "group" if chat_type in ("group","supergroup") else "private",
+                f"user:{user.username or user.id}"
+            ]
+            if msg.reply_to_message:
+                tags.append("reply")
+
+            # build metadata
+            metadata = {
+                "chat_id": chat_id,
+                "from_user_id": user.id,
+                "from_username": user.username,
+                "message_id": msg.message_id,
+                "text": msg.text or msg.caption or "",
+            }
+            if msg.reply_to_message:
+                metadata["reply_to_message_id"] = msg.reply_to_message.message_id
+
+            # create the segment
             seg = ContextObject.make_segment(
                 semantic_label=f"tg_{kind}",
                 content_refs=[],
                 tags=tags,
-                metadata={"data": data, "telegram_message_id": msg.message_id}
+                metadata=metadata
             )
-            seg.summary = str(data)
+            seg.summary  = metadata["text"]
             seg.stage_id = "telegram_update"
             seg.touch()
 
+            # if this is a reply, link back to the original ContextObject
             if msg.reply_to_message:
                 orig = next(
+                    (
+                        c for c in chat_asm.repo.query(
+                            lambda c: c.metadata.get("message_id")
+                                      == msg.reply_to_message.message_id
+                        )
+                    ),
+                    None
+                )
+                if orig:
+                    seg.references.append(orig.context_id)
+
+            # save into the repo
+            chat_asm.repo.save(seg)
+
+
+            # ─── enrich for replies ─────────────────────────────────────
+            if msg.reply_to_message:
+                orig_msg = msg.reply_to_message
+                # resolve original sender
+                orig_user = (
+                    f"@{orig_msg.from_user.username}"
+                    if orig_msg.from_user and orig_msg.from_user.username
+                    else orig_msg.from_user.full_name
+                )
+                # add reply tags & metadata
+                seg.tags.extend([
+                    f"reply_to_user:{orig_user}",
+                    f"reply_to_msg:{orig_msg.message_id}"
+                ])
+                seg.metadata.update({
+                    "reply_to_user":      orig_user,
+                    "reply_to_msg_id":    orig_msg.message_id
+                })
+                # updated summary
+                sender = user.username or user.first_name
+                seg.summary = (
+                    f"{sender} replied to {orig_user} "
+                    f"(msg {orig_msg.message_id}): {data}"
+                )
+            else:
+                # no reply → just the raw text/data
+                seg.summary = str(data)
+
+            seg.stage_id = "telegram_update"
+            seg.touch()
+
+            # ─── reference the original ContextObject if we have it ───
+            if msg.reply_to_message:
+                orig_ctx = next(
                     (c for c in chat_asm.repo.query(
                         lambda c: c.metadata.get("telegram_message_id")
                                   == msg.reply_to_message.message_id
                     )),
                     None
                 )
-                if orig:
-                    seg.references.append(orig.context_id)
+                if orig_ctx:
+                    seg.references.append(orig_ctx.context_id)
 
+            # ─── finally, persist ───────────────────────────────────────
             chat_asm.repo.save(seg)
 
             text = (msg.text or "").strip()
@@ -718,7 +789,7 @@ def telegram_input(asm):
                     users = _REG.list_all()
                     await context.bot.send_message(
                         chat_id,
-                        "\n".join(f"@{u['username']}: {u['id']}" for u in users) or "(none)"
+                        "\n".join(f"@{u['username']} Said: {u['id']}" for u in users) or "(none)"
                     )
                     return
                 if cmd == "/list_groups":
