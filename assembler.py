@@ -30,28 +30,6 @@ from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
 import re, base64, requests
 
-def _extract_image_b64(self, text: str) -> list[str]:
-    """
-    Find any local paths or HTTP(S) URLs ending in an image extension,
-    load/​download them, base64-encode, and return the list.
-    """
-    pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
-    matches = re.findall(pattern, text, flags=re.IGNORECASE)
-    imgs: list[str] = []
-    for loc in matches:
-        try:
-            if loc.lower().startswith(("http://", "https://")):
-                resp = requests.get(loc, timeout=5)
-                resp.raise_for_status()
-                data = resp.content
-            else:
-                with open(loc, "rb") as f:
-                    data = f.read()
-            imgs.append(base64.b64encode(data).decode("utf-8"))
-        except Exception:
-            # skip unreadable or unreachable
-            continue
-    return imgs
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _canon(call: str) -> str:
@@ -976,38 +954,61 @@ class Assembler:
         block += "# ——— USER QUESTION ———\n" + user_parts[-1]   # keep only newest
         block += "<end_of_turn>\n<start_of_turn>model\n"
         return block
+        
 
+    def _extract_image_b64(self, text: str) -> list[str]:
+        """
+        Find any local filepaths or HTTP(S) URLs ending in .jpg/.png/etc.
+        Read/fetch & base64-encode them.
+        """
+        pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+        imgs_b64: list[str] = []
+        for loc in re.findall(pattern, text, flags=re.IGNORECASE):
+            try:
+                if loc.lower().startswith(("http://", "https://")):
+                    resp = requests.get(loc, timeout=5)
+                    resp.raise_for_status()
+                    data = resp.content
+                else:
+                    with open(loc, "rb") as f:
+                        data = f.read()
+                imgs_b64.append(base64.b64encode(data).decode("utf-8"))
+            except Exception:
+                # if fetch/read fails, skip
+                continue
+        return imgs_b64
+    
     def _stream_and_capture(
         self,
         model: str,
         messages: list[dict[str, str]],
+        *,
         tag: str = ""
     ) -> str:
         """
-        Stream a response while auto-converting to Gemma-3 format when
-        the model name starts with ``gemma3``.  Also detects any local
-        or HTTP(S) image paths in the last user message, base64-encodes
-        them, and passes them via `images=[...]` into the Ollama API.
+        Stream a response, auto-Gemma-3 formatting, and if the last user
+        message contains image paths or URLs, base64-encode & pass them
+        via `images=[…]` into Ollama.
         """
-        # — format swap for Gemma-3 —————————————————————
+        # ——— gemma-3 formatting —————————————————————
         if model.lower().startswith("gemma3"):
             prompt = self._gemma_format(messages)
             messages = [{"role": "user", "content": prompt}]
 
-        # — detect & encode any images in the last user message ————————
-        last_content = messages[-1]["content"]
-        imgs = self._extract_image_b64(last_content)  # uses your helper
+        # ——— extract any images from the last user message ———
+        last_msg = messages[-1]["content"]
+        imgs     = self._extract_image_b64(last_msg)
 
-        # — build chat kwargs ———————————————————————————————
+        # ——— build chat kwargs ————————————————————————
         chat_kwargs: dict[str, Any] = {
-            "model": model,
+            "model":    model,
             "messages": messages,
-            "stream": True,
+            "stream":   True,
         }
         if imgs:
             chat_kwargs["images"] = imgs
 
-        # — normal streaming ————————————————————————————————
+        # ——— stream & accumulate ——————————————————————
         out = ""
         print(f"{tag} ", end="", flush=True)
         for part in chat(**chat_kwargs):
