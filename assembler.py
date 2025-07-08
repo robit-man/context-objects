@@ -1010,6 +1010,24 @@ class Assembler:
 
         return imgs_b64
     
+    def _b64_from_paths(self, paths: List[str], *, max_bytes: int = 8 * 1024 * 1024) -> List[str]:
+        """
+        Given absolute file paths, load and base-64-encode each image
+        (skipping any > max_bytes).  Returns the unique, ordered list.
+        """
+        import base64, os
+        out, seen = [], set()
+        for p in paths:
+            try:
+                if p in seen or not os.path.isfile(p) or os.path.getsize(p) > max_bytes:
+                    continue
+                with open(p, "rb") as fh:
+                    out.append(base64.b64encode(fh.read()).decode("ascii"))
+                    seen.add(p)
+            except Exception:
+                continue
+        return out
+        
     def _stream_and_capture(
         self,
         model: str,
@@ -1019,30 +1037,41 @@ class Assembler:
         max_image_bytes: int = 8 * 1024 * 1024,
     ) -> str:
         """
-        Streams a response from Ollama, automatically inlining any images
-        referenced in the *last* user message.
+        Streams a response from Ollama.
 
-        • Gemma-3 prompts are re-formatted automatically.
-        • Images are passed as base-64 strings when present.
+        ‣  Automatically inlines **all** image references found in:
+            • the *last* user message   (URLs or file paths)
+            • *any* earlier message lines that look like file paths
+        ‣  Additionally, if a message line exactly matches a previously
+        stored absolute path in the repo (“context recalls”), that file
+        is loaded and injected too.
         """
-        # ── Gemma-3 special-case ───────────────────────────────────────────
-        if model.lower().startswith("gemma3"):
-            prompt   = self._gemma_format(messages)
-            messages = [{"role": "user", "content": prompt}]
+        import re, base64, os, itertools
 
-        # ── Discover & encode images ───────────────────────────────────────
-        last_msg  = messages[-1]["content"]
-        imgs_b64  = self._extract_image_b64(last_msg, max_bytes=max_image_bytes)
+        # ── 1) collect candidate paths from every message line ──────────────
+        path_pat = re.compile(
+            r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\.(?:jpg|jpeg|png|bmp|gif|webp))",
+            re.IGNORECASE,
+        )
+        all_paths = []
+        for m in messages:
+            all_paths.extend(path_pat.findall(m["content"]))
 
-        chat_kwargs: dict[str, Any] = {
-            "model":    model,
-            "messages": messages,
-            "stream":   True,
-        }
-        if imgs_b64:
+        # dedupe while preserving order
+        all_paths = list(dict.fromkeys(all_paths))
+
+        # ── 2) turn those paths into base-64 strings ────────────────────────
+        imgs_b64 = self._b64_from_paths(all_paths, max_bytes=max_image_bytes)
+
+        # ── 3) ALSO include URLs/paths in the last user turn as before ──────
+        extra = self._extract_image_b64(messages[-1]["content"], max_bytes=max_image_bytes)
+        imgs_b64.extend(x for x in extra if x not in imgs_b64)
+
+        # ── 4) construct chat kwargs and stream ─────────────────────────────
+        chat_kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+        if imgs_b64:                                  # only send if we have any
             chat_kwargs["images"] = imgs_b64
 
-        # ── Stream & collect output ────────────────────────────────────────
         out_parts: list[str] = []
         print(f"{tag} ", end="", flush=True)
         for part in chat(**chat_kwargs):
@@ -1050,9 +1079,7 @@ class Assembler:
             print(chunk, end="", flush=True)
             out_parts.append(chunk)
         print()
-
         return "".join(out_parts)
-
 
 
 

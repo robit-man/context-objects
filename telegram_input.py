@@ -588,12 +588,13 @@ def telegram_input(asm):
 
     if Assembler:
         async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            import json
-            import tempfile
-            import subprocess
-            import os
-            import asyncio
-            import uuid
+            """
+            Unified handler for text, voice, photo, document, etc.
+            • Saves incoming photos to CAPTURE_DIR
+            • Creates a ContextObject segment for every message
+            • Queues the request into the per-chat Assembler runner
+            """
+            import json, tempfile, subprocess, os, asyncio, uuid
             from datetime import datetime
             from telegram.constants import ChatAction
             from context import ContextObject
@@ -601,12 +602,12 @@ def telegram_input(asm):
             from user_registry import _REG
             from group_registry import _GREG
 
+            bot       = context.bot
             chat_id   = update.effective_chat.id
             chat_type = update.effective_chat.type
-            bot       = context.bot
             bot_name  = bot.username.lower()
 
-            # ── Load config ───────────────────────────────────────────────────────
+            # ── Config flags ──────────────────────────────────────────────────
             try:
                 with open("config.json", "r") as f:
                     cfg = json.load(f)
@@ -615,11 +616,10 @@ def telegram_input(asm):
             group_only    = cfg.get("group_only", False)
             allow_private = cfg.get("allow_private", True)
 
-            # ── Enforce “group only” / DM enable/disable ──────────────────────────
             if chat_type == "private" and (group_only or not allow_private):
                 return
 
-            # ── Extract the actual Telegram message ───────────────────────────────
+            # ── Extract the Telegram message object ───────────────────────────
             msg = (
                 update.message
                 or update.edited_message
@@ -629,34 +629,30 @@ def telegram_input(asm):
             if not msg:
                 return
 
-            # ── Determine kind & raw data ────────────────────────────────────────
+            # ── Identify “kind” and pull raw content / files ──────────────────
             kind, data = "other", None
+            image_paths: list[str] = []
+
             if msg.text:
                 kind, data = "text", msg.text
-            elif msg.photo:
-                kind = "photo"
-                image_paths: List[str] = []
 
+            elif msg.photo:                                  # <── PHOTOS
+                kind = "photo"
                 for p in msg.photo:
                     file = await bot.get_file(p.file_id)
                     local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
                     await file.download_to_drive(str(local_path))
                     image_paths.append(str(local_path.resolve()))
-
-                # show a neutral placeholder in the chat history
                 data = f"{len(image_paths)} image(s)"
-
-
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
                 kind = "photo"
-                image_paths = []
                 file = await bot.get_file(msg.document.file_id)
-                ext = msg.document.mime_type.split("/")[-1]
+                ext  = msg.document.mime_type.split("/")[-1]
                 local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.{ext}"
                 await file.download_to_drive(str(local_path))
                 image_paths.append(str(local_path.resolve()))
-                data = f"{len(image_paths)} image(s)"
+                data = "1 image"
 
             elif msg.document:
                 kind, data = "document", msg.document.file_id
@@ -667,39 +663,23 @@ def telegram_input(asm):
             elif msg.video:
                 kind, data = "video", msg.video.file_id
             elif msg.location:
-                loc = msg.location
-                kind, data = "location", f"{loc.latitude},{loc.longitude}"
+                loc  = msg.location
+                kind = "location"
+                data = f"{loc.latitude},{loc.longitude}"
             elif msg.poll:
                 kind, data = "poll", msg.poll.question
-            else:
-                kind, data = "other", repr(msg.to_dict())
-            
-            image_paths: List[str] = []
-            if kind == "photo":
-                for p in msg.photo:
-                    file = await bot.get_file(p.file_id)
-                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
-                    await file.download_to_drive(str(local_path))
-                    image_paths.append(str(local_path.resolve()))
-                data = f"{len(image_paths)} image(s)"
 
-
+            # ── Timestamp & logging ───────────────────────────────────────────
             now = datetime.utcnow().isoformat() + "Z"
-            logger.info(f"[{now}] Incoming update — chat_id={chat_id} kind={kind} data={data!r}")
+            logger.info(
+                f"[{now}] Incoming update — chat_id={chat_id} kind={kind} data={data!r}"
+            )
 
-            # ── Register user & group ────────────────────────────────────────────
-            user = update.effective_user
-            if user and user.username:
-                _REG.add(user.username, user.id)
-            if chat_type in ("group", "supergroup", "channel"):
-                title = update.effective_chat.title or f"chat_{chat_id}"
-                _GREG.add(title, chat_id)
-
-            # ── Lazy‐init per‐chat Assembler ──────────────────────────────────────
+            # ── Lazy-init per-chat Assembler & utilities ──────────────────────
             chat_asm = assemblers.get(chat_id)
             if chat_asm is None:
                 repo = make_per_chat_repo(chat_id)
-                tts = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
+                tts  = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
                 tts.set_mode("file")
                 chat_asm = Assembler(
                     context_path=f"context_{chat_id}.jsonl",
@@ -712,12 +692,20 @@ def telegram_input(asm):
                 assemblers[chat_id] = chat_asm
             chat_asm._chat_contexts.add(chat_id)
 
-            # ── Build tags & metadata for this segment ───────────────────────────
+            # ── User & group registries ───────────────────────────────────────
+            user = update.effective_user
+            if user and user.username:
+                _REG.add(user.username, user.id)
+            if chat_type in ("group", "supergroup", "channel"):
+                title = update.effective_chat.title or f"chat_{chat_id}"
+                _GREG.add(title, chat_id)
+
+            # ── Build tags & *define metadata up-front* ───────────────────────
             tags = [
                 "telegram_update",
                 kind,
-                "group" if chat_type in ("group","supergroup") else "private",
-                f"user:{user.username or user.id}"
+                "group" if chat_type in ("group", "supergroup") else "private",
+                f"user:{user.username or user.id}",
             ]
             if msg.reply_to_message:
                 tags.append("reply")
@@ -732,144 +720,102 @@ def telegram_input(asm):
                 "text":          msg.text or msg.caption or "",
             }
 
-            # if we just downloaded images, attach their absolute disk paths
-            if kind == "photo":
-                metadata["image_paths"] = image_paths  # for downstream use only
+            # ── If we have photos, store paths & notify user ──────────────────
+            if image_paths:
+                metadata["image_paths"] = image_paths
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "✅ Saved image(s) to disk:\n"
+                        + "\n".join(f"- `{p}`" for p in image_paths)
+                        + "\n\nYou can now run `/analyze_image <path>` to inspect any of these."
+                    ),
+                    reply_to_message_id=msg.message_id,
+                    parse_mode="Markdown",
+                )
 
-            # Preserve reply-link metadata
             if msg.reply_to_message:
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
                 if msg.reply_to_message.from_user.id == bot.id:
                     metadata["in_reply_to_bot_message_id"] = msg.reply_to_message.message_id
 
-
-            # ── Create & save the ContextObject segment ──────────────────────────
+            # ── Create & save ContextObject segment ───────────────────────────
             seg = ContextObject.make_segment(
                 semantic_label=f"tg_{kind}",
                 content_refs=[],
                 tags=tags,
-                metadata=metadata
+                metadata=metadata,
             )
             seg.summary  = metadata["text"]
             seg.stage_id = "telegram_update"
             seg.touch()
-
-            # ── Link replies back to the original ContextObject ────────────────
-            if msg.reply_to_message:
-                orig = next(
-                    (c for c in chat_asm.repo.query(
-                        lambda c: c.metadata.get("message_id")
-                                == msg.reply_to_message.message_id
-                    )),
-                    None
-                )
-                if orig:
-                    seg.references.append(orig.context_id)
-
             chat_asm.repo.save(seg)
 
-            # ── If voice note, download & transcribe ────────────────────────────
+            # ── Voice-note transcription (Whisper) ────────────────────────────
             text = (msg.text or "").strip()
             if msg.voice and not text:
                 try:
                     raw_ogg = tempfile.mktemp(suffix=".oga")
-                    vf = await bot.get_file(msg.voice.file_id)
+                    vf      = await bot.get_file(msg.voice.file_id)
                     await vf.download_to_drive(raw_ogg)
-                    wav = raw_ogg + ".wav"
+                    wav     = raw_ogg + ".wav"
                     subprocess.run(
-                        ["ffmpeg","-y","-loglevel","error","-i",raw_ogg,"-ac","1","-ar","16000",wav],
-                        check=True
+                        ["ffmpeg", "-y", "-loglevel", "error", "-i", raw_ogg, "-ac", "1", "-ar", "16000", wav],
+                        check=True,
                     )
                     result = _WHISPER.transcribe(wav, language="en")
-                    text = result.get("text","").strip() or text
+                    text   = result.get("text", "").strip() or text
                 except Exception as ex:
-                    await bot.send_message(chat_id, f"❌ Voice note error: {ex}",
-                                        reply_to_message_id=msg.message_id)
+                    await bot.send_message(
+                        chat_id, f"❌ Voice note error: {ex}", reply_to_message_id=msg.message_id
+                    )
                 finally:
                     for p in (locals().get("raw_ogg"), locals().get("wav")):
                         if p and os.path.exists(p):
-                            try: os.unlink(p)
-                            except: pass
+                            try:
+                                os.unlink(p)
+                            except:
+                                pass
 
-            # ── Handle slash commands in private chats ───────────────────────────
-            if chat_type == "private" and text.startswith("/"):
-                parts = text.split(None, 2)
-                cmd   = parts[0].lower()
-                if cmd == "/list_users":
-                    users = _REG.list_all()
-                    await bot.send_message(
-                        chat_id,
-                        "\n".join(f"@{u['username']} ⟶ {u['id']}" for u in users) or "(none)"
-                    )
-                    return
-                if cmd == "/list_groups":
-                    groups = _GREG.list_all()
-                    await bot.send_message(
-                        chat_id,
-                        "\n".join(f"{g['name']} ⟶ {g['chat_id']}" for g in groups) or "(none)"
-                    )
-                    return
-                if cmd == "/dm" and len(parts) == 3:
-                    target, body = parts[1], parts[2]
-                    target_id    = _REG.id_for(target.lstrip("@").lower())
-                    if not target_id:
-                        await bot.send_message(chat_id, f"User @{target} not found.",
-                                            reply_to_message_id=msg.message_id)
-                    else:
-                        await bot.send_message(target_id, f"DM from @{user.username}: {body}")
-                        await bot.send_message(chat_id, f"✔️ Sent to @{target}",
-                                            reply_to_message_id=msg.message_id)
-                    return
-                if cmd == "/gm" and len(parts) == 3:
-                    grp, body = parts[1], parts[2]
-                    grp_id    = _GREG.id_for(grp)
-                    if not grp_id:
-                        await bot.send_message(chat_id, f"Group '{grp}' not found.",
-                                            reply_to_message_id=msg.message_id)
-                    else:
-                        await bot.send_message(grp_id, f"[Group DM] {body}")
-                        await bot.send_message(chat_id, f"✔️ Sent to group '{grp}'",
-                                            reply_to_message_id=msg.message_id)
-                    return
+            # ── Decide if we should respond / run inference ───────────────────
+            sender = user.username or user.first_name
+            if image_paths:
+                user_text = f"{sender} sent image(s): " + " ".join(image_paths)
+            else:
+                user_text = f"{sender}: {text}"
 
-            # ── Decide whether to run inference ─────────────────────────────────
+            trigger_id = msg.message_id
             wants_reply = False
             if text:
                 try:
                     wants_reply = await asyncio.to_thread(chat_asm.filter_callback, text)
                 except Exception:
                     wants_reply = False
-        
 
+            mention_me = any(
+                ent.type == "mention"
+                and msg.text[ent.offset : ent.offset + ent.length].lstrip("@").lower() == bot_name
+                for ent in (msg.entities or [])
+            )
             do_infer = (
                 chat_type == "private"
                 or msg.voice
                 or wants_reply
-                or any(
-                    ent.type == "mention"
-                    and msg.text[ent.offset:ent.offset+ent.length].lstrip("@").lower() == bot_name
-                    for ent in (msg.entities or [])
-                )
+                or mention_me
                 or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
             )
             if not do_infer:
                 return
 
-            sender = user.username or user.first_name
-            if image_paths:
-                user_text = f"{sender} sent {len(image_paths)} image(s)"
-            else:
-                user_text = f"{sender}: {text}"
-
-            trigger_id = msg.message_id
-            key        = (chat_id, user.id)
-            queue      = _pending.setdefault(key, asyncio.Queue())
+            # ── Queue / run the Assembler for this chat/user pair ─────────────
+            key   = (chat_id, user.id)
+            queue = _pending.setdefault(key, asyncio.Queue())
 
             if (prev := running.get(key)) and not prev.done():
                 await bot.send_message(
                     chat_id,
                     "⚠️ I’m still working on your previous request—I’ll handle this one next.",
-                    reply_to_message_id=trigger_id
+                    reply_to_message_id=trigger_id,
                 )
                 await queue.put((user_text, trigger_id))
                 return
