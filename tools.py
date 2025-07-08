@@ -2913,6 +2913,110 @@ class Tools:
         })
 
 
+    @staticmethod
+    def get_visual_input(
+        camera: int | str = 0,
+        *,
+        query: str | None = None,
+        model_tier: str = "primary",
+        temperature: float = 0.5
+    ) -> str:
+        """
+        get_visual_input
+        ----------------
+        If `camera` is a URL or one of the shorthand tags ("rs_color", etc.),
+        we will ask the LLM to describe that feed directly via its URL.
+        Otherwise, we fall back to capturing a frame (HTTP or cv2),
+        saving it under ./captures/visual_<TIMESTAMP>.jpg, and then describing that file.
+        """
+
+        import requests, cv2, os, json
+        from datetime import datetime
+
+        # normalize & detect explicit URL / shorthand
+        if isinstance(camera, str):
+            url = camera.strip()
+            # rs_* shorthands
+            if url in {"rs_color", "rs_depth", "rs_ir_left", "rs_ir_right"}:
+                url = f"http://127.0.0.1:8080/camera/{url}"
+            # if it looks like HTTP(S), describe it directly
+            if url.lower().startswith(("http://", "https://")):
+                prompt = (f"{query.strip() if query else 'Please describe this image.'}"
+                          f"\n\nImage URL: {url}\n\nPlease answer.")
+                return Tools.auxiliary_inference(
+                    prompt,
+                    temperature=temperature,
+                    model_tier=model_tier,
+                    system="You are a highly–skilled visual analyst."
+                )
+
+        # ── otherwise we still need to fetch & save a frame ───────────────────
+        def _fetch_http(u: str) -> bytes | None:
+            try:
+                r = requests.get(u, timeout=2); r.raise_for_status()
+                return r.content
+            except Exception as e:
+                log_message(f"[HTTP camera] {u} → {e}", "WARN")
+                return None
+
+        def _fetch_cv2(idx: int) -> bytes | None:
+            cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name=="nt" else 0)
+            if not cam.isOpened(): return None
+            ok, frame = cam.read(); cam.release()
+            if not ok: return None
+            _, buf = cv2.imencode(".jpg", frame)
+            return buf.tobytes()
+
+        tried: list[str] = []
+        raw_bytes = None
+
+        if isinstance(camera, int):
+            n = camera
+            patterns = [
+                f"http://127.0.0.1:8080/camera/default_{n}.jpeg",
+                f"http://127.0.0.1:8080/camera/default_{n}",
+            ]
+            for u in patterns:
+                tried.append(u)
+                raw_bytes = _fetch_http(u)
+                if raw_bytes:
+                    break
+            if raw_bytes is None:
+                raw_bytes = _fetch_cv2(n)
+        else:
+            # fallback if someone passed a non-http string that isn't rs_*
+            try:
+                # treat as URL anyway
+                raw_bytes = _fetch_http(str(camera))
+                tried.append(str(camera))
+            except:
+                raw_bytes = None
+
+        if raw_bytes is None:
+            log_message(f"No camera sources reachable. Tried: {tried}", "ERROR")
+            return json.dumps({"error": "Camera source not reachable."})
+
+        # persist to disk
+        cap_dir = os.path.join(os.path.dirname(__file__), "captures")
+        os.makedirs(cap_dir, exist_ok=True)
+        ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(cap_dir, f"visual_{ts}.jpg")
+        with open(path, "wb") as f:
+            f.write(raw_bytes)
+        log_message(f"Image saved → {path}", "SUCCESS")
+
+        # build prompt for saved file
+        prompt = f"{query.strip() if query else 'Please describe what you see in this image.'}"
+        prompt += f"\n\nImage path: {path}\n\nPlease answer."
+
+        return Tools.auxiliary_inference(
+            prompt,
+            temperature=temperature,
+            model_tier=model_tier,
+            system="You are a highly–skilled visual analyst."
+        )
+
+
     # This static method captures one frame from the default webcam using OpenCV, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the image.
     @staticmethod
     def capture_webcam_and_annotate(query: str=None):
@@ -3401,80 +3505,9 @@ class Tools:
         except Exception as e:
             log_message(f"auxiliary_inference error: {e}", "ERROR")
             return json.dumps({"error": str(e)})
+
+
         
-    @staticmethod
-    def get_visual_input(
-        camera: int | str = 0,
-        *,
-        query: str | None = None,
-        model_tier: str = "primary",
-        temperature: float = 0.5
-    ) -> str:
-        """
-        Capture or fetch a single image frame (via HTTP or cv2), hand raw bytes
-        to auxiliary_inference so the LLM can see it directly.
-        """
-        import requests, cv2, os, json
-        from datetime import datetime
-
-        def _fetch_http(u: str) -> bytes | None:
-            try:
-                r = requests.get(u, timeout=2); r.raise_for_status()
-                return r.content
-            except Exception as e:
-                log_message(f"[HTTP camera] {u} → {e}", "WARN")
-                return None
-
-        def _fetch_cv2(idx: int) -> bytes | None:
-            cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name=="nt" else 0)
-            if not cam.isOpened(): return None
-            ok, frame = cam.read(); cam.release()
-            if not ok: return None
-            _, buf = cv2.imencode(".jpg", frame)
-            return buf.tobytes()
-
-        # 1) Detect URL or shorthand
-        image_bytes: bytes | None = None
-        if isinstance(camera, str):
-            url = camera.strip()
-            # shorthand to HTTP
-            if url in {"rs_color","rs_depth","rs_ir_left","rs_ir_right"}:
-                url = f"http://127.0.0.1:8080/camera/{url}"
-            if url.lower().startswith(("http://","https://")):
-                image_bytes = _fetch_http(url)
-
-        # 2) If still none and camera is int, try HTTP then cv2
-        if image_bytes is None and isinstance(camera, int):
-            tried = []
-            for u in [
-                f"http://127.0.0.1:8080/camera/default_{camera}.jpeg",
-                f"http://127.0.0.1:8080/camera/default_{camera}"
-            ]:
-                tried.append(u)
-                image_bytes = _fetch_http(u)
-                if image_bytes: break
-            if image_bytes is None:
-                image_bytes = _fetch_cv2(camera)
-
-        # 3) If still none and camera was non-HTTP str, try HTTP anyway
-        if image_bytes is None and isinstance(camera, str):
-            image_bytes = _fetch_http(camera)
-
-        if image_bytes is None:
-            log_message("No camera source reachable.", "ERROR")
-            return json.dumps({"error":"Camera not reachable"})
-
-        # 4) Build a natural prompt
-        prompt = (query.strip() if query else "Please describe what you see in this image.")
-        # 5) Hand off raw bytes to auxiliary_inference
-        return Tools.auxiliary_inference(
-            prompt,
-            temperature=temperature,
-            model_tier=model_tier,
-            system="You are a highly–skilled visual analyst.",
-            images=[image_bytes]
-        )
-    
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
         """
