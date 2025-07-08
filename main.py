@@ -386,23 +386,41 @@ if updated:
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
     
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
-for model in (config.get("primary_model"), config.get("secondary_model"), config.get("decision_model")):
+import subprocess
+
+for model in (config.get("primary_model"),
+              config.get("secondary_model"),
+              config.get("decision_model")):
+
+    if not model:                      # config might return None / ""
+        continue
+
+    base_name = model.split(":", 1)[0]  # “llama3” from “llama3:8b”
+
     # try at most twice: original pull, then (if needed) pull after upgrade
     for attempt in range(2):
         try:
-            # Get the list of models already present
-            existing = subprocess.check_output(
+            # Current inventory
+            existing_raw = subprocess.check_output(
                 ["ollama", "list"],
                 stderr=subprocess.STDOUT,
                 text=True
             )
-            if model in existing:
+
+            # Build a set of base-names already present
+            present = {
+                ln.split()[0].split(":", 1)[0]          # first token, strip tag
+                for ln in existing_raw.splitlines() if ln.strip()
+            }
+
+            if base_name in present:
                 log_message(f"Ollama model '{model}' already present.", "INFO")
                 break
 
-            log_message(f"Model '{model}' not found locally—pulling with Ollama...", "PROCESS")
+            log_message(f"Model '{model}' not found locally — pulling with Ollama…",
+                        "PROCESS")
 
-            # Run the pull and capture output so we can inspect failures
+            # Pull the model
             result = subprocess.run(
                 ["ollama", "pull", model],
                 capture_output=True,
@@ -410,14 +428,15 @@ for model in (config.get("primary_model"), config.get("secondary_model"), config
             )
 
             if result.returncode == 0:
-                log_message(f"Successfully pulled Ollama model '{model}'.", "SUCCESS")
+                log_message(f"Successfully pulled Ollama model '{model}'.",
+                            "SUCCESS")
                 break  # done with this model
 
-            # ── Pull failed ────────────────────────────────────────────────
-            combined_out = (result.stdout or "") + (result.stderr or "")
+            # ── Pull failed ──────────────────────────────────────────────
+            combined = (result.stdout or "") + (result.stderr or "")
             needs_upgrade = (
-                "requires a newer version of Ollama" in combined_out
-                or "manifest: 412" in combined_out
+                "requires a newer version of Ollama" in combined
+                or "manifest: 412" in combined
             )
 
             if needs_upgrade and attempt == 0:
@@ -428,17 +447,19 @@ for model in (config.get("primary_model"), config.get("secondary_model"), config
                     )
                 except subprocess.CalledProcessError as up_err:
                     log_message(f"Failed to upgrade Ollama: {up_err}", "ERROR")
-                    break  # give up on this model
+                    break                     # give up on this model
                 else:
-                    log_message("Upgrade complete—retrying pull…", "INFO")
-                    continue  # retry pulling after upgrade
+                    log_message("Upgrade complete — retrying pull…", "INFO")
+                    continue                  # retry after upgrade
             else:
-                log_message(f"Error pulling model '{model}': {combined_out.strip()}", "WARNING")
-                break  # unrecoverable error; stop retrying
+                log_message(f"Error pulling model '{model}': {combined.strip()}",
+                            "WARNING")
+                break                         # unrecoverable; stop retrying
 
         except subprocess.CalledProcessError as e:
             log_message(f"Subprocess error with model '{model}': {e}", "WARNING")
             break
+
 
 
 # ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
