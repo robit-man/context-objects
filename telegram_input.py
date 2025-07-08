@@ -42,8 +42,8 @@ from group_registry import _GREG
 import whisper
 _WHISPER = whisper.load_model("base")  # load once
 
-CAPTURE_DIR = Path("captures")
-CAPTURE_DIR.mkdir(exist_ok=True)
+CAPTURE_DIR = Path(__file__).parent / "captures"
+CAPTURE_DIR.mkdir(exist_ok=True, parents=True)
 
 # basic logging
 logging.basicConfig(
@@ -635,15 +635,27 @@ def telegram_input(asm):
                 kind, data = "text", msg.text
             elif msg.photo:
                 kind = "photo"
-                # save each photo locally under captures/
-                image_paths: list[str] = []
-                for p in msg.photo:
-                    file = await bot.get_file(p.file_id)
-                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
-                    await file.download_to_drive(str(local_path))
-                    image_paths.append(str(local_path))
-                # downstream just sees “n image(s)”
+                image_paths: List[str] = []
+                if kind == "photo":
+                    for p in msg.photo:
+                        file = await bot.get_file(p.file_id)
+                        local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
+                        await file.download_to_drive(str(local_path))
+                        image_paths.append(str(local_path.resolve()))
+                    data = f"{len(image_paths)} image(s)"
+
+
+
+            elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
+                kind = "photo"
+                image_paths = []
+                file = await bot.get_file(msg.document.file_id)
+                ext = msg.document.mime_type.split("/")[-1]
+                local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.{ext}"
+                await file.download_to_drive(str(local_path))
+                image_paths.append(str(local_path.resolve()))
                 data = f"{len(image_paths)} image(s)"
+
             elif msg.document:
                 kind, data = "document", msg.document.file_id
             elif msg.sticker:
@@ -660,15 +672,15 @@ def telegram_input(asm):
             else:
                 kind, data = "other", repr(msg.to_dict())
             
-            image_paths: list[str] = []
+            image_paths: List[str] = []
             if kind == "photo":
                 for p in msg.photo:
                     file = await bot.get_file(p.file_id)
-                    local_path = tempfile.mktemp(suffix=".jpg")
-                    await file.download_to_drive(local_path)
-                    image_paths.append(local_path)
-                # let downstream see “n image(s)” instead of raw file_id
+                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
+                    await file.download_to_drive(str(local_path))
+                    image_paths.append(str(local_path.resolve()))
                 data = f"{len(image_paths)} image(s)"
+
 
             now = datetime.utcnow().isoformat() + "Z"
             logger.info(f"[{now}] Incoming update — chat_id={chat_id} kind={kind} data={data!r}")
@@ -717,9 +729,22 @@ def telegram_input(asm):
                 "message_id":    msg.message_id,
                 "text":          msg.text or msg.caption or "",
             }
-            # if we just downloaded images, include their disk paths
+
+            # if we just downloaded images, attach their absolute disk paths
             if kind == "photo":
                 metadata["image_paths"] = image_paths
+
+                # let the user know exactly where we stored them and point to analysis tools
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "✅ Saved image(s) to disk:\n"
+                        + "\n".join(f"- `{p}`" for p in image_paths)
+                        + "\n\nYou can now run `/analyze_image <path>` to analyze any of these."
+                    ),
+                    reply_to_message_id=msg.message_id,
+                    parse_mode="Markdown"
+                )
 
             if msg.reply_to_message:
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
@@ -822,6 +847,7 @@ def telegram_input(asm):
                     wants_reply = await asyncio.to_thread(chat_asm.filter_callback, text)
                 except Exception:
                     wants_reply = False
+        
 
             do_infer = (
                 chat_type == "private"
@@ -1004,7 +1030,14 @@ def telegram_input(asm):
 
         running: dict[tuple[int,int], asyncio.Task] = {}
         app.add_handler(
-            MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, _handle),
+            MessageHandler(
+                (filters.TEXT
+                | filters.VOICE
+                | filters.PHOTO
+                | filters.Document.ALL)
+                & ~filters.COMMAND,
+                _handle
+            ),
             group=1
         )
 
