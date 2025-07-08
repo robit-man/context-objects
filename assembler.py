@@ -28,6 +28,30 @@ from ollama import chat, embed
 from tools import TOOL_SCHEMAS
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
+import re, base64, requests
+
+def _extract_image_b64(self, text: str) -> list[str]:
+    """
+    Find any local paths or HTTP(S) URLs ending in an image extension,
+    load/​download them, base64-encode, and return the list.
+    """
+    pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+    imgs: list[str] = []
+    for loc in matches:
+        try:
+            if loc.lower().startswith(("http://", "https://")):
+                resp = requests.get(loc, timeout=5)
+                resp.raise_for_status()
+                data = resp.content
+            else:
+                with open(loc, "rb") as f:
+                    data = f.read()
+            imgs.append(base64.b64encode(data).decode("utf-8"))
+        except Exception:
+            # skip unreadable or unreachable
+            continue
+    return imgs
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _canon(call: str) -> str:
@@ -961,22 +985,38 @@ class Assembler:
     ) -> str:
         """
         Stream a response while auto-converting to Gemma-3 format when
-        the model name starts with ``gemma3``.
+        the model name starts with ``gemma3``.  Also detects any local
+        or HTTP(S) image paths in the last user message, base64-encodes
+        them, and passes them via `images=[...]` into the Ollama API.
         """
-        # — format swap for Gemma-3 ————————————————
+        # — format swap for Gemma-3 —————————————————————
         if model.lower().startswith("gemma3"):
-            prompt   = self._gemma_format(messages)
+            prompt = self._gemma_format(messages)
             messages = [{"role": "user", "content": prompt}]
 
-        # — normal streaming ————————————————————————
+        # — detect & encode any images in the last user message ————————
+        last_content = messages[-1]["content"]
+        imgs = self._extract_image_b64(last_content)  # uses your helper
+
+        # — build chat kwargs ———————————————————————————————
+        chat_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+        }
+        if imgs:
+            chat_kwargs["images"] = imgs
+
+        # — normal streaming ————————————————————————————————
         out = ""
         print(f"{tag} ", end="", flush=True)
-        for part in chat(model=model, messages=messages, stream=True):
+        for part in chat(**chat_kwargs):
             chunk = part["message"]["content"]
             print(chunk, end="", flush=True)
             out += chunk
         print()
         return out
+
 
 
     def _parse_task_tree(
