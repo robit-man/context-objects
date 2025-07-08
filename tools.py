@@ -2922,8 +2922,40 @@ class Tools:
         temperature: float = 0.5
     ) -> str:
         """
-        Grab one frame from a local webcam *or* an HTTP camera endpoint,
-        persist it, then ask an LLM to describe it.
+        get_visual_input
+        ----------------
+        Capture a single frame from either a local webcam **or** one of the
+        HTTP camera feeds on 127.0.0.1:8080, save it to
+        ./captures/visual_<UTC-timestamp>.jpg, then ask an LLM to describe what
+        the image shows.
+
+        Quick-start
+        -----------
+        Calling `Tools.get_visual_input()` with no arguments (or `camera=0`)
+        walks a fallback chain—default_0 → video/default_0 → cv2 webcam 0—
+        stopping at the **first source that returns a valid frame**.  
+        Treat it as a “first-available camera” helper when you don’t care which
+        device is online.
+
+        Parameters
+        ----------
+        camera : int 0–7 | str URL
+            • *int* N → tries  
+            http://127.0.0.1:8080/{camera|video}/default_N[.jpeg] then cv2 N.  
+            • *str* URL → fetch that URL directly.  
+            Shorthands: "rs_color", "rs_depth", "rs_ir_left", "rs_ir_right".
+        query : str | None
+            Extra question to append to the description prompt.
+        model_tier : {'primary','secondary','decision'}, default 'secondary'
+            LLM pipeline for the description; falls back to *primary* if missing.
+        temperature : float, default 0.5
+            Sampling temperature for the LLM call.
+
+        Returns
+        -------
+        str
+            Image description on success, else JSON string
+            {'error': '<reason>'}.
         """
 
         # --------------------------- helpers ---------------------------------
