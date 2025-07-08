@@ -636,14 +636,14 @@ def telegram_input(asm):
             if msg.text:
                 kind, data = "text", msg.text
 
-            elif msg.photo:                                  # <── PHOTOS
-                kind = "photo"
-                for p in msg.photo:
-                    file = await bot.get_file(p.file_id)
-                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
-                    await file.download_to_drive(str(local_path))
-                    image_paths.append(str(local_path.resolve()))
-                data = f"{len(image_paths)} image(s)"
+            elif msg.photo:
+                # only take the largest size
+                p = msg.photo[-1]
+                file = await bot.get_file(p.file_id)
+                b = await file.download_as_bytearray()
+                img_bytes = bytes(b)
+                metadata["image_bytes"] = [img_bytes]
+                data = f"{len(metadata['image_bytes'])} image(s)"
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
                 kind = "photo"
@@ -865,8 +865,10 @@ def telegram_input(asm):
                         chat_asm.tts.set_mode("file")
                         try:
                             final = await asyncio.to_thread(
-                                chat_asm.run_with_meta_context, request_text, status_cb
-                            )
+                            chat_asm.run_with_meta_context,
+                            request_text, status_cb,
+                            images=metadata.get("image_bytes")
+                        )
                         except Exception:
                             logger.exception("run_with_meta_context failed")
                             final = ""

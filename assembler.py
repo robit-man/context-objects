@@ -1033,8 +1033,10 @@ class Assembler:
         model: str,
         messages: list[dict[str, str]],
         *,
+        temperature: float = 0.7,
         tag: str = "",
         max_image_bytes: int = 8 * 1024 * 1024,
+        images: list[bytes] | None = None
     ) -> str:
         """
         Streams a response from Ollama.
@@ -1053,28 +1055,43 @@ class Assembler:
             r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\.(?:jpg|jpeg|png|bmp|gif|webp))",
             re.IGNORECASE,
         )
-        all_paths = []
-        for m in messages:
-            all_paths.extend(path_pat.findall(m["content"]))
+        # ── 1) gather any in-memory images first ─────────────────────────────
+        imgs_data: list[bytes] = images or []
 
-        # dedupe while preserving order
-        all_paths = list(dict.fromkeys(all_paths))
+        # ── 2) if none provided, scan for HTTP/absolute paths and load bytes ─
+        if not imgs_data:
+            all_paths: list[str] = []
+            for m in messages:
+                all_paths.extend(path_pat.findall(m["content"]))
+            # dedupe while preserving order
+            all_paths = list(dict.fromkeys(all_paths))
 
-        # ── 2) turn those paths into base-64 strings ────────────────────────
-        imgs_b64 = self._b64_from_paths(all_paths, max_bytes=max_image_bytes)
+            for loc in all_paths:
+                try:
+                    if loc.lower().startswith(("http://", "https://")):
+                        resp = requests.get(loc, timeout=5)
+                        resp.raise_for_status()
+                        imgs_data.append(resp.content)
+                    else:
+                        p = Path(loc).expanduser().resolve()
+                        if p.is_file() and p.stat().st_size <= max_image_bytes:
+                            imgs_data.append(p.read_bytes())
+                except Exception:
+                    continue
 
-        # ── 3) ALSO include URLs/paths in the last user turn as before ──────
-        extra = self._extract_image_b64(messages[-1]["content"], max_bytes=max_image_bytes)
-        imgs_b64.extend(x for x in extra if x not in imgs_b64)
+        # ── 3) inject raw bytes into the last user message dict ──────────────
+        if imgs_data:
+            messages[-1]["images"] = imgs_data
 
-        # ── 4) construct chat kwargs and stream ─────────────────────────────
-        chat_kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
-        if imgs_b64:                                  # only send if we have any
-            chat_kwargs["images"] = imgs_b64
-
+        # ── 4) stream via Ollama—no top-level images kwarg ───────────────────
         out_parts: list[str] = []
         print(f"{tag} ", end="", flush=True)
-        for part in chat(**chat_kwargs):
+        for part in chat(
+            model=model,
+            messages=messages,
+            stream=True,
+            temperature=temperature  # or pass via options if you prefer
+        ):
             chunk = part["message"]["content"]
             print(chunk, end="", flush=True)
             out_parts.append(chunk)
@@ -1673,6 +1690,7 @@ class Assembler:
         self,
         user_text: str,
         status_cb: Callable[[str, Any], None] = lambda *a: None,
+        images: list[bytes] | None = None
     ) -> str:
         from context import sanitize_jsonl
         from datetime import datetime
@@ -1692,6 +1710,7 @@ class Assembler:
             "errors":     [],
             "tool_ctxs":  [],
             "recent_ids": [],  # will be filled in Stage 3
+            "images":    images or [],
         }
         self._last_state = state
 
@@ -1754,7 +1773,7 @@ class Assembler:
             reply = ""
             for chunk in chat(
                 model=self.primary_model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": prompt, "images": state.get("images") or []}],
                 stream=True
             ):
                 reply_chunk = chunk["message"]["content"]

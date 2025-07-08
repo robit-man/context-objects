@@ -261,7 +261,7 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
         {"role": "user",   "content": user_text},
     ]
 
-    out = self._stream_and_capture(self.secondary_model, msgs, tag="[Clarifier]")
+    out = self._stream_and_capture(self.secondary_model, msgs, tag="[Clarifier]", images=state.get("images"))
     # retry once on JSON parse failure
     for attempt in (1, 2):
         try:
@@ -1381,7 +1381,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         {"role": "user",   "content": user_text},
     ]
     reply = self._stream_and_capture(
-        self.primary_model, msgs, tag="[Assistant]"
+        self.primary_model, msgs, tag="[Assistant]", images=state.get("images")
     ).strip()
 
     # ──────────────────────────────────────────────────────────────────────
