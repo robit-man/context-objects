@@ -607,6 +607,7 @@ def telegram_input(asm):
             chat_type = update.effective_chat.type
             bot_name  = bot.username.lower()
 
+            
             # ── Config flags ──────────────────────────────────────────────────
             try:
                 with open("config.json", "r") as f:
@@ -628,6 +629,18 @@ def telegram_input(asm):
             )
             if not msg:
                 return
+            ''
+            # ── Who sent it? ─────────────────────────────────────────────────
+            user = update.effective_user
+
+            # ── Now build metadata ────────────────────────────────────────────
+            metadata = {
+                "chat_id":       chat_id,
+                "from_user_id":  user.id,
+                "from_username": user.username,
+                "message_id":    msg.message_id,
+                "text":          msg.text or msg.caption or "",
+            }
 
             # ── Identify “kind” and pull raw content / files ──────────────────
             kind, data = "other", None
@@ -641,9 +654,11 @@ def telegram_input(asm):
                 p = msg.photo[-1]
                 file = await bot.get_file(p.file_id)
                 b = await file.download_as_bytearray()
-                img_bytes = bytes(b)
-                metadata["image_bytes"] = [img_bytes]
-                data = f"{len(metadata['image_bytes'])} image(s)"
+                # base64-encode so it’s JSON-safe
+                import base64
+                img_b64 = base64.b64encode(bytes(b)).decode("ascii")
+                metadata["image_b64"] = [img_b64]
+                data = f"{len(metadata['image_b64'])} image(s)"
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
                 kind = "photo"
@@ -712,13 +727,6 @@ def telegram_input(asm):
                 if msg.reply_to_message.from_user.id == bot.id:
                     tags.append("reply_to_bot")
 
-            metadata = {
-                "chat_id":       chat_id,
-                "from_user_id":  user.id,
-                "from_username": user.username,
-                "message_id":    msg.message_id,
-                "text":          msg.text or msg.caption or "",
-            }
 
             # ── If we have photos, store paths & notify user ──────────────────
             if image_paths:
@@ -867,7 +875,7 @@ def telegram_input(asm):
                             final = await asyncio.to_thread(
                             chat_asm.run_with_meta_context,
                             request_text, status_cb,
-                            images=metadata.get("image_bytes")
+                            images=metadata.get("image_b64")
                         )
                         except Exception:
                             logger.exception("run_with_meta_context failed")
