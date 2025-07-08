@@ -3444,8 +3444,13 @@ class Tools:
         context: object | None = None,
         model_tier: str | None = None
     ) -> str:
-        """(docstring omitted for brevity)"""
+        """
+        Invoke an LLM with a prompt, optional system/context, and configurable
+        *model tier*  (“primary”, “secondary”, or “decision”).
 
+        All existing behaviour is preserved; if `model_tier` is omitted or
+        unrecognised, we fall back to the primary model defined in config.
+        """
         # 1) choose model
         tier_map = {
             "primary":   config.get("primary_model"),
