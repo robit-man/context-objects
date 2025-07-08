@@ -2912,6 +2912,115 @@ class Tools:
             "prompt": f"Please describe what you see in the screenshot, considering this is a screenshot which is of the computer that you reside on, and activity on the screen may be critical to answering questions, be as verbose as possible and describe any text or images present at '{path}'."
         })
 
+
+    @staticmethod
+    def get_visual_input(
+        camera: int | str = 0,
+        *,
+        query: str | None = None,
+        model_tier: str = "secondary",
+        temperature: float = 0.5
+    ) -> str:
+        """
+        Grab one frame from **either** a local webcam **or** an HTTP camera
+        endpoint, persist it, then ask an LLM to describe it.
+
+        Args
+        ----
+        camera
+            • int 0-7  → fetch ``http://127.0.0.1:8080/camera/default_<N>.jpeg``  
+              (falls back to cv2 webcam index *N* if the URL is unreachable)  
+            • str URL → use the URL directly (must return JPEG/PNG bytes)
+        query
+            Extra natural-language question to append to the image-description
+            prompt.
+        model_tier
+            Which model pipeline to route through: ``"primary"``, ``"secondary"``
+            or ``"decision"``.  Defaults to the secondary/tool model.
+        temperature
+            Sampling temperature for the follow-up LLM description.
+
+        Returns
+        -------
+        The LLM’s textual description (string).  Errors are returned as JSON
+        ``{"error": "..."}`` strings so the caller can decide how to surface
+        them.
+        """
+
+        # ------------------------------------------------------------------
+        # 1) Resolve camera → bytes
+        # ------------------------------------------------------------------
+        def _fetch_http(url: str):
+            try:
+                r = requests.get(url, timeout=2)
+                r.raise_for_status()
+                return r.content
+            except Exception as e:
+                log_message(f"HTTP camera fetch failed for {url}: {e}", "WARN")
+                return None
+
+        def _fetch_cv2(idx: int):
+            cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == "nt" else 0)
+            if not cam.isOpened():
+                return None
+            ok, frame = cam.read()
+            cam.release()
+            if not ok:
+                return None
+            _, buf = cv2.imencode(".jpg", frame)
+            return buf.tobytes()
+
+        # decide strategy
+        raw_bytes = None
+        url_tried = None
+
+        if isinstance(camera, int):
+            url_tried = f"http://127.0.0.1:8080/camera/default_{camera}.jpeg"
+            raw_bytes = _fetch_http(url_tried)
+            if raw_bytes is None:                         # fallback → cv2
+                raw_bytes = _fetch_cv2(camera)
+        else:                                             # explicit URL
+            url_tried = str(camera)
+            raw_bytes = _fetch_http(url_tried)
+
+        if raw_bytes is None:
+            log_message("All camera sources unreachable.", "ERROR")
+            return json.dumps({"error": "Camera source not reachable."})
+
+        # ------------------------------------------------------------------
+        # 2) Persist frame
+        # ------------------------------------------------------------------
+        capture_dir = os.path.join(os.path.dirname(__file__), "captures")
+        os.makedirs(capture_dir, exist_ok=True)
+        ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(capture_dir, f"visual_{ts}.jpg")
+
+        try:
+            with open(path, "wb") as f:
+                f.write(raw_bytes)
+            log_message(f"Image saved to {path}", "SUCCESS")
+        except Exception as e:
+            log_message(f"Failed to save image: {e}", "ERROR")
+            return json.dumps({"error": str(e)})
+
+        # ------------------------------------------------------------------
+        # 3) Ask an LLM to describe it
+        # ------------------------------------------------------------------
+        q_prompt = (
+            "Describe, in rich detail, everything visible in the image "
+            f"located at: {path}."
+        )
+        if query:
+            q_prompt = f"{query.strip()}\n\nImage path: {path}\n\nPlease answer."
+
+        desc = Tools.auxiliary_inference(
+            q_prompt,
+            temperature=temperature,
+            model_tier=model_tier,
+            system="You are a highly–skilled visual analyst."
+        )
+        return desc
+
     # This static method captures one frame from the default webcam using OpenCV, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the image.
     @staticmethod
     def capture_webcam_and_annotate(query: str=None):
@@ -3315,77 +3424,60 @@ class Tools:
 
     # This static method invokes the secondary LLM (for tool processing) with a user prompt and an optional temperature. It streams tokens to the console as they arrive and returns the full assistant message content as a string.
     @staticmethod
-    def auxiliary_inference(prompt: str,*,temperature: float = 0.7,system: str | None = None,context: object | None = None,) -> str:
+    def auxiliary_inference(prompt: str, *, temperature: float = 0.7, system: str | None = None,
+                            context: object | None = None, model_tier: str = "secondary") -> str:
         """
-        Invoke the secondary LLM (for tool processing) with a user prompt,
-        optional temperature, and optional system instructions and context.
+        Invoke an LLM with streaming.
 
-        Streams tokens to the console as they arrive, and returns the full
-        assistant message content as a string.
+        Args
+        ----
+        prompt        : Main user question or instruction.
+        temperature   : Sampling temperature for the LLM.
+        system        : Optional system-level instruction inserted *before* context & prompt.
+        context       : Any object whose string form should be injected *before* the prompt.
+        model_tier    : Which configured model to hit:
+                        • "primary"   → cfg["primary_model"]
+                        • "secondary" → cfg["secondary_model"] (fallback → primary)
+                        • "decision"  → cfg["decision_model"]  (fallback → secondary)
 
-        Args:
-            prompt: The main user question or instruction.
-            temperature: Sampling temperature for the LLM.
-            system:    Optional system-level instruction to inject *before*
-                       context and prompt.
-            context:   Optional contextual data (any type) that will be
-                       stringified and injected *before* the prompt.
-
-        Usage:
-            ```python
-            # simple use:
-            auxiliary_inference("Summarize X for me")
-
-            # with extra system instructions and context:
-            auxiliary_inference(
-                prompt="What’s the bug here?",
-                system="You are a seasoned Python debugger.",
-                context=source_code_str
-            )
-            ```
+        Returns
+        -------
+        The assistant’s response text, or a JSON ``{"error": …}`` string on failure.
         """
-        model_selected = config.get("primary_model")
-        # build message list in the required order
+
+        tier_map = {
+            "primary":   config.get("primary_model"),
+            "secondary": config.get("secondary_model", config.get("primary_model")),
+            "decision":  config.get("decision_model",  config.get("secondary_model")),
+        }
+        model_selected = tier_map.get(model_tier.lower(), tier_map["secondary"])
+
+        # build messages
         messages: list[dict[str, str]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
         if context is not None:
-            # stringify any type of context
             messages.append({"role": "system", "content": str(context)})
-        # finally the user prompt
         messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": model_selected,
-            "temperature": temperature,
-            "messages": messages,
-            "stream": True
-        }
 
         try:
             log_message(
-                f"Calling secondary agent tool (streaming) "
-                f"with prompt={prompt!r}, temperature={temperature}, "
-                f"system={system!r}, context={'<provided>' if context is not None else None}",
-                "PROCESS"
+                f"auxiliary_inference(streaming) model={model_selected}, tier={model_tier}, "
+                f"temp={temperature}", "PROCESS"
             )
             content = ""
-            print("⟳ Secondary Agent Tool Stream:", end="", flush=True)
-            for part in chat(
-                model=model_selected,
-                messages=messages,
-                stream=True
-            ):
+            print("⟳ LLM-stream:", end="", flush=True)
+            for part in chat(model=model_selected, messages=messages, stream=True):
                 tok = part["message"]["content"]
                 content += tok
                 print(tok, end="", flush=True)
-            print()  # newline after stream finishes
-            log_message("Secondary agent tool stream complete.", "SUCCESS")
+            print()          # newline after stream finishes
+            log_message("auxiliary_inference stream complete", "SUCCESS")
             return content
 
         except Exception as e:
-            log_message(f"Error in secondary agent tool: {e}", "ERROR")
-            return f"Error in secondary agent: {e}"
+            log_message(f"auxiliary_inference error: {e}", "ERROR")
+            return json.dumps({"error": str(e)})
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:

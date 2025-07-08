@@ -3,24 +3,31 @@
 assembler.py — Stage-driven pipeline with full observability and
 dynamic, chronological context windows per stage.
 """
-import ast, json, re
+import ast
 import inspect
 import json
+import math
 import numpy as np
-import os, json, random, math, textwrap
+import os
+import random
 import re
+
 import stages
 
-from context import ContextObject, ContextRepository, HybridContextRepository, MemoryManager, default_clock
+from copy import deepcopy
+from context import (
+    ContextObject,
+    ContextRepository,
+    HybridContextRepository,
+    MemoryManager,
+    default_clock,
+)
 from dataclasses import dataclass, field
 from functools import lru_cache
 from ollama import chat, embed
 from tools import TOOL_SCHEMAS
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
-from typing import Any, Dict, List, Tuple
-from context import sanitize_jsonl
-from datetime import datetime
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _canon(call: str) -> str:
@@ -622,59 +629,88 @@ class Assembler:
 
     def _seed_tool_schemas(self) -> None:
         """
-        Guarantee exactly one ContextObject per tool in TOOL_SCHEMAS:
-         - INSERT if missing
-         - UPDATE if JSON differs
-         - DEDUPE extras
-        """
-        import json
+        Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
+        and clean out any obsolete schemas that are no longer defined.
 
-        # 1) Bucket existing schema rows by tool-name
-        buckets: Dict[str, List[ContextObject]] = {}
-        for ctx in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in c.tags):
+        Behaviour
+        ---------
+        • INSERT   – if the tool isn’t in the repo yet.
+        • UPDATE   – if the stored JSON, label, or tags differ.
+        • DEDUPE   – keep newest, delete extras.
+        • PURGE/ARCHIVE – if a schema exists for a tool name that has been
+                        removed from TOOL_SCHEMAS.
+        """
+
+        # ---------- 1) bucket existing rows by canonical tool name ----------
+        buckets: dict[str, list[ContextObject]] = {}
+        for ctx in self.repo.query(
+            lambda c: c.component == "schema" and "tool_schema" in c.tags
+        ):
             try:
                 name = json.loads(ctx.metadata["schema"])["name"]
                 buckets.setdefault(name, []).append(ctx)
             except Exception:
                 continue
 
-        # 2) Upsert each canonical schema
+        # ---------- 2) upsert every canonical entry -------------------------
         for name, canonical in TOOL_SCHEMAS.items():
             canonical_blob = json.dumps(canonical, sort_keys=True)
             rows = buckets.get(name, [])
 
-            # A) No existing row → insert
+            # A) entirely new tool → INSERT
             if not rows:
-                new_ctx = ContextObject.make_schema(
+                ctx = ContextObject.make_schema(
                     label=name,
                     schema_def=canonical_blob,
                     tags=["artifact", "tool_schema"],
                 )
-                new_ctx.touch()
-                self.repo.save(new_ctx)
+                ctx.touch(); self.repo.save(ctx)
                 continue
 
-            # B) Keep only the newest, delete duplicates
+            # B) keep newest row, delete duplicates
             rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper = rows[0]
-            for dup in rows[1:]:
-                self.repo.delete(dup.context_id)
+            keeper, *dups = rows
+            for d in dups:
+                self.repo.delete(d.context_id)
 
-            # C) Check for changes
+            # C) detect changes in JSON or metadata
             changed = False
-            existing_blob = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
-            if existing_blob != canonical_blob:
+            stored_blob = json.dumps(
+                json.loads(keeper.metadata["schema"]), sort_keys=True
+            )
+            if stored_blob != canonical_blob:
                 keeper.metadata["schema"] = canonical_blob
+                changed = True
+
+            if keeper.semantic_label != name:
+                keeper.semantic_label = name
                 changed = True
 
             if "tool_schema" not in keeper.tags:
                 keeper.tags.append("tool_schema")
                 changed = True
 
-            # D) Only persist if we actually changed something
             if changed:
-                keeper.touch()
-                self.repo.save(keeper)
+                keeper.touch(); self.repo.save(keeper)
+
+        # ---------- 3) purge / archive orphaned schemas ---------------------
+        obsolete = [
+            (name, rows)
+            for name, rows in buckets.items()
+            if name not in TOOL_SCHEMAS
+        ]
+        for name, rows in obsolete:
+            # strategy: keep ONE copy but mark it legacy, delete the rest
+            rows.sort(key=lambda c: c.timestamp, reverse=True)
+            keep, *extras = rows
+            for e in extras:
+                self.repo.delete(e.context_id)
+
+            if "legacy_tool_schema" not in keep.tags:
+                keep.tags.append("legacy_tool_schema")
+            keep.tags = [t for t in keep.tags if t != "tool_schema"]
+            keep.touch(); self.repo.save(keep)
+
 
     def _seed_static_prompts(self) -> None:
         """
