@@ -138,11 +138,10 @@
         <select id="semanticFilter"></select>
 
         <button id="timeToggle">Time Mode</button>
-        <div id="timeIndicators"
-     style="margin-left:auto;display:flex;gap:8px;font-size:0.85rem">
-  <span id="nowTime">// now </span>
-  <span id="viewTime">// view </span>
-</div>
+        <div id="timeIndicators" style="margin-left:auto;display:flex;gap:8px;font-size:0.85rem">
+            <span id="nowTime">// now </span>
+            <span id="viewTime">// view </span>
+        </div>
     </div>
 
     <!-- ─── HOVER JSON PANE ─────────────────────────────────────────────── -->
@@ -185,7 +184,7 @@
         //////////////////////////////////////////////////////////////////////
         // UI & STATE
         //////////////////////////////////////////////////////////////////////
-        const nowLbl  = document.getElementById('nowTime');
+        const nowLbl = document.getElementById('nowTime');
         const viewLbl = document.getElementById('viewTime');
 
         /* wheel → Y-units. 0.05 ≃  0.5  sec per scroll-tick with msPerUnit = 10 000 ms */
@@ -215,8 +214,17 @@
         let lastSize = 0;
         let lastETag = '';
         const POLL_INTERVAL = 1000;
+        let scrollVelocity = 0;
+        const SCROLL_ACCEL = 0.002;  // tweak: how much wheel delta becomes velocity
+        const SCROLL_FRICTION = 0.90;   // per-frame multiplier (<1 to slow down)
+        const SCROLL_DIR = -1;
+        let scrollBoost = 10;
+        let lastWheelDir = 0;
+        let lastWheelTime = 0;
 
-
+        const BOOST_INCREMENT = 0.3;    // how much boost you gain per rapid event
+        const BOOST_DECAY = 0.85;   // how quickly boost winds down
+        const BOOST_MAX = 5;      // cap on boost multiplier
         const MAX_INSTANCES_HARD = 0xFFFF;
         const HARD_MAX_NODES = 1000;
         let prevCount = 0;
@@ -255,7 +263,7 @@
         const comps = [...new Set([...nodeMap.values()].map(n => n.data.component))];
         const hueMap = Object.fromEntries(comps.map((c, i) => [c, i / comps.length]));
         const MS_PER_UNIT = LAYOUT_CONFIG.msPerUnit;  // ms per world‐unit, e.g. 10 000
-        
+
         function getContextFileUrl(cacheBust = false) {
             let fn = fileSelector.value;
             if (!/^context(?:_-?\d+)?\.jsonl$/.test(fn)) fn = 'context.jsonl';
@@ -1360,62 +1368,69 @@
         scene.background = new THREE.Color(0x111111);
 
         // ─── CAMERA ──────────────────────────────────────────────────────────
-const camera = new THREE.PerspectiveCamera(
-  60,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  2e6
-);
-camera.position.set(0, -100, 0);
-camera.lookAt(0, 0, 0);    // baseline = looking along +Y (180° polar)
+        const camera = new THREE.PerspectiveCamera(
+            60,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            2e6
+        );
+        camera.position.set(0, -100, 0);
+        camera.lookAt(0, 0, 0);    // baseline = looking along +Y (180° polar)
 
-// ─── RENDERER ────────────────────────────────────────────────────────
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.appendChild(renderer.domElement);
+        // ─── RENDERER ────────────────────────────────────────────────────────
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
 
-// ─── CONTROLS ────────────────────────────────────────────────────────
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
+        // ─── CONTROLS ────────────────────────────────────────────────────────
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
 
-// lock out zoom & pan
-controls.enableZoom = false;
-controls.enablePan  = false;
+        // lock out zoom & pan
+        controls.enableZoom = false;
+        controls.enablePan = false;
 
-// (optional) flip horizontal drag direction
-controls.rotateSpeed = -controls.rotateSpeed;
+        // (optional) flip horizontal drag direction
+        controls.rotateSpeed = -controls.rotateSpeed;
 
-// full pitch range so you can sweep “up” and “down” around the Y-axis baseline
-controls.minPolarAngle   = 0;       // look all the way “through” to –Y
-controls.maxPolarAngle   = Math.PI; // back down to +Y
+        // full pitch range so you can sweep “up” and “down” around the Y-axis baseline
+        controls.minPolarAngle = 0;       // look all the way “through” to –Y
+        controls.maxPolarAngle = Math.PI; // back down to +Y
 
-// full 360° yaw
-controls.minAzimuthAngle = -Infinity;
-controls.maxAzimuthAngle =  Infinity;
+        // full 360° yaw
+        controls.minAzimuthAngle = -Infinity;
+        controls.maxAzimuthAngle = Infinity;
 
-// one-time sync
-controls.update();
-
-
+        // one-time sync
+        controls.update();
 
 
-        renderer.domElement.addEventListener('wheel', onWheel, { passive:false });
 
+
+        renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
         function onWheel(e) {
-        e.preventDefault();
+            e.preventDefault();
 
-        // invert wheel so ↑ = back in time, ↓ = forward toward now
-        const deltaUnits = -e.deltaY * SCROLL_SPEED;
+            // compute a positive baseDelta when wheel-down
+            const baseDelta =  e.deltaY * SCROLL_ACCEL;
+            const dir = Math.sign(baseDelta);
+            const now = Date.now();
 
-        // accumulate from 0 → +∞
-        graphGroup.position.y = Math.min(0, graphGroup.position.y + deltaUnits);
-        yScrollOffset = graphGroup.position.y; // keep drift logic in sync
+            // build up boost if you’re flicking same direction quickly
+            if (dir === lastWheelDir && (now - lastWheelTime) < 200) {
+                scrollBoost = Math.min(BOOST_MAX, scrollBoost + BOOST_INCREMENT);
+            } else {
+                scrollBoost = 1;
+            }
+            lastWheelDir = dir;
+            lastWheelTime = now;
 
-        // ── recalc the “view” timestamp ───────────────────────────────────
-        const elapsedMs = -yScrollOffset * MS_PER_UNIT;
-        const viewDate = new Date(Date.now() - elapsedMs);
-        viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
+            // non-linear flick + boost
+            scrollVelocity += dir * Math.abs(baseDelta) ** 1.2 * scrollBoost;
         }
+
+
+
 
         const raycaster = new THREE.Raycaster();
         const pointer = new THREE.Vector2();
@@ -1980,91 +1995,95 @@ controls.update();
         ageSel.addEventListener('change', applyFilters);
 
         // ─── header clocks ────────────────────────────────
-        const now      = new Date();
+        const now = new Date();
         const viewTime = new Date(now - graphGroup.position.y * LAYOUT_CONFIG.msPerUnit);
 
-        nowLbl.textContent  = 'Now:  '  + now.toLocaleString();
-        viewLbl.textContent = 'View: '  + viewTime.toLocaleString();
-
+        nowLbl.textContent = 'Now:  ' + now.toLocaleString();
+        viewLbl.textContent = 'View: ' + viewTime.toLocaleString();
         /********************************************************************
          *  Animation loop  (COMPLETE, SELF-CONTAINED)
          *******************************************************************/
         function animate() {
             requestAnimationFrame(animate);
 
-            /* ── orbit damping, etc. ────────────────────────────────────────── */
             controls.update();
 
-            /* ── gentle “age conveyor-belt” upward drift ───────────────────── */
-            {
-                const now = Date.now();
-                const dt = now - lastDriftT;
-                yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / LAYOUT_CONFIG.msPerUnit;
-                lastDriftT = now;
-                graphGroup.position.y = yScrollOffset;
-            }
+ if (Math.abs(scrollVelocity) > 1e-4) {
+  yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
+  scrollVelocity *= SCROLL_FRICTION;
+} else {
+  scrollVelocity = 0;
+}
 
-            /* ── camera tween (fly-to) ─────────────────────────────────────── */
+graphGroup.position.y = yScrollOffset;
+
+// ── recalc view clock by subtracting the negative offset ────────────
+const nowDate  = new Date();
+// Option A: flip the sign on elapsedMs
+const elapsedMs = -yScrollOffset * MS_PER_UNIT;  
+const viewDate  = new Date(nowDate - elapsedMs);
+            // ── decay the boost multiplier ────────────────────────────────────
+            scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
+
+            // ── optional conveyor-belt drift ─────────────────────────────────
+            const nowMs = Date.now();
+            const dt = nowMs - lastDriftT;
+            yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / MS_PER_UNIT;
+            lastDriftT = nowMs;
+
+            graphGroup.position.y = yScrollOffset;
+
+            // ── update header clocks ──────────────────────────────────────────
+            nowLbl.textContent = 'Now:  ' + nowDate.toLocaleString();
+            viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
+
+            // ── camera tween (fly-to) ────────────────────────────────────────
             if (cameraTween) {
-                const t = Math.min((performance.now() - cameraTween.start) /
-                    cameraTween.duration, 1);
-                camera.position
-                    .lerpVectors(cameraTween.fromPos, cameraTween.toPos, t);
-                controls.target
-                    .lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, t);
+                const t = Math.min((performance.now() - cameraTween.start) / cameraTween.duration, 1);
+                camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, t);
+                controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, t);
                 if (t >= 1) cameraTween = null;
             }
 
-            /* ── pointer-hover handling ─────────────────────────────────────── */
+            // ── pointer-hover handling ───────────────────────────────────────
             if (instMesh) {
-                scene.updateMatrixWorld();   // <-- NEW LINE
+                scene.updateMatrixWorld();
                 raycaster.setFromCamera(pointer, camera);
                 const hit = raycaster.intersectObject(instMesh, false)[0];
-
                 if (hit && hit.instanceId !== undefined) {
                     const idx = hit.instanceId;
-
-                    /* hover changed? */
                     if (idx !== hoveredIdx) {
                         hoveredIdx = idx;
-
-                        /* find { ctxId, node } by instance index */
-                        const found = [...nodeMap.entries()]
-                            .find(([, n]) => n._instanceIndex === idx);
-
+                        const found = [...nodeMap.entries()].find(([, n]) => n._instanceIndex === idx);
                         if (found) {
                             const [ctxId, node] = found;
                             hovered = ctxId;
-
-                            /* 1️⃣ live JSON preview */
+                            // live JSON preview
                             selPane.textContent = JSON.stringify(node.data, null, 2);
-
-                            /* 2️⃣ full detail table */
+                            // full detail table
                             populateDetail(ctxId);
-
-                            /* 3️⃣ highlight ONLY the direct edges */
-                            flashNeighbours(ctxId);          // <── NEW: bright-flash neighbours
+                            // bright-flash neighbours
+                            flashNeighbours(ctxId);
                         }
                     }
                 } else {
-                    hoveredIdx = null;
-                    hovered = null;
+                    hoveredIdx = hovered = null;
                 }
             }
 
-            /* ── reset any leftover emissive flashes if hover left node ─────── */
+            // ── reset any leftover emissive flashes if hover left node ───────
             if (hovered !== previousHoveredId) {
                 previousHoveredId = hovered;
-                /* (single material shared by all spheres – toggling once is enough) */
                 if (instMesh) instMesh.material.emissiveIntensity = 0;
             }
 
-            /* ── final render ──────────────────────────────────────────────── */
+            // ── final render ─────────────────────────────────────────────────
             renderer.render(scene, camera);
         }
 
-        // first load + start loop
-        animate();                             // begin render loop
+        // start it up
+        animate();
+
 
         populateFileSelector()
             .then(loadGraph)
