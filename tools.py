@@ -2924,93 +2924,79 @@ class Tools:
         """
         get_visual_input
         ----------------
-        Capture a single frame from either a local webcam **or** one of the
-        HTTP camera feeds on 127.0.0.1:8080, save it to
-        ./captures/visual_<UTC-timestamp>.jpg, then ask an LLM to describe what
-        the image shows.
-
-        Quick-start
-        -----------
-        Calling `Tools.get_visual_input()` with no arguments (or `camera=0`)
-        walks a fallback chain—default_0 → video/default_0 → cv2 webcam 0—
-        stopping at the **first source that returns a valid frame**.  
-        Treat it as a “first-available camera” helper when you don’t care which
-        device is online.
-
-        Parameters
-        ----------
-        camera : int 0–7 | str URL
-            • *int* N → tries  
-            http://127.0.0.1:8080/{camera|video}/default_N[.jpeg] then cv2 N.  
-            • *str* URL → fetch that URL directly.  
-            Shorthands: "rs_color", "rs_depth", "rs_ir_left", "rs_ir_right".
-        query : str | None
-            Extra question to append to the description prompt.
-        model_tier : {'primary','secondary','decision'}, default 'primary'
-            LLM pipeline for the description; falls back to *primary* if missing.
-        temperature : float, default 0.5
-            Sampling temperature for the LLM call.
-
-        Returns
-        -------
-        str
-            Image description on success, else JSON string
-            {'error': '<reason>'}.
+        If `camera` is a URL or one of the shorthand tags ("rs_color", etc.),
+        we will ask the LLM to describe that feed directly via its URL.
+        Otherwise, we fall back to capturing a frame (HTTP or cv2),
+        saving it under ./captures/visual_<TIMESTAMP>.jpg, and then describing that file.
         """
 
-        # --------------------------- helpers ---------------------------------
-        def _fetch_http(url: str) -> bytes | None:
+        import requests, cv2, os, json
+        from datetime import datetime
+
+        # normalize & detect explicit URL / shorthand
+        if isinstance(camera, str):
+            url = camera.strip()
+            # rs_* shorthands
+            if url in {"rs_color", "rs_depth", "rs_ir_left", "rs_ir_right"}:
+                url = f"http://127.0.0.1:8080/camera/{url}"
+            # if it looks like HTTP(S), describe it directly
+            if url.lower().startswith(("http://", "https://")):
+                prompt = (f"{query.strip() if query else 'Please describe this image.'}"
+                          f"\n\nImage URL: {url}\n\nPlease answer.")
+                return Tools.auxiliary_inference(
+                    prompt,
+                    temperature=temperature,
+                    model_tier=model_tier,
+                    system="You are a highly–skilled visual analyst."
+                )
+
+        # ── otherwise we still need to fetch & save a frame ───────────────────
+        def _fetch_http(u: str) -> bytes | None:
             try:
-                r = requests.get(url, timeout=2)
-                r.raise_for_status()
+                r = requests.get(u, timeout=2); r.raise_for_status()
                 return r.content
             except Exception as e:
-                log_message(f"[HTTP camera] {url} → {e}", "WARN")
+                log_message(f"[HTTP camera] {u} → {e}", "WARN")
                 return None
 
         def _fetch_cv2(idx: int) -> bytes | None:
-            cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == "nt" else 0)
-            if not cam.isOpened():
-                return None
-            ok, frame = cam.read()
-            cam.release()
-            if not ok:
-                return None
+            cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name=="nt" else 0)
+            if not cam.isOpened(): return None
+            ok, frame = cam.read(); cam.release()
+            if not ok: return None
             _, buf = cv2.imencode(".jpg", frame)
             return buf.tobytes()
 
-        # --------------------------- 1) acquire frame ------------------------
-        raw_bytes: bytes | None = None
         tried: list[str] = []
+        raw_bytes = None
 
         if isinstance(camera, int):
             n = camera
-            # preferred order of patterns
             patterns = [
-                f"http://127.0.0.1:8080/camera/default_{n}",
                 f"http://127.0.0.1:8080/camera/default_{n}.jpeg",
-                f"http://127.0.0.1:8080/video/default_{n}",
-                f"http://127.0.0.1:8080/video/default_{n}.jpeg",
+                f"http://127.0.0.1:8080/camera/default_{n}",
             ]
-            for url in patterns:
-                tried.append(url)
-                raw_bytes = _fetch_http(url)
+            for u in patterns:
+                tried.append(u)
+                raw_bytes = _fetch_http(u)
                 if raw_bytes:
                     break
-            if raw_bytes is None:                       # last-chance fallback
+            if raw_bytes is None:
                 raw_bytes = _fetch_cv2(n)
-        else:                                           # explicit URL or rs_* tag
-            url = str(camera).strip()
-            if url in {"rs_color", "rs_depth", "rs_ir_left", "rs_ir_right"}:
-                url = f"http://127.0.0.1:8080/camera/{url}"
-            tried.append(url)
-            raw_bytes = _fetch_http(url)
+        else:
+            # fallback if someone passed a non-http string that isn't rs_*
+            try:
+                # treat as URL anyway
+                raw_bytes = _fetch_http(str(camera))
+                tried.append(str(camera))
+            except:
+                raw_bytes = None
 
         if raw_bytes is None:
             log_message(f"No camera sources reachable. Tried: {tried}", "ERROR")
             return json.dumps({"error": "Camera source not reachable."})
 
-        # --------------------------- 2) persist ------------------------------
+        # persist to disk
         cap_dir = os.path.join(os.path.dirname(__file__), "captures")
         os.makedirs(cap_dir, exist_ok=True)
         ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -3019,20 +3005,17 @@ class Tools:
             f.write(raw_bytes)
         log_message(f"Image saved → {path}", "SUCCESS")
 
-        # --------------------------- 3) LLM description ----------------------
-        prompt = (
-            f"Describe, in rich detail, everything visible in the image at {path}."
-        )
-        if query:
-            prompt = f"{query.strip()}\n\nImage path: {path}\n\nPlease answer."
+        # build prompt for saved file
+        prompt = f"{query.strip() if query else 'Please describe what you see in this image.'}"
+        prompt += f"\n\nImage path: {path}\n\nPlease answer."
 
-        desc = Tools.auxiliary_inference(
+        return Tools.auxiliary_inference(
             prompt,
             temperature=temperature,
             model_tier=model_tier,
             system="You are a highly–skilled visual analyst."
         )
-        return desc
+
 
     # This static method captures one frame from the default webcam using OpenCV, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the image.
     @staticmethod
@@ -3435,9 +3418,8 @@ class Tools:
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
 
-
     @staticmethod
-    def auxiliary_inference(           # ← still a single-line definition
+    def auxiliary_inference(           # ← unchanged signature
         prompt: str,
         *, temperature: float = 0.7,
         system: str | None = None,
@@ -3446,20 +3428,23 @@ class Tools:
     ) -> str:
         """
         Invoke an LLM with a prompt, optional system/context, and configurable
-        *model tier*  (“primary”, “secondary”, or “decision”).
+        *model tier* (“primary”, “secondary”, or “decision”).
 
-        All existing behaviour is preserved; if `model_tier` is omitted or
-        unrecognised, we fall back to the primary model defined in config.
+        Now also scans the `prompt` for:
+            • local image filepaths (e.g. '/path/to/foo.jpg')
+            • HTTP(S) URLs ending in an image extension
+        Base64-encodes any it finds, and sends them in an `images` parameter.
         """
+        import re, base64, json, requests
         # 1) choose model
         tier_map = {
             "primary":   config.get("primary_model"),
             "secondary": config.get("secondary_model", config.get("primary_model")),
             "decision":  config.get("decision_model",  config.get("secondary_model",
-                                                                  config.get("primary_model")))
+                                                                    config.get("primary_model")))
         }
         model_selected = tier_map.get((model_tier or "primary").lower(),
-                                      config.get("primary_model"))
+                                        config.get("primary_model"))
 
         # 2) assemble messages
         messages: list[dict[str, str]] = []
@@ -3469,11 +3454,31 @@ class Tools:
             messages.append({"role": "system", "content": str(context)})
         messages.append({"role": "user", "content": prompt})
 
-        # 3) stream
+        # 3) detect any image paths or URLs in the prompt
+        #    matches either /some/path/file.jpg or http://.../.png
+        pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+        matches = re.findall(pattern, prompt, flags=re.IGNORECASE)
+        images_base64: list[str] = []
+        for loc in matches:
+            try:
+                if loc.lower().startswith(("http://", "https://")):
+                    resp = requests.get(loc, timeout=5)
+                    resp.raise_for_status()
+                    data = resp.content
+                else:
+                    with open(loc, "rb") as f:
+                        data = f.read()
+                images_base64.append(base64.b64encode(data).decode("utf-8"))
+            except Exception:
+                # skip any we can't fetch or open
+                continue
+
+        # 4) stream via chat(); include images=… only if we have them
         try:
             log_message(
                 f"auxiliary_inference(model={model_selected}, "
-                f"prompt={prompt!r}, temp={temperature}, tier={model_tier})",
+                f"prompt={prompt!r}, temp={temperature}, tier={model_tier}, "
+                f"images={len(images_base64)})",
                 "PROCESS"
             )
 
@@ -3483,7 +3488,8 @@ class Tools:
                 model=model_selected,
                 messages=messages,
                 stream=True,
-                options={"temperature": temperature}   # ← FIX HERE
+                options={"temperature": temperature},
+                **({"images": images_base64} if images_base64 else {})
             ):
                 tok = part["message"]["content"]
                 content += tok
@@ -3495,6 +3501,7 @@ class Tools:
         except Exception as e:
             log_message(f"auxiliary_inference error: {e}", "ERROR")
             return json.dumps({"error": str(e)})
+
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
