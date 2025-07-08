@@ -2922,35 +2922,13 @@ class Tools:
         temperature: float = 0.5
     ) -> str:
         """
-        get_visual_input
-        ----------------
-        If `camera` is a URL or one of the shorthand tags ("rs_color", etc.),
-        we will ask the LLM to describe that feed directly via its URL.
-        Otherwise, we fall back to capturing a frame (HTTP or cv2),
-        saving it under ./captures/visual_<TIMESTAMP>.jpg, and then describing that file.
+        Fetch or capture a frame (HTTP or cv2), then send raw bytes
+        to auxiliary_inference so the LLM can see it directly.
+        Supports URLs like http://.../camera/default_0 (no .jpg extension).
         """
-
         import requests, cv2, os, json
         from datetime import datetime
 
-        # normalize & detect explicit URL / shorthand
-        if isinstance(camera, str):
-            url = camera.strip()
-            # rs_* shorthands
-            if url in {"rs_color", "rs_depth", "rs_ir_left", "rs_ir_right"}:
-                url = f"http://127.0.0.1:8080/camera/{url}"
-            # if it looks like HTTP(S), describe it directly
-            if url.lower().startswith(("http://", "https://")):
-                prompt = (f"{query.strip() if query else 'Please describe this image.'}"
-                          f"\n\nImage URL: {url}\n\nPlease answer.")
-                return Tools.auxiliary_inference(
-                    prompt,
-                    temperature=temperature,
-                    model_tier=model_tier,
-                    system="You are a highly–skilled visual analyst."
-                )
-
-        # ── otherwise we still need to fetch & save a frame ───────────────────
         def _fetch_http(u: str) -> bytes | None:
             try:
                 r = requests.get(u, timeout=2); r.raise_for_status()
@@ -2967,53 +2945,41 @@ class Tools:
             _, buf = cv2.imencode(".jpg", frame)
             return buf.tobytes()
 
-        tried: list[str] = []
-        raw_bytes = None
+        # 1) Try string camera as URL or shorthand
+        image_bytes: bytes | None = None
+        if isinstance(camera, str):
+            url = camera.strip()
+            # handle any rs_* shorthand here...
+            if url.lower().startswith(("http://", "https://")):
+                image_bytes = _fetch_http(url)
 
-        if isinstance(camera, int):
-            n = camera
-            patterns = [
-                f"http://127.0.0.1:8080/camera/default_{n}.jpeg",
-                f"http://127.0.0.1:8080/camera/default_{n}",
-            ]
-            for u in patterns:
-                tried.append(u)
-                raw_bytes = _fetch_http(u)
-                if raw_bytes:
-                    break
-            if raw_bytes is None:
-                raw_bytes = _fetch_cv2(n)
-        else:
-            # fallback if someone passed a non-http string that isn't rs_*
-            try:
-                # treat as URL anyway
-                raw_bytes = _fetch_http(str(camera))
-                tried.append(str(camera))
-            except:
-                raw_bytes = None
+        # 2) If still none and camera is int, try default feeds then cv2
+        if image_bytes is None and isinstance(camera, int):
+            for u in (
+                f"http://127.0.0.1:8080/camera/default_{camera}.jpeg",
+                f"http://127.0.0.1:8080/camera/default_{camera}"
+            ):
+                image_bytes = _fetch_http(u)
+                if image_bytes: break
+            if image_bytes is None:
+                image_bytes = _fetch_cv2(camera)
 
-        if raw_bytes is None:
-            log_message(f"No camera sources reachable. Tried: {tried}", "ERROR")
-            return json.dumps({"error": "Camera source not reachable."})
+        # 3) Final fallback for non-HTTP string
+        if image_bytes is None and isinstance(camera, str):
+            image_bytes = _fetch_http(camera)
 
-        # persist to disk
-        cap_dir = os.path.join(os.path.dirname(__file__), "captures")
-        os.makedirs(cap_dir, exist_ok=True)
-        ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(cap_dir, f"visual_{ts}.jpg")
-        with open(path, "wb") as f:
-            f.write(raw_bytes)
-        log_message(f"Image saved → {path}", "SUCCESS")
+        if image_bytes is None:
+            log_message("No camera source reachable.", "ERROR")
+            return json.dumps({"error":"Camera not reachable"})
 
-        # build prompt for saved file
-        prompt = f"{query.strip() if query else 'Please describe what you see in this image.'}"
-        prompt += f"\n\nImage path: {path}\n\nPlease answer."
-
+        # 4) Build prompt and hand off raw bytes
+        prompt = query.strip() if query else "Please describe what you see in this image."
         return Tools.auxiliary_inference(
             prompt,
             temperature=temperature,
             model_tier=model_tier,
-            system="You are a highly–skilled visual analyst."
+            system="You are a highly–skilled visual analyst.",
+            images=[image_bytes]
         )
 
 
@@ -3418,8 +3384,7 @@ class Tools:
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
 
-    @staticmethod
-    def auxiliary_inference(           # ← signature unchanged except for new `images` kwarg
+    def auxiliary_inference(
         prompt: str,
         *,
         temperature: float = 0.7,
@@ -3430,10 +3395,9 @@ class Tools:
     ) -> str:
         """
         Invoke an LLM with a prompt, optional system/context, configurable
-        model tier, and *optional* images.
-
-        If you pass `images=[b'...']`, those bytes will be sent directly.
-        Otherwise we scan the prompt for .jpg/.png URLs or paths and load them.
+        model tier, and *optional* images (raw bytes). If you supply
+        `images=[b'...']`, those bytes go straight into the last user message.
+        Otherwise we fall back to scanning the prompt for .jpg/.png URLs or paths.
         """
         import re, json, requests
 
@@ -3441,8 +3405,8 @@ class Tools:
         tier_map = {
             "primary":   config.get("primary_model"),
             "secondary": config.get("secondary_model", config.get("primary_model")),
-            "decision":  config.get("decision_model",  config.get("secondary_model",
-                                                                    config.get("primary_model")))
+            "decision":  config.get("decision_model",
+                          config.get("secondary_model", config.get("primary_model")))
         }
         model_selected = tier_map.get((model_tier or "primary").lower(),
                                       config.get("primary_model"))
@@ -3460,7 +3424,7 @@ class Tools:
         if images:
             images_data = images
         else:
-            # scan for URLs or local paths ending in common extensions
+            # scan for HTTP or absolute local paths ending in image exts
             pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
             for loc in re.findall(pattern, prompt, flags=re.IGNORECASE):
                 try:
@@ -3474,7 +3438,11 @@ class Tools:
                 except Exception:
                     continue
 
-        # 4) stream via chat(); include images only if we have any
+        # 4) inject images into the last message dict if we have any
+        if images_data:
+            messages[-1]["images"] = images_data
+
+        # 5) stream via chat()
         try:
             log_message(
                 f"auxiliary_inference(model={model_selected}, "
@@ -3482,19 +3450,14 @@ class Tools:
                 f"images={len(images_data)})",
                 "PROCESS"
             )
-
             content = ""
             print("⟳ Auxiliary-LLM stream:", end="", flush=True)
-            chat_kwargs = {
-                "model":      model_selected,
-                "messages":   messages,
-                "stream":     True,
-                "options":    {"temperature": temperature},
-            }
-            if images_data:
-                chat_kwargs["images"] = images_data  # raw bytes list
-
-            for part in chat(**chat_kwargs):
+            for part in chat(
+                model=model_selected,
+                messages=messages,
+                stream=True,
+                options={"temperature": temperature},
+            ):
                 tok = part["message"]["content"]
                 content += tok
                 print(tok, end="", flush=True)
