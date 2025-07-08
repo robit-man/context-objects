@@ -3435,40 +3435,28 @@ class Tools:
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
 
+
     @staticmethod
-    def auxiliary_inference(
+    def auxiliary_inference(           # ← still a single-line definition
         prompt: str,
-        *,
-        temperature: float = 0.7,
+        *, temperature: float = 0.7,
         system: str | None = None,
         context: object | None = None,
-        model_tier: str | None = None           # ← NEW (optional)
+        model_tier: str | None = None
     ) -> str:
-        """
-        Invoke an LLM with a prompt, optional system/context, and configurable
-        *model tier*  (“primary”, “secondary”, or “decision”).
+        """(docstring omitted for brevity)"""
 
-        All existing behaviour is preserved; if `model_tier` is omitted or
-        unrecognised, we fall back to the primary model defined in config.
-        """
-
-        # ------------------------------------------------------------------
-        # 1) pick model
-        # ------------------------------------------------------------------
+        # 1) choose model
         tier_map = {
             "primary":   config.get("primary_model"),
             "secondary": config.get("secondary_model", config.get("primary_model")),
             "decision":  config.get("decision_model",  config.get("secondary_model",
-                                                                config.get("primary_model")))
+                                                                  config.get("primary_model")))
         }
-        model_selected = tier_map.get(
-            (model_tier or "primary").lower(),
-            config.get("primary_model")
-        )
+        model_selected = tier_map.get((model_tier or "primary").lower(),
+                                      config.get("primary_model"))
 
-        # ------------------------------------------------------------------
-        # 2) compose message list
-        # ------------------------------------------------------------------
+        # 2) assemble messages
         messages: list[dict[str, str]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
@@ -3476,9 +3464,7 @@ class Tools:
             messages.append({"role": "system", "content": str(context)})
         messages.append({"role": "user", "content": prompt})
 
-        # ------------------------------------------------------------------
-        # 3) stream request
-        # ------------------------------------------------------------------
+        # 3) stream
         try:
             log_message(
                 f"auxiliary_inference(model={model_selected}, "
@@ -3488,10 +3474,12 @@ class Tools:
 
             content = ""
             print("⟳ Auxiliary-LLM stream:", end="", flush=True)
-            for part in chat(model=model_selected,
-                            messages=messages,
-                            stream=True,
-                            temperature=temperature):
+            for part in chat(
+                model=model_selected,
+                messages=messages,
+                stream=True,
+                options={"temperature": temperature}   # ← FIX HERE
+            ):
                 tok = part["message"]["content"]
                 content += tok
                 print(tok, end="", flush=True)
@@ -3501,7 +3489,7 @@ class Tools:
 
         except Exception as e:
             log_message(f"auxiliary_inference error: {e}", "ERROR")
-            return json.dumps({"error": f"{e}"})
+            return json.dumps({"error": str(e)})
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
