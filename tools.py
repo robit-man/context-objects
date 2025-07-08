@@ -2918,7 +2918,7 @@ class Tools:
         camera: int | str = 0,
         *,
         query: str | None = None,
-        model_tier: str = "secondary",
+        model_tier: str = "primary",
         temperature: float = 0.5
     ) -> str:
         """
@@ -2946,7 +2946,7 @@ class Tools:
             Shorthands: "rs_color", "rs_depth", "rs_ir_left", "rs_ir_right".
         query : str | None
             Extra question to append to the description prompt.
-        model_tier : {'primary','secondary','decision'}, default 'secondary'
+        model_tier : {'primary','secondary','decision'}, default 'primary'
             LLM pipeline for the description; falls back to *primary* if missing.
         temperature : float, default 0.5
             Sampling temperature for the LLM call.
