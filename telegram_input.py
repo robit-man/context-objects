@@ -42,6 +42,9 @@ from group_registry import _GREG
 import whisper
 _WHISPER = whisper.load_model("base")  # load once
 
+CAPTURE_DIR = Path("captures")
+CAPTURE_DIR.mkdir(exist_ok=True)
+
 # basic logging
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
@@ -631,7 +634,16 @@ def telegram_input(asm):
             if msg.text:
                 kind, data = "text", msg.text
             elif msg.photo:
-                kind, data = "photo", msg.photo[-1].file_id
+                kind = "photo"
+                # save each photo locally under captures/
+                image_paths: list[str] = []
+                for p in msg.photo:
+                    file = await bot.get_file(p.file_id)
+                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
+                    await file.download_to_drive(str(local_path))
+                    image_paths.append(str(local_path))
+                # downstream just sees “n image(s)”
+                data = f"{len(image_paths)} image(s)"
             elif msg.document:
                 kind, data = "document", msg.document.file_id
             elif msg.sticker:
@@ -699,13 +711,14 @@ def telegram_input(asm):
                     tags.append("reply_to_bot")
 
             metadata = {
-                "chat_id":                 chat_id,
-                "from_user_id":            user.id,
-                "from_username":           user.username,
-                "message_id":              msg.message_id,
-                "text":                    msg.text or msg.caption or "",
+                "chat_id":       chat_id,
+                "from_user_id":  user.id,
+                "from_username": user.username,
+                "message_id":    msg.message_id,
+                "text":          msg.text or msg.caption or "",
             }
-            if image_paths:
+            # if we just downloaded images, include their disk paths
+            if kind == "photo":
                 metadata["image_paths"] = image_paths
 
             if msg.reply_to_message:
