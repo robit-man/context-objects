@@ -2922,44 +2922,21 @@ class Tools:
         temperature: float = 0.5
     ) -> str:
         """
-        Grab one frame from **either** a local webcam **or** an HTTP camera
-        endpoint, persist it, then ask an LLM to describe it.
-
-        Args
-        ----
-        camera
-            • int 0-7  → fetch ``http://127.0.0.1:8080/camera/default_<N>.jpeg``  
-              (falls back to cv2 webcam index *N* if the URL is unreachable)  
-            • str URL → use the URL directly (must return JPEG/PNG bytes)
-        query
-            Extra natural-language question to append to the image-description
-            prompt.
-        model_tier
-            Which model pipeline to route through: ``"primary"``, ``"secondary"``
-            or ``"decision"``.  Defaults to the secondary/tool model.
-        temperature
-            Sampling temperature for the follow-up LLM description.
-
-        Returns
-        -------
-        The LLM’s textual description (string).  Errors are returned as JSON
-        ``{"error": "..."}`` strings so the caller can decide how to surface
-        them.
+        Grab one frame from a local webcam *or* an HTTP camera endpoint,
+        persist it, then ask an LLM to describe it.
         """
 
-        # ------------------------------------------------------------------
-        # 1) Resolve camera → bytes
-        # ------------------------------------------------------------------
-        def _fetch_http(url: str):
+        # --------------------------- helpers ---------------------------------
+        def _fetch_http(url: str) -> bytes | None:
             try:
                 r = requests.get(url, timeout=2)
                 r.raise_for_status()
                 return r.content
             except Exception as e:
-                log_message(f"HTTP camera fetch failed for {url}: {e}", "WARN")
+                log_message(f"[HTTP camera] {url} → {e}", "WARN")
                 return None
 
-        def _fetch_cv2(idx: int):
+        def _fetch_cv2(idx: int) -> bytes | None:
             cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == "nt" else 0)
             if not cam.isOpened():
                 return None
@@ -2970,51 +2947,55 @@ class Tools:
             _, buf = cv2.imencode(".jpg", frame)
             return buf.tobytes()
 
-        # decide strategy
-        raw_bytes = None
-        url_tried = None
+        # --------------------------- 1) acquire frame ------------------------
+        raw_bytes: bytes | None = None
+        tried: list[str] = []
 
         if isinstance(camera, int):
-            url_tried = f"http://127.0.0.1:8080/camera/default_{camera}.jpeg"
-            raw_bytes = _fetch_http(url_tried)
-            if raw_bytes is None:                         # fallback → cv2
-                raw_bytes = _fetch_cv2(camera)
-        else:                                             # explicit URL
-            url_tried = str(camera)
-            raw_bytes = _fetch_http(url_tried)
+            n = camera
+            # preferred order of patterns
+            patterns = [
+                f"http://127.0.0.1:8080/camera/default_{n}",
+                f"http://127.0.0.1:8080/camera/default_{n}.jpeg",
+                f"http://127.0.0.1:8080/video/default_{n}",
+                f"http://127.0.0.1:8080/video/default_{n}.jpeg",
+            ]
+            for url in patterns:
+                tried.append(url)
+                raw_bytes = _fetch_http(url)
+                if raw_bytes:
+                    break
+            if raw_bytes is None:                       # last-chance fallback
+                raw_bytes = _fetch_cv2(n)
+        else:                                           # explicit URL or rs_* tag
+            url = str(camera).strip()
+            if url in {"rs_color", "rs_depth", "rs_ir_left", "rs_ir_right"}:
+                url = f"http://127.0.0.1:8080/camera/{url}"
+            tried.append(url)
+            raw_bytes = _fetch_http(url)
 
         if raw_bytes is None:
-            log_message("All camera sources unreachable.", "ERROR")
+            log_message(f"No camera sources reachable. Tried: {tried}", "ERROR")
             return json.dumps({"error": "Camera source not reachable."})
 
-        # ------------------------------------------------------------------
-        # 2) Persist frame
-        # ------------------------------------------------------------------
-        capture_dir = os.path.join(os.path.dirname(__file__), "captures")
-        os.makedirs(capture_dir, exist_ok=True)
+        # --------------------------- 2) persist ------------------------------
+        cap_dir = os.path.join(os.path.dirname(__file__), "captures")
+        os.makedirs(cap_dir, exist_ok=True)
         ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(capture_dir, f"visual_{ts}.jpg")
+        path = os.path.join(cap_dir, f"visual_{ts}.jpg")
+        with open(path, "wb") as f:
+            f.write(raw_bytes)
+        log_message(f"Image saved → {path}", "SUCCESS")
 
-        try:
-            with open(path, "wb") as f:
-                f.write(raw_bytes)
-            log_message(f"Image saved to {path}", "SUCCESS")
-        except Exception as e:
-            log_message(f"Failed to save image: {e}", "ERROR")
-            return json.dumps({"error": str(e)})
-
-        # ------------------------------------------------------------------
-        # 3) Ask an LLM to describe it
-        # ------------------------------------------------------------------
-        q_prompt = (
-            "Describe, in rich detail, everything visible in the image "
-            f"located at: {path}."
+        # --------------------------- 3) LLM description ----------------------
+        prompt = (
+            f"Describe, in rich detail, everything visible in the image at {path}."
         )
         if query:
-            q_prompt = f"{query.strip()}\n\nImage path: {path}\n\nPlease answer."
+            prompt = f"{query.strip()}\n\nImage path: {path}\n\nPlease answer."
 
         desc = Tools.auxiliary_inference(
-            q_prompt,
+            prompt,
             temperature=temperature,
             model_tier=model_tier,
             system="You are a highly–skilled visual analyst."
