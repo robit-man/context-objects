@@ -642,8 +642,8 @@ def telegram_input(asm):
                         local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
                         await file.download_to_drive(str(local_path))
                         image_paths.append(str(local_path.resolve()))
+                    # let downstream see “n image(s)” instead of raw file_id
                     data = f"{len(image_paths)} image(s)"
-
 
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
