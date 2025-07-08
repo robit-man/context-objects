@@ -33,7 +33,7 @@ import json
 from telegram import Update, Bot, error as tg_error
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 from telegram.request import HTTPXRequest
-
+from telegram.constants import ChatAction
 from context import HybridContextRepository, ContextObject, _locked, sanitize_jsonl
 from tts_service import TTSManager
 from user_registry import _REG
@@ -146,6 +146,35 @@ def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridCont
         sqlite_path=sqlite_path,
         archive_max_mb=archive_max_mb,
     )
+
+async def set_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug true|false
+    Only the configured admin (via /setadmin) may run this.
+    Toggles config.json["debug"].
+    """
+    user_id = update.effective_user.id
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+
+    admin_id = cfg.get("admin_chat_id")
+    if user_id != admin_id:
+        await update.message.reply_text("❌ You are not authorized to use /debug.")
+        return
+
+    if not context.args or context.args[0].lower() not in ("true", "false"):
+        await update.message.reply_text("Usage: /debug true|false")
+        return
+
+    enabled = context.args[0].lower() == "true"
+    cfg["debug"] = enabled
+    with open("config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    await update.message.reply_text(f"✔️ Debugging {'enabled' if enabled else 'disabled'}.")
 
 async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -550,6 +579,7 @@ def telegram_input(asm):
     app.add_handler(CommandHandler("setadmin", set_admin), group=0)
     app.add_handler(CommandHandler("blacklist", blacklist), group=0)
     app.add_handler(CommandHandler("dm", set_dm), group=0)
+    app.add_handler(CommandHandler("debug", set_debug), group=0)    
 
     app.add_error_handler(error_handler)
 
@@ -767,18 +797,50 @@ def telegram_input(asm):
                 return
 
             async def start_runner(request_text: str, reply_to_id: int):
-                placeholder = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"init reply to chat id {reply_to_id}...",
-                    reply_to_message_id=reply_to_id
-                )
-                placeholder_id = placeholder.message_id
-                status_cb, stop_status = _make_status_cb(
-                    loop, context.bot, chat_id, placeholder_id
-                )
+                # ── Load debug flag ─────────────────────────────────────────
+                try:
+                    with open("config.json", "r") as _f:
+                        _cfg = json.load(_f)
+                except FileNotFoundError:
+                    _cfg = {}
+                debug_enabled = _cfg.get("debug", False)
+
+                placeholder_id: Optional[int] = None
+                typing_task: Optional[asyncio.Task] = None
+
+                if debug_enabled:
+                    # live “processing…” placeholder + staged edits
+                    placeholder = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🛠️ Processing...",
+                        reply_to_message_id=reply_to_id
+                    )
+                    placeholder_id = placeholder.message_id
+                    status_cb, stop_status = _make_status_cb(
+                        loop, context.bot, chat_id, placeholder_id
+                    )
+                else:
+                    # fallback: send typing actions until done
+                    status_cb = lambda *args, **kwargs: None
+                    stop_status = lambda: None
+
+                    async def _typing_loop():
+                        try:
+                            while True:
+                                await context.bot.send_chat_action(
+                                    chat_id=chat_id,
+                                    action=ChatAction.TYPING
+                                )
+                                await asyncio.sleep(4)
+                        except asyncio.CancelledError:
+                            return
+
+                    typing_task = loop.create_task(_typing_loop())
 
                 async def runner():
+                    nonlocal placeholder_id, typing_task
                     try:
+                        # clear any previous audio tasks
                         for qobj in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
                             while True:
                                 try:
@@ -798,76 +860,59 @@ def telegram_input(asm):
                             final = ""
                         finally:
                             stop_status()
+                            if typing_task:
+                                typing_task.cancel()
 
                         if not final.strip():
-                            try:
-                                await context.bot.delete_message(
-                                    chat_id=chat_id,
-                                    message_id=placeholder_id
-                                )
-                            except:
-                                pass
-                            return
-
-                        if len(final) < 4000:
-                            if os.name == "nt":
-                                sent = await context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=final,
-                                    reply_to_message_id=reply_to_id
-                                )
+                            # nothing generated; clean up placeholder if any
+                            if placeholder_id:
                                 try:
-                                    await context.bot.pin_chat_message(
-                                        chat_id=chat_id,
-                                        message_id=sent.message_id,
-                                        disable_notification=True
-                                    )
-                                    asyncio.create_task(
-                                        _delayed_unpin(
-                                            context.bot,
-                                            chat_id,
-                                            sent.message_id
-                                        )
-                                    )
+                                    await context.bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
                                 except:
                                     pass
-                            else:
+                            return
+
+                        # deliver final text
+                        if debug_enabled:
+                            # replace the placeholder
+                            if len(final) < 4000:
                                 sent = await context.bot.edit_message_text(
                                     chat_id=chat_id,
                                     message_id=placeholder_id,
                                     text=final
                                 )
+                            else:
+                                # delete old and chunk
+                                await context.bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                await _send_long_text_async(context.bot, chat_id, final, reply_to=reply_to_id)
+                        else:
+                            # always send a fresh message
+                            if len(final) < 4000:
+                                sent = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=final,
+                                    reply_to_message_id=reply_to_id
+                                )
+                            else:
+                                await _send_long_text_async(context.bot, chat_id, final, reply_to=reply_to_id)
+
+                        # pin/unpin if we have a single 'sent'
+                        if 'sent' in locals():
+                            try:
                                 await context.bot.pin_chat_message(
                                     chat_id=chat_id,
                                     message_id=sent.message_id,
                                     disable_notification=True
                                 )
-                                asyncio.create_task(
-                                    _delayed_unpin(
-                                        context.bot,
-                                        chat_id,
-                                        sent.message_id
-                                    )
-                                )
-                        else:
-                            try:
-                                await context.bot.delete_message(
-                                    chat_id=chat_id,
-                                    message_id=placeholder_id
-                                )
+                                asyncio.create_task(_delayed_unpin(context.bot, chat_id, sent.message_id))
                             except:
                                 pass
-                            await _send_long_text_async(
-                                context.bot,
-                                chat_id,
-                                final,
-                                reply_to=reply_to_id
-                            )
 
+                        # now send voice
                         chat_asm.tts.enqueue(final)
                         await asyncio.to_thread(chat_asm.tts._file_q.join)
 
-                        oggs = []
+                        oggs: List[str] = []
                         while True:
                             try:
                                 p = chat_asm.tts._ogg_q.get_nowait()
@@ -879,50 +924,36 @@ def telegram_input(asm):
                         if oggs:
                             if len(oggs) == 1:
                                 with open(oggs[0], "rb") as vf:
-                                    await context.bot.send_voice(
-                                        chat_id=chat_id,
-                                        voice=vf,
-                                        reply_to_message_id=reply_to_id
-                                    )
+                                    await context.bot.send_voice(chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id)
                             else:
-                                combined = os.path.join(
-                                    tempfile.gettempdir(),
-                                    f"combined_{uuid.uuid4().hex}.ogg"
-                                )
-                                ins     = sum([["-i", p] for p in oggs], [])
+                                combined = os.path.join(tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg")
+                                ins = sum([["-i", p] for p in oggs], [])
                                 streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
-                                filt    = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
+                                filt = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
                                 subprocess.run(
-                                    [
-                                        "ffmpeg", "-y", "-loglevel", "error",
-                                        *ins,
-                                        "-filter_complex", filt,
-                                        "-c:a", "libopus",
-                                        "-b:a", "48k",
-                                        combined
-                                    ],
+                                    ["ffmpeg", "-y", "-loglevel", "error", *ins, "-filter_complex", filt,
+                                     "-c:a", "libopus", "-b:a", "48k", combined],
                                     check=True
                                 )
                                 with open(combined, "rb") as vf:
-                                    await context.bot.send_voice(
-                                        chat_id=chat_id,
-                                        voice=vf,
-                                        reply_to_message_id=reply_to_id
-                                    )
+                                    await context.bot.send_voice(chat_id=chat_id, voice=vf, reply_to_message_id=reply_to_id)
 
                     except asyncio.CancelledError:
-                        try:
-                            await context.bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=placeholder_id,
-                                text="⚠️ Previous request cancelled."
-                            )
-                        except:
-                            pass
+                        # if runner is cancelled, clean up placeholder
+                        if placeholder_id:
+                            try:
+                                await context.bot.edit_message_text(
+                                    chat_id=chat_id,
+                                    message_id=placeholder_id,
+                                    text="⚠️ Previous request cancelled."
+                                )
+                            except:
+                                pass
                     except Exception:
                         logger.exception("Unexpected error in Telegram runner; swallowing")
                     finally:
                         running.pop((chat_id, context.bot.id), None)
+                        # process any queued requests
                         try:
                             nxt, nxt_id = _pending[(chat_id, context.bot.id)].get_nowait()
                         except:
@@ -930,6 +961,8 @@ def telegram_input(asm):
                         await start_runner(nxt, nxt_id)
 
                 running[(chat_id, context.bot.id)] = loop.create_task(runner())
+            
+
 
             await start_runner(user_text, trigger_id)
 
