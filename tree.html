@@ -138,6 +138,11 @@
         <select id="semanticFilter"></select>
 
         <button id="timeToggle">Time Mode</button>
+        <div id="timeIndicators"
+     style="margin-left:auto;display:flex;gap:8px;font-size:0.85rem">
+  <span id="nowTime">// now </span>
+  <span id="viewTime">// view </span>
+</div>
     </div>
 
     <!-- ─── HOVER JSON PANE ─────────────────────────────────────────────── -->
@@ -180,6 +185,11 @@
         //////////////////////////////////////////////////////////////////////
         // UI & STATE
         //////////////////////////////////////////////////////////////////////
+        const nowLbl  = document.getElementById('nowTime');
+        const viewLbl = document.getElementById('viewTime');
+
+        /* wheel → Y-units. 0.05 ≃  0.5  sec per scroll-tick with msPerUnit = 10 000 ms */
+        const SCROLL_SPEED = 0.05;
         const fileSelector = document.getElementById('fileSelector');
 
         const ageSel = document.getElementById('ageFilter');
@@ -244,7 +254,8 @@
         pickableMeshes.length = 0;
         const comps = [...new Set([...nodeMap.values()].map(n => n.data.component))];
         const hueMap = Object.fromEntries(comps.map((c, i) => [c, i / comps.length]));
-
+        const MS_PER_UNIT = LAYOUT_CONFIG.msPerUnit;  // ms per world‐unit, e.g. 10 000
+        
         function getContextFileUrl(cacheBust = false) {
             let fn = fileSelector.value;
             if (!/^context(?:_-?\d+)?\.jsonl$/.test(fn)) fn = 'context.jsonl';
@@ -1348,20 +1359,63 @@
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x111111);
 
-        const camera = new THREE.PerspectiveCamera(
-            60,
-            window.innerWidth / window.innerHeight,
-            0.1,
-            2e6
-        );
-        camera.position.set(0, 500, 500);
+        // ─── CAMERA ──────────────────────────────────────────────────────────
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  2e6
+);
+camera.position.set(0, -100, 0);
+camera.lookAt(0, 0, 0);    // baseline = looking along +Y (180° polar)
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        document.body.appendChild(renderer.domElement);
+// ─── RENDERER ────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
 
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
+// ─── CONTROLS ────────────────────────────────────────────────────────
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// lock out zoom & pan
+controls.enableZoom = false;
+controls.enablePan  = false;
+
+// (optional) flip horizontal drag direction
+controls.rotateSpeed = -controls.rotateSpeed;
+
+// full pitch range so you can sweep “up” and “down” around the Y-axis baseline
+controls.minPolarAngle   = 0;       // look all the way “through” to –Y
+controls.maxPolarAngle   = Math.PI; // back down to +Y
+
+// full 360° yaw
+controls.minAzimuthAngle = -Infinity;
+controls.maxAzimuthAngle =  Infinity;
+
+// one-time sync
+controls.update();
+
+
+
+
+        renderer.domElement.addEventListener('wheel', onWheel, { passive:false });
+
+        function onWheel(e) {
+        e.preventDefault();
+
+        // invert wheel so ↑ = back in time, ↓ = forward toward now
+        const deltaUnits = -e.deltaY * SCROLL_SPEED;
+
+        // accumulate from 0 → +∞
+        graphGroup.position.y = Math.min(0, graphGroup.position.y + deltaUnits);
+        yScrollOffset = graphGroup.position.y; // keep drift logic in sync
+
+        // ── recalc the “view” timestamp ───────────────────────────────────
+        const elapsedMs = -yScrollOffset * MS_PER_UNIT;
+        const viewDate = new Date(Date.now() - elapsedMs);
+        viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
+        }
 
         const raycaster = new THREE.Raycaster();
         const pointer = new THREE.Vector2();
@@ -1924,6 +1978,13 @@
 
         fileSelector.addEventListener('change', () => loadGraph());
         ageSel.addEventListener('change', applyFilters);
+
+        // ─── header clocks ────────────────────────────────
+        const now      = new Date();
+        const viewTime = new Date(now - graphGroup.position.y * LAYOUT_CONFIG.msPerUnit);
+
+        nowLbl.textContent  = 'Now:  '  + now.toLocaleString();
+        viewLbl.textContent = 'View: '  + viewTime.toLocaleString();
 
         /********************************************************************
          *  Animation loop  (COMPLETE, SELF-CONTAINED)
