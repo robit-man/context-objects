@@ -956,26 +956,58 @@ class Assembler:
         return block
         
 
-    def _extract_image_b64(self, text: str) -> list[str]:
+    def _extract_image_b64(self, text: str, *, max_bytes: int = 8 * 1024 * 1024) -> list[str]:
         """
-        Find any local filepaths or HTTP(S) URLs ending in .jpg/.png/etc.
-        Read/fetch & base64-encode them.
+        Scan *text* for image-like tokens and return a list of base-64 strings
+        ready for Ollama’s  `images=[ … ]` parameter.
+
+        Recognised forms
+        ─────────────────
+          • HTTP/HTTPS URLs ending in .jpg/.jpeg/.png/.bmp/.gif/.webp
+          • Absolute/relative POSIX paths   (/foo/bar.png,  ./pic.jpg,  ../x.webp)
+          • Windows-style paths             (C:\\images\\cat.jpeg)
+          • Home-relative paths             (~/Downloads/photo.png)
+
+        Safety guards
+        ─────────────
+          • Any item > *max_bytes* is skipped.
+          • Network fetches use streaming + 5 s timeout.
         """
-        pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+        # full list of accepted extensions
+        exts = r"(?:jpg|jpeg|png|bmp|gif|webp)"
+
+        pattern = rf"""
+            (?P<url>https?://\S+?\.{exts}) |               # remote
+            (?P<path>
+                (?:~|\.{1,2}|[A-Za-z]:)?[^\s"'<>|]+\.{exts} # local
+            )
+        """
+
         imgs_b64: list[str] = []
-        for loc in re.findall(pattern, text, flags=re.IGNORECASE):
+        for m in re.finditer(pattern, text, re.IGNORECASE | re.VERBOSE):
+            loc = m.group().strip()
+
             try:
+                # ── Remote URL ──────────────────────────────────────────────
                 if loc.lower().startswith(("http://", "https://")):
-                    resp = requests.get(loc, timeout=5)
-                    resp.raise_for_status()
-                    data = resp.content
+                    with requests.get(loc, timeout=5, stream=True) as resp:
+                        resp.raise_for_status()
+                        data = resp.raw.read(max_bytes + 1)
+                        if len(data) > max_bytes:
+                            continue  # too large
+                # ── Local file path ─────────────────────────────────────────
                 else:
-                    with open(loc, "rb") as f:
-                        data = f.read()
-                imgs_b64.append(base64.b64encode(data).decode("utf-8"))
+                    p = Path(loc).expanduser().resolve()
+                    if not p.is_file() or p.stat().st_size > max_bytes:
+                        continue
+                    data = p.read_bytes()
+
+                imgs_b64.append(base64.b64encode(data).decode("ascii"))
+
             except Exception:
-                # if fetch/read fails, skip
+                # swallow any fetch/IO error
                 continue
+
         return imgs_b64
     
     def _stream_and_capture(
@@ -983,40 +1015,44 @@ class Assembler:
         model: str,
         messages: list[dict[str, str]],
         *,
-        tag: str = ""
+        tag: str = "",
+        max_image_bytes: int = 8 * 1024 * 1024,
     ) -> str:
         """
-        Stream a response, auto-Gemma-3 formatting, and if the last user
-        message contains image paths or URLs, base64-encode & pass them
-        via `images=[…]` into Ollama.
+        Streams a response from Ollama, automatically inlining any images
+        referenced in the *last* user message.
+
+        • Gemma-3 prompts are re-formatted automatically.
+        • Images are passed as base-64 strings when present.
         """
-        # ——— gemma-3 formatting —————————————————————
+        # ── Gemma-3 special-case ───────────────────────────────────────────
         if model.lower().startswith("gemma3"):
-            prompt = self._gemma_format(messages)
+            prompt   = self._gemma_format(messages)
             messages = [{"role": "user", "content": prompt}]
 
-        # ——— extract any images from the last user message ———
-        last_msg = messages[-1]["content"]
-        imgs     = self._extract_image_b64(last_msg)
+        # ── Discover & encode images ───────────────────────────────────────
+        last_msg  = messages[-1]["content"]
+        imgs_b64  = self._extract_image_b64(last_msg, max_bytes=max_image_bytes)
 
-        # ——— build chat kwargs ————————————————————————
         chat_kwargs: dict[str, Any] = {
             "model":    model,
             "messages": messages,
             "stream":   True,
         }
-        if imgs:
-            chat_kwargs["images"] = imgs
+        if imgs_b64:
+            chat_kwargs["images"] = imgs_b64
 
-        # ——— stream & accumulate ——————————————————————
-        out = ""
+        # ── Stream & collect output ────────────────────────────────────────
+        out_parts: list[str] = []
         print(f"{tag} ", end="", flush=True)
         for part in chat(**chat_kwargs):
             chunk = part["message"]["content"]
             print(chunk, end="", flush=True)
-            out += chunk
+            out_parts.append(chunk)
         print()
-        return out
+
+        return "".join(out_parts)
+
 
 
 

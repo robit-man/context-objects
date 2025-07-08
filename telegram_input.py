@@ -636,14 +636,16 @@ def telegram_input(asm):
             elif msg.photo:
                 kind = "photo"
                 image_paths: List[str] = []
-                if kind == "photo":
-                    for p in msg.photo:
-                        file = await bot.get_file(p.file_id)
-                        local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
-                        await file.download_to_drive(str(local_path))
-                        image_paths.append(str(local_path.resolve()))
-                    # let downstream see “n image(s)” instead of raw file_id
-                    data = f"{len(image_paths)} image(s)"
+
+                for p in msg.photo:
+                    file = await bot.get_file(p.file_id)
+                    local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.jpg"
+                    await file.download_to_drive(str(local_path))
+                    image_paths.append(str(local_path.resolve()))
+
+                # show a neutral placeholder in the chat history
+                data = f"{len(image_paths)} image(s)"
+
 
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
@@ -732,24 +734,14 @@ def telegram_input(asm):
 
             # if we just downloaded images, attach their absolute disk paths
             if kind == "photo":
-                metadata["image_paths"] = image_paths
+                metadata["image_paths"] = image_paths  # for downstream use only
 
-                # let the user know exactly where we stored them and point to analysis tools
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "✅ Saved image(s) to disk:\n"
-                        + "\n".join(f"- `{p}`" for p in image_paths)
-                        + "\n\nYou can now run `/analyze_image <path>` to analyze any of these."
-                    ),
-                    reply_to_message_id=msg.message_id,
-                    parse_mode="Markdown"
-                )
-
+            # Preserve reply-link metadata
             if msg.reply_to_message:
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
                 if msg.reply_to_message.from_user.id == bot.id:
                     metadata["in_reply_to_bot_message_id"] = msg.reply_to_message.message_id
+
 
             # ── Create & save the ContextObject segment ──────────────────────────
             seg = ContextObject.make_segment(
@@ -865,8 +857,7 @@ def telegram_input(asm):
 
             sender = user.username or user.first_name
             if image_paths:
-                img_list = ", ".join(image_paths)
-                user_text = f"{sender} sent image(s): {img_list}"
+                user_text = f"{sender} sent {len(image_paths)} image(s)"
             else:
                 user_text = f"{sender}: {text}"
 

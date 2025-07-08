@@ -384,19 +384,61 @@ if updated:
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
-
+    
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 for model in (config.get("primary_model"), config.get("secondary_model"), config.get("decision_model")):
-    try:
-        existing = subprocess.check_output(["ollama", "list"], text=True)
-        if model not in existing:
+    # try at most twice: original pull, then (if needed) pull after upgrade
+    for attempt in range(2):
+        try:
+            # Get the list of models already present
+            existing = subprocess.check_output(
+                ["ollama", "list"],
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            if model in existing:
+                log_message(f"Ollama model '{model}' already present.", "INFO")
+                break
+
             log_message(f"Model '{model}' not found locally—pulling with Ollama...", "PROCESS")
-            subprocess.check_call(["ollama", "pull", model])
-            log_message(f"Successfully pulled Ollama model '{model}'.", "SUCCESS")
-        else:
-            log_message(f"Ollama model '{model}' already present.", "INFO")
-    except subprocess.CalledProcessError as e:
-        log_message(f"Error pulling model '{model}': {e}", "WARNING")
+
+            # Run the pull and capture output so we can inspect failures
+            result = subprocess.run(
+                ["ollama", "pull", model],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                log_message(f"Successfully pulled Ollama model '{model}'.", "SUCCESS")
+                break  # done with this model
+
+            # ── Pull failed ────────────────────────────────────────────────
+            combined_out = (result.stdout or "") + (result.stderr or "")
+            needs_upgrade = (
+                "requires a newer version of Ollama" in combined_out
+                or "manifest: 412" in combined_out
+            )
+
+            if needs_upgrade and attempt == 0:
+                log_message("Ollama is out of date; upgrading Ollama…", "PROCESS")
+                try:
+                    subprocess.check_call(
+                        ["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"]
+                    )
+                except subprocess.CalledProcessError as up_err:
+                    log_message(f"Failed to upgrade Ollama: {up_err}", "ERROR")
+                    break  # give up on this model
+                else:
+                    log_message("Upgrade complete—retrying pull…", "INFO")
+                    continue  # retry pulling after upgrade
+            else:
+                log_message(f"Error pulling model '{model}': {combined_out.strip()}", "WARNING")
+                break  # unrecoverable error; stop retrying
+
+        except subprocess.CalledProcessError as e:
+            log_message(f"Subprocess error with model '{model}': {e}", "WARNING")
+            break
 
 
 # ──────────── PIPER + ONNX SETUP ─────────────────────────────────────────────
