@@ -1033,7 +1033,7 @@ class Assembler:
         model: str,
         messages: list[dict[str, str]],
         *,
-        temperature: float = 0.7,
+        #temperature: float = 0.7,
         tag: str = "",
         max_image_bytes: int = 8 * 1024 * 1024,
         images: list[bytes] | None = None
@@ -1090,7 +1090,6 @@ class Assembler:
             model=model,
             messages=messages,
             stream=True,
-            temperature=temperature  # or pass via options if you prefer
         ):
             chunk = part["message"]["content"]
             print(chunk, end="", flush=True)
@@ -1685,7 +1684,6 @@ class Assembler:
         )
         return choice.upper() == "TOOLS"
     
-
     def run_with_meta_context(
         self,
         user_text: str,
@@ -1710,7 +1708,7 @@ class Assembler:
             "errors":     [],
             "tool_ctxs":  [],
             "recent_ids": [],  # will be filled in Stage 3
-            "images":    images or [],
+            "images":     images or [],
         }
         self._last_state = state
 
@@ -1751,37 +1749,30 @@ class Assembler:
 
         # ─── Fast-path when tools not needed (Gemma-3 format) ────────────
         if not state["use_tools"]:
-            # 1) Pull the last 10 conversation segments
             recent = self.repo.query(lambda c: c.domain == "segment")[-10:]
             convo_lines = [
                 ("User: " if c.semantic_label == "user_input" else "Assistant: ") + c.summary
                 for c in recent
             ]
-
-            # 2) Build a single Gemma-style prompt:
-            #    • recent convo as system-level context
-            #    • current user question as the user turn
             system_block = "### Recent conversation ###\n" + "\n".join(convo_lines)
             msgs = [
                 {"role": "system", "content": system_block},
                 {"role": "user",   "content": user_text},
             ]
-            prompt = self._gemma_format(msgs)          # <-- uses helper you added earlier
+            prompt = self._gemma_format(msgs)
 
-            # 3) Stream the reply
             from ollama import chat
             reply = ""
             for chunk in chat(
                 model=self.primary_model,
-                messages=[{"role": "user", "content": prompt, "images": state.get("images") or []}],
+                messages=[{"role": "user", "content": prompt, "images": state.get("images")}],
                 stream=True
             ):
-                reply_chunk = chunk["message"]["content"]
-                reply += reply_chunk
+                reply += chunk["message"]["content"]
                 status_cb("fast_reply", reply)
+
             status_cb("output", reply)
             return reply
-
 
         # ─── Stage 1: record_input ───────────────────────────────────────
         t0 = datetime.utcnow()
@@ -1809,7 +1800,10 @@ class Assembler:
             extra = self._get_history()
             state["recent_ids"] = [c.context_id for c in extra]
             out3 = self._stage3_retrieve_and_merge_context(
-                user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
+                user_text,
+                state["user_ctx"],
+                state["sys_ctx"],
+                extra_ctx=extra
             )
             state.update(out3)
             _record_perf("retrieve_and_merge_context", "(merged)", True)
@@ -1866,12 +1860,13 @@ class Assembler:
         # ─── Stage 7: planning_summary ──────────────────────────────────
         t0 = datetime.utcnow()
         try:
-            logging.debug("Planning with tools: %s", [t["name"] for t in state.get("tools_list", [])])
+            logging.debug("Planning with tools: %s", [t["name"] for t in state["tools_list"]])
             ctx7, plan_out = self._stage7_planning_summary(
-                state.get("clar_ctx"),
-                state.get("know_ctx"),
-                state.get("tools_list", []),
-                user_text
+                state["clar_ctx"],
+                state["know_ctx"],
+                state["tools_list"],
+                user_text,
+                state
             )
             state["plan_ctx"]    = ctx7
             state["plan_output"] = plan_out
@@ -1884,7 +1879,10 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             _, _, fixed = self._stage7b_plan_validation(
-                state["plan_ctx"], state["plan_output"], state.get("tools_list", [])
+                state["plan_ctx"],
+                state["plan_output"],
+                state["tools_list"],
+                state
             )
             state["fixed_calls"] = fixed
             _record_perf("plan_validation", f"{len(fixed)} calls", True)
@@ -1897,8 +1895,9 @@ class Assembler:
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
-                "\n".join(state.get("fixed_calls", [])),
-                state.get("tools_list", [])
+                "\n".join(state["fixed_calls"]),
+                state["tools_list"],
+                state
             )
             state.update({"tc_ctx": tc_ctx, "raw_calls": raw_calls, "schemas": schemas})
             _record_perf("tool_chaining", f"{len(raw_calls)} calls", True, tc_ctx)
@@ -1909,7 +1908,7 @@ class Assembler:
         # ─── Stage 8.5: user_confirmation ─────────────────────────────
         t0 = datetime.utcnow()
         try:
-            confirmed = self._stage8_5_user_confirmation(state.get("raw_calls", []), user_text)
+            confirmed = self._stage8_5_user_confirmation(state["raw_calls"], user_text)
             state["confirmed_calls"] = confirmed
             _record_perf("user_confirmation", "(auto-approved)", True)
         except Exception as e:
@@ -1920,11 +1919,12 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             tcs = self._stage9_invoke_with_retries(
-                state.get("confirmed_calls", []),
-                state.get("plan_output", ""),
-                state.get("schemas", []),
+                state["confirmed_calls"],
+                state["plan_output"],
+                state["schemas"],
                 user_text,
-                state["clar_ctx"].metadata
+                state["clar_ctx"].metadata,
+                state
             )
             state["tool_ctxs"] = tcs
             _record_perf("invoke_with_retries", f"{len(tcs)} runs", True)
@@ -1937,9 +1937,10 @@ class Assembler:
         try:
             rp = self._stage9b_reflection_and_replan(
                 state["tool_ctxs"],
-                state.get("plan_output", ""),
+                state["plan_output"],
                 user_text,
-                state["clar_ctx"].metadata
+                state["clar_ctx"].metadata,
+                state
             )
             state["replan"] = rp
             _record_perf("reflection_and_replan", f"replan={bool(rp)}", True)
@@ -1958,13 +1959,16 @@ class Assembler:
             state["errors"].append(("assemble_and_infer", str(e)))
             state["draft"] = ""
 
-        if state.get("errors"):
+        if state["errors"]:
             t0 = datetime.utcnow()
             try:
                 patched = self._stage10b_response_critique_and_safety(
-                    state["draft"], user_text, state.get("tool_ctxs", [])
+                    state["draft"],
+                    user_text,
+                    state["tool_ctxs"],
+                    state
                 )
-                state["draft"] = patched.strip() or state["draft"]
+                state["draft"] = patched or state["draft"]
                 _record_perf("response_critique", "(patched)", True)
             except Exception as e:
                 _record_perf("response_critique", str(e), False)
@@ -1984,7 +1988,8 @@ class Assembler:
         t0 = datetime.utcnow()
         try:
             self._stage11_memory_writeback(
-                state.get("final", ""), state.get("tool_ctxs", [])
+                state["final"],
+                state["tool_ctxs"]
             )
             _record_perf("memory_writeback", "(queued)", True)
         except Exception as e:
@@ -2002,7 +2007,7 @@ class Assembler:
             pass
 
         # final output
-        out = state.get("final", "").strip()
+        out = state["final"].strip()
         self._last_state = state
         status_cb("output", out)
         return out

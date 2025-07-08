@@ -342,7 +342,7 @@ def _make_status_cb(
     chat_id: int,
     msg_id: Optional[int],
     *,
-    max_lines: int = 10,
+    max_lines: int = 30,
     min_interval: float = 5,
 ):
     if os.name == "nt":
@@ -784,8 +784,7 @@ def telegram_input(asm):
                                 os.unlink(p)
                             except:
                                 pass
-
-            # ── Decide if we should respond / run inference ───────────────────
+            # ── Decide if we should respond / run inference ────────────────────
             sender = user.username or user.first_name
             if image_paths:
                 user_text = f"{sender} sent image(s): " + " ".join(image_paths)
@@ -793,24 +792,44 @@ def telegram_input(asm):
                 user_text = f"{sender}: {text}"
 
             trigger_id = msg.message_id
-            wants_reply = False
-            if text:
-                try:
-                    wants_reply = await asyncio.to_thread(chat_asm.filter_callback, text)
-                except Exception:
-                    wants_reply = False
 
+            # 1️⃣ filter_callback (just user_text)
+            try:
+                wants_reply = await asyncio.to_thread(
+                    chat_asm.filter_callback, user_text
+                )
+                logger.info("✅ filter_callback → %s", wants_reply)
+            except Exception as err:
+                logger.error("❌ filter_callback error: %s", err)
+                wants_reply = True  # default to yes on error
+
+            # 2️⃣ tools_callback (just user_text)
+            try:
+                use_tools = await asyncio.to_thread(
+                    chat_asm.tools_callback, user_text
+                )
+                logger.info("✅ tools_callback → %s", use_tools)
+            except Exception as err:
+                logger.error("❌ tools_callback error: %s", err)
+                use_tools = True  # default to yes on error
+
+            # 3️⃣ mention‐me check
             mention_me = any(
                 ent.type == "mention"
-                and msg.text[ent.offset : ent.offset + ent.length].lstrip("@").lower() == bot_name
+                and msg.text[ent.offset : ent.offset + ent.length]
+                    .lstrip("@").lower() == bot_name
                 for ent in (msg.entities or [])
             )
+
+            # Final decision: only run if tools are allowed *and* one of the triggers fires
             do_infer = (
-                chat_type == "private"
-                or msg.voice
-                or wants_reply
-                or mention_me
-                or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
+                use_tools and (
+                    chat_type == "private"
+                    or msg.voice
+                    or wants_reply
+                    or mention_me
+                    or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
+                )
             )
             if not do_infer:
                 return
@@ -827,7 +846,6 @@ def telegram_input(asm):
                 )
                 await queue.put((user_text, trigger_id))
                 return
-
             # ── Runner that stages “processing…” then delivers text+voice ─────────
             async def start_runner(request_text: str, reply_to_id: int):
                 # Load debug flag
@@ -886,10 +904,10 @@ def telegram_input(asm):
                                 typing_task.cancel()
 
                         if not final.strip():
-                            if placeholder_id:
-                                try:
-                                    await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                                except: pass
+                            #if placeholder_id:
+                            #    try:
+                            #        await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                            #    except: pass
                             return
 
                         # deliver text
@@ -899,7 +917,7 @@ def telegram_input(asm):
                                     chat_id=chat_id, message_id=placeholder_id, text=final
                                 )
                             else:
-                                await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                #await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
                                 await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
                         else:
                             if len(final) < 4000:

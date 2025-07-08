@@ -65,19 +65,29 @@ def _stage3_retrieve_and_merge_context(
     and recent tool outputs — using human-inspired capacities and decay.
     """
     import re
-    from datetime import datetime as _dt, timedelta
+    from datetime import datetime as _dt, timezone, timedelta
     import concurrent.futures
 
     # ——— Helpers —————————————————————————————————————————————————————————————
     now = default_clock()
 
     def _to_dt(ts):
+        """
+        Parse ISO timestamp or datetime, and always return a naïve UTC datetime.
+        """
         if isinstance(ts, str):
             try:
-                return _dt.fromisoformat(ts.replace("Z", "+00:00"))
-            except:
+                # parse as aware UTC, then drop tzinfo
+                dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception as e:
+                # fallback to now if parse fails
+                print(f"⚠️ [timestamp parse error] {ts!r} → {e}")
                 return now
-        return ts
+        if isinstance(ts, _dt):
+            # drop any tzinfo if present
+            return ts.astimezone(timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+        return now
 
     def _dedupe(objs):
         seen = set()
@@ -210,7 +220,6 @@ def _stage3_retrieve_and_merge_context(
                 merged.append(c)
                 seen.add(c.summary)
 
-    # priority: system → user input → working memory → short-term → semantic → associative → tool
     _add([sys_ctx])
     _add([user_ctx])
     _add(segments + inferences)
@@ -221,17 +230,6 @@ def _stage3_retrieve_and_merge_context(
 
     merged_ids = [c.context_id for c in merged]
     wm_ids     = [c.context_id for c in segments + inferences]
-
-    # ——— Debug print —————————————————————————————————————————————————
-    self._print_stage_context("context_merge", {
-        "system":    [sys_ctx.summary],
-        "narrative": [narr_ctx.summary],
-        "working":   [c.summary for c in segments + inferences],
-        "recent":    [c.summary for c in recent],
-        "semantic":  [c.summary for c in semantic],
-        "assoc":     [f"{c.summary} (score={getattr(c,'retrieval_score',0):.2f})" for c in assoc],
-        "tools":     [c.summary for c in recent_tools],
-    })
 
     return {
         "narrative_ctx": narr_ctx,
@@ -279,7 +277,8 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
                         {"role": "system", "content": retry_sys},
                         {"role": "user",   "content": out}
                     ],
-                    tag="[ClarifierRetry]"
+                    tag="[ClarifierRetry]",
+                    images=state.get("images")
                 )
             else:
                 # give up: wrap raw text into notes
@@ -303,7 +302,7 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
     self.repo.save(ctx)
     return ctx
 
-def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
+def _stage5_external_knowledge(self, clar_ctx: ContextObject, state: Dict[str,Any] = None) -> ContextObject:
     import json
     import concurrent.futures
     from datetime import datetime, timedelta
@@ -313,72 +312,73 @@ def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
     # ── 0) Prune stale/overflow contexts ──────────────────────────────────
     prune_summary = self._stage_prune_context_store({})
 
-    # ── 1) In parallel, gather:
-    #    A) recent segments (user_input/assistant)
-    #    B) recent final_inference stages
-    #    C) similarity hits on clarifier keywords
-    #    D) local summary‐match hits
+    # ── 1) In parallel, gather raw ContextObjects ────────────────────────
     with concurrent.futures.ThreadPoolExecutor() as exec:
-        fut_seg = exec.submit(
-            lambda: sorted(
-                [c for c in self.repo.query(
-                    lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
-                )],
-                key=lambda c: c.timestamp, reverse=True
-            )[: self.top_k]
-        )
-        fut_inf = exec.submit(
-            lambda: sorted(
-                [c for c in self.repo.query(
-                    lambda c: c.semantic_label=="final_inference"
-                )],
-                key=lambda c: c.timestamp, reverse=True
-            )[: self.top_k]
-        )
-        fut_sim = exec.submit(
-            lambda: [
-                h for kw in clar_ctx.metadata.get("keywords", [])
-                for h in self.engine.query(
-                    stage_id="external_knowledge_retrieval",
-                    similarity_to=kw,
-                    top_k=self.top_k
+        fut_seg = exec.submit(lambda: sorted(
+            [c for c in self.repo.query(
+                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+            )],
+            key=lambda c: c.timestamp, reverse=True
+        )[: self.top_k])
+
+        fut_inf = exec.submit(lambda: sorted(
+            [c for c in self.repo.query(
+                lambda c: c.semantic_label=="final_inference"
+            )],
+            key=lambda c: c.timestamp, reverse=True
+        )[: self.top_k])
+
+        fut_sim = exec.submit(lambda: [
+            h for kw in clar_ctx.metadata.get("keywords", [])
+            for h in self.engine.query(
+                stage_id="external_knowledge_retrieval",
+                similarity_to=kw,
+                top_k=self.top_k
+            )
+        ])
+
+        fut_loc = exec.submit(lambda: [
+            c for c in self.repo.query(
+                lambda c: (
+                    c.semantic_label in ("user_input","assistant","final_inference")
+                    and datetime.fromisoformat(c.timestamp.rstrip("Z")) >= now - timedelta(hours=1)
+                    and any(kw.lower() in (c.summary or "").lower() for kw in clar_ctx.metadata.get("keywords", []))
                 )
-            ]
-        )
-        fut_loc = exec.submit(
-            lambda: [
-                c for c in self.repo.query(
-                    lambda c: (
-                        c.semantic_label in ("user_input","assistant","final_inference")
-                        and datetime.fromisoformat(c.timestamp.rstrip("Z")) >= now - timedelta(hours=1)
-                        and any(kw.lower() in (c.summary or "").lower() for kw in clar_ctx.metadata.get("keywords", []))
-                    )
-                )
-            ]
-        )
+            )
+        ])
 
     segs = fut_seg.result(timeout=2.0) if fut_seg else []
     infs = fut_inf.result(timeout=2.0) if fut_inf else []
     sims = fut_sim.result(timeout=2.0) if fut_sim else []
     locs = fut_loc.result(timeout=2.0) if fut_loc else []
 
-    # ── 2) Build working memory entries
+    # ── 2) snippet‐truncation helper ───────────────────────────────────────
+    MAX_SNIP_LEN = 200
+    def truncate(txt: str) -> str:
+        if len(txt) > MAX_SNIP_LEN:
+            return txt[:MAX_SNIP_LEN].rstrip() + "…"
+        return txt
+
+    # ── 3) Build working memory entries (truncated) ───────────────────────
     working_memory = []
     for c in reversed(segs):
-        working_memory.append(f"(WM) [{c.semantic_label}] {c.summary}")
+        working_memory.append(f"(WM)[{c.semantic_label}] {truncate(c.summary)}")
     for c in reversed(infs):
-        working_memory.append(f"(WM) [{c.semantic_label}] {c.summary}")
+        working_memory.append(f"(WM)[{c.semantic_label}] {truncate(c.summary)}")
 
-    # ── 3) Build similarity snippets
-    sim_snips = [f"(EXT) [{','.join(h.tags)}] {h.summary}" for h in sims]
+    # ── 4) Build similarity snippets ──────────────────────────────────────
+    sim_snips = [
+        f"(EXT)[{','.join(h.tags)}] {truncate(h.summary)}"
+        for h in sims
+    ]
 
-    # ── 4) Build local‐match snippets
+    # ── 5) Build local‐match snippets ─────────────────────────────────────
     loc_snips = []
     for c in locs:
         tag = "SEG" if c.domain=="segment" else "INF"
-        loc_snips.append(f"(LOC-{tag}) [{c.semantic_label}] {c.summary}")
+        loc_snips.append(f"(LOC-{tag})[{c.semantic_label}] {truncate(c.summary)}")
 
-    # ── 5) Fallback to last 5 segments if nothing collected
+    # ── 6) Fallback to last 5 segments if nothing collected ───────────────
     if not (working_memory or sim_snips or loc_snips):
         fallback = sorted(
             [c for c in self.repo.query(
@@ -387,43 +387,50 @@ def _stage5_external_knowledge(self, clar_ctx: ContextObject) -> ContextObject:
             key=lambda c: c.timestamp, reverse=True
         )[:5]
         for c in reversed(fallback):
-            working_memory.append(f"(FB) [{c.semantic_label}] {c.summary}")
+            working_memory.append(f"(FB)[{c.semantic_label}] {truncate(c.summary)}")
 
-    # ── 6) Combine and dedupe, preserving order
+    # ── 7) Combine, dedupe, and cap total snippet count ───────────────────
     all_snips = working_memory + sim_snips + loc_snips
     seen = set(); unique = []
     for s in all_snips:
         if s not in seen:
             seen.add(s); unique.append(s)
+            if len(unique) >= self.top_k * 3:  # avoid runaway length
+                break
 
-    # ── 7) Persist and return
+    # ── 8) Persist and return as a ContextObject ─────────────────────────
+    summary_text = "\n".join(unique) or "(none)"
     ctx = ContextObject.make_stage(
         "external_knowledge_retrieval",
         clar_ctx.references,
         {"snippets": unique}
     )
     ctx.stage_id = "external_knowledge_retrieval"
-    ctx.summary  = "\n".join(unique) or "(none)"
+    ctx.summary  = summary_text
     ctx.touch()
     self.repo.save(ctx)
 
-    # ── 8) Debug print
+    # ── 9) Debug print ────────────────────────────────────────────────────
     self._print_stage_context("external_knowledge_retrieval", {
         "pruned":         prune_summary,
         "working_memory": working_memory or ["(none)"],
-        "similarity":     sim_snips or ["(none)"],
-        "local_matches":  loc_snips or ["(none)"],
+        "similarity":     sim_snips     or ["(none)"],
+        "local_matches":  loc_snips     or ["(none)"],
+        "total_snips":    len(unique),
     })
 
     return ctx
 
-def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
+def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
     """
     Return a de-duplicated, lexicographically sorted list of:
-    { "name": "<tool_name>", "description": "<one-line desc>" }
+      { "name": "<tool_name>",
+        "description": "<one-line truncated desc>",
+        "schema": <full JSON-RPC schema dict>
+      }
     for every tool_schema in the repo.
     """
-    import json
+    import json, textwrap
 
     # 1) Load every schema context object tagged "tool_schema"
     rows = self.repo.query(
@@ -431,7 +438,7 @@ def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
     )
 
     # 2) Keep only the newest per tool name
-    buckets: dict[str, ContextObject] = {}
+    buckets: Dict[str, Any] = {}
     for ctx in rows:
         try:
             blob = json.loads(ctx.metadata["schema"])
@@ -441,118 +448,162 @@ def _stage6_prepare_tools(self) -> List[Dict[str, str]]:
         if name not in buckets or ctx.timestamp > buckets[name].timestamp:
             buckets[name] = ctx
 
-    # 3) Build the list, sorted by tool name
-    tool_defs: list[dict[str, str]] = []
+    # 3) Build the list, sorted by tool name, including truncated description + full schema
+    tool_defs: List[Dict[str, Any]] = []
     for name in sorted(buckets):
         blob = json.loads(buckets[name].metadata["schema"])
-        desc = blob.get("description", "").split("\n", 1)[0]
-        tool_defs.append({"name": name, "description": desc})
+        full_desc = blob.get("description", "").split("\n", 1)[0]
+        short_desc = textwrap.shorten(full_desc, width=60, placeholder="…")
+        tool_defs.append({
+            "name":        name,
+            "description": short_desc,
+            "schema":      blob,
+        })
 
     return tool_defs
+
 
 def _stage7_planning_summary(
     self,
     clar_ctx: ContextObject,
     know_ctx: ContextObject,
-    tools_list: List[Dict[str, str]],
+    tools_list: List[Dict[str, Any]],
     user_text: str,
+    state: Dict[str, Any],
 ) -> Tuple[ContextObject, str]:
-    import json, re, hashlib, datetime
-    from typing import Any, Dict, List, Tuple
+    """
+    1) Load the latest planning_prompt artifact (or fallback to config)
+    2) Inject truncated tool list (name + short desc)
+    3) Run up to 3 JSON-only planning passes, halving snippets each retry
+    4) Take the raw plan, find which tools were selected
+    5) Inject full schemas for only those tools and do one final “fill in missing args” pass
+    6) Serialize to plan_json and persist
+    """
+    import json, re, hashlib, datetime, textwrap
 
-    # Helper to strip out a bare JSON block
     def _clean_json_block(text: str) -> str:
         m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
         if m:
             return m.group(1)
         m2 = re.search(r"(\{.*\})", text, flags=re.S)
-        return m2.group(1) if m2 else text.strip()
+        return (m2.group(1) if m2 else text).strip()
 
-    # 0) Load prior plan critiques for optional feedback (unchanged)
+    # 0) load any prior plan critiques
     critique_rows = self.repo.query(
         lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"
     )
     critique_rows.sort(key=lambda c: c.timestamp)
-    critique_block = (
-        "\n".join(f"• {c.metadata.get('critique','')}" for c in critique_rows)
-        if critique_rows else "(no prior critiques)"
-    )
     critique_ids = [c.context_id for c in critique_rows]
 
-    # 1) Build the strict system prompt + injected tool list
-    #    planning_prompt ends with "Available tools:\n"
-    tool_lines = "\n".join(f"- **{t['name']}**: {t['description']}"
-                            for t in tools_list) or "(none)"
-    base_system = (
-        self._get_prompt("planning_prompt")
-        + tool_lines
+    # 1) fetch the “planning_prompt” artifact
+    prompt_rows = self.repo.query(
+        lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"
     )
+    prompt_rows.sort(key=lambda c: c.timestamp, reverse=True)
+    system_base = prompt_rows[0].summary if prompt_rows else self._get_prompt("planning_prompt")
 
-    # 2) Build the user prompt
-    base_user = (
-        f"User question:\n{user_text}\n\n"
-        f"Clarified intent:\n{clar_ctx.summary}\n\n"
-        f"Snippets:\n{know_ctx.summary or '(none)'}"
-    )
+    # 2) assemble truncated tool list
+    tool_lines = "\n".join(
+        f"- **{t['name']}**: {t['description']}"
+        for t in tools_list
+    ) or "(none)"
+    base_system = "\n\n".join([
+        system_base.rstrip(),
+        "Available tools:",
+        tool_lines
+    ])
+    replan_system = "\n\n".join([
+        "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.",
+        "Available tools:",
+        tool_lines
+    ])
 
+    # 3) prepare user block
+    original_snips = (know_ctx.summary or "").splitlines()
+    def build_user(snips):
+        return "\n\n".join([
+            f"User question:\n{user_text}",
+            f"Clarified intent:\n{clar_ctx.summary}",
+            "Snippets:\n" + ("\n".join(snips) if snips else "(none)")
+        ])
+    full_user = build_user(original_snips)
+
+    # 4) up to 3 planning passes
     last_calls = None
-    plan_obj = None
-    cleaned = ""
-
-    # 3) Up to 3 passes to produce valid JSON & exact tool names
+    plan_obj   = None
     for attempt in range(1, 4):
-        tag = "[Planner]" if attempt == 1 else "[PlannerReplan]"
         if attempt == 1:
-            msgs = [
-                {"role": "system", "content": base_system},
-                {"role": "user",   "content": base_user},
-            ]
+            sys_p, user_p, tag = base_system, full_user, "[Planner]"
         else:
-            msgs = [
-                {"role": "system", "content":
-                    "Your previous plan used invalid or non-exact tool names.  "
-                    "Please use only the EXACT names listed and output only the required JSON."},
-                {"role": "user",   "content": cleaned},
-            ]
+            keep = max(1, len(original_snips)//(2**(attempt-1)))
+            sys_p, user_p, tag = replan_system, build_user(original_snips[:keep]), "[PlannerReplan]"
 
-        raw = self._stream_and_capture(self.secondary_model, msgs, tag=tag)
+        raw = self._stream_and_capture(
+            self.secondary_model,
+            [{"role":"system","content":sys_p},
+             {"role":"user",  "content":user_p}],
+            tag=tag,
+            images=state.get("images")
+        )
         cleaned = _clean_json_block(raw)
-
-        # Attempt to parse
         try:
             cand = json.loads(cleaned)
             assert isinstance(cand, dict) and "tasks" in cand
             plan_obj = cand
         except:
-            # Fallback: regex extract any calls (won't match exact names, but let validation catch)
-            calls = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', raw)
-            plan_obj = {"tasks": [
-                {"call": c, "tool_input": {}, "subtasks": []} for c in calls
-            ]}
+            calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw)
+            plan_obj = {"tasks":[{"call":c,"tool_input":{},"subtasks":[]} for c in calls]}
 
-        # 4) Reject any non-exact tool names
-        valid_names = {t["name"] for t in tools_list}
-        unknown = [t["call"] for t in plan_obj["tasks"] if t["call"] not in valid_names]
+        # reject unknown tools
+        valid   = {t["name"] for t in tools_list}
+        unknown = [t["call"] for t in plan_obj["tasks"] if t["call"] not in valid]
         if unknown:
             self._print_stage_context(
                 f"planning_summary:unknown_tools(attempt={attempt})",
-                {"unknown": unknown, "allowed": sorted(valid_names)}
+                {"unknown":unknown,"allowed":sorted(valid)}
             )
             continue
 
-        # 5) Plateau guard
+        # plateau guard
         this_calls = [t["call"] for t in plan_obj["tasks"]]
         if last_calls is not None and this_calls == last_calls:
             self._print_stage_context(
                 f"planning_summary:plateaued(attempt={attempt})",
-                {"calls": this_calls}
+                {"calls":this_calls}
             )
-            break
         last_calls = this_calls
         break
 
-    # 6) Flatten subtasks → list of calls
-    def _flatten(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 5) now automatically refine by presenting full schemas for selected tools
+    selected = {t["call"] for t in plan_obj.get("tasks", [])}
+    schema_lines = []
+    for t in tools_list:
+        if t["name"] in selected:
+            schema_lines.append(
+                f"**{t['name']}**\n```json\n"
+                + json.dumps(t["schema"], indent=2)
+                + "\n```"
+            )
+    if schema_lines:
+        refine_system = "Fill in all missing tool_input arguments using the schemas below:\n\n" + "\n\n".join(schema_lines)
+        refine_user   = json.dumps({"tasks": plan_obj["tasks"]})
+        raw2 = self._stream_and_capture(
+            self.secondary_model,
+            [{"role":"system","content":refine_system},
+             {"role":"user",  "content":refine_user}],
+            tag="[PlannerRefine]",
+            images=state.get("images")
+        )
+        cleaned2 = _clean_json_block(raw2)
+        try:
+            cand2 = json.loads(cleaned2)
+            assert isinstance(cand2, dict) and "tasks" in cand2
+            plan_obj = cand2
+        except:
+            pass
+
+    # 6) flatten & serialize
+    def _flatten(task):
         out = [task]
         for sub in task.get("subtasks", []):
             out.extend(_flatten(sub))
@@ -564,59 +615,48 @@ def _stage7_planning_summary(
 
     call_strings = []
     for task in flat:
-        name = task["call"]
+        name   = task["call"]
         params = task.get("tool_input", {}) or {}
         if params:
-            args = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}'
-                            for k, v in params.items())
+            args = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in params.items())
             call_strings.append(f"{name}({args})")
         else:
             call_strings.append(f"{name}()")
 
-    # 7) Serialize final plan & compute short ID
-    plan_json = json.dumps({"tasks": [
-        {"call": s, "subtasks": []} for s in call_strings
-    ]})
-    plan_sig = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
+    plan_json = json.dumps({"tasks":[{"call":s,"subtasks":[]} for s in call_strings]})
+    plan_sig  = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
 
-    # 8) Persist planning_summary context
+    # 7) persist planning_summary + signal + tracker
     ctx = ContextObject.make_stage(
         "planning_summary",
         clar_ctx.references + know_ctx.references + critique_ids,
-        {"plan": plan_obj, "attempt": attempt, "plan_id": plan_sig}
+        {"plan":plan_obj, "attempt":attempt, "plan_id":plan_sig}
     )
     ctx.stage_id = f"planning_summary_{plan_sig}"
-    ctx.summary = plan_json
+    ctx.summary  = plan_json
     ctx.touch(); self.repo.save(ctx)
 
-    # Signal success/failure for RL
-    if call_strings:
-        succ = ContextObject.make_success(
-            f"Planner → {len(call_strings)} task(s)", refs=[ctx.context_id]
-        )
-    else:
-        succ = ContextObject.make_failure(
-            "Planner → empty plan", refs=[ctx.context_id]
-        )
+    succ_cls = ContextObject.make_success if call_strings else ContextObject.make_failure
+    succ_msg = f"Planner → {len(call_strings)} task(s)" if call_strings else "Planner → empty plan"
+    succ = succ_cls(succ_msg, refs=[ctx.context_id])
     succ.stage_id = f"planning_summary_signal_{plan_sig}"
     succ.touch(); self.repo.save(succ)
 
-    # 9) Initialize plan tracker
     tracker = ContextObject.make_stage(
         "plan_tracker",
         [ctx.context_id],
         {
-            "plan_id": plan_sig,
+            "plan_id":     plan_sig,
             "total_calls": len(call_strings),
-            "succeeded": 0,
-            "attempts": 0,
-            "status": "in_progress",
-            "started_at": datetime.datetime.utcnow().isoformat() + "Z"
+            "succeeded":   0,
+            "attempts":    0,
+            "status":      "in_progress",
+            "started_at":  datetime.datetime.utcnow().isoformat() + "Z"
         }
     )
     tracker.semantic_label = plan_sig
-    tracker.stage_id = f"plan_tracker_{plan_sig}"
-    tracker.summary = "initialized plan tracker"
+    tracker.stage_id       = f"plan_tracker_{plan_sig}"
+    tracker.summary        = "initialized plan tracker"
     tracker.touch(); self.repo.save(tracker)
 
     return ctx, plan_json
@@ -626,6 +666,7 @@ def _stage7b_plan_validation(
     plan_ctx: ContextObject,
     plan_output: str,
     tools_list: List[Dict[str, str]],
+    state: Dict[str, Any]
 ) -> Tuple[List[str], List[Tuple[str, str]], List[str]]:
     """
     Robust JSON-based plan validation. Keeps original tool_input intact,
@@ -714,7 +755,8 @@ def _stage7b_plan_validation(
                     "Return ONLY a JSON {'tasks':[...]} with each task’s tool_input now complete."},
                 {"role": "user",   "content": json.dumps(prompt)},
             ],
-            tag="[PlanFix]"
+            tag="[PlanFix]",
+            images=state.get("images", None)
         ).strip()
 
         try:
@@ -755,7 +797,8 @@ def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
     plan_output: str,
-    tools_list: List[Dict[str, str]]
+    tools_list: List[Dict[str, str]],
+    state: Dict[str, Any]
 ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
     import json, re
 
@@ -917,6 +960,7 @@ def _stage9b_reflection_and_replan(
     plan_output: str,
     user_text: str,
     clar_metadata: Dict[str, Any],
+    state: Dict[str, Any],
     max_tokens: int = 128000
 ) -> Optional[str]:
     """
@@ -1014,6 +1058,7 @@ def _stage9_invoke_with_retries(
     selected_schemas: List["ContextObject"],
     user_text: str,
     clar_metadata: Dict[str, Any],
+    state: Dict[str, Any]
 ) -> List["ContextObject"]:
     import json, re, hashlib, datetime, logging
     from typing import Tuple, Any, Dict, List
@@ -1264,7 +1309,7 @@ def _stage9_invoke_with_retries(
             {"role": "user",   "content": json.dumps({"tool_calls": pending})},
         ]
         out = self._stream_and_capture(
-            self.secondary_model, retry_msgs, tag="[ToolChainRetry]"
+            self.secondary_model, retry_msgs, tag="[ToolChainRetry]", images=state.get("images")
         ).strip()
         try:
             pending = json.loads(out)["tool_calls"]
@@ -1293,54 +1338,57 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     """
     import json
     from context import ContextObject  # adjust import as needed
+
     print(
         "[assemble_and_infer] tool_ctxs = "
         + ", ".join(f"{t.stage_id}:{t.metadata.get('output')!r}" for t in state.get("tool_ctxs", [])),
         "DEBUG"
     )
-    # ──────────────────────────────────────────────────────────────────────
-    # 1) Collect *all* relevant context-IDs, but only if they exist
-    # ──────────────────────────────────────────────────────────────────────
-    refs: list[str] = []
+    print("[DEBUG] → entering assemble_and_infer with state keys:", list(state.keys()))
+    print("[DEBUG]    plan_output =", repr(state.get("plan_output")))
+    print("[DEBUG]    tc_ctx      =", getattr(state.get("tc_ctx"), "context_id", None))
+    print("[DEBUG]    tool_ctxs   =", [t.context_id for t in state.get("tool_ctxs", [])])
+    print("[DEBUG]    wm_ids      =", state.get("wm_ids"))
+    print("[DEBUG]    recent_ids  =", state.get("recent_ids"))
 
+    # ─── 1) Collect all relevant context-IDs ──────────────────────────────────
+    refs: list[str] = []
     def _maybe_add(key: str):
-        obj = state.get(key)
-        if obj:
-            refs.append(obj.context_id)
+        ctx = state.get(key)
+        if ctx:
+            refs.append(ctx.context_id)
 
     _maybe_add("user_ctx")
     _maybe_add("sys_ctx")
-    _maybe_add("tc_ctx")    # ← include the tool_chaining context (full JSON schemas)
+    _maybe_add("tc_ctx")    # include the tool_chaining context
     refs.extend(state.get("wm_ids", []))
     refs.extend(state.get("recent_ids", []))
     _maybe_add("clar_ctx")
     _maybe_add("know_ctx")
     _maybe_add("plan_ctx")
-    # include any tool calls
     for t in state.get("tool_ctxs", []):
         refs.append(t.context_id)
 
-    # de-dup while preserving order
+    # de-duplicate while preserving order
     seen, ordered = set(), []
     for cid in refs:
         if cid not in seen:
             seen.add(cid)
             ordered.append(cid)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 2) Load the ContextObjects, skipping stale ones
-    # ──────────────────────────────────────────────────────────────────────
+    # ─── 2) Load the ContextObjects, skipping missing ones ───────────────────
     ctxs = []
     for cid in ordered:
         try:
-            ctxs.append(self.repo.get(cid))
+            ctx = self.repo.get(cid)
         except KeyError:
+            print(f"[DEBUG]    missing context {cid}")
             continue
+        print(f"[DEBUG]    loaded {cid} → {ctx.summary!r}")
+        ctxs.append(ctx)
     ctxs.sort(key=lambda c: c.timestamp)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 3) Inline every bit of context into one big “knowledge sheet”
-    # ──────────────────────────────────────────────────────────────────────
+    # ─── 3) Inline into one big “knowledge sheet” ──────────────────────────
     interm_parts: list[str] = []
     for c in ctxs:
         if c.component == "tool_output":
@@ -1351,7 +1399,6 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
                 blob = repr(out)
             interm_parts.append(f"[{c.stage_id} (tool output)]\n{blob}")
         elif c.semantic_label == "tool_chaining":
-            # now include the full JSON schemas we seeded
             docs = c.metadata.get("tool_docs", "")
             interm_parts.append(f"[tool_schemas]\n{docs}")
         else:
@@ -1365,12 +1412,10 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         "inlined_context":  interm_parts,
     })
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 4) Final LLM call
-    # ──────────────────────────────────────────────────────────────────────
+    # ─── 4) Final LLM call ──────────────────────────────────────────────────
     final_sys = self._get_prompt("final_inference_prompt")
     plan_text = state.get("plan_output", "(no plan)")
-    self._last_plan_output = plan_text  # for critic stage
+    self._last_plan_output = plan_text
 
     msgs = [
         {"role": "system", "content": final_sys},
@@ -1380,13 +1425,12 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         {"role": "system", "content": interm},
         {"role": "user",   "content": user_text},
     ]
+    print("[DEBUG]    refs to load:", ordered)
     reply = self._stream_and_capture(
         self.primary_model, msgs, tag="[Assistant]", images=state.get("images")
     ).strip()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 5) Persist the answer (even if tc_ctx/tool_ctxs missing)
-    # ──────────────────────────────────────────────────────────────────────
+    # ─── 5) Persist the answer ──────────────────────────────────────────────
     ci_refs = []
     if state.get("tc_ctx"):
         ci_refs.append(state["tc_ctx"].context_id)
@@ -1402,9 +1446,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     resp_ctx.touch()
     self.repo.save(resp_ctx)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 6) **NEW**: also record this reply as an assistant segment for next turn
-    # ──────────────────────────────────────────────────────────────────────
+    # ─── 6) Also record this reply as assistant segment ───────────────────
     seg = ContextObject.make_segment(
         semantic_label="assistant",
         content_refs=[resp_ctx.context_id],
@@ -1421,7 +1463,8 @@ def _stage10b_response_critique_and_safety(
     self,
     draft: str,
     user_text: str,
-    tool_ctxs: List[ContextObject]
+    tool_ctxs: List[ContextObject],
+    state: Dict[str, Any]
 ) -> str:
     import json, difflib, datetime
 
@@ -1457,8 +1500,13 @@ def _stage10b_response_critique_and_safety(
         {"role": "system", "content": critic_sys},
         {"role": "user",   "content": prompt_user},
     ]
-    polished = self._stream_and_capture(self.secondary_model, msgs, tag="[Critic]").strip()
-
+    polished = self._stream_and_capture(
+        self.secondary_model,
+        msgs,
+        tag="[Critic]",
+        images=state.get("images")
+    ).strip()
+    
     # 4) If unchanged, just return it
     if polished == draft.strip():
         return polished
@@ -1775,7 +1823,8 @@ def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
                             "You are the same meta-reasoner; answer only from the given data, be concise."},
                         {"role":"user","content": q_text}
                     ],
-                    tag=f"[NarrativeAnswer_{idx}]"
+                    tag=f"[NarrativeAnswer_{idx}]",
+                    images=state.get("images")
                 ).strip()
 
             # record answer

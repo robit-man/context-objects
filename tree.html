@@ -1412,7 +1412,7 @@
             e.preventDefault();
 
             // compute a positive baseDelta when wheel-down
-            const baseDelta =  e.deltaY * SCROLL_ACCEL;
+            const baseDelta = e.deltaY * SCROLL_ACCEL;
             const dir = Math.sign(baseDelta);
             const now = Date.now();
 
@@ -2008,20 +2008,20 @@
 
             controls.update();
 
- if (Math.abs(scrollVelocity) > 1e-4) {
-  yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
-  scrollVelocity *= SCROLL_FRICTION;
-} else {
-  scrollVelocity = 0;
-}
+            if (Math.abs(scrollVelocity) > 1e-4) {
+                yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
+                scrollVelocity *= SCROLL_FRICTION;
+            } else {
+                scrollVelocity = 0;
+            }
 
-graphGroup.position.y = yScrollOffset;
+            graphGroup.position.y = yScrollOffset;
 
-// ── recalc view clock by subtracting the negative offset ────────────
-const nowDate  = new Date();
-// Option A: flip the sign on elapsedMs
-const elapsedMs = -yScrollOffset * MS_PER_UNIT;  
-const viewDate  = new Date(nowDate - elapsedMs);
+            // ── recalc view clock by subtracting the negative offset ────────────
+            const nowDate = new Date();
+            // Option A: flip the sign on elapsedMs
+            const elapsedMs = -yScrollOffset * MS_PER_UNIT;
+            const viewDate = new Date(nowDate - elapsedMs);
             // ── decay the boost multiplier ────────────────────────────────────
             scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
 
