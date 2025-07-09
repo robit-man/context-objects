@@ -5,27 +5,68 @@
     <meta charset="utf-8" />
     <title>Context Graph Viewer</title>
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Doto:wght@100..900&display=swap');
+
+        * {
+            font-family: "Doto", sans-serif;
+        }
+
+        input,
+        select,
+        button,
+        textarea,
+        select,
+        label {
+            font-family: "Doto", sans-serif;
+            font-style: normal;
+            background: transparent !important;
+            border: 1px dashed #333 !important;
+            color: white !important;
+            line-height: 1.75;
+            font-size: 0.75rem;
+            height: 2rem;
+            box-sizing: border-box;
+            backdrop-filter: blur(3px);
+            border-top: unset !important;
+            border-left: unset !important;
+
+        }
+
+        option {
+            font-family: "Doto", sans-serif;
+            font-style: normal;
+            background: black !important;
+            border: 1px dashed #333 !important;
+            color: white !important;
+        }
+
         html,
         body {
             margin: 0;
             height: 100%;
             overflow: hidden;
-            background: #111;
             color: #eee;
             font-family: Arial, Helvetica, sans-serif;
         }
 
         #ui {
+            box-sizing: border-box;
             position: fixed;
             top: 0;
             left: 0;
             right: 0;
-            padding: 6px 12px;
-            background: rgba(0, 0, 0, 0.6);
             display: flex;
-            gap: 12px;
-            align-items: center;
+            box-sizing: border-box;
+            justify-content: space-between;
             z-index: 10;
+        }
+
+        .column {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            height: 100%;
+            border-radius: 6px;
         }
 
         #ui label {
@@ -43,16 +84,21 @@
             font-size: 0.9rem;
         }
 
+        *::-webkit-scrollbar {
+            display: none;
+        }
+
         #selectednode {
+            width: 0px;
+            font-size: 0.5rem;
+            opacity: 0.5;
+            display: none;
             position: fixed;
             top: 3em;
-            right: 0;
-            width: 30%;
-            max-width: 300px;
-            height: 40%;
+            left: 0;
+            width: auto;
+            height: calc(60% - 3em);
             overflow: auto;
-            background: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(6px);
             padding: 8px;
             font-size: 0.8rem;
             border-top-left-radius: 6px;
@@ -61,21 +107,37 @@
             z-index: 9;
         }
 
+        .row {
+            display: flex;
+            flex-flow: wrap;
+        }
+
+        #timeindicators {
+
+            font-family: "Doto", sans-serif;
+            font-style: normal;
+            background: transparent !important;
+            color: white !important;
+        }
+
         #detailPanel {
+            width: 0px;
+            font-size: 0.5rem;
             position: fixed;
             bottom: 0;
             left: 0;
-            width: 30%;
-            max-width: 300px;
-            height: 40%;
+            top: 8em;
+            bottom: 0;
+            width: auto;
+            max-width: 25%;
+            min-width: 300px;
             overflow: auto;
-            background: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(6px);
             padding: 8px;
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             border-top-right-radius: 6px;
             box-sizing: border-box;
             z-index: 9;
+            text-shadow: 0px 0px 2px black;
         }
 
         #detailPanel table {
@@ -84,14 +146,52 @@
         }
 
         #detailPanel td {
-            padding: 4px;
-            border-bottom: 1px solid #444;
             vertical-align: top;
+            padding-left: 0.5rem;
         }
 
         #detailPanel td:first-child {
             font-weight: bold;
-            width: 30%;
+            text-align: right;
+            padding-right: 0.5rem;
+            padding-left: 0rem;
+            border-right: 1px dashed #555;
+        }
+
+        .sidebar-item-highlight::after {
+            content: '';
+            left: -0.5rem;
+            width: 1px;
+            height: calc(100% - 1rem);
+            background: white;
+            animation: expand 0.2s ease-in-out;
+        }
+
+        @keyframes expand {
+            0% {
+                width: 0rem;
+            }
+
+            50% {
+                width: 0.25rem;
+            }
+
+            100% {
+                width: 0rem;
+            }
+        }
+
+        .sidebar-header {
+            display: flex;
+            flex-flow: column;
+        }
+
+        .sidebar-header:hover {
+            background: #333;
+        }
+
+        .json-section>div {
+            margin: 2px 0;
         }
 
         a.ref-link {
@@ -120,27 +220,41 @@
 <body>
     <!-- ─── CONTROL BAR ─────────────────────────────────────────────────── -->
     <div id="ui">
-        <label for="fileSelector">File:</label>
-        <select id="fileSelector">\
-        </select>
+        <div class="column">
 
-        <label for="ageFilter">Age window:</label>
-        <select id="ageFilter">
-            <option value="all">All</option>
-            <option value="h1">Last hour</option>
-            <option value="d1">Last 24 h</option>
-            <option value="w1">Last 7 days</option>
-            <option value="m1">Last 30 days</option>
-        </select>
+            <div class="row">
+                <select id="ageFilter">
+                    <option value="all">All</option>
+                    <option value="h1">Last hour</option>
+                    <option value="d1">Last 24 h</option>
+                    <option value="w1">Last 7 days</option>
+                    <option value="m1">Last 30 days</option>
+                </select>
 
-        <select id="domainFilter"></select>
-        <select id="componentFilter"></select>
-        <select id="semanticFilter"></select>
+                <select id="domainFilter"></select>
+                <select id="componentFilter"></select>
+                <select id="semanticFilter"></select>
+            </div>
 
-        <button id="timeToggle">Time Mode</button>
-        <div id="timeIndicators" style="margin-left:auto;display:flex;gap:8px;font-size:0.85rem">
-            <span id="nowTime">// now </span>
-            <span id="viewTime">// view </span>
+            <div class="row">
+                <select id="fileSelector">\
+                </select> <button id="timeToggle">Time Mode</button>
+
+            </div>
+
+        </div>
+        <div class="column">
+            <div class="row">
+
+                <div id="timeIndicators" style="background:transparent;           
+border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; padding:0 0.5rem;
+                        border: 1px dashed #333;border-top:unset;border-right:unset;
+
+            height:2rem;">
+                    <span id="nowTime">// <b>now</b> </span>
+                    <span id="viewTime">// <b>view</b> </span>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -149,6 +263,22 @@
 
     <!-- ─── DETAIL TABLE PANEL ─────────────────────────────────────────── -->
     <div id="detailPanel"></div>
+
+    <!-- ─── SIDEBAR MODULE LIST ─────────────────────────────────────────── -->
+    <div id="sidebarList" style="
+           position: fixed;
+           top: 2rem;
+           right: 0;
+           bottom: 0;
+           width: 300px;
+           overflow-y: auto;
+           color: #eee;
+           font-size: 0.75rem;
+           backdrop-filter: blur(3px);
+           z-index: 8;
+         ">
+        <!-- dynamically populated -->
+    </div>
 
     <!-- ─── THREE.JS + LOGIC ─────────────────────────────────────────────── -->
     <script type="module">
@@ -160,7 +290,7 @@
         //////////////////////////////////////////////////////////////////////
         const LAYOUT_CONFIG = {
             // 60000 ms = 1 minute → 1 Y-unit
-            msPerUnit: 10 * 1000,
+            msPerUnit: 1 * 1000,
 
             // you can speed up spawning independently of drift
             spawnFactor: 1.0,
@@ -172,10 +302,10 @@
             minSphereY: 0
         };
         const DISPLAY_CONFIG = {
-            sphereRadius: 5,
-            sphereSegments: 5,
+            sphereRadius: 10,
+            sphereSegments: 8,
             lineBaseOpacity: 0.1,
-            hoverHighlightOpacity: 0.5,
+            hoverHighlightOpacity: 0.3,
             chainDelay: 200,
             maxChainDepth: 10,
             fadeOutDuration: 1000
@@ -188,7 +318,7 @@
         const viewLbl = document.getElementById('viewTime');
 
         /* wheel → Y-units. 0.05 ≃  0.5  sec per scroll-tick with msPerUnit = 10 000 ms */
-        const SCROLL_SPEED = 0.05;
+        const SCROLL_SPEED = 0.5;
         const fileSelector = document.getElementById('fileSelector');
 
         const ageSel = document.getElementById('ageFilter');
@@ -216,15 +346,15 @@
         const POLL_INTERVAL = 1000;
         let scrollVelocity = 0;
         const SCROLL_ACCEL = 0.002;  // tweak: how much wheel delta becomes velocity
-        const SCROLL_FRICTION = 0.90;   // per-frame multiplier (<1 to slow down)
+        const SCROLL_FRICTION = .99;   // per-frame multiplier (<1 to slow down)
         const SCROLL_DIR = -1;
-        let scrollBoost = 10;
+        let scrollBoost = 100;
         let lastWheelDir = 0;
         let lastWheelTime = 0;
 
-        const BOOST_INCREMENT = 0.3;    // how much boost you gain per rapid event
-        const BOOST_DECAY = 0.85;   // how quickly boost winds down
-        const BOOST_MAX = 5;      // cap on boost multiplier
+        const BOOST_INCREMENT = 50;    // how much boost you gain per rapid event
+        const BOOST_DECAY = 0.75;   // how quickly boost winds down
+        const BOOST_MAX = 1000;      // cap on boost multiplier
         const MAX_INSTANCES_HARD = 0xFFFF;
         const HARD_MAX_NODES = 1000;
         let prevCount = 0;
@@ -319,6 +449,121 @@
                 /* ignore—populateFileSelector already logged */
                 loadGraph(fileSelector.value);
             });
+
+
+        // 1️⃣ Build the nested list from allData after each full load
+        // ─── Replacement buildSidebarList ──────────────────────────────────────
+        function buildSidebarList(data) {
+            const container = document.getElementById('sidebarList');
+            container.innerHTML = '';
+
+            // group by context_id
+            const groups = data.reduce((acc, o) => {
+                (acc[o.context_id] ??= []).push(o);
+                return acc;
+            }, {});
+
+            // recursive renderer for arbitrary-depth JSON
+            function renderObject(obj, parent) {
+                if (obj === null || typeof obj !== 'object') {
+                    // primitive → read-only input
+                    let inp;
+                    if (typeof obj === 'boolean') {
+                        inp = document.createElement('input');
+                        inp.type = 'checkbox';
+                        inp.checked = obj;
+                        inp.disabled = true;
+                    } else if (typeof obj === 'number') {
+                        inp = document.createElement('input');
+                        inp.type = 'number';
+                        inp.value = obj;
+                        inp.readOnly = true;
+                    } else {
+                        inp = document.createElement('input');
+                        inp.type = 'text';
+                        inp.value = obj;
+                        inp.readOnly = true;
+                    }
+                    inp.style = 'margin:2px 0; width:100%;';
+                    parent.appendChild(inp);
+
+                } else if (Array.isArray(obj)) {
+                    obj.forEach((item, i) => {
+                        const section = document.createElement('div');
+                        section.style = 'margin-left:12px; border-left:1px solid #444; padding-left:6px;';
+                        const title = document.createElement('div');
+                        title.textContent = `[${i}]`;
+                        title.style = 'font-weight:bold; cursor:pointer;';
+                        section.appendChild(title);
+                        const content = document.createElement('div');
+                        content.style = 'display:none;';
+                        renderObject(item, content);
+                        section.appendChild(content);
+                        title.onclick = () => {
+                            content.style.display = content.style.display === 'none' ? 'block' : 'none';
+                        };
+                        parent.appendChild(section);
+                    });
+
+                } else {
+                    // object → each key as collapsible
+                    Object.entries(obj).forEach(([key, val]) => {
+                        const section = document.createElement('div');
+                        section.style = 'margin-left:12px; border-left:1px solid #444; padding-left:6px;';
+                        const title = document.createElement('div');
+                        title.textContent = key;
+                        title.style = 'font-weight:bold; cursor:pointer;';
+                        section.appendChild(title);
+                        const content = document.createElement('div');
+                        content.style = 'display:none;';
+                        renderObject(val, content);
+                        section.appendChild(content);
+                        title.onclick = () => {
+                            content.style.display = content.style.display === 'none' ? 'block' : 'none';
+                        };
+                        parent.appendChild(section);
+                    });
+                }
+            }
+
+            for (const [ctxId, objs] of Object.entries(groups)) {
+                // header
+                const header = document.createElement('div');
+                header.id = `header-${ctxId}`;
+                header.className = 'sidebar-header';
+                header.style =
+                    'cursor:pointer; padding:2px 8px; border-left:1px dashed #555; border-bottom:1px solid #333; margin-top:8; display:flex; justify-content:space-between;';
+                header.textContent = `${objs[0].domain} | ${objs[0].component} | ${objs[0].semantic_label}`;
+                const idSpan = document.createElement('span');
+                idSpan.textContent = ctxId;
+                idSpan.style = 'opacity:0.6; font-size:0.75rem;';
+                header.appendChild(idSpan);
+                container.appendChild(header);
+
+                // collapsible dropdown container
+                const dropdown = document.createElement('div');
+                dropdown.id = `dropdown-${ctxId}`;
+                dropdown.style = 'display:none; margin-left:4px;';
+                objs.forEach((o, idx) => {
+                    const itemContainer = document.createElement('div');
+                    itemContainer.id = `sidebar-item-container-${ctxId}-${idx}`;
+                    itemContainer.style =
+                        'padding:4px 0; cursor:pointer; border-bottom:1px solid #333;';
+                    renderObject(o, itemContainer);
+                    itemContainer.onclick = () => tweenToNode(ctxId);
+                    dropdown.appendChild(itemContainer);
+                });
+                container.appendChild(dropdown);
+
+                // toggle expand/collapse group
+                header.onclick = () => {
+                    const isHidden = dropdown.style.display === 'none';
+                    dropdown.style.display = isHidden ? 'block' : 'none';
+                };
+            }
+        }
+
+
         // ——— REPLACEMENT ———
         let isBuilding = false;
         //////////////////////////////////////////////////////////////////////////
@@ -444,7 +689,7 @@
         function colourNode(idx, obj) {
             const hue = hueMapCurrent[obj.component] ?? 0;
             const sat = 0.6;
-            const lgt = 0.5;
+            const lgt = 0.8;
             instMesh.instanceColor.setXYZ(idx,
                 ...new THREE.Color().setHSL(hue, sat, lgt).toArray());
         }
@@ -955,6 +1200,17 @@
             freeEdgeIx = instEdge?.count || 0;
         }
 
+        // ─── SIDEBAR REBUILD AFTER loadGraph ─────────────────────────────────
+        const oldLoadGraph = loadGraph;
+        loadGraph = async function (...args) {
+            // 1) run your existing full-load logic
+            await oldLoadGraph(...args);
+            // 2) then rebuild the nested sidebar
+            buildSidebarList(allData);
+        };
+        // ──────────────────────────────────────────────────────────────────────
+
+
         async function grabTailChunk(url,
             maxBytes = 128 * 1024,
             wantLines = 300) {
@@ -1365,7 +1621,7 @@
         // THREE.JS SETUP
         //////////////////////////////////////////////////////////////////////////
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x111111);
+        scene.background = new THREE.Color(0x000000);
 
         // ─── CAMERA ──────────────────────────────────────────────────────────
         const camera = new THREE.PerspectiveCamera(
@@ -1578,8 +1834,8 @@
         }
         function unixNow() { return Date.now(); }
         function edgeThickness(w) {
-            const MIN = 0.05;   // thinnest possible edge
-            const MAX = 0.40;   // thickest possible edge
+            const MIN = 0.1;   // thinnest possible edge
+            const MAX = 10;   // thickest possible edge
             /* clamp & normalise:   0 → MIN,   1 or above → MAX  */
             w = Math.min(Math.max(w, 0), 1);
             return MIN + (MAX - MIN) * w;
@@ -1777,7 +2033,7 @@
 
             /* back the camera off slightly so the sphere isn't inside the near-plane */
             const toTarget = worldPos;
-            const toPos = worldPos.clone().add(new THREE.Vector3(0, 10, 30)); // 10 up, 30 back
+            const toPos = worldPos.clone().add(new THREE.Vector3(0, 100, 100)); // 10 up, 30 back
 
             /* 3️⃣  set up the tween */
             cameraTween = {
@@ -1795,6 +2051,7 @@
             const obj = nodeMap.get(id).data;
             detailPanel.innerHTML = '';
             const tbl = document.createElement('table');
+
             Object.entries(obj).forEach(([k, v]) => {
                 const tr = document.createElement('tr');
                 const tdK = document.createElement('td');
@@ -1807,28 +2064,61 @@
                         const a = document.createElement('a');
                         a.textContent = rid;
                         a.className = 'ref-link';
-                        a.onclick = e => { e.preventDefault(); tweenToNode(rid); };
+                        a.onclick = e => {
+                            e.preventDefault();
+                            tweenToNode(rid);
+
+                            // expand sidebar dropdown for this context_id
+                            const dropdown = document.getElementById(`dropdown-${rid}`);
+                            if (dropdown) dropdown.style.display = 'block';
+
+                            // clear previous highlights
+                            document.querySelectorAll('.sidebar-item-highlight')
+                                .forEach(el => el.classList.remove('sidebar-item-highlight'));
+
+                            // highlight & scroll to the first item container
+                            const itemEl = document.getElementById(`sidebar-item-container-${rid}-0`);
+                            if (itemEl) {
+                                itemEl.classList.add('sidebar-item-highlight');
+                                itemEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                        };
                         tdV.appendChild(a);
                     });
-                }
-                // association_strengths object
-                else if (typeof v === 'object' && v !== null && k === 'association_strengths') {
+
+                    // association_strengths object
+                } else if (typeof v === 'object' && v !== null && k === 'association_strengths') {
                     Object.entries(v).forEach(([rid, w]) => {
                         const a = document.createElement('a');
                         a.textContent = `${rid} (${w})`;
                         a.className = 'ref-link';
-                        a.onclick = e => { e.preventDefault(); tweenToNode(rid); };
+                        a.onclick = e => {
+                            e.preventDefault();
+                            tweenToNode(rid);
+
+                            // same sidebar logic as above
+                            const dropdown = document.getElementById(`dropdown-${rid}`);
+                            if (dropdown) dropdown.style.display = 'block';
+                            document.querySelectorAll('.sidebar-item-highlight')
+                                .forEach(el => el.classList.remove('sidebar-item-highlight'));
+                            const itemEl = document.getElementById(`sidebar-item-container-${rid}-0`);
+                            if (itemEl) {
+                                itemEl.classList.add('sidebar-item-highlight');
+                                itemEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                        };
                         tdV.appendChild(a);
                     });
-                }
-                else {
-                    tdV.textContent = (typeof v === 'object') ? JSON.stringify(v) : v;
+
+                } else {
+                    tdV.textContent = typeof v === 'object' ? JSON.stringify(v) : v;
                 }
 
                 tr.appendChild(tdK);
                 tr.appendChild(tdV);
                 tbl.appendChild(tr);
             });
+
             detailPanel.appendChild(tbl);
         }
 
@@ -1890,12 +2180,13 @@
         renderer.domElement.addEventListener('pointermove', onPointerMove);
         renderer.domElement.addEventListener('click', onClick);
 
+
         function onClick(ev) {
             /* ── pick the instance that was clicked ────────────────────────────── */
-            onPointerMove(ev);                         // update `pointer`
+            onPointerMove(ev);
             if (!instMesh) return;
 
-            scene.updateMatrixWorld();                 // make sure matrices are fresh
+            scene.updateMatrixWorld();
             raycaster.setFromCamera(pointer, camera);
 
             const hit = raycaster.intersectObject(instMesh, false)[0];
@@ -1909,13 +2200,13 @@
             const [ctxId, node] = ctxEntry;
 
             /* ── remember selection & recolour immediately ─────────────────────── */
-            hovered = selectedId = ctxId;              // global state
-            applyFilters();                            // ⬅ recolour nodes/edges right away
+            hovered = selectedId = ctxId;
+            applyFilters();
 
             /* ── show JSON preview ─────────────────────────────────────────────── */
             selPane.textContent = JSON.stringify(node.data, null, 2);
 
-            /* ── build the detail table (unchanged) ────────────────────────────── */
+            /* ── build the detail table ────────────────────────────────────────── */
             detailPanel.innerHTML = '';
             const ts0 = parseTimestamp(node.data.timestamp).getTime();
             const tbl = document.createElement('table');
@@ -1964,11 +2255,26 @@
             detailPanel.appendChild(tbl);
 
             /* ── visual feedback on graph ───────────────────────────────────────── */
-            flashNeighbours(ctxId);    // instant white flash on directly-connected edges
-            triggerChain(ctxId, 0);    // ripple outward through the network
-            tweenToNode(ctxId);        // optional: fly the camera to the clicked node
-        }
+            flashNeighbours(ctxId);
+            triggerChain(ctxId, 0);
+            tweenToNode(ctxId);
 
+            /* ── scroll & highlight in sidebar ─────────────────────────────────── */
+            // remove previous highlights
+            document.querySelectorAll('.sidebar-item-highlight')
+                .forEach(el => el.classList.remove('sidebar-item-highlight'));
+
+            // expand the dropdown for this ctxId
+            const dropdown = document.getElementById(`dropdown-${ctxId}`);
+            if (dropdown) dropdown.style.display = 'block';
+
+            // scroll to the header for this ctxId
+            const header = document.getElementById(`header-${ctxId}`);
+            if (header) {
+                header.classList.add('sidebar-item-highlight');
+                header.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }
 
 
 
@@ -2058,16 +2364,33 @@
                         if (found) {
                             const [ctxId, node] = found;
                             hovered = ctxId;
-                            // live JSON preview
+
+                            // live JSON preview & detail
                             selPane.textContent = JSON.stringify(node.data, null, 2);
-                            // full detail table
                             populateDetail(ctxId);
-                            // bright-flash neighbours
+
+                            // visual feedback on graph
                             flashNeighbours(ctxId);
+
+                            // NEW → scroll & highlight sidebar entry
+                            const el = document.querySelector(`[id^="sidebar-item-container-${ctxId}-"]`);
+                            if (el) {
+                                // clear prior highlights
+                                document
+                                    .querySelectorAll('.sidebar-item-highlight')
+                                    .forEach(e => e.classList.remove('sidebar-item-highlight'));
+                                // highlight this one
+                                el.classList.add('sidebar-item-highlight');
+                                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
                         }
                     }
                 } else {
                     hoveredIdx = hovered = null;
+                    // remove highlight when not hovering any node
+                    document
+                        .querySelectorAll('.sidebar-item-highlight')
+                        .forEach(e => e.classList.remove('sidebar-item-highlight'));
                 }
             }
 
