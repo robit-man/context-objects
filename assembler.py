@@ -1844,15 +1844,17 @@ class Assembler:
                 f"[Recent conversation]\n{convo}"
             )
 
-            # automatic similarity picks
             AUTO_THRESH = 0.5
-            descs = [ (t["name"], t["description"]) for t in self.tools_list ]
+            descs = [(t["name"], t.get("description", "")) for t in state.get("tools_list", [])]
+
             qv = self.engine.embedder(user_text)
-            sims = [float(np.dot(qv, self.engine.embedder(d))/
-                          (np.linalg.norm(qv)*np.linalg.norm(self.engine.embedder(d))+1e-9))
-                    for _, d in descs]
+            sims = [
+                float(np.dot(qv, self.engine.embedder(d)) /
+                    (np.linalg.norm(qv)*np.linalg.norm(self.engine.embedder(d)) + 1e-9))
+                for _, d in descs
+            ]
             auto_tools = sorted(
-                [descs[i][0] for i,s in enumerate(sims) if s>=AUTO_THRESH],
+                [descs[i][0] for i, s in enumerate(sims) if s >= AUTO_THRESH],
                 key=lambda n: -sims[[d[0] for d in descs].index(n)]
             )[:3]
 

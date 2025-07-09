@@ -88,6 +88,13 @@
             display: none;
         }
 
+        * {
+            -ms-overflow-style: none;
+            /* IE and Edge */
+            scrollbar-width: none;
+            /* Firefox */
+        }
+
         #selectednode {
             width: 0px;
             font-size: 0.5rem;
@@ -128,15 +135,15 @@
             left: 0;
             top: 8em;
             bottom: 0;
-            width: auto;
-            max-width: 25%;
-            min-width: 300px;
+            width: 500px;
+            max-width: 50%;
             overflow: auto;
             padding: 8px;
             font-size: 0.75rem;
             border-top-right-radius: 6px;
             box-sizing: border-box;
             z-index: 9;
+            display: inline-table;
             text-shadow: 0px 0px 2px black;
         }
 
@@ -279,6 +286,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
          ">
         <!-- dynamically populated -->
     </div>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
 
     <!-- ─── THREE.JS + LOGIC ─────────────────────────────────────────────── -->
     <script type="module">
@@ -302,12 +310,12 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             minSphereY: 0
         };
         const DISPLAY_CONFIG = {
-            sphereRadius: 10,
-            sphereSegments: 8,
-            lineBaseOpacity: 0.1,
+            sphereRadius: 1,
+            sphereSegments: 3,
+            lineBaseOpacity: 0.5,
             hoverHighlightOpacity: 0.3,
             chainDelay: 200,
-            maxChainDepth: 10,
+            maxChainDepth: 50,
             fadeOutDuration: 1000
         };
 
@@ -395,13 +403,16 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         const MS_PER_UNIT = LAYOUT_CONFIG.msPerUnit;  // ms per world‐unit, e.g. 10 000
 
         function getContextFileUrl(cacheBust = false) {
+            // use the actual host/IP instead of 0.0.0.0
+            const host = window.location.hostname || 'localhost';
             let fn = fileSelector.value;
             if (!/^context(?:_-?\d+)?\.jsonl$/.test(fn)) fn = 'context.jsonl';
-            return `http://0.0.0.0:8000/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
+            return `http://${host}:8000/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
         }
+
         async function populateFileSelector() {
             try {
-                const res = await fetch('/', { cache: 'no-store' });
+                const res = await fetch(window.location.origin + '/', { cache: 'no-store' });
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const txt = await res.text();
                 let files = [];
@@ -450,6 +461,87 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                 loadGraph(fileSelector.value);
             });
 
+        function runForceLayout() {
+            // 1️⃣ build nodes & links arrays
+            const nodes = [...nodeMap.entries()].map(([id, entry]) => ({
+                id,
+                x: entry.pos.x,
+                y: entry.pos.z   // map z→y for 2D layout
+            }));
+            const links = edges.map(e => ({ source: e.source, target: e.target }));
+
+            // 2️⃣ run a D3 force simulation
+            const sim = d3.forceSimulation(nodes)
+                .force('charge', d3.forceManyBody().strength(-30))
+                .force('link', d3.forceLink(links)
+                    .id(d => d.id)
+                    .distance(100)
+                    .strength(1))
+                .force('center', d3.forceCenter(0, 0))
+                .stop();
+
+            for (let i = 0; i < 200; ++i) sim.tick();
+
+            // 3️⃣ write back new positions
+            nodes.forEach(n => {
+                const entry = nodeMap.get(n.id);
+                entry.pos.x = n.x;
+                entry.pos.z = n.y;
+            });
+
+            // 4️⃣ update node instance matrices
+            nodeMap.forEach(entry => {
+                instMesh.setMatrixAt(
+                    entry._instanceIndex,
+                    new THREE.Matrix4().setPosition(entry.pos)
+                );
+            });
+            instMesh.instanceMatrix.needsUpdate = true;
+
+            // 5️⃣ rebuild edges to their new positions
+            updateEdgeMeshes();
+        }
+        // ─── New helper: rebuild all edges based on updated nodeMap ──────────
+        function updateEdgeMeshes() {
+            if (!instEdge) initEdges();
+
+            const mat = new THREE.Matrix4();
+            const axisY = new THREE.Vector3(0, 1, 0);
+            let ei = 0;
+
+            edges.forEach(e => {
+                const src = nodeMap.get(e.source);
+                const tgt = nodeMap.get(e.target);
+                if (!src || !tgt) return;
+
+                // compute direction & length
+                const dir = new THREE.Vector3().subVectors(tgt.pos, src.pos);
+                const len = dir.length();
+                if (!len) return;
+
+                // build the orientation quaternion
+                const quat = new THREE.Quaternion()
+                    .setFromUnitVectors(axisY, dir.clone().normalize());
+
+                // compose the instance matrix (thin box from src → tgt)
+                mat.compose(src.pos, quat, new THREE.Vector3(0.2, len, 0.2));
+                instEdge.setMatrixAt(ei, mat);
+
+                // copy the source node's color
+                const srcIdx = src._instanceIndex;
+                const r = instMesh.instanceColor.getX(srcIdx);
+                const g = instMesh.instanceColor.getY(srcIdx);
+                const b = instMesh.instanceColor.getZ(srcIdx);
+                instEdge.instanceColor.setXYZ(ei, r, g, b);
+
+                ei++;
+            });
+
+            // upload counts + attributes
+            instEdge.count = ei;
+            instEdge.instanceMatrix.needsUpdate = true;
+            instEdge.instanceColor.needsUpdate = true;
+        }
 
         // 1️⃣ Build the nested list from allData after each full load
         // ─── Replacement buildSidebarList ──────────────────────────────────────
@@ -564,7 +656,6 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         }
 
 
-        // ——— REPLACEMENT ———
         let isBuilding = false;
         //////////////////////////////////////////////////////////////////////////
         // BATCHED NODE CREATION
@@ -693,60 +784,72 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             instMesh.instanceColor.setXYZ(idx,
                 ...new THREE.Color().setHSL(hue, sat, lgt).toArray());
         }
-        function appendEdgesFast(srcObjs) {
-            ensureEdgeMesh();
+       function appendEdgesFast(srcObjs) {
+  ensureEdgeMesh();
 
-            const mat = new THREE.Matrix4();
-            const yAxis = new THREE.Vector3(0, 1, 0);
+  const mat = new THREE.Matrix4();
+  const yAxis = new THREE.Vector3(0, 1, 0);
 
-            for (const o of srcObjs) {
-                const entry = nodeMap.get(o.context_id);
-                if (!entry) continue;
+  for (const o of srcObjs) {
+    const entry = nodeMap.get(o.context_id);
+    if (!entry) continue;
 
-                const srcPos = entry.pos.clone();
-                const cIdx = entry._instanceIndex;
-                const refs = Array.isArray(o.references) ? o.references : [];
-                const assocs = o.association_strengths
-                    ? Object.keys(o.association_strengths)
-                    : [];
-                const targets = [...refs, ...assocs];
+    const srcPos = entry.pos.clone();
+    const cIdx = entry._instanceIndex;
+    const refs = Array.isArray(o.references) ? o.references : [];
+    const assocs = o.association_strengths
+      ? Object.keys(o.association_strengths)
+      : [];
+    const targets = [...refs, ...assocs];
 
-                for (const tgtId of targets) {
-                    const tgtEntry = nodeMap.get(tgtId);
-                    if (!tgtEntry) continue;
+    for (const tgtId of targets) {
+      const tgtEntry = nodeMap.get(tgtId);
+      if (!tgtEntry) continue;
 
-                    const tgtPos = tgtEntry.pos.clone();
-                    const dir = new THREE.Vector3().subVectors(tgtPos, srcPos);
-                    const len = dir.length();
-                    if (len === 0) continue;
+      const tgtPos = tgtEntry.pos.clone();
+      const dir = new THREE.Vector3().subVectors(tgtPos, srcPos);
+      const len = dir.length();
+      if (len === 0) continue;
 
-                    // if we're about to overflow, grow capacity now
-                    if (freeEdgeIx + 1 > instEdge.countCapacity) {
-                        growMeshCapacity(instEdge);
-                    }
+      // if we're about to overflow, grow capacity now
+      if (freeEdgeIx + 1 > instEdge.countCapacity) {
+        growMeshCapacity(instEdge);
+      }
 
-                    // build the edge transform
-                    const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.normalize());
-                    const s = new THREE.Vector3(0.2, len, 0.2);
-                    mat.compose(srcPos, q, s);
+      // build the edge transform
+      const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.normalize());
+      const s = new THREE.Vector3(0.2, len, 0.2);
+      mat.compose(srcPos, q, s);
+      instEdge.setMatrixAt(freeEdgeIx, mat);
 
-                    instEdge.setMatrixAt(freeEdgeIx, mat);
+      // copy the source node's color
+      const r = instMesh.instanceColor.getX(cIdx);
+      const g = instMesh.instanceColor.getY(cIdx);
+      const b = instMesh.instanceColor.getZ(cIdx);
+      instEdge.instanceColor.setXYZ(freeEdgeIx, r, g, b);
 
-                    // copy the source node's color
-                    const r = instMesh.instanceColor.getX(cIdx);
-                    const g = instMesh.instanceColor.getY(cIdx);
-                    const b = instMesh.instanceColor.getZ(cIdx);
-                    instEdge.instanceColor.setXYZ(freeEdgeIx, r, g, b);
+      // record edge metadata
+      edges[freeEdgeIx] = {
+        source: o.context_id,
+        target: tgtId,
+        index: freeEdgeIx,
+        weight: (o.association_strengths?.[tgtId] || 1)
+      };
 
-                    freeEdgeIx++;
-                }
-            }
+      freeEdgeIx++;
+    }
 
-            // commit to GPU
-            instEdge.count = freeEdgeIx;
-            instEdge.instanceMatrix.needsUpdate = true;
-            instEdge.instanceColor.needsUpdate = true;
-        }
+    // **after** wiring up all the new edges for this node,
+    // light up its entire upstream‐chain:
+    highlightPathFrom(o.context_id);
+  }
+
+  // commit to GPU
+  instEdge.count = freeEdgeIx;
+  instEdge.instanceMatrix.needsUpdate = true;
+  instEdge.instanceColor.needsUpdate = true;
+}
+
 
 
 
@@ -810,18 +913,20 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             instEdge = new THREE.InstancedMesh(
                 geo,
                 new THREE.MeshBasicMaterial({ vertexColors: true }),
-                START_CAP * 4 /* edges usually >> nodes */);
-            instEdge.frustumCulled = false;       // ← ADD THIS LINE
+                START_CAP * 4
+            );
+            instEdge.frustumCulled = false;
 
+            // ✏️ allocate the full capacity, and name it `instanceColor`
             const cAttr = new THREE.InstancedBufferAttribute(
-                new Float32Array(instEdge.instanceCount * 3), 3);
-            instEdge.geometry.setAttribute('color', cAttr);
+                new Float32Array(instEdge.countCapacity * 3), 3
+            );
+            instEdge.geometry.setAttribute('instanceColor', cAttr);
             instEdge.instanceColor = cAttr;
-            instEdge.countCapacity = instEdge.count;
-            instEdge.count = 0;
 
             graphGroup.add(instEdge);
         }
+
         /***********************************************************************
          *  growInstancedMesh(oldMesh)
          *  doubles capacity (up to 65535 instances – WebGL1 limit)
@@ -1200,15 +1305,21 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             freeEdgeIx = instEdge?.count || 0;
         }
 
-        // ─── SIDEBAR REBUILD AFTER loadGraph ─────────────────────────────────
+        // Find your existing loadGraph override at the bottom of your module:
         const oldLoadGraph = loadGraph;
         loadGraph = async function (...args) {
-            // 1) run your existing full-load logic
             await oldLoadGraph(...args);
-            // 2) then rebuild the nested sidebar
+
+            // 1) re‐layout nodes via D3
+            runForceLayout();
+
+            // 2) rebuild ALL edges to match new node positions
+            updateEdgeMeshes();
+
+            // 3) rebuild sidebar
             buildSidebarList(allData);
         };
-        // ──────────────────────────────────────────────────────────────────────
+
 
 
         async function grabTailChunk(url,
@@ -1691,7 +1802,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         const raycaster = new THREE.Raycaster();
         const pointer = new THREE.Vector2();
 
-        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        scene.add(new THREE.AmbientLight(0xffffff, 5));
         const keyLight = new THREE.DirectionalLight(0xffffff, 5);
         keyLight.position.set(0, 0, 0);
         scene.add(keyLight);
@@ -1711,101 +1822,111 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         // ───────────────────────────────────────────────────────────────────
         // ─── one-time InstancedMesh for all edges ──────────────────────────────
         function initEdges() {
-            if (instEdge) return;             // already built
+            if (instEdge) return;
 
+            // 1) build a thin box (pivot at bottom) for each edge
             const geo = new THREE.BoxGeometry(0.1, 1, 0.1);
-            geo.translate(0, 0.5, 0);         // scale-Y stretches tip-to-tip
+            geo.translate(0, 0.5, 0); // move origin to base
+
+            // 2) per-edge material
             const mat = new THREE.MeshBasicMaterial({
-                color: 0xffffff,              // multiplied by instanceColor under the hood
-                transparent: false,
+                vertexColors: true,    // ← look for a "color" attribute
+                transparent: true,     // ← allow fade/alpha later
                 depthWrite: false
             });
 
+            // 3) create the InstancedMesh
             instEdge = new THREE.InstancedMesh(geo, mat, MAX_EDGES);
             instEdge.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 
-            /* per-edge colour buffer – every edge starts mid-grey */
-            const cols = new Float32Array(MAX_EDGES * 3).fill(BASE_EDGE_GREY);
+            // 4) allocate & seed a "color" attribute (r,g,b per instance)
+            const base = BASE_EDGE_GREY;
+            const cols = new Float32Array(MAX_EDGES * 3).fill(base);
             const cAttr = new THREE.InstancedBufferAttribute(cols, 3)
                 .setUsage(THREE.DynamicDrawUsage);
-            instEdge.geometry.setAttribute('instanceColor', cAttr);
-            instEdge.instanceColor = cAttr;      // <- mandatory in r178+
+
+            // 5) attach it *as* the "color" attribute so the material picks it up
+            instEdge.geometry.setAttribute('color', cAttr);
+            // still convenient to reference it as `instEdge.instanceColor` in your code
+            instEdge.instanceColor = cAttr;
 
             graphGroup.add(instEdge);
         }
 
+        // ─── Ensure your per‐edge alpha attribute exists ──────────
         function ensureEdgeAlphaAttr() {
-            if (!instEdge) return;                       // mesh not ready yet
-            if (instEdge.geometry.attributes.alpha) return; // already there
+            if (!instEdge) return;                              // mesh not ready
+            if (instEdge.geometry.attributes.alpha) return;     // already installed
 
-            const aAttr = new THREE.InstancedBufferAttribute(
-                new Float32Array(MAX_EDGES).fill(DISPLAY_CONFIG.lineBaseOpacity), 1
-            ).setUsage(THREE.DynamicDrawUsage);
+            const alphaArr = new Float32Array(MAX_EDGES)
+                .fill(DISPLAY_CONFIG.lineBaseOpacity);
+            const aAttr = new THREE.InstancedBufferAttribute(alphaArr, 1)
+                .setUsage(THREE.DynamicDrawUsage);
 
             instEdge.geometry.setAttribute('alpha', aAttr);
         }
+
+        // ─── Full rebuild of every edge ─────────────────────────
         function rebuildEdges() {
-            initEdges();                               // make sure the InstancedMesh exists
-            const colAttr = instEdge.instanceColor;    // per-instance colour buffer
-            edges.length = 0;                          // reset JS-side list
-            let ei = 0;                                // running instance index
+            initEdges();               // make sure instEdge exists
+            ensureEdgeAlphaAttr();     // install alpha buffer if needed
+
+            const colAttr = instEdge.instanceColor;
+            edges.length = 0;
+            let ei = 0;
 
             nodeMap.forEach((src, srcId) => {
-
-                /* strongest link weight per target */
+                // gather strongest‐weight per target
                 const links = new Map();
                 (src.data.references || []).forEach(rid => links.set(rid, 1));
                 Object.entries(src.data.association_strengths || {})
                     .forEach(([rid, w]) =>
-                        links.set(rid, Math.max(links.get(rid) || 0, w)));
+                        links.set(rid, Math.max(links.get(rid) || 0, w))
+                    );
 
                 links.forEach((w, tgtId) => {
                     const tgt = nodeMap.get(tgtId);
                     if (!tgt || ei >= MAX_EDGES) return;
 
-                    /* orientation + length */
+                    // direction & length
                     const dir = new THREE.Vector3().subVectors(tgt.pos, src.pos);
                     const len = dir.length();
-                    if (!len) return;                         // avoid zero-length edges
+                    if (!len) return;
 
+                    // orientation quaternion
                     const quat = new THREE.Quaternion()
-                        .setFromUnitVectors(new THREE.Vector3(0, 1, 0),
-                            dir.normalize());
+                        .setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
 
-                    /* variable thickness based on link weight */
-                    const t = edgeThickness(w);               // 0‥1 → 0.05‥0.40
+                    // thickness based on weight
+                    const t = edgeThickness(w);
 
-                    /* write transform (XZ thickness = t) */
+                    // write transform
                     instEdge.setMatrixAt(
                         ei,
                         new THREE.Matrix4().compose(
                             src.pos,
                             quat,
-                            new THREE.Vector3(t, len, t)      // Y = length
+                            new THREE.Vector3(t, len, t)
                         )
                     );
 
-                    /* colour = RGB of the source node */
+                    // copy colour from source node
                     const srcIdx = src._instanceIndex;
-                    colAttr.setXYZ(
-                        ei,
-                        instMesh.instanceColor.getX(srcIdx),
-                        instMesh.instanceColor.getY(srcIdx),
-                        instMesh.instanceColor.getZ(srcIdx)
-                    );
+                    const r = instMesh.instanceColor.getX(srcIdx);
+                    const g = instMesh.instanceColor.getY(srcIdx);
+                    const b = instMesh.instanceColor.getZ(srcIdx);
+                    colAttr.setXYZ(ei, r, g, b);
 
-                    /* edge metadata – idx ↔︎ instanceId */
-                    edges[ei] = { source: srcId, target: tgtId, index: ei, weight: w };
+                    edges.push({ source: srcId, target: tgtId, index: ei, weight: w });
                     ei++;
                 });
             });
 
-            /* commit GPU updates */
+            // upload
             instEdge.count = ei;
             instEdge.instanceMatrix.needsUpdate = true;
             colAttr.needsUpdate = true;
         }
-
 
 
         //////////////////////////////////////////////////////////////////////////
@@ -1821,8 +1942,6 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         }
 
 
-        ensureEdgeAlphaAttr();   // make alpha buffer immediately
-        rebuildEdges();
 
         //////////////////////////////////////////////////////////////////////
         // HELPERS
@@ -2125,6 +2244,46 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         //////////////////////////////////////////////////////////////////////
         // CHAIN REACTION
         //////////////////////////////////////////////////////////////////////
+/**
+ * Starting from `nodeId`, walk *all* references upstream
+ * (breadth‐first) and pulse every connecting edge white.
+ * Uses your existing pulseEdge(idx, baseGrey) which fades it back.
+ */
+function highlightPathFrom(nodeId) {
+  if (!instEdge || !edges.length) return;
+  const seen = new Set([ nodeId ]);
+  const queue = [ nodeId ];
+  const axisY = new THREE.Vector3(0,1,0);
+
+  while (queue.length) {
+    const srcId = queue.shift();
+    const srcNode = nodeMap.get(srcId);
+    if (!srcNode) continue;
+
+    // collect both references[] + association_strengths keys
+    const ups = [
+      ...(srcNode.data.references||[]),
+      ...Object.keys(srcNode.data.association_strengths||{})
+    ];
+
+    for (const tgtId of ups) {
+      if (!nodeMap.has(tgtId) || seen.has(tgtId)) continue;
+      seen.add(tgtId);
+      queue.push(tgtId);
+
+      // find the edge index that joins srcId -> tgtId
+      const e = edges.find(e =>
+        (e.source===srcId && e.target===tgtId) ||
+        (e.source===tgtId && e.target===srcId)
+      );
+      if (e) {
+        // pulse white, then fade back to its original grey
+        const baseGrey = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1,e.weight);
+        pulseEdge(e.index, baseGrey);
+      }
+    }
+  }
+}
 
 
         /***********************************************************************
@@ -2255,8 +2414,10 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             detailPanel.appendChild(tbl);
 
             /* ── visual feedback on graph ───────────────────────────────────────── */
-            flashNeighbours(ctxId);
-            triggerChain(ctxId, 0);
+highlightPathFrom(ctxId);
+
+// optionally still do the breadth-first “chain reaction” if you like:
+triggerChain(ctxId, 0);
             tweenToNode(ctxId);
 
             /* ── scroll & highlight in sidebar ─────────────────────────────────── */
@@ -2408,6 +2569,8 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         animate();
 
 
+        ensureEdgeAlphaAttr();   // make alpha buffer immediately
+        rebuildEdges();
         populateFileSelector()
             .then(loadGraph)
             .then(() => {

@@ -148,20 +148,34 @@ def _stage3_retrieve_and_merge_context(
 
     def _to_dt(ts):
         """
-        Parse ISO timestamp or datetime, and always return a naïve UTC datetime.
+        Parse either RFC-3339 / ISO8601 strings *or* our compact
+        YYYYMMDDTHHMMSSZ timestamps, and always return a naïve UTC datetime.
         """
+        from datetime import datetime, timezone
+
         if isinstance(ts, str):
+            # 1) Try ISO8601 (e.g. "2025-07-09T13:08:48.123456Z" or with +00:00)
             try:
-                # parse as aware UTC, then drop tzinfo
-                dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+                # ensure the Z→+00:00 for fromisoformat
+                iso = ts if "Z" not in ts else ts.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso)
+                # drop tzinfo
                 return dt.astimezone(timezone.utc).replace(tzinfo=None)
-            except Exception as e:
-                # fallback to now if parse fails
+            except ValueError:
+                pass
+
+            # 2) Try our compact format YYYYMMDDTHHMMSSZ
+            try:
+                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+            except ValueError as e:
                 print(f"⚠️ [timestamp parse error] {ts!r} → {e}")
                 return now
-        if isinstance(ts, _dt):
-            # drop any tzinfo if present
+
+        if isinstance(ts, datetime):
+            # drop any tzinfo
             return ts.astimezone(timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+
+        # fallback
         return now
 
     def _dedupe(objs):
