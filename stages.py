@@ -38,6 +38,81 @@ def _utc_iso() -> str:
     from datetime import datetime
     return datetime.utcnow().isoformat() + "Z"
 
+def squash_narrative(lines, keep_last=5, max_len=160):
+    """
+    lines : iterable[str]   (chronological order)
+    Returns a compact list with at most `keep_last` recent items plus a
+    single summary for the elided middle.
+    """
+    total = len(lines)
+    if total <= keep_last:
+        pool = lines
+    else:
+        pool = ["… (%d earlier entries)" % (total - keep_last)] + list(lines[-keep_last:])
+
+    out = []
+    for ln in pool:
+        # cut at first sentence end ≤ max_len
+        sent_end = re.search(r"[.!?]\s", ln)
+        clip_at  = sent_end.end() if sent_end and sent_end.end() <= max_len else max_len
+        out.append(textwrap.shorten(ln, clip_at, placeholder="…"))
+    return out
+
+def trim_snip(snip, max_words=100, ctx_id=""):
+    words = snip.split()
+    if len(words) <= max_words:
+        return snip
+    # find nearest sentence end before the cut
+    cut = " ".join(words[:max_words])
+    m   = re.search(r"[.!?]\s[^.!?]*?$", cut)
+    cut = cut[:m.end()] if m else cut
+    return f"{cut} … [extended {len(snip)-len(cut)} chars, search {ctx_id}]"
+
+# -----------------------------------------------------------------------
+# Pretty debug snapshot for _stage10_assemble_and_infer
+# -----------------------------------------------------------------------
+def _dump_ai_state(state: dict[str, Any]) -> None:
+    from textwrap import shorten
+
+    # ── helpers ─────────────────────────────────────────────────────────
+    def _crop(val: str, ln: int = 60) -> str:
+        return shorten(str(val), width=ln, placeholder="…")
+
+    # Core scalars -------------------------------------------------------
+    plan_out  = _crop(state.get("plan_output", "(none)"), 120)
+    tc_ctx_id = getattr(state.get("tc_ctx"), "context_id", None)
+    wm_ids    = state.get("wm_ids", [])
+    rec_ids   = state.get("recent_ids", [])
+
+    # Tool-ctx table -----------------------------------------------------
+    tool_rows = []
+    for t in state.get("tool_ctxs", []):
+        stage  = t.stage_id
+        cid    = t.context_id
+        output = _crop(t.metadata.get("output", "(no output)"))
+        tool_rows.append(f"│ {stage:<24} │ {cid:<36} │ {output}")
+
+    tool_table = (
+        "│ stage_id                 │ context_id                          │ output\n"
+        "├" + "─"*26 + "┼" + "─"*38 + "┼" + "─"*62 + "\n"
+        + "\n".join(tool_rows or ["│ (none)                    │ (n/a)                               │"])
+    )
+
+    # Final block --------------------------------------------------------
+    block = f"""
+╔═══════════════════════  ASSEMBLE & INFER  ═══════════════════════╗
+║ State keys : {_crop(list(state.keys()), 100)}{' '*(53-len(_crop(list(state.keys()),100)))}║
+║ plan_out   : {plan_out:<53}║
+║ tc_ctx_id  : {tc_ctx_id or '(none)':<53}║
+║ wm_ids     : {_crop(wm_ids, 100):<53}║
+║ recent_ids : {_crop(rec_ids, 100):<53}║
+╟───────────────────────────── TOOL CTXS ──────────────────────────╢
+{tool_table}
+╚══════════════════════════════════════════════════════════════════╝
+"""
+    print(block.strip("\n"))
+
+
 
 def _stage1_record_input(self, user_text: str) -> ContextObject:
     # record the new user input
@@ -302,124 +377,172 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
     self.repo.save(ctx)
     return ctx
 
-def _stage5_external_knowledge(self, clar_ctx: ContextObject, state: Dict[str,Any] = None) -> ContextObject:
-    import json
-    import concurrent.futures
+def _stage5_external_knowledge(
+    self,
+    clar_ctx: ContextObject,
+    state: Dict[str, Any] | None = None,
+) -> ContextObject:
+    """
+    Build a light-weight “working memory” context window:
+
+    • WM   – most-recent user/assistant/final_inference segments
+    • EXT  – top-k semantic matches to clarifier keywords
+    • LOC  – keyword matches from the last hour
+    • FALLBACK – extra embeds if we’re still too thin
+
+    Similar snippets are wrapped in a clearly-labelled block so the model
+    can differentiate “fresh memory” from “semantic echoes”.
+    """
+    import re, concurrent.futures
     from datetime import datetime, timedelta
 
-    now = default_clock()
+    now       = default_clock()
+    top_k     = max(3, self.top_k)          # be defensive
+    MIN_SNIPS = 5
 
-    # ── 0) Prune stale/overflow contexts ──────────────────────────────────
+    # ─── helpers ────────────────────────────────────────────────────────
+    def _ts(t: str) -> datetime:
+        try:
+            return datetime.strptime(t.rstrip("Z"), "%Y%m%dT%H%M%S")
+        except Exception:
+            return now
+
+    IGNORE_PAT = re.compile(r"^(error|traceback|browser not open|no such file)", re.I)
+
+    def _trim(txt: str, ctx_id: str) -> str:
+        words = txt.split()
+        if len(words) <= 100:
+            return txt
+        head = " ".join(words[:100])
+        m = re.search(r"[\.!\?]\s", txt[len(head):])
+        if m:
+            head = txt[: len(head) + m.end()]
+        hidden = len(txt) - len(head)
+        return f"{head.rstrip()} … [extended {hidden} chars, search {ctx_id} to retrieve full string]"
+
     prune_summary = self._stage_prune_context_store({})
 
-    # ── 1) In parallel, gather raw ContextObjects ────────────────────────
-    with concurrent.futures.ThreadPoolExecutor() as exec:
-        fut_seg = exec.submit(lambda: sorted(
-            [c for c in self.repo.query(
-                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
-            )],
-            key=lambda c: c.timestamp, reverse=True
-        )[: self.top_k])
+    # ─── 1) parallel fetch  ─────────────────────────────────────────────
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        fut_seg = ex.submit(lambda: sorted(
+            self.repo.query(lambda c:
+                c.domain == "segment" and c.semantic_label in ("user_input", "assistant")
+            ),
+            key=lambda c: _ts(c.timestamp), reverse=True
+        )[: top_k])
 
-        fut_inf = exec.submit(lambda: sorted(
-            [c for c in self.repo.query(
-                lambda c: c.semantic_label=="final_inference"
-            )],
-            key=lambda c: c.timestamp, reverse=True
-        )[: self.top_k])
+        fut_inf = ex.submit(lambda: sorted(
+            self.repo.query(lambda c: c.semantic_label == "final_inference"),
+            key=lambda c: _ts(c.timestamp), reverse=True
+        )[: top_k])
 
-        fut_sim = exec.submit(lambda: [
-            h for kw in clar_ctx.metadata.get("keywords", [])
-            for h in self.engine.query(
+        # embedding search helper with rudimentary ranking
+        def _embed_search(query: str, k: int):
+            hits = self.engine.query(
+                similarity_to=query,
                 stage_id="external_knowledge_retrieval",
-                similarity_to=kw,
-                top_k=self.top_k
+                top_k=k
             )
+            # sort by retrieval_score if the engine set it
+            hits.sort(key=lambda h: getattr(h, "retrieval_score", 0.0), reverse=True)
+            return hits
+
+        kws = clar_ctx.metadata.get("keywords") or []
+        if not kws and clar_ctx.summary:
+            kws = [clar_ctx.summary]
+
+        fut_sim = ex.submit(lambda: [
+            h for kw in kws for h in _embed_search(kw, max(1, top_k // 2))
         ])
 
-        fut_loc = exec.submit(lambda: [
-            c for c in self.repo.query(
-                lambda c: (
-                    c.semantic_label in ("user_input","assistant","final_inference")
-                    and datetime.fromisoformat(c.timestamp.rstrip("Z")) >= now - timedelta(hours=1)
-                    and any(kw.lower() in (c.summary or "").lower() for kw in clar_ctx.metadata.get("keywords", []))
-                )
-            )
+        fut_loc = ex.submit(lambda: [
+            c for c in self.repo.query(lambda c:
+                c.semantic_label in ("user_input", "assistant", "final_inference")
+                and _ts(c.timestamp) >= now - timedelta(hours=1)
+                and any(kw.lower() in (c.summary or "").lower() for kw in kws))
         ])
 
-    segs = fut_seg.result(timeout=2.0) if fut_seg else []
-    infs = fut_inf.result(timeout=2.0) if fut_inf else []
-    sims = fut_sim.result(timeout=2.0) if fut_sim else []
-    locs = fut_loc.result(timeout=2.0) if fut_loc else []
+    segs, infs, sims, locs = (
+        fut_seg.result(), fut_inf.result(), fut_sim.result(), fut_loc.result()
+    )
 
-    # ── 2) snippet‐truncation helper ───────────────────────────────────────
-    MAX_SNIP_LEN = 200
-    def truncate(txt: str) -> str:
-        if len(txt) > MAX_SNIP_LEN:
-            return txt[:MAX_SNIP_LEN].rstrip() + "…"
-        return txt
-
-    # ── 3) Build working memory entries (truncated) ───────────────────────
-    working_memory = []
-    for c in reversed(segs):
-        working_memory.append(f"(WM)[{c.semantic_label}] {truncate(c.summary)}")
-    for c in reversed(infs):
-        working_memory.append(f"(WM)[{c.semantic_label}] {truncate(c.summary)}")
-
-    # ── 4) Build similarity snippets ──────────────────────────────────────
-    sim_snips = [
-        f"(EXT)[{','.join(h.tags)}] {truncate(h.summary)}"
-        for h in sims
+    # ─── 2) assemble WORKING MEMORY snippets ────────────────────────────
+    working = [
+        f"(WM)[{c.semantic_label}] {_trim(c.summary, c.context_id)}"
+        for c in reversed(segs + infs)
+        if c.summary and not IGNORE_PAT.search(c.summary)
     ]
 
-    # ── 5) Build local‐match snippets ─────────────────────────────────────
-    loc_snips = []
-    for c in locs:
-        tag = "SEG" if c.domain=="segment" else "INF"
-        loc_snips.append(f"(LOC-{tag})[{c.semantic_label}] {truncate(c.summary)}")
+    # ─── 3) SIMILARITY block  ───────────────────────────────────────────
+    sim_block: list[str] = []
+    seen_sim_ids: set[str] = set()
+    for h in sims:
+        if h.context_id in seen_sim_ids:
+            continue
+        if h.summary and not IGNORE_PAT.search(h.summary):
+            sim_block.append(f"{_trim(h.summary, h.context_id)}")
+            seen_sim_ids.add(h.context_id)
 
-    # ── 6) Fallback to last 5 segments if nothing collected ───────────────
-    if not (working_memory or sim_snips or loc_snips):
-        fallback = sorted(
-            [c for c in self.repo.query(
-                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
-            )],
-            key=lambda c: c.timestamp, reverse=True
-        )[:5]
-        for c in reversed(fallback):
-            working_memory.append(f"(FB)[{c.semantic_label}] {truncate(c.summary)}")
+    if sim_block:
+        sim_snips = ["[SIMILAR THINGS I REMEMBER IN MY MEMORY]"] + [
+            f"- {snip}" for snip in sim_block
+        ]
+    else:
+        sim_snips = ["[SIMILAR THINGS I REMEMBER IN MY MEMORY]", "- (none)"]
 
-    # ── 7) Combine, dedupe, and cap total snippet count ───────────────────
-    all_snips = working_memory + sim_snips + loc_snips
-    seen = set(); unique = []
-    for s in all_snips:
-        if s not in seen:
-            seen.add(s); unique.append(s)
-            if len(unique) >= self.top_k * 3:  # avoid runaway length
-                break
+    # ─── 4) LOCAL keyword matches ───────────────────────────────────────
+    loc_snips = [
+        f"(LOC)[{c.semantic_label}] {_trim(c.summary, c.context_id)}"
+        for c in locs
+        if c.summary and not IGNORE_PAT.search(c.summary)
+    ] or ["(LOC) (no matches found)"]
 
-    # ── 8) Persist and return as a ContextObject ─────────────────────────
-    summary_text = "\n".join(unique) or "(none)"
+    # ─── 5) Fallback if overall too thin  ───────────────────────────────
+    fb_snips: list[str] = []
+    if len(working + sim_snips + loc_snips) < MIN_SNIPS:
+        extra = _embed_search(clar_ctx.summary or "", top_k)
+        fb_snips = [
+            f"(FALLBACK)[{c.semantic_label}] {_trim(c.summary, c.context_id)}"
+            for c in extra
+            if c.summary and not IGNORE_PAT.search(c.summary)
+        ] or ["(FALLBACK) (no matches found)"]
+
+    # ─── 6) Deduplicate & cap  ──────────────────────────────────────────
+    raw = working + sim_snips + loc_snips + fb_snips
+    seen_norm, unique = set(), []
+    for s in raw:
+        key = re.sub(r"\s+", " ", s.lower())
+        if key not in seen_norm:
+            seen_norm.add(key)
+            unique.append(s)
+        if len(unique) >= top_k * 3:
+            break
+
+    # ─── 7) persist context object  ─────────────────────────────────────
     ctx = ContextObject.make_stage(
         "external_knowledge_retrieval",
         clar_ctx.references,
-        {"snippets": unique}
+        {"snippets": unique},
     )
     ctx.stage_id = "external_knowledge_retrieval"
-    ctx.summary  = summary_text
+    ctx.summary  = "\n".join(unique)
     ctx.touch()
     self.repo.save(ctx)
 
-    # ── 9) Debug print ────────────────────────────────────────────────────
+    # ─── 8) debug print  ────────────────────────────────────────────────
     self._print_stage_context("external_knowledge_retrieval", {
         "pruned":         prune_summary,
-        "working_memory": working_memory or ["(none)"],
-        "similarity":     sim_snips     or ["(none)"],
-        "local_matches":  loc_snips     or ["(none)"],
+        "working_memory": working or ["(none)"],
+        "similarity":     sim_snips,
+        "local_matches":  loc_snips,
+        "fallback":       fb_snips or ["(none)"],
         "total_snips":    len(unique),
     })
 
     return ctx
+
+
+
 
 def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
     """
@@ -797,115 +920,168 @@ def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
     plan_output: str,
-    tools_list: List[Dict[str, str]],
+    tools_list: List[Dict[str, Any]],
     state: Dict[str, Any]
 ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
+    """
+    Convert the planner’s output into a validated list of canonical call
+    strings, even if the JSON is badly mangled.
+
+    •  Zero-arg tools: any arguments hallucinated by the model are stripped.
+    •  Salvage mode: if JSON is malformed, we still extract tool names +
+       whatever parameter hints we can find.
+    """
     import json, re
 
-    # ── A) JSON-first extraction of calls ──────────────────────────────
-    calls: List[str] = []
+    # ------------------------------------------------------------------ #
+    # 0)  schema lookup (name → schema)                                   #
+    # ------------------------------------------------------------------ #
+    schema_map = {
+        json.loads(s.metadata["schema"])["name"]: json.loads(s.metadata["schema"])
+        for s in self.repo.query(
+            lambda c: c.component == "schema" and "tool_schema" in c.tags
+        )
+    }
+
+    def _strip_args_if_unused(name: str, call_string: str) -> str:
+        """If schema has no parameters, return '<name>()'."""
+        sch = schema_map.get(name)
+        if sch and not sch.get("parameters", {}).get("properties"):
+            return f"{name}()"
+        return call_string
+
+    # ------------------------------------------------------------------ #
+    # A)  Extract call strings                                            #
+    # ------------------------------------------------------------------ #
+    calls: list[str] = []
+
     try:
+        # ---------- happy path: planner returned valid JSON -------------
         plan = json.loads(plan_output)
         def _flatten(tasks):
-            out = []
+            flat = []
             for t in tasks:
-                out.append(t)
-                out.extend(_flatten(t.get("subtasks", [])))
-            return out
+                flat.append(t)
+                flat.extend(_flatten(t.get("subtasks", [])))
+            return flat
 
-        flat = _flatten(plan.get("tasks", []))
-        for t in flat:
-            name = t["call"]
-            inp  = t.get("tool_input", {}) or {}
-            if inp:
-                args = ",".join(
-                    f'{k}={json.dumps(v, ensure_ascii=False)}'
-                    for k, v in inp.items()
-                )
-                calls.append(f"{name}({args})")
+        for t in _flatten(plan.get("tasks", [])):
+            name   = t["call"].split("(", 1)[0]
+            params = t.get("tool_input", {}) or {}
+            if params:
+                arg_s = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}"
+                                 for k, v in params.items())
+                calls.append(f"{name}({arg_s})")
             else:
                 calls.append(f"{name}()")
 
     except Exception:
-        # only if JSON really is broken, fallback to regex
-        parsed = Tools.parse_tool_call(plan_output)
-        if parsed:
-            raw = [parsed]
-        else:
-            raw = re.findall(r'\b[A-Za-z_]\w*\([^)]*\)', plan_output)
-        seen = set()
-        for c in raw:
-            if c not in seen:
-                seen.add(c)
-                calls.append(c)
+        # ---------- salvage mode ----------------------------------------
+        salvage: set[str] = set()
 
-    # ── B) Load matching schemas & build docs blob ──────────────────
-    all_schemas = self.repo.query(
-        lambda c: c.component=="schema" and "tool_schema" in c.tags
-    )
-    selected_schemas, docs_blob_parts = [], []
-    wanted = {c.split("(")[0] for c in calls}
-    for sch_obj in all_schemas:
-        schema = json.loads(sch_obj.metadata["schema"])
-        if schema["name"] in wanted:
-            selected_schemas.append(sch_obj)
-            docs_blob_parts.append(
-                f"**{schema['name']}**\n```json\n"
-                + json.dumps(schema, indent=2)
-                + "\n```"
-            )
-    docs_blob = "\n\n".join(docs_blob_parts)
+        # 1)  classic  foo(bar=1)-style regex
+        for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\(([^)]*)\)', plan_output):
+            name, raw_args = m.group(1), m.group(2).strip()
+            if raw_args:
+                salvage.add(f"{name}({raw_args})")
+            else:
+                salvage.add(f"{name}()")
 
-    # ── C) Confirm with the LLM ────────────────────────────────────
-    system = self._get_prompt("toolchain_prompt") + docs_blob
+        # 2)  broken-JSON fragments  "call": "tool", "tool_input": {...}
+        pat = re.compile(
+            r'"call"\s*:\s*"(?P<name>[A-Za-z_]\w*)".*?'
+            r'"tool_input"\s*:\s*(?P<input>\{[^}]*\})',
+            re.S
+        )
+        for m in pat.finditer(plan_output):
+            name, blob = m.group("name"), m.group("input")
+            # try a gentle JSON load first
+            try:
+                arg_dict = json.loads(blob.replace("'", '"'))
+            except Exception:
+                # naive K=V fallback
+                arg_dict = {}
+                for kv in re.finditer(r'"?([A-Za-z_]\w*)"?\s*[:=]\s*"?([^,"}]+)"?', blob):
+                    arg_dict[kv.group(1)] = kv.group(2)
+
+            if arg_dict:
+                arg_s = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}"
+                                 for k, v in arg_dict.items())
+                salvage.add(f"{name}({arg_s})")
+            else:
+                salvage.add(f"{name}()")
+
+        calls.extend(sorted(salvage))
+
+    # ------------------------------------------------------------------ #
+    # B)  Build docs for selected tools                                   #
+    # ------------------------------------------------------------------ #
+    wanted = {c.split("(", 1)[0] for c in calls}
+    selected_schemas, docs = [], []
+    for s in self.repo.query(lambda c: c.component=="schema" and "tool_schema" in c.tags):
+        sch = json.loads(s.metadata["schema"])
+        if sch["name"] in wanted:
+            selected_schemas.append(s)
+            docs.append(f"**{sch['name']}**\n```json\n{json.dumps(sch, indent=2)}\n```")
+    docs_blob = "\n\n".join(docs)
+
+    # ------------------------------------------------------------------ #
+    # C)  LLM confirmation / correction                                  #
+    # ------------------------------------------------------------------ #
+    system_prompt = self._get_prompt("toolchain_prompt") + docs_blob
     self._print_stage_context("tool_chaining", {
         "plan":    [plan_output[:200]],
-        "schemas": docs_blob_parts
+        "schemas": docs or ["(none)"]
     })
-    out = self._stream_and_capture(
+    reply = self._stream_and_capture(
         self.secondary_model,
-        [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": json.dumps({"tool_calls": calls})},
-        ],
+        [{"role": "system", "content": system_prompt},
+         {"role": "user",   "content": json.dumps({"tool_calls": calls})}],
         tag="[ToolChain]"
     )
 
-    # ── D) Parse back the confirmed list, then normalise ───────────────
-    raw_confirmed = calls
+    confirmed_raw = calls
     try:
-        blob = re.search(r'\{.*"tool_calls".*?\}', out, flags=re.S).group(0)
-        parsed2 = json.loads(blob)
-        if isinstance(parsed2.get("tool_calls"), list):
-            raw_confirmed = parsed2["tool_calls"]
+        blob = re.search(r'\{.*"tool_calls".*?\}', reply, re.S).group(0)
+        parsed = json.loads(blob)
+        if isinstance(parsed.get("tool_calls"), list):
+            confirmed_raw = parsed["tool_calls"]
     except Exception:
         pass
 
-    # --- normalise any dict objects to strings ------------------------
+    # ------------------------------------------------------------------ #
+    # D)  Canonicalise + strip bogus args                                #
+    # ------------------------------------------------------------------ #
     def _obj2str(item):
         if isinstance(item, dict):
-            name = item.get("name") or item.get("tool_name") or item.get("call")
-            args = item.get("arguments", item.get("parameters", {})) or {}
-            if args:
-                arg_s = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}'
-                                 for k, v in args.items())
-                return f"{name}({arg_s})"
-            return f"{name}()"
-        return str(item).strip()
+            nm  = item.get("name") or item.get("tool_name") or item.get("call")
+            pr  = item.get("arguments") or item.get("parameters") or {}
+            if pr:
+                a = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in pr.items())
+                s = f"{nm}({a})"
+            else:
+                s = f"{nm}()"
+        else:
+            s = str(item).strip()
+        name, rest = s.split("(", 1)
+        return _strip_args_if_unused(name, f"({rest}")
 
-    confirmed = [_obj2str(c) for c in raw_confirmed]
+    confirmed = [_obj2str(c) for c in confirmed_raw]
 
-    # ── E) Persist & return ────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # E)  Persist                                                        #
+    # ------------------------------------------------------------------ #
     tc_ctx = ContextObject.make_stage(
         "tool_chaining",
         plan_ctx.references + [s.context_id for s in selected_schemas],
         {"tool_calls": confirmed, "tool_docs": docs_blob}
     )
     tc_ctx.stage_id = "tool_chaining"
-    tc_ctx.summary  = json.dumps(confirmed)
+    tc_ctx.summary  = json.dumps(confirmed, ensure_ascii=False)
     tc_ctx.touch(); self.repo.save(tc_ctx)
 
     return tc_ctx, confirmed, selected_schemas
+
 
 def _stage8_5_user_confirmation(
     self,
@@ -1330,92 +1506,123 @@ def _stage9_invoke_with_retries(
     tracker.touch(); self.repo.save(tracker)
     return tool_ctxs
 
+
 def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
     """
-    Assemble every bit of context we have, run one final LLM pass, and
-    persist the answer — even if earlier tool stages failed or were skipped.
-    Also record the assistant’s reply as a segment for future context.
+    Assemble a compact, relevance-first context window, run the final LLM pass,
+    and persist the answer.  All earlier tool failures are ignored here—this
+    stage *always* produces a reply and stores it as both final_inference and
+    an assistant segment.
     """
-    import json
-    from context import ContextObject  # adjust import as needed
+    import json, itertools
+    from context import ContextObject  # local import to avoid cycles
 
-    print(
-        "[assemble_and_infer] tool_ctxs = "
-        + ", ".join(f"{t.stage_id}:{t.metadata.get('output')!r}" for t in state.get("tool_ctxs", [])),
-        "DEBUG"
-    )
-    print("[DEBUG] → entering assemble_and_infer with state keys:", list(state.keys()))
-    print("[DEBUG]    plan_output =", repr(state.get("plan_output")))
-    print("[DEBUG]    tc_ctx      =", getattr(state.get("tc_ctx"), "context_id", None))
-    print("[DEBUG]    tool_ctxs   =", [t.context_id for t in state.get("tool_ctxs", [])])
-    print("[DEBUG]    wm_ids      =", state.get("wm_ids"))
-    print("[DEBUG]    recent_ids  =", state.get("recent_ids"))
+    # ── CONFIG ────────────────────────────────────────────────────────────
+    MAX_CTX_OBJS      = 20         # absolute max snippets fed to the model
+    MAX_TOOL_OBJS     = 4          # keep just the N most-recent tool outputs
+    MAX_CHARS_PER_OBJ = 380        # truncate summary / tool blobs here
 
-    # ─── 1) Collect all relevant context-IDs ──────────────────────────────────
-    refs: list[str] = []
-    def _maybe_add(key: str):
+    # helper: cut at sentence boundary
+    def _snip(txt: str) -> str:
+        if not txt:
+            return ""
+        if len(txt) <= MAX_CHARS_PER_OBJ:
+            return txt
+        head = txt[:MAX_CHARS_PER_OBJ]
+        stop = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
+        cut  = head[: stop + 1 if stop != -1 else MAX_CHARS_PER_OBJ]
+        return cut.rstrip() + " …"
+
+    # helper: add ctx to list if present
+    def _maybe_add(key: str, into: list[str]):
         ctx = state.get(key)
         if ctx:
-            refs.append(ctx.context_id)
+            into.append(ctx.context_id)
 
-    _maybe_add("user_ctx")
-    _maybe_add("sys_ctx")
-    _maybe_add("tc_ctx")    # include the tool_chaining context
-    refs.extend(state.get("wm_ids", []))
-    refs.extend(state.get("recent_ids", []))
-    _maybe_add("clar_ctx")
-    _maybe_add("know_ctx")
-    _maybe_add("plan_ctx")
-    for t in state.get("tool_ctxs", []):
-        refs.append(t.context_id)
+    # ── 1) COLLECT IDS, WEIGHTED BY RECENCY / CATEGORY ───────────────────
+    refs: list[str] = []
+    _maybe_add("user_ctx",  refs)
+    _maybe_add("sys_ctx",   refs)
+    _maybe_add("tc_ctx",    refs)     # tool_chaining (schemas)
+    _maybe_add("clar_ctx",  refs)
+    _maybe_add("know_ctx",  refs)
+    _maybe_add("plan_ctx",  refs)
 
-    # de-duplicate while preserving order
+    # always include the latest relevance_summary if it exists
+    summary_ctx = next(
+        (c for c in state.get("recent_ctxs", []) or []   # assembler may stash this
+         if getattr(c, "stage_id", "") == "relevance_summary"),
+        None
+    )
+    if summary_ctx:
+        refs.append(summary_ctx.context_id)
+
+    # recent “working memory” / dialogue snippets
+    for lst, cap in (("wm_ids", 6), ("recent_ids", 4)):
+        ids = state.get(lst, [])
+        ids = sorted(ids, key=lambda cid: self.repo.get(cid).timestamp, reverse=True)[:cap]
+        refs.extend(ids)
+
+    # tool outputs – most recent N
+    tool_ids = [t.context_id for t in state.get("tool_ctxs", [])]
+    tool_ids = sorted(tool_ids, key=lambda cid: self.repo.get(cid).timestamp, reverse=True)[:MAX_TOOL_OBJS]
+    refs.extend(tool_ids)
+
+    # de-dupe while preserving first appearance
     seen, ordered = set(), []
     for cid in refs:
         if cid not in seen:
             seen.add(cid)
             ordered.append(cid)
 
-    # ─── 2) Load the ContextObjects, skipping missing ones ───────────────────
-    ctxs = []
+    # ── 2) LOAD OBJECTS (skip missing) ────────────────────────────────────
+    ctxs: list[ContextObject] = []
     for cid in ordered:
         try:
-            ctx = self.repo.get(cid)
+            ctxs.append(self.repo.get(cid))
         except KeyError:
-            print(f"[DEBUG]    missing context {cid}")
             continue
-        print(f"[DEBUG]    loaded {cid} → {ctx.summary!r}")
-        ctxs.append(ctx)
+    # ensure chronological order (older → newer) before slicing
     ctxs.sort(key=lambda c: c.timestamp)
 
-    # ─── 3) Inline into one big “knowledge sheet” ──────────────────────────
+    # ── 3) INLINE + TRIM ──────────────────────────────────────────────────
     interm_parts: list[str] = []
     for c in ctxs:
-        if c.component == "tool_output":
-            out = c.metadata.get("output")
-            try:
-                blob = json.dumps(out, indent=2, ensure_ascii=False)
-            except Exception:
-                blob = repr(out)
-            interm_parts.append(f"[{c.stage_id} (tool output)]\n{blob}")
-        elif c.semantic_label == "tool_chaining":
-            docs = c.metadata.get("tool_docs", "")
-            interm_parts.append(f"[tool_schemas]\n{docs}")
-        else:
-            interm_parts.append(f"[{c.stage_id}] {c.summary}")
-    interm = "\n\n".join(interm_parts)
+        if c.stage_id == "relevance_summary":
+            # keep exactly as-is, always first
+            interm_parts.insert(0, c.summary.strip())
+            continue
 
+        if c.component == "tool_output":
+            blob = _snip(json.dumps(c.metadata.get("output"), ensure_ascii=False))
+            interm_parts.append(f"[{c.stage_id}-out]\n{blob}")
+        elif c.semantic_label == "tool_chaining":
+            # compress big schema blob to just tool names
+            try:
+                doc = c.metadata.get("tool_docs", "")
+                names = ", ".join(t["name"] for t in json.loads(doc)["tools"][:6])
+            except Exception:
+                names = "<unknown tools>"
+            interm_parts.append(f"[tool_schemas] {names}")
+        else:
+            interm_parts.append(f"[{c.stage_id}] {_snip(c.summary or '')}")
+
+    # cap total snippets
+    interm_parts = interm_parts[:MAX_CTX_OBJS]
+    interm       = "\n\n".join(interm_parts)
+
+    # ── 4) LOG DEBUG VIEW ────────────────────────────────────────────────
     self._print_stage_context("assemble_and_infer", {
         "user_question":    [user_text],
         "plan":             [state.get("plan_output", "(no plan)")],
-        "inference_prompt": [self.inference_prompt],
-        "inlined_context":  interm_parts,
+        "included_ids":     ordered[:MAX_CTX_OBJS],
+        "snippets_count":   len(interm_parts),
     })
 
-    # ─── 4) Final LLM call ──────────────────────────────────────────────────
-    final_sys = self._get_prompt("final_inference_prompt")
-    plan_text = state.get("plan_output", "(no plan)")
-    self._last_plan_output = plan_text
+    # ── 5) LLM CALL ───────────────────────────────────────────────────────
+    final_sys   = self._get_prompt("final_inference_prompt")
+    plan_text   = state.get("plan_output", "(no plan)")
+    self._last_plan_output = plan_text     # stash for critic stage
 
     msgs = [
         {"role": "system", "content": final_sys},
@@ -1425,141 +1632,176 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         {"role": "system", "content": interm},
         {"role": "user",   "content": user_text},
     ]
-    print("[DEBUG]    refs to load:", ordered)
+
     reply = self._stream_and_capture(
-        self.primary_model, msgs, tag="[Assistant]", images=state.get("images")
+        self.primary_model,
+        msgs,
+        tag="[Assistant]",
+        images=state.get("images")
     ).strip()
 
-    # ─── 5) Persist the answer ──────────────────────────────────────────────
-    ci_refs = []
+    # ── 6) PERSIST ANSWER ────────────────────────────────────────────────
+    tool_ref_ids = [t.context_id for t in state.get("tool_ctxs", [])]
     if state.get("tc_ctx"):
-        ci_refs.append(state["tc_ctx"].context_id)
-    ci_refs.extend(t.context_id for t in state.get("tool_ctxs", []))
+        tool_ref_ids.insert(0, state["tc_ctx"].context_id)
 
     resp_ctx = ContextObject.make_stage(
         stage_name="final_inference",
-        input_refs=ci_refs,
+        input_refs=tool_ref_ids,
         output={"text": reply},
     )
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
-    resp_ctx.touch()
-    self.repo.save(resp_ctx)
+    resp_ctx.touch(); self.repo.save(resp_ctx)
 
-    # ─── 6) Also record this reply as assistant segment ───────────────────
     seg = ContextObject.make_segment(
         semantic_label="assistant",
         content_refs=[resp_ctx.context_id],
         tags=["assistant"]
     )
-    seg.summary  = reply
+    seg.summary = reply
     seg.stage_id = "assistant"
-    seg.touch()
-    self.repo.save(seg)
+    seg.touch(); self.repo.save(seg)
 
     return reply
+
+
 
 def _stage10b_response_critique_and_safety(
     self,
     draft: str,
     user_text: str,
-    tool_ctxs: List[ContextObject],
-    state: Dict[str, Any]
+    tool_ctxs: list["ContextObject"],
+    state: dict[str, Any],
 ) -> str:
-    import json, difflib, datetime
+    """
+    1)  Run a *relevance-extraction* mini-pass that distils the raw window
+        down to ≤ 8 ultra-focused bullet points.
+    2)  Feed ONLY that bullet list (plus the user question & draft) to an
+        editor prompt whose sole job is to fix factual gaps, integrate the
+        bullets and produce a direct answer.  No disclaimers are asked for.
+    3)  Persist artefacts & diff exactly as before.
+    """
+    import json, difflib
+    from context import ContextObject
 
-    # Recover the plan
+    # ————————————————————————————————————————
+    # Gather plan text & tool outputs (unchanged)
+    # ————————————————————————————————————————
     plan_text = getattr(self, "_last_plan_output", "(no plan)")
-
-    # 1) Collect all tool outputs
-    outputs = []
+    outputs   = []
     for c in tool_ctxs:
-        out = c.metadata.get("output")
         try:
-            blob = json.dumps(out, indent=2, ensure_ascii=False)
-        except:
-            blob = repr(out)
+            blob = json.dumps(c.metadata.get("output"), indent=2, ensure_ascii=False)
+        except Exception:
+            blob = repr(c.metadata.get("output"))
         outputs.append(f"[{c.stage_id}]\n{blob}")
 
-    # 2) Build richer critic prompt
-    critic_sys = self._get_prompt("critic_prompt")
-    prompt_user = "\n\n".join([
-        f"User asked:\n{user_text}",
-        f"Plan executed:\n{plan_text}",
-        f"Your draft:\n{draft}",
-        "Here are the raw tool results:\n" + "\n\n".join(outputs),
-    ])
+    # ————————————————————————————————————————
+    # 1️⃣  RELEVANCE EXTRACTOR
+    # ————————————————————————————————————————
+    extractor_sys = (
+        "You are a relevance extractor.\n"
+        "Return ONLY the information that directly helps answer the user.\n"
+        "Strict format: at most 8 lines, each starting with the bullet '• '."
+    )
+    extractor_user = "\n\n".join((
+        f"USER QUESTION:\n{user_text}",
+        f"PLAN EXECUTED:\n{plan_text}",
+        "RAW DRAFT:\n" + draft,
+        "RAW TOOL OUTPUTS:\n" + "\n\n".join(outputs),
+    ))
 
-    self._print_stage_context("response_critique", {
-        "system_directives": [critic_sys],
-        "user_payload":      [prompt_user],
-    })
+    bullets = self._stream_and_capture(
+        self.secondary_model,
+        [
+            {"role": "system", "content": extractor_sys},
+            {"role": "user",   "content": extractor_user},
+        ],
+        tag="[RelevExtract]",
+        images=state.get("images"),
+    ).strip()
 
-    # 3) Invoke LLM
-    msgs = [
-        {"role": "system", "content": critic_sys},
-        {"role": "user",   "content": prompt_user},
-    ]
+    # persist for traceability
+    sum_ctx = ContextObject.make_stage(
+        "relevance_summary", [], {"summary": bullets}
+    )
+    sum_ctx.stage_id = "relevance_summary"
+    sum_ctx.summary  = bullets
+    sum_ctx.touch(); self.repo.save(sum_ctx)
+
+    # ————————————————————————————————————————
+    # 2️⃣  POLISHER / CRITIC (NO extra guardrails)
+    # ————————————————————————————————————————
+    editor_sys = (
+        "You are an expert editor.\n"
+        "Use ONLY the bullet list to fix or extend the draft so it answers the "
+        "user fully and directly. Do NOT invent extra content or apologies."
+    )
+    editor_user = "\n\n".join((
+        f"USER QUESTION:\n{user_text}",
+        "RELEVANT BULLETS:\n" + bullets,
+        "CURRENT DRAFT:\n" + draft,
+    ))
+
     polished = self._stream_and_capture(
         self.secondary_model,
-        msgs,
-        tag="[Critic]",
-        images=state.get("images")
+        [
+            {"role": "system", "content": editor_sys},
+            {"role": "user",   "content": editor_user},
+        ],
+        tag="[Polisher]",
+        images=state.get("images"),
     ).strip()
-    
-    # 4) If unchanged, just return it
+
+    # short-circuit if unchanged
     if polished == draft.strip():
         return polished
 
-    # 5) Compute diff summary
+    # ————————————————————————————————————————
+    # 3️⃣  Diff summary + dynamic-prompt patch
+    # ————————————————————————————————————————
     diff = difflib.unified_diff(
-        draft.splitlines(), polished.splitlines(),
-        lineterm="", n=1
+        draft.splitlines(), polished.splitlines(), lineterm="", n=1
     )
     diff_summary = "; ".join(
         ln for ln in diff if ln.startswith(("+ ", "- "))
     ) or "(minor re-formatting)"
 
-    # 6) Upsert dynamic_prompt_patch (as before)
+    # upsert / refresh the dynamic-prompt patch
     patch_rows = self.repo.query(
         lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
     )
     patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
-    if patch_rows:
-        patch = patch_rows[0]
-        for extra in patch_rows[1:]:
-            self.repo.delete(extra.context_id)
-    else:
-        patch = ContextObject.make_policy(
-            "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
-        )
+    patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
+        "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
+    )
     if patch.summary != diff_summary:
         patch.summary = diff_summary
         patch.metadata["policy"] = diff_summary
         patch.touch(); self.repo.save(patch)
-        self._print_stage_context("dynamic_patch_written", {"patch": diff_summary})
 
-    # 7) Persist the polished reply
+    # ————————————————————————————————————————
+    # 4️⃣  Persist polished reply + critique
+    # ————————————————————————————————————————
     resp_ctx = ContextObject.make_stage(
-        "response_critique",
-        [],  # no extra refs
-        {"text": polished}
+        "response_critique", [sum_ctx.context_id], {"text": polished}
     )
     resp_ctx.stage_id = "response_critique"
     resp_ctx.summary  = polished
     resp_ctx.touch(); self.repo.save(resp_ctx)
 
-    # 8) Create a standalone plan_critique that will feed into the next planner run
     critique_ctx = ContextObject.make_stage(
         "plan_critique",
         [resp_ctx.context_id] + [c.context_id for c in tool_ctxs],
-        {"critique": polished, "diff": diff_summary}
+        {"critique": polished, "diff": diff_summary},
     )
     critique_ctx.component      = "analysis"
     critique_ctx.semantic_label = "plan_critique"
     critique_ctx.touch(); self.repo.save(critique_ctx)
 
     return polished
+
 
 def _stage11_memory_writeback(
     self,

@@ -59,6 +59,32 @@ def _done_calls(repo) -> set[str]:
             done.add(obj.metadata["tool_call"])
     return done
 
+
+import logging
+_EMBED_LOG = logging.getLogger("embed_preview")          # configure in main if you want colour etc.
+_PREVIEW_LEN = 120                                       # chars to print
+
+def _loggable_snippet(txt: str, n=_PREVIEW_LEN) -> str:
+    """Collapse whitespace + truncate for neat one-line preview."""
+    snip = " ".join(txt.split())
+    return (snip[: n] + "…") if len(snip) > n else snip
+
+def embed_text(text: str) -> np.ndarray:
+    """
+    Wrapper around ollama.embed that also logs WHAT we embed.
+    Prints one line: length + preview (first 120 non-newline chars).
+    Falls back to zeros on any error.
+    """
+    try:
+        _EMBED_LOG.info("⮕ EMBED %4d ch | %s", len(text), _loggable_snippet(text))
+        resp = embed(model="nomic-embed-text", input=text)
+        vec  = np.array(resp["embeddings"], dtype=float).flatten()
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
+    except Exception as err:
+        _EMBED_LOG.warning("⚠️  embed failed: %s", err)
+        return np.zeros(768, dtype=float)
+
 class RLController:
     """
     Multi-armed bandit with baseline + recall bias.
@@ -188,6 +214,7 @@ class TaskExecutor:
                 )
                 succ.touch()
                 self.asm.repo.save(succ)
+                self.memman.register_relationships(succ, embed_text)
                 self.asm.memman.reinforce(succ.context_id, [t.context_id])
             else:
                 fail = ContextObject.make_failure(
@@ -328,6 +355,8 @@ class ContextQueryEngine:
         for c in out:
             c.record_recall(stage_id=stage_id, coactivated_with=[])
             self.repo.save(c)
+            self.memman.register_relationships(c, embed_text)
+
         return out
     
 class Assembler:
@@ -387,7 +416,7 @@ class Assembler:
             "clarifier_prompt",
             "You are Clarifier. Expand the user’s intent into a JSON object with "
             "two keys: 'keywords' (an array of concise keywords) and 'notes'. "
-            "Notes should produce NO value judgements or claims, and should only expand on what the user said."
+            "Notes should produce NO value judgements or claims, and should only expand on what the user said. ignore irrelevant errors in context unrelated to the user’s intent. "
             "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
@@ -510,21 +539,6 @@ class Assembler:
             )
         self.memman = MemoryManager(self.repo)
         
-        # — setup embedding engine —
-        @staticmethod
-        def embed_text(text: str) -> np.ndarray:
-            """
-            Return a unit-normalised embedding vector (shape: 768, dtype=float).
-            Falls back to all-zeros on any error.
-            """
-            try:
-                resp = embed(model="nomic-embed-text", input=text)
-                vec  = np.array(resp["embeddings"], dtype=float).flatten()
-                norm = np.linalg.norm(vec)
-                return vec / norm if norm > 0 else vec
-            except Exception:
-                return np.zeros(768, dtype=float)
-
 
         self.engine = ContextQueryEngine(self.repo, lambda t: embed_text(t))
         
@@ -595,6 +609,8 @@ class Assembler:
                     tags=["dynamic_prompt","curiosity_template"]
                 )
                 tmpl.touch(); self.repo.save(tmpl)
+                self.memman.register_relationships(tmpl, embed_text)
+
                 self.curiosity_templates.append(tmpl)
 
         # auto‐generate “requires X” templates if missing
@@ -615,6 +631,7 @@ class Assembler:
                         )
                         tmpl.touch()
                         self.repo.save(tmpl)
+                        self.memman.register_relationships(tmpl, embed_text)
                         self.curiosity_templates.append(tmpl)
 
         # — RLController for curiosity-template selection —
@@ -670,6 +687,8 @@ class Assembler:
                     tags=["artifact", "tool_schema"],
                 )
                 ctx.touch(); self.repo.save(ctx)
+                self.memman.register_relationships(ctx, embed_text)
+
                 continue
 
             # B) keep newest row, delete duplicates
@@ -697,6 +716,8 @@ class Assembler:
 
             if changed:
                 keeper.touch(); self.repo.save(keeper)
+                self.memman.register_relationships(keeper, embed_text)
+
 
         # ---------- 3) purge / archive orphaned schemas ---------------------
         obsolete = [
@@ -715,6 +736,8 @@ class Assembler:
                 keep.tags.append("legacy_tool_schema")
             keep.tags = [t for t in keep.tags if t != "tool_schema"]
             keep.touch(); self.repo.save(keep)
+            self.memman.register_relationships(keep, embed_text)
+
 
 
     def _seed_static_prompts(self) -> None:
@@ -769,6 +792,8 @@ class Assembler:
                 )
                 new_ctx.touch()
                 self.repo.save(new_ctx)
+                self.memman.register_relationships(new_ctx, embed_text)
+
                 continue
 
             # B) Keep only the newest, delete duplicates
@@ -791,6 +816,8 @@ class Assembler:
             if changed:
                 keeper.touch()
                 self.repo.save(keeper)
+                self.memman.register_relationships(keeper, embed_text)
+
 
 
 
@@ -833,6 +860,8 @@ class Assembler:
             ctx.tags = list(tags)
             ctx.touch()
             self.repo.save(ctx)
+            self.memman.register_relationships(ctx, embed_text)
+
             return ctx
 
         # ---- DEDUPE ----  (rows[0] is newest because jsonl is append-only)
@@ -863,6 +892,8 @@ class Assembler:
         keeper.references = [n.context_id for n in narr_objs]
         keeper.touch()
         self.repo.save(keeper)
+        self.memman.register_relationships(keeper, embed_text)
+
         return keeper
     
     def _load_system_prompts(self) -> ContextObject:
@@ -898,6 +929,8 @@ class Assembler:
         )
         keeper.touch()
         self.repo.save(keeper)
+        self.memman.register_relationships(keeper, embed_text)
+
         return keeper
 
 
@@ -910,8 +943,7 @@ class Assembler:
         return segs[-self.hist_k:]
 
     def _print_stage_context(self, name: str, sections: Dict[str, Any]):
-        print("--- Stage Context Dump -----------------------------------------------------")
-        print(f"\n>>> [Stage: {name}] Context window:")
+        print(f"\n\n\n██████▓▓▓▓▒▒▒▒▒░░░░ [START: {name}] Context window: ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████")
         for title, lines in sections.items():
             print(f"  -- {title}:")
             if isinstance(lines, str):
@@ -922,7 +954,7 @@ class Assembler:
                     print(f"     {ln}")
             else:
                 print(f"     {lines}")
-        print("--- Stage Context Dump End -------------------------------------------------")
+        print(f"██████▓▓▓▓▒▒▒▒▒░░░░░░ [END: {name}] Context window: ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████\n\n\n")
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
@@ -933,6 +965,8 @@ class Assembler:
         )
         ctx.touch()
         self.repo.save(ctx)
+        self.memman.register_relationships(ctx, embed_text)
+
     # ————————————————————————————————————————————————————————————
     # Gemma-3 prompt builder
     def _gemma_format(self, messages: list[dict[str, str]]) -> str:
@@ -1027,76 +1061,80 @@ class Assembler:
             except Exception:
                 continue
         return out
-        
+    
+    
     def _stream_and_capture(
         self,
         model: str,
         messages: list[dict[str, str]],
         *,
-        #temperature: float = 0.7,
         tag: str = "",
         max_image_bytes: int = 8 * 1024 * 1024,
-        images: list[bytes] | None = None
+        images: list[bytes] | None = None,
     ) -> str:
         """
-        Streams a response from Ollama.
-
-        ‣  Automatically inlines **all** image references found in:
-            • the *last* user message   (URLs or file paths)
-            • *any* earlier message lines that look like file paths
-        ‣  Additionally, if a message line exactly matches a previously
-        stored absolute path in the repo (“context recalls”), that file
-        is loaded and injected too.
+        Stream a response from Ollama with automatic image inlining **and**
+        a run-away repetition guard that retries once on failure.
         """
-        import re, base64, os, itertools
+        import re, base64, os, requests
+        from pathlib import Path
 
-        # ── 1) collect candidate paths from every message line ──────────────
+        # ---------- helper: inline images (unchanged) ------------------------
         path_pat = re.compile(
             r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\.(?:jpg|jpeg|png|bmp|gif|webp))",
             re.IGNORECASE,
         )
-        # ── 1) gather any in-memory images first ─────────────────────────────
         imgs_data: list[bytes] = images or []
-
-        # ── 2) if none provided, scan for HTTP/absolute paths and load bytes ─
         if not imgs_data:
-            all_paths: list[str] = []
-            for m in messages:
-                all_paths.extend(path_pat.findall(m["content"]))
-            # dedupe while preserving order
-            all_paths = list(dict.fromkeys(all_paths))
-
+            all_paths = list({p for m in messages for p in path_pat.findall(m["content"])})
             for loc in all_paths:
                 try:
                     if loc.lower().startswith(("http://", "https://")):
-                        resp = requests.get(loc, timeout=5)
-                        resp.raise_for_status()
-                        imgs_data.append(resp.content)
+                        r = requests.get(loc, timeout=5)
+                        r.raise_for_status()
+                        imgs_data.append(r.content)
                     else:
                         p = Path(loc).expanduser().resolve()
                         if p.is_file() and p.stat().st_size <= max_image_bytes:
                             imgs_data.append(p.read_bytes())
                 except Exception:
-                    continue
-
-        # ── 3) inject raw bytes into the last user message dict ──────────────
+                    pass
         if imgs_data:
             messages[-1]["images"] = imgs_data
 
-        # ── 4) stream via Ollama—no top-level images kwarg ───────────────────
-        out_parts: list[str] = []
-        print(f"{tag} ", end="", flush=True)
-        for part in chat(
-            model=model,
-            messages=messages,
-            stream=True,
-        ):
-            chunk = part["message"]["content"]
-            print(chunk, end="", flush=True)
-            out_parts.append(chunk)
-        print()
-        return "".join(out_parts)
+        # ---------- repetition detection pattern -----------------------------
+        RE_RUNAWAY = re.compile(r"(.{1,10}?)(?:\1){49,}", re.DOTALL)
 
+        def _run_stream() -> tuple[str, bool]:
+            """Return (text, hit_guard)."""
+            from ollama import chat
+            buff, hit_guard = [], False
+            print(f"{tag} ", end="", flush=True)
+            for part in chat(model=model, messages=messages, stream=True):
+                chunk = part["message"]["content"]
+                print(chunk, end="", flush=True)
+                buff.append(chunk)
+                recent = "".join(buff)[-4096:]
+                if RE_RUNAWAY.search(recent):
+                    hit_guard = True
+                    print("[Run-away guard] Repetition detected – aborting stream.")
+                    break
+            print()
+            return "".join(buff), hit_guard
+
+        # ---------- first attempt --------------------------------------------
+        text, guard_hit = _run_stream()
+
+        # ---------- retry once if guard triggered ----------------------------
+        if guard_hit:
+            print("[Run-away guard] Retrying stream once …")
+            text, guard_hit = _run_stream()     # second attempt
+            if guard_hit:
+                # still bad – collapse repeats to 10 and return
+                text = RE_RUNAWAY.sub(lambda m: m.group(1) * 10, text)
+                print("[Run-away guard] Second attempt also repeated – truncated output.")
+
+        return text
 
 
     def _parse_task_tree(
@@ -1341,6 +1379,8 @@ class Assembler:
             self.memman.reinforce(clar.context_id, [q_ctx.context_id])
             q_ctx.touch()
             self.repo.save(q_ctx)
+            self.memman.register_relationships(q_ctx, embed_text)
+
 
             # 4b) Ask the LLM
             reply = self._stream_and_capture(
@@ -1369,6 +1409,8 @@ class Assembler:
             self.memman.reinforce(q_ctx.context_id, [a_ctx.context_id])
             a_ctx.touch()
             self.repo.save(a_ctx)
+            self.memman.register_relationships(a_ctx, embed_text)
+
 
             # track which template you used and collect the reply
             state.setdefault("curiosity_used", []).append(picked.semantic_label)
@@ -1437,6 +1479,8 @@ class Assembler:
                 retrieval_score=score
             )
             self.repo.save(ctx)
+            self.memman.register_relationships(ctx, embed_text)
+
 
         prompt_block = "\n".join(
             f"- {textwrap.shorten(c.metadata.get('prompt', c.metadata.get('policy','')), 80)}"
@@ -1550,6 +1594,8 @@ class Assembler:
                 )
                 patch.touch()
                 self.repo.save(patch)
+                self.memman.register_relationships(patch, embed_text)
+
 
             elif action == "remove" and text:
                 for row in rows:
@@ -1580,6 +1626,8 @@ class Assembler:
         refine_ctx.component = "patch"
         refine_ctx.touch()
         self.repo.save(refine_ctx)
+        self.memman.register_relationships(refine_ctx, embed_text)
+
 
         return f"{action}:{text or '(none)'}"
 
@@ -1593,7 +1641,7 @@ class Assembler:
             return True
         except KeyError:
             return False
-                
+                    
 
     def decision_callback(
         self,
@@ -1602,19 +1650,28 @@ class Assembler:
         system_template: str,
         history_size: int,
         var_names: List[str],
-        record: bool = True         # ← new parameter, defaulting to True
+        record: bool = True
     ) -> str:
         import re
-        # 1) Build mapping
+        import json
+
+        # 1) Build mapping and fill in the system prompt
         mapping = {vn: opt for vn, opt in zip(var_names, options)}
         system_msg = system_template.format(**mapping)
 
-        # 2) Gather recent conversation
+        # 2) Gather and print recent conversation for clarity
         segs = sorted(
             [c for c in self.repo.query(lambda c: c.domain=="segment"
-                                       and c.semantic_label in ("user_input","assistant"))],
+                                    and c.semantic_label in ("user_input","assistant"))],
             key=lambda c: c.timestamp
         )[-history_size:]
+        print(f"\n[Decision] — last {history_size} turns:")
+        for c in segs:
+            role = "User" if c.semantic_label=="user_input" else "Assistant"
+            print(f"    {role}: {c.summary}")
+        print("")
+
+        # 3) Build the user message block
         convo = "\n".join(
             ("User: " if c.semantic_label=="user_input" else "Assistant: ")
             + c.summary
@@ -1622,37 +1679,62 @@ class Assembler:
         )
         user_msg = f"=== Recent Conversation ===\n{convo}\n\n=== New Message ===\n{user_text}"
 
-        # 3) Call the model
-        resp = ""
-        for part in chat(
-            model=self.decision_model,
-            messages=[
-                {"role":"system","content":system_msg},
-                {"role":"user","content":user_msg}
-            ],
-            stream=True
-        ):
-            resp += part["message"]["content"]
+        # 4) Prepare for recursive correction
+        attempt = 0
+        prompt_user = user_msg
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": prompt_user},
+        ]
 
-        # 4) Optionally record Q&A
-        if record:
-            q = ContextObject.make_stage("decision_question", [], {
-                "prompt": system_msg + "\n\n" + user_msg
-            })
-            q.component = "decision"; q.semantic_label = "question"; q.touch()
-            self.repo.save(q)
+        # 5) Loop until a valid option is returned
+        while True:
+            full_resp = self._stream_and_capture(
+                model=self.decision_model,
+                messages=messages,
+                tag="[Decision]"
+            ).strip()
 
-            a = ContextObject.make_stage("decision_answer", [q.context_id], {
-                "answer": resp.strip()
-            })
-            a.component = "decision"; a.semantic_label = "answer"; a.touch()
-            self.repo.save(a)
+            if record:
+                if attempt == 0:
+                    q_name, a_name = "decision_question", "decision_answer"
+                    prompt_label = user_msg
+                else:
+                    q_name, a_name = "decision_feedback_question", "decision_feedback_answer"
+                    prompt_label = prompt_user
 
-        # 5) Return matching option (or raw text)
-        for opt in options:
-            if re.search(rf"\b{re.escape(opt)}\b", resp, re.I):
-                return opt
-        return resp.strip()
+                # record question
+                q = ContextObject.make_stage(q_name, [], {
+                    "prompt_system": system_msg,
+                    "prompt_user":   prompt_label
+                })
+                q.component = "decision"; q.semantic_label = "question"; q.touch()
+                self.repo.save(q)
+
+                # record answer
+                a = ContextObject.make_stage(a_name, [q.context_id], {
+                    "answer": full_resp
+                })
+                a.component = "decision"; a.semantic_label = "answer"; a.touch()
+                self.repo.save(a)
+
+            # check for a valid option
+            for opt in options:
+                if re.search(rf"\b{re.escape(opt)}\b", full_resp, re.I):
+                    return opt
+
+            # no valid option found: prepare feedback prompt
+            prompt_user = (
+                "Your previous response did not include one of the required options.\n"
+                f"Previous response:\n{full_resp}\n\n"
+                "Now apply that logic and respond with only one of the following options: "
+                + ", ".join(options)
+            )
+            messages = [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": prompt_user},
+            ]
+            attempt += 1
 
 
     def filter_callback(self, user_text: str) -> bool:
@@ -1660,7 +1742,7 @@ class Assembler:
             user_text=user_text,
             options=["YES", "NO"],
             system_template=(
-                "You are attentive to the ongoing conversation, and if you should interject or reply. If the user even hints at trying to get your attention in any history please continue to bias towards {arg1}. "
+                "You are attentive to the ongoing conversation, and if you should interject or reply. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=8,
@@ -1690,54 +1772,50 @@ class Assembler:
         status_cb: Callable[[str, Any], None] = lambda *a: None,
         images: list[bytes] | None = None
     ) -> str:
-        from context import sanitize_jsonl
+        import logging, time, numpy as np
         from datetime import datetime
-        import logging
+        from context import ContextObject, sanitize_jsonl
 
-        # sanitize JSONL store
+        # ─── Bootstrap & sanitize ─────────────────────────────────────────
         sanitize_jsonl(self.context_path)
-
-        # short-circuit empty
         if not user_text or not user_text.strip():
             status_cb("output", "")
             return ""
 
-        # initialize shared state and stash for meta-stages
         state: Dict[str, Any] = {
-            "user_text":  user_text,
-            "errors":     [],
-            "tool_ctxs":  [],
-            "recent_ids": [],  # will be filled in Stage 3
-            "images":     images or [],
+            "user_text":   user_text,
+            "errors":      [],
+            "tool_ctxs":   [],
+            "recent_ids":  [],
+            "images":      images or [],
         }
         self._last_state = state
 
-        # helper to record performance
-        def _record_perf(stage: str, summary: str, ok: bool, ctx: ContextObject = None):
+        # ─── Perf recorder helper ──────────────────────────────────────────
+        def _record_perf(stage, summary, ok, ctx=None):
             duration = (datetime.utcnow() - t0).total_seconds()
             refs = [state["user_ctx"].context_id] if "user_ctx" in state else []
             perf = ContextObject.make_stage(
-                "stage_performance",
-                refs,
+                "stage_performance", refs,
                 {"stage": stage, "duration": duration, "error": not ok}
             )
-            perf.touch()
-            self.repo.save(perf)
+            perf.touch(); self.repo.save(perf)
+            self.memman.register_relationships(perf, embed_text)
             status_cb(stage, summary)
 
-        # ─── Stage 0: decision_to_respond ────────────────────────────────
+        # ─── Stage 0: decision_to_respond ─────────────────────────────────
         t0 = datetime.utcnow()
         try:
             should = self.filter_callback(user_text)
             state["should_respond"] = should
             _record_perf("decision_to_respond", str(should), True)
             if not should:
-                status_cb("output", "")
+                status_cb("output", "…")  # no reply
                 return ""
         except Exception as e:
             _record_perf("decision_to_respond", str(e), False)
 
-        # ─── Stage 0.5: decide if we need tool calls / planning ───────────
+        # ─── Stage 0.5: decide_tool_usage ─────────────────────────────────
         t0 = datetime.utcnow()
         try:
             use_tools = self.tools_callback(user_text)
@@ -1747,34 +1825,80 @@ class Assembler:
             state["use_tools"] = True
             _record_perf("decide_tool_usage", str(e), False)
 
-        # ─── Fast-path when tools not needed (Gemma-3 format) ────────────
+        # ─── Fast-path: no planning/tools ─────────────────────────────────
         if not state["use_tools"]:
-            recent = self.repo.query(lambda c: c.domain == "segment")[-10:]
-            convo_lines = [
-                ("User: " if c.semantic_label == "user_input" else "Assistant: ") + c.summary
-                for c in recent
-            ]
-            system_block = "### Recent conversation ###\n" + "\n".join(convo_lines)
-            msgs = [
-                {"role": "system", "content": system_block},
-                {"role": "user",   "content": user_text},
-            ]
-            prompt = self._gemma_format(msgs)
+            # human-style “thinking…” dots
+            for _ in range(3):
+                print(".", end="", flush=True); time.sleep(0.25)
+            print()
 
-            from ollama import chat
-            reply = ""
-            for chunk in chat(
-                model=self.primary_model,
-                messages=[{"role": "user", "content": prompt, "images": state.get("images")}],
-                stream=True
-            ):
-                reply += chunk["message"]["content"]
-                status_cb("fast_reply", reply)
+            # build dynamic system prompt from narrative + last N
+            hist = self._get_history()
+            convo = "\n".join(
+                ("User: " if c.semantic_label=="user_input" else "Assistant: ") + c.summary
+                for c in hist
+            )
+            narr = self._load_narrative_context().summary
+            system_block = (
+                f"[System prompt—your narrative so far]\n{narr}\n\n"
+                f"[Recent conversation]\n{convo}"
+            )
+
+            # automatic similarity picks
+            AUTO_THRESH = 0.5
+            descs = [ (t["name"], t["description"]) for t in self.tools_list ]
+            qv = self.engine.embedder(user_text)
+            sims = [float(np.dot(qv, self.engine.embedder(d))/
+                          (np.linalg.norm(qv)*np.linalg.norm(self.engine.embedder(d))+1e-9))
+                    for _, d in descs]
+            auto_tools = sorted(
+                [descs[i][0] for i,s in enumerate(sims) if s>=AUTO_THRESH],
+                key=lambda n: -sims[[d[0] for d in descs].index(n)]
+            )[:3]
+
+            # invoke chosen tools in parallel
+            auto_outputs = []
+            for tool in auto_tools:
+                print(f"[AutoInvoke] {tool}()", flush=True)
+                out = self._stream_and_capture(
+                    self.secondary_model,
+                    [{"role":"system","content":f"Invoke tool: {tool}()"}],
+                    tag="[AutoTool]"
+                )
+                auto_outputs.append((tool, out))
+                tc = ContextObject.make_stage(
+                    "tool_output",
+                    state.get("plan_ctx", []).references if "plan_ctx" in state else [],
+                    {"tool_name": tool, "output": out}
+                )
+                tc.component="tool_output"; tc.semantic_label=tool
+                tc.touch(); self.repo.save(tc)
+                state["tool_ctxs"].append(tc)
+
+            # collapse into small context window
+            snippet = "\n".join(f"{t}: {o[:80]}…" for t,o in auto_outputs)
+            msgs = [
+                {"role":"system", "content": system_block + "\n\n[Auto-tools]\n" + snippet},
+                {"role":"user",   "content": user_text}
+            ]
+            reply = self._stream_and_capture(
+                self.primary_model, msgs,
+                tag="[Assistant]"
+            ).strip()
 
             status_cb("output", reply)
             return reply
 
-        # ─── Stage 1: record_input ───────────────────────────────────────
+        # ─── If tools WILL be used, announce immediately ───────────────────
+        tools_list = [t["name"] for t in self._stage6_prepare_tools()]
+        announce = (
+            "Got it! This may take a moment—I’ll be using: "
+            + ", ".join(tools_list[:3])
+            + " …"
+        )
+        status_cb("announcement", announce)
+
+        # ─── Stage 1: record_input ────────────────────────────────────────
         t0 = datetime.utcnow()
         try:
             ctx1 = self._stage1_record_input(user_text)
@@ -1826,6 +1950,7 @@ class Assembler:
                 {"summary": ""}
             )
             dummy.touch(); self.repo.save(dummy)
+            
             state["clar_ctx"] = dummy
 
         # ─── Stage 5: external_knowledge_retrieval ──────────────────────

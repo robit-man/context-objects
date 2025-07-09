@@ -8,12 +8,13 @@ import logging
 import sqlite3
 import threading
 import contextlib
+import numpy as np
 from threading import Lock
 from json import JSONDecodeError
+import math, time, json, collections
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional
-
 
 if os.name == "nt":
     @contextlib.contextmanager
@@ -111,6 +112,12 @@ class ContextObject:
     acl: Dict[str, Any]         = field(default_factory=dict)
     batch_id: Optional[str]     = None
     dirty: bool                 = True
+
+    def _ts_seconds(self) -> float:
+        """Return timestamp (or last_accessed) in epoch seconds."""
+        ts = self.last_accessed or self.timestamp
+        return datetime.strptime(ts.rstrip("Z"), "%Y%m%dT%H%M%S").timestamp()
+
 
     def __post_init__(self):
         # create the lock here (not a dataclass field)
@@ -789,7 +796,23 @@ class HybridContextRepository:
         
         return cls._singleton
 
-    
+# ╔══════════════════════════════════════════════════════════════╗
+# ║            H O L O G R A P H I C   M E M O R Y               ║
+# ╚══════════════════════════════════════════════════════════════╝
+# --- internal parameters (tweak freely) -------------------------
+_HMR_SIM_THRESH   = 0.35        # cosine similarity edge cut-off
+_HMR_TAG_W        = 0.6         # weight on shared-tag edges
+_HMR_REF_W        = 1.0         # explicit reference edge weight
+_HMR_SIM_W        = 0.4         # multiplier on sim edges
+_HMR_DECAY_SECS   = 60 * 60 * 24   # temporal proximity half-life
+
+
+def _ts_seconds(self) -> float:
+    """Return timestamp (or last_accessed) in epoch seconds."""
+    ts = self.last_accessed or self.timestamp
+    return datetime.strptime(ts.rstrip("Z"), "%Y%m%dT%H%M%S").timestamp()
+
+
 ContextRepository = HybridContextRepository
 
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
@@ -798,6 +821,9 @@ class MemoryManager:
     High-level service for associative recall, reinforcement, pruning,
     and spreading-activation (“thought chains”).
     """
+
+    _graph: Dict[str, Dict[str, float]] = {}   # ← NEW: shared holographic graph
+
     def __init__(self, repo: ContextRepository):
         self.repo = repo
 
@@ -853,7 +879,7 @@ class MemoryManager:
         hops: int = 3,
         decay: float = 0.5,
         assoc_weight: float = 1.0,
-        recency_weight: float = 1.0
+        recency_weight: float = 1.0,
     ) -> Dict[str, float]:
         """
         Perform spreading-activation from seed_ids over N hops.
@@ -960,6 +986,135 @@ class MemoryManager:
             return la < cutoff and not c.pinned
         for ctx in self.repo.query(stale):
             self.repo.delete(ctx.context_id)
+
+    def _add_edge(self, src: str, dst: str, w: float) -> None:
+        if src == dst:
+            return
+        self._graph.setdefault(src, {})
+        self._graph[src][dst] = self._graph[src].get(dst, 0.0) + w
+
+    # ------------- 1️⃣  register_relationships ----------------------
+    def register_relationships(self,
+                               ctx: ContextObject,
+                               embed_fn: Callable[[str], np.ndarray]) -> None:
+        """
+        Call once after saving a new/updated ContextObject.
+        • Skips re-registering relationships for the same ctx.
+        • Uses an in-memory cache for embeddings.
+        • Limits similarity scans to the last N items.
+        """
+        import math
+        # Keep track of which contexts we've already processed
+        if not hasattr(self, "_registered_ctxs"):
+            self._registered_ctxs: set[str] = set()
+        cid = ctx.context_id
+        if cid in self._registered_ctxs:
+            return
+        self._registered_ctxs.add(cid)
+
+        # ---------- explicit references ----------
+        for rid in ctx.references:
+            self._add_edge(cid, rid, _HMR_REF_W)
+            self._add_edge(rid, cid, _HMR_REF_W)
+
+        # ---------- shared tags ----------
+        for tag in ctx.tags:
+            tag_node = f"tag::{tag}"
+            self._add_edge(cid, tag_node, _HMR_TAG_W)
+            self._add_edge(tag_node, cid, _HMR_TAG_W)
+
+        # ---------- semantic similarity ----------
+        # initialize embedding cache if missing
+        if not hasattr(self, "_embed_cache"):
+            self._embed_cache: Dict[str, np.ndarray] = {}
+        def _get_vec(text: str) -> np.ndarray:
+            if text not in self._embed_cache:
+                self._embed_cache[text] = embed_fn(text)
+            return self._embed_cache[text]
+
+        try:
+            v1 = _get_vec(ctx.summary or "")
+            # only compare to the most recent M items
+            recents = self.repo.query(lambda _: True)[-200:]
+            for other in recents:
+                if other.context_id == cid or not other.summary:
+                    continue
+                # skip if we've already embedded this other
+                txt = other.summary
+                v2 = _get_vec(txt)
+                sim = float(np.dot(v1, v2) /
+                            (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9))
+                if sim >= _HMR_SIM_THRESH:
+                    w = _HMR_SIM_W * sim
+                    self._add_edge(cid, other.context_id, w)
+                    self._add_edge(other.context_id, cid, w)
+        except Exception:
+            pass
+
+        # ---------- temporal proximity (<10 min) ----------
+        now = ctx._ts_seconds()
+        # limit scan to contexts added in the last window
+        window = 600  # seconds
+        candidates = [
+            c for c in self.repo.query(lambda c: True)
+            if abs(now - c._ts_seconds()) <= window and c.context_id != cid
+        ]
+        for other in candidates:
+            age = abs(now - other._ts_seconds())
+            w = math.exp(-age / _HMR_DECAY_SECS)
+            self._add_edge(cid, other.context_id, w)
+            self._add_edge(other.context_id, cid, w)
+
+    # ------------- 2️⃣  holographic_recall --------------------------
+    def holographic_recall(self,
+                        cue_ids: List[str] | None = None,
+                        cue_text: str | None = None,
+                        hops: int = 2,
+                        top_n: int = 10,
+                        embed_fn: Callable[[str], np.ndarray] | None = None
+                        ) -> List[ContextObject]:
+        """
+        Fuse cue_ids &/or cue_text into a single excitation vector,
+        run multi-hop spreading activation over _graph, return top_n ContextObjects.
+        """
+        cue_ids = cue_ids or []
+        activation: Dict[str, float] = collections.Counter({cid: 1.0 for cid in cue_ids})
+
+        # text cue → similarity edges once
+        if cue_text and embed_fn:
+            qv = embed_fn(cue_text)
+            for c in self.repo.query(lambda _: True):
+                if not c.summary:
+                    continue
+                vv  = embed_fn(c.summary)
+                sim = float(np.dot(qv, vv) /
+                            (np.linalg.norm(qv) * np.linalg.norm(vv) + 1e-9))
+                if sim >= _HMR_SIM_THRESH:
+                    activation[c.context_id] += _HMR_SIM_W * sim
+
+        # hop propagation
+        frontier = dict(activation)
+        for _ in range(hops):
+            new_frontier = collections.Counter()
+            for nid, act in frontier.items():
+                for nbr, w in self._graph.get(nid, {}).items():
+                    new_frontier[nbr] += act * w
+            for k, v in new_frontier.items():
+                activation[k] += v
+            frontier = new_frontier
+
+        # rank & materialise
+        ranked = sorted(activation.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        out    = []
+        for cid, score in ranked:
+            try:
+                obj = self.repo.get(cid)
+                obj.retrieval_score = score
+                out.append(obj)
+            except KeyError:
+                continue
+        return out
+
 
 
 # ─ Graph Interface Layer ───────────────────────────────────────────────────────

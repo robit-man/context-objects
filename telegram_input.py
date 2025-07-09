@@ -150,6 +150,56 @@ def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridCont
         archive_max_mb=archive_max_mb,
     )
 
+async def list_pins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /pins  →  return every pinned message we’ve logged for THIS chat,
+    formatted in one (or several) triple-back-tick blocks.
+    """
+    chat_id = update.effective_chat.id
+
+    chat_asm = assemblers.get(chat_id)
+    if chat_asm is None:
+        await update.message.reply_text("⚠️ I don’t have any history for this chat yet.")
+        return
+
+    # fetch all ContextObjects we wrote with semantic_label == "bot_pinned"
+    pins = sorted(
+        chat_asm.repo.query(lambda c: c.semantic_label == "telegram_pinned"),  # ← fixed
+        key=lambda c: c.timestamp                                             # ← safer sort
+    )
+    CHUNK = 3700
+    for i in range(0, len(lines := [
+        f"[{p.metadata.get('telegram_message_id')}] {p.metadata.get('author')}: {p.metadata.get('text', '')}"
+        for p in pins
+    ]), CHUNK):
+        block = "```\n" + "\n".join(lines[i:i+CHUNK]) + "\n```"
+        await update.message.reply_text(block, parse_mode="Markdown")
+
+    if not pins:
+        await update.message.reply_text("No pinned messages recorded so far.")
+        return
+
+    # build one big list → chunk if >4 000 chars (Telegram hard limit)
+    lines = [
+        f"[{p.metadata.get('telegram_message_id')}] "
+        f"{p.metadata.get('author')}: {p.metadata.get('text', '')}"
+        for p in pins
+    ]
+    blob = "```\n" + "\n".join(lines) + "\n```"
+
+    if len(blob) < 4000:
+        await update.message.reply_text(blob, parse_mode="Markdown")
+    else:
+        # reuse existing helper to split into safe chunks
+        await _send_long_text_async(
+            context.bot,
+            chat_id,
+            blob,
+            chunk_size=3800,
+            reply_to=update.message.message_id
+        )
+
+
 async def set_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /debug true|false
@@ -458,39 +508,51 @@ async def _start_runner_for_pin(
                 await bot.send_voice(chat_id, vf, reply_to_message_id=reply_to_id)
 
 async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # If assembler.py is broken, bail early
-    try:
-        from assembler import Assembler
-    except Exception:
-        return
+    """
+    Handle any message-pin event (from human or bot).
 
+    • Saves a ContextObject so the Assembler can reason over the pin later.
+    • Shows a one-liner ASCII block in the console for quick visibility.
+    • Optionally kicks off an inference if filter_callback() says “yes”.
+    """
+    # ── 0) Quick sanity: must contain a pinned_message ────────────────────
     msg = update.message
-    # must be a pin event, by a bot, with an actual pinned_message
-    if (
-        not msg
-        or not msg.pinned_message
-        or not msg.from_user.is_bot
-    ):
+    if not msg or not msg.pinned_message:
         return
 
-    pinned = msg.pinned_message
-    chat_id = update.effective_chat.id
+    pinned   = msg.pinned_message
+    chat_id  = update.effective_chat.id
+    bot_id   = context.bot.id
 
-    # **NEW**: ignore if the pinned message was sent by this very bot
-    if pinned.from_user.id == context.bot.id:
-        logger.debug(f"Ignoring pin of own message {pinned.message_id}")
+    # Ignore if **this** bot is pinning its *own* content
+    if pinned.from_user and pinned.from_user.id == bot_id:
+        logger.debug("Ignoring pin of my own message %s", pinned.message_id)
         return
 
-    # identify who pinned what
-    pinner = (msg.from_user.username or str(msg.from_user.id)).lower()
-    author = (pinned.from_user.username or str(pinned.from_user.id)).lower()
+    # ── 1) Gather pin metadata ───────────────────────────────────────────
+    pinner = (msg.from_user.username  or str(msg.from_user.id)      ).lower()
+    author = (pinned.from_user.username or str(pinned.from_user.id) ).lower() \
+             if pinned.from_user else "unknown"
     text   = pinned.text or pinned.caption or "<non-text content>"
 
-    # lazy-init per-chat assembler (only if assembler import succeeded above)
+    # ── 1a) VISUAL LOG for humans ────────────────────────────────────────
+    pin_block = (
+        "\n╔════════════════════════════════════ PIN DETECTED ═════════════════════════════╗\n"
+        f"║ Chat   : {chat_id}\n"
+        f"║ Pinner : {pinner}\n"
+        f"║ Author : {author}\n"
+        f"║ Msg ID : {pinned.message_id}\n"
+        "╟───────────────────────────────────────────────────────────────────────────────╢\n"
+        f"║ {text}\n"
+        "╚═══════════════════════════════════════════════════════════════════════════════╝"
+    )
+    logger.info(pin_block)
+
+    # ── 2) Ensure the per-chat Assembler exists ──────────────────────────
     chat_asm = assemblers.get(chat_id)
     if not chat_asm and _default_asm:
         repo = make_per_chat_repo(chat_id)
-        tts = TTSManager(
+        tts  = TTSManager(
             logger=_default_asm.tts.log,
             cfg=_default_asm.cfg,
             audio_service=None
@@ -505,47 +567,55 @@ async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             repo=repo,
         )
         assemblers[chat_id] = chat_asm
+    if chat_asm:
         chat_asm._chat_contexts.add(chat_id)
 
-    # build & save the ContextObject segment
+    # ── 3) Persist the pin as a ContextObject ────────────────────────────
     seg = ContextObject.make_segment(
-        semantic_label="bot_pinned",
+        semantic_label="telegram_pinned",
         content_refs=[],
         tags=[
-            "bot_message",
             "pinned",
             f"pinner:{pinner}",
             f"author:{author}",
             f"msgid:{pinned.message_id}"
         ],
         metadata={
-            "pinner": pinner,
-            "author": author,
-            "text": text,
-            "telegram_message_id": pinned.message_id
+            "pinner":              pinner,
+            "author":              author,
+            "text":                text,
+            "telegram_message_id": pinned.message_id,
+            "pinner_is_bot":       msg.from_user.is_bot,
+            "author_is_bot":       pinned.from_user.is_bot if pinned.from_user else None,
         }
     )
     seg.summary  = text
     seg.stage_id = "telegram_pinned"
     seg.touch()
-    chat_asm.repo.save(seg)
+    if chat_asm:
+        chat_asm.repo.save(seg)
 
-    # decide if this pinned text should trigger a reply
+    # ── 4) Should we react to the content of the pin? ────────────────────
+    if not chat_asm:
+        return                               # no Assembler available
+
     fake_input = f"{author}: {text}"
     try:
         wants_reply = chat_asm.filter_callback(fake_input)
     except Exception:
         wants_reply = False
+
     if not wants_reply:
         return
 
-    # enqueue or start a runner for this pin-driven inference
-    key   = (chat_id, context.bot.id)
+    # ── 5) Queue / launch an inference run (one at a time per chat) ──────
+    key   = (chat_id, bot_id)
     queue = _pending_pin.setdefault(key, asyncio.Queue())
+
     if (prev := _running_pin.get(key)) and not prev.done():
         await queue.put((fake_input, pinned.message_id))
     else:
-        task = asyncio.create_task(
+        _running_pin[key] = asyncio.create_task(
             _start_runner_for_pin(
                 chat_asm,
                 context.bot,
@@ -554,7 +624,8 @@ async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pinned.message_id
             )
         )
-        _running_pin[key] = task
+
+
         
 def telegram_input(asm):
     global _default_asm
@@ -578,11 +649,15 @@ def telegram_input(asm):
         notify_admin(f"⚠️ *assembler.py import failed:*\n```{tb[:1500]}```")
         Assembler = None
 
-    app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, _on_pin), group=0)
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, _on_pin),
+        group=0
+    )    
     app.add_handler(CommandHandler("setadmin", set_admin), group=0)
     app.add_handler(CommandHandler("blacklist", blacklist), group=0)
     app.add_handler(CommandHandler("dm", set_dm), group=0)
     app.add_handler(CommandHandler("debug", set_debug), group=0)    
+    app.add_handler(CommandHandler("pins", list_pins), group=0)
 
     app.add_error_handler(error_handler)
 
@@ -821,18 +896,20 @@ def telegram_input(asm):
                 for ent in (msg.entities or [])
             )
 
-            # Final decision: only run if tools are allowed *and* one of the triggers fires
-            do_infer = (
-                use_tools and (
-                    chat_type == "private"
-                    or msg.voice
-                    or wants_reply
-                    or mention_me
-                    or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
-                )
+            # ── Final decision ───────────────────────────────────────────────
+            # ‘should_respond’ is about WHETHER to reply at all.
+            # ‘use_tools’ merely hints HOW the Assembler may reply (full pipeline vs fast-path).
+            should_respond = (
+                chat_type == "private"
+                or msg.voice
+                or wants_reply
+                or mention_me
+                or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
             )
-            if not do_infer:
-                return
+
+            if not should_respond:
+                return  # nothing to do, quietly exit
+
 
             # ── Queue / run the Assembler for this chat/user pair ─────────────
             key   = (chat_id, user.id)
@@ -993,7 +1070,6 @@ def telegram_input(asm):
             await start_runner(user_text, trigger_id)
 
 
-        running: dict[tuple[int,int], asyncio.Task] = {}
         app.add_handler(
             MessageHandler(
                 (filters.TEXT
@@ -1016,3 +1092,5 @@ def telegram_input(asm):
         loop.run_until_complete(app.stop())
         loop.run_until_complete(app.shutdown())
         loop.close()
+
+running: dict[tuple[int,int], asyncio.Task] = {}
