@@ -845,10 +845,10 @@ def _stage8_tool_chaining(
     tools_list: List[Dict[str, Any]],
     state: Dict[str, Any]
 ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
-    import json, re
+    import json, re, inspect
     from tools import Tools
 
-    # Ensure that Tools can always reach the current repo
+    # Ensure Tools can always reach the current repo
     Tools.repo = self.repo
 
     # 0) load schemas from the repo
@@ -893,7 +893,7 @@ def _stage8_tool_chaining(
         if json.loads(s.metadata["schema"])["name"] in wanted
     ]
 
-    # C) actually invoke each tool, injecting assembler & logging verbosely
+    # C) actually invoke each tool, injecting assembler only when needed
     tool_ctxs: List[ContextObject] = []
     confirmed: List[str]  = []
     for call_str in calls:
@@ -913,18 +913,24 @@ def _stage8_tool_chaining(
                     except Exception:
                         kwargs[k] = v.strip('"\'')
 
-        # Inject the assembler itself so tools always have .repo
-        kwargs.setdefault("assembler", self)
-
         func = getattr(Tools, name)
+        sig  = inspect.signature(func)
+
+        # only inject assembler if the tool actually declares it
+        if "assembler" in sig.parameters:
+            invoke_kwargs = {"assembler": self, **kwargs}
+        else:
+            invoke_kwargs = kwargs
+
         try:
-            output = func(**kwargs)
+            output = func(**invoke_kwargs)
             exception = None
         except Exception as e:
             output, exception = None, str(e)
 
-        # Verbose log for debugging
-        print(f"[ToolInvocation] {name} called with {kwargs!r} → output={output!r}, exception={exception!r}")
+        # verbose logging
+        print(f"[ToolInvocation] {name} called with {invoke_kwargs!r} → "
+              f"output={output!r}, exception={exception!r}")
 
         # persist the tool_output context
         sch_ctx = next(
