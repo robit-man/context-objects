@@ -286,12 +286,18 @@ class TaskExecutor:
 class ContextQueryEngine:
     """
     Retrieval with time, tags, domain/component filters,
-    regex & embedding similarity.
-    Records recalls per stage.
+    regex & embedding similarity.  
+    Records recalls & registers associative edges.
     """
-    def __init__(self, repo: ContextRepository, embedder: Callable[[str], np.ndarray]):
+    def __init__(
+        self,
+        repo: ContextRepository,
+        embedder: Callable[[str], np.ndarray],
+        memman: MemoryManager,
+    ):
         self.repo = repo
         self.embedder = embedder
+        self.memman = memman
         self._cache: Dict[str, np.ndarray] = {}
 
     def _vec(self, text: str) -> np.ndarray:
@@ -312,50 +318,44 @@ class ContextQueryEngine:
         summary_regex: Optional[str] = None,
         top_k: int = 5
     ) -> List[ContextObject]:
-        # fetch all
-        ctxs = self.repo.query(lambda c: True)
+        import re, numpy as np
 
-        # time window
+        # 1) fetch and filter...
+        ctxs = self.repo.query(lambda c: True)
         if time_range:
             start, end = time_range
             ctxs = [c for c in ctxs if start <= c.timestamp <= end]
-
-        # tags include/exclude
         if tags:
             ctxs = [c for c in ctxs if set(tags) & set(c.tags)]
         if exclude_tags:
             ctxs = [c for c in ctxs if not (set(exclude_tags) & set(c.tags))]
-
-        # domain/component
         if domain:
             ctxs = [c for c in ctxs if c.domain in domain]
         if component:
             ctxs = [c for c in ctxs if c.component in component]
-
-        # regex on summary
         if summary_regex:
             pat = re.compile(summary_regex, re.I)
             ctxs = [c for c in ctxs if c.summary and pat.search(c.summary)]
 
-        # similarity ranking
+        # 2) similarity sort
         if similarity_to:
             qv = self._vec(similarity_to)
             scored = []
             for c in ctxs:
-                if not c.summary:
-                    continue
+                if not c.summary: continue
                 vv = self._vec(c.summary)
                 sim = float(np.dot(qv, vv) /
-                            (np.linalg.norm(qv) * np.linalg.norm(vv)))
+                            (np.linalg.norm(qv)*np.linalg.norm(vv) + 1e-9))
                 scored.append((c, sim))
             scored.sort(key=lambda x: x[1], reverse=True)
-            ctxs = [c for c, _ in scored]
+            ctxs = [c for c,_ in scored]
 
+        # 3) take top_k, record & register
         out = ctxs[:top_k]
         for c in out:
             c.record_recall(stage_id=stage_id, coactivated_with=[])
             self.repo.save(c)
-            self.memman.register_relationships(c, embed_text)
+            self.memman.register_relationships(c, self.embedder)
 
         return out
     
@@ -429,9 +429,28 @@ class Assembler:
         )
         self.planning_prompt = self.cfg.get(
             "planning_prompt",
+            # ✂── NEW PLANNER PROMPT ────────────────────────────────────────────
             "You are the Planner.  Emit **only** a JSON object matching:\n\n"
             "{ \"tasks\": [ { \"call\": \"tool_name\", \"tool_input\": { /* named params */ }, \"subtasks\": [] }, … ] }\n\n"
-            "If you cannot, just list the tool calls. Only return exact objects from the list of Available tools:\n"
+            "When one task needs the output of a previous task, use the placeholder syntax:\n"
+            "  \"[<previous_call>.output]\"\n"
+            "For example:\n"
+            "```json\n"
+            "{\n"
+            "  \"tasks\": [\n"
+            "    { \"call\": \"tool_1\", \"tool_input\": {} },\n"
+            "    {\n"
+            "      \"call\": \"tool_2\",\n"
+            "      \"tool_input\": {\n"
+            "        \"topic\": \"generated input incorporating upstream tool output from [tool_1.output]\",\n"
+            "        \"kwargs\": \"\"\n"
+            "      }\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "```\n"
+            "If you cannot, just list the tool calls.  Only return exact objects from the list of Available tools:\n"
+            # ────────────────────────────────────────────────────────────────────────
         )
         self.toolchain_prompt = self.cfg.get(
             "toolchain_prompt",
@@ -537,10 +556,15 @@ class Assembler:
                 sqlite_path=sqlite_path,
                 archive_max_mb=self.cfg.get("archive_max_mb", 10.0),
             )
-        self.memman = MemoryManager(self.repo)
-        
 
-        self.engine = ContextQueryEngine(self.repo, lambda t: embed_text(t))
+        self.memman = MemoryManager(self.repo)
+
+        # Pass memman into the query engine so it can register recalls
+        self.engine = ContextQueryEngine(
+            repo=self.repo,
+            embedder=embed_text,
+            memman=self.memman
+        )
         
         from context import sanitize_jsonl
         sanitize_jsonl(self.context_path)
@@ -640,11 +664,10 @@ class Assembler:
             alpha=self.cfg.get("curiosity_alpha", 0.1),
             path=self.cfg.get("curiosity_weights_path", "curiosity_weights.rl")
         )
-
-
         self.engine = ContextQueryEngine(
-           self.repo,
-           lambda t: embed_text(t)  # Use your custom embedding function
+            repo=self.repo,
+            embedder=embed_text,
+            memman=self.memman
         )
 
 
@@ -1652,89 +1675,92 @@ class Assembler:
         var_names: List[str],
         record: bool = True
     ) -> str:
-        import re
-        import json
+        import re, json
 
         # 1) Build mapping and fill in the system prompt
-        mapping = {vn: opt for vn, opt in zip(var_names, options)}
+        mapping   = {vn: opt for vn, opt in zip(var_names, options)}
         system_msg = system_template.format(**mapping)
 
-        # 2) Gather and print recent conversation for clarity
+        # 2) Fetch the running narrative context instead of raw segments
+        narr_ctx = self._load_narrative_context()
+        narrative = narr_ctx.summary or "(no narrative yet)"
+
+        # 3) Show a brief snippet of recent turns as well (optional)
         segs = sorted(
             [c for c in self.repo.query(lambda c: c.domain=="segment"
                                     and c.semantic_label in ("user_input","assistant"))],
             key=lambda c: c.timestamp
         )[-history_size:]
-        print(f"\n[Decision] — last {history_size} turns:")
-        for c in segs:
-            role = "User" if c.semantic_label=="user_input" else "Assistant"
-            print(f"    {role}: {c.summary}")
-        print("")
-
-        # 3) Build the user message block
-        convo = "\n".join(
-            ("User: " if c.semantic_label=="user_input" else "Assistant: ")
-            + c.summary
+        snippet = "\n".join(
+            f"{'User' if c.semantic_label=='user_input' else 'Assistant'}: {c.summary}"
             for c in segs
         )
-        user_msg = f"=== Recent Conversation ===\n{convo}\n\n=== New Message ===\n{user_text}"
+        if snippet:
+            context_block = f"### Narrative So Far ###\n{narrative}\n\n### Recent Turns ###\n{snippet}"
+        else:
+            context_block = f"### Narrative So Far ###\n{narrative}"
 
-        # 4) Prepare for recursive correction
-        attempt = 0
-        prompt_user = user_msg
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user",   "content": prompt_user},
-        ]
+        # 4) Build user-message
+        user_msg = f"{context_block}\n\n=== New Message ===\n{user_text}"
 
         # 5) Loop until a valid option is returned
+        attempt = 0
+        prompt_user = user_msg
         while True:
             full_resp = self._stream_and_capture(
                 model=self.decision_model,
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": prompt_user}
+                ],
                 tag="[Decision]"
             ).strip()
 
+            # 6) Optionally record each Q&A
             if record:
-                if attempt == 0:
-                    q_name, a_name = "decision_question", "decision_answer"
-                    prompt_label = user_msg
-                else:
-                    q_name, a_name = "decision_feedback_question", "decision_feedback_answer"
-                    prompt_label = prompt_user
+                # question
+                q_name = "decision_question" if attempt == 0 else "decision_feedback_question"
+                q_ctx = ContextObject.make_stage(
+                    stage_name=q_name,
+                    input_refs=[narr_ctx.context_id],
+                    output={
+                        "prompt_system": system_msg,
+                        "prompt_user":   prompt_user
+                    }
+                )
+                q_ctx.component      = "decision"
+                q_ctx.semantic_label = "question"
+                q_ctx.tags.append("decision")
+                q_ctx.touch(); self.repo.save(q_ctx)
+                self.memman.register_relationships(q_ctx, embed_text)
 
-                # record question
-                q = ContextObject.make_stage(q_name, [], {
-                    "prompt_system": system_msg,
-                    "prompt_user":   prompt_label
-                })
-                q.component = "decision"; q.semantic_label = "question"; q.touch()
-                self.repo.save(q)
+                # answer
+                a_name = "decision_answer" if attempt == 0 else "decision_feedback_answer"
+                a_ctx = ContextObject.make_stage(
+                    stage_name=a_name,
+                    input_refs=[q_ctx.context_id],
+                    output={"answer": full_resp}
+                )
+                a_ctx.component      = "decision"
+                a_ctx.semantic_label = "answer"
+                a_ctx.tags.append("decision")
+                a_ctx.touch(); self.repo.save(a_ctx)
+                self.memman.register_relationships(a_ctx, embed_text)
 
-                # record answer
-                a = ContextObject.make_stage(a_name, [q.context_id], {
-                    "answer": full_resp
-                })
-                a.component = "decision"; a.semantic_label = "answer"; a.touch()
-                self.repo.save(a)
-
-            # check for a valid option
+            # 7) Check for a valid option
             for opt in options:
                 if re.search(rf"\b{re.escape(opt)}\b", full_resp, re.I):
                     return opt
 
-            # no valid option found: prepare feedback prompt
+            # 8) Prepare feedback prompt
             prompt_user = (
-                "Your previous response did not include one of the required options.\n"
+                "Your response didn’t include one of the required options.\n"
                 f"Previous response:\n{full_resp}\n\n"
-                "Now apply that logic and respond with only one of the following options: "
+                "Please respond with exactly one of: "
                 + ", ".join(options)
             )
-            messages = [
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": prompt_user},
-            ]
             attempt += 1
+
 
 
     def filter_callback(self, user_text: str) -> bool:
@@ -1742,7 +1768,7 @@ class Assembler:
             user_text=user_text,
             options=["YES", "NO"],
             system_template=(
-                "You are attentive to the ongoing conversation, and if you should interject or reply. "
+                "You are attentive to the ongoing conversation, and if you should interject or reply. Bias to true if it seems like a request or question, otherwise false. "
                 "Answer exactly {arg1} or {arg2}."
             ),
             history_size=8,

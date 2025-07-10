@@ -868,26 +868,25 @@ def telegram_input(asm):
 
             trigger_id = msg.message_id
 
-            # 1️⃣ filter_callback (just user_text)
+            # 1️⃣ filter_callback
             try:
-                wants_reply = await asyncio.to_thread(
+                wants_reply, filter_text = await asyncio.to_thread(
                     chat_asm.filter_callback, user_text
                 )
-                logger.info("✅ filter_callback → %s", wants_reply)
+                logger.info("✅ filter_callback → %s", filter_text)
             except Exception as err:
                 logger.error("❌ filter_callback error: %s", err)
-                wants_reply = True  # default to yes on error
+                wants_reply, filter_text = True, "<error>"
 
-            # 2️⃣ tools_callback (just user_text)
+            # 2️⃣ tools_callback
             try:
-                use_tools = await asyncio.to_thread(
+                use_tools, tools_text = await asyncio.to_thread(
                     chat_asm.tools_callback, user_text
                 )
-                logger.info("✅ tools_callback → %s", use_tools)
+                logger.info("✅ tools_callback → %s", tools_text)
             except Exception as err:
                 logger.error("❌ tools_callback error: %s", err)
-                use_tools = True  # default to yes on error
-
+                use_tools, tools_text = True, "<error>"
             # 3️⃣ mention‐me check
             mention_me = any(
                 ent.type == "mention"
@@ -981,10 +980,10 @@ def telegram_input(asm):
                                 typing_task.cancel()
 
                         if not final.strip():
-                            #if placeholder_id:
-                            #    try:
-                            #        await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                            #    except: pass
+                            if placeholder_id:
+                                try:
+                                    await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                except: pass
                             return
 
                         # deliver text
@@ -994,7 +993,7 @@ def telegram_input(asm):
                                     chat_id=chat_id, message_id=placeholder_id, text=final
                                 )
                             else:
-                                #await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                                await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
                                 await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
                         else:
                             if len(final) < 4000:

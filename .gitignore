@@ -1,6 +1,7 @@
 .venv
 .env
 .setup_complete
+.http_venv
 *.log
 *.rl
 *.db*

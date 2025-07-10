@@ -127,6 +127,10 @@
             color: white !important;
         }
 
+        .ref-link {
+            pointer-events: all !important;
+        }
+
         #detailPanel {
             width: 0px;
             font-size: 0.5rem;
@@ -144,6 +148,7 @@
             box-sizing: border-box;
             z-index: 9;
             display: inline-table;
+            pointer-events: none;
             text-shadow: 0px 0px 2px black;
         }
 
@@ -298,7 +303,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         //////////////////////////////////////////////////////////////////////
         const LAYOUT_CONFIG = {
             // 60000 ms = 1 minute → 1 Y-unit
-            msPerUnit: 1 * 1000,
+            msPerUnit: 10 * 1000,
 
             // you can speed up spawning independently of drift
             spawnFactor: 1.0,
@@ -310,9 +315,9 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             minSphereY: 0
         };
         const DISPLAY_CONFIG = {
-            sphereRadius: 1,
-            sphereSegments: 3,
-            lineBaseOpacity: 0.5,
+            sphereRadius: 2,
+            sphereSegments: 8,
+            lineBaseOpacity: 0.8,
             hoverHighlightOpacity: 0.3,
             chainDelay: 200,
             maxChainDepth: 50,
@@ -377,6 +382,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let lastOffset = 0;
         let leftover = "";    // carry over any partial line
         const OVERLAP = 1024;   // bytes to rewind so you don't cut a JSON in half
+        const STORAGE_KEY = 'selectedContextFile';
 
         let nodeMap = new Map();
         let edges = [];
@@ -395,18 +401,24 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let yScrollOffset = 0;
         // last time we applied that drift
         let lastDriftT = Date.now();
-
         // ←── PICKABLE INSTANCES SETUP ──→
         pickableMeshes.length = 0;
         const comps = [...new Set([...nodeMap.values()].map(n => n.data.component))];
         const hueMap = Object.fromEntries(comps.map((c, i) => [c, i / comps.length]));
         const MS_PER_UNIT = LAYOUT_CONFIG.msPerUnit;  // ms per world‐unit, e.g. 10 000
-
+let autoScrollEnabled = true;
+const sidebar = document.getElementById('sidebarList');
+sidebar.addEventListener('scroll', () => {
+  const nearBottom =
+    sidebar.scrollTop + sidebar.clientHeight >=
+    sidebar.scrollHeight - 5;
+  autoScrollEnabled = nearBottom;
+});
         function getContextFileUrl(cacheBust = false) {
-            // use the actual host/IP instead of 0.0.0.0
             const host = window.location.hostname || 'localhost';
-            let fn = fileSelector.value;
-            if (!/^context(?:_-?\d+)?\.jsonl$/.test(fn)) fn = 'context.jsonl';
+            // trust whatever the user chose
+            const fn = fileSelector.value || 'context.jsonl';
+            console.log('getContextFileUrl() →', `http://${host}:8000/${fn}`);
             return `http://${host}:8000/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
         }
 
@@ -426,7 +438,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                         throw new Error('JSON is not an array');
                     }
                 } catch (jsonErr) {
-                    console.warn('Could not parse /files as JSON, falling back to HTML scrape:', jsonErr);
+                    console.warn('Could not parse / as JSON, falling back to HTML scrape:', jsonErr);
                     // 2) fallback — pull href="context_....jsonl"
                     const regex = /href="(context(?:_-?\d+)?\.jsonl)"/g;
                     let m;
@@ -435,31 +447,49 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                     }
                 }
 
-                // 3) dedupe & filter
+                // 3) dedupe & filter & sort
                 const unique = Array.from(new Set(files))
-                    .filter(f => /^context(?:_-?\d+)?\.jsonl$/.test(f));
+                    .filter(f => /^context(?:_-?\d+)?\.jsonl$/.test(f))
+                    .sort();
 
                 // 4) rebuild the <select>
                 fileSelector.innerHTML = unique
                     .map(f => `<option value="${f}">${f}</option>`)
                     .join('');
 
+                // 5) restore last selection if present
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved && unique.includes(saved)) {
+                    fileSelector.value = saved;
+                }
+
             } catch (err) {
                 console.warn('populateFileSelector failed; keeping existing <option>s:', err);
-                // leave whatever was in <select> alone
             }
         }
 
-        // wire it up:
-        fileSelector.addEventListener('change', () => loadGraph());
+        // call loadGraph() whenever user picks a file
+        fileSelector.addEventListener('change', () => {
+            localStorage.setItem(STORAGE_KEY, fileSelector.value);
+            loadGraph();
+        });
 
-        // on startup:
-        populateFileSelector()
-            .then(() => loadGraph(fileSelector.value))
-            .catch(() => {
-                /* ignore—populateFileSelector already logged */
-                loadGraph(fileSelector.value);
-            });
+        // on startup: populate, restore or default, then load
+        ; (async () => {
+            await populateFileSelector();
+            if (!localStorage.getItem(STORAGE_KEY) && fileSelector.options.length) {
+                fileSelector.value = fileSelector.options[0].value;
+            }
+            // do the very first full load
+            await loadGraph();
+            // now that allData is populated, mark the sentinel
+            if (allData.length) {
+                lastContextId = allData[allData.length - 1].context_id;
+            }
+            // now start polling
+            setInterval(pollForNew, POLL_INTERVAL);
+        })();
+
 
         function runForceLayout() {
             // 1️⃣ build nodes & links arrays
@@ -470,7 +500,13 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             }));
             const links = edges.map(e => ({ source: e.source, target: e.target }));
 
-            // 2️⃣ run a D3 force simulation
+            // 2️⃣ stash current positions for tweening
+            const layoutTime = performance.now();
+            nodeMap.forEach(entry => {
+                entry.prevPos = entry.pos.clone();
+            });
+
+            // 3️⃣ run a D3 force simulation
             const sim = d3.forceSimulation(nodes)
                 .force('charge', d3.forceManyBody().strength(-30))
                 .force('link', d3.forceLink(links)
@@ -482,25 +518,19 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
 
             for (let i = 0; i < 200; ++i) sim.tick();
 
-            // 3️⃣ write back new positions
+            // 4️⃣ write back new target positions
             nodes.forEach(n => {
                 const entry = nodeMap.get(n.id);
                 entry.pos.x = n.x;
                 entry.pos.z = n.y;
+                // kick off a 600 ms tween
+                entry.tweenStart = layoutTime;
+                entry.tweenDuration = 600;
             });
 
-            // 4️⃣ update node instance matrices
-            nodeMap.forEach(entry => {
-                instMesh.setMatrixAt(
-                    entry._instanceIndex,
-                    new THREE.Matrix4().setPosition(entry.pos)
-                );
-            });
-            instMesh.instanceMatrix.needsUpdate = true;
-
-            // 5️⃣ rebuild edges to their new positions
-            updateEdgeMeshes();
+            // 5️⃣ (No immediate mesh update here – animate() will drive it)
         }
+
         // ─── New helper: rebuild all edges based on updated nodeMap ──────────
         function updateEdgeMeshes() {
             if (!instEdge) initEdges();
@@ -688,7 +718,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             // 1️⃣ Ensure mesh exists & has room
             ensureSphereMesh();
             while (freeNodeIx + fresh.length > instMesh.countCapacity) {
-                growMeshCapacity(instMesh);
+                growInstancedMesh(instMesh);
             }
 
             // 2️⃣ Update palette & connectivity ceiling
@@ -700,45 +730,58 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             maxConnCurrent = Math.max(
                 maxConnCurrent,
                 ...fresh.map(o =>
-                    (o.references?.length || 0)
-                    + Object.keys(o.association_strengths || {}).length
+                    (o.references?.length || 0) +
+                    Object.keys(o.association_strengths || {}).length
                 )
             );
 
-            // 3️⃣ Append each newcomer
-            const mat = new THREE.Matrix4();
+            // 3️⃣ Append each newcomer with a Y‐tween
             const clr = new THREE.Color();
             const now = Date.now();
-            const groupY = graphGroup.position.y; // current drift
+            const groupY = graphGroup.position.y;
 
             for (const o of fresh) {
                 const idx = freeNodeIx++;
 
                 // compute connectivity
-                const conn = (o.references?.length || 0)
-                    + Object.keys(o.association_strengths || {}).length;
+                const conn = (o.references?.length || 0) +
+                    Object.keys(o.association_strengths || {}).length;
 
-                // 1) global age‐based Y
+                // final (target) local Y
                 const ageMs = now - parseTimestamp(o.timestamp).getTime();
                 const globalY = Math.max(
                     LAYOUT_CONFIG.minSphereY,
                     ageMs / LAYOUT_CONFIG.msPerUnit
                 );
-
-                // 2) convert to local Y by subtracting group drift
                 const localY = globalY - groupY;
 
-                // 3) scatter XZ
+                // scatter XZ
                 const rNorm = 1 - (conn / maxConnCurrent);
                 const r = rNorm * LAYOUT_CONFIG.maxXZRadius;
                 const ang = Math.random() * Math.PI * 2;
-                const x = Math.cos(ang) * r;
-                const z = Math.sin(ang) * r;
+                const x = Math.cos(ang) * r, z = Math.sin(ang) * r;
 
-                // 4) set instance matrix
-                instMesh.setMatrixAt(idx, mat.makeTranslation(x, localY, z));
+                // record entry with tween metadata
+                nodeMap.set(o.context_id, {
+                    data: o,
+                    // final position
+                    pos: new THREE.Vector3(x, localY, z),
+                    // initial injection at world Y=0 → localY = –groupY
+                    prevPos: new THREE.Vector3(x, -groupY, z),
+                    tweenStart: performance.now(),
+                    tweenDuration: 800,
+                    connectivity: conn,
+                    mesh: instMesh,
+                    _instanceIndex: idx
+                });
 
-                // colour = HSL palette or flash white
+                // set initial matrix at prevPos
+                instMesh.setMatrixAt(
+                    idx,
+                    new THREE.Matrix4().makeTranslation(x, -groupY, z)
+                );
+
+                // color
                 const hue = hueMapCurrent[o.component] ?? 0;
                 const sat = 0.5 + 0.5 * (conn / maxConnCurrent);
                 if (flashWhite) {
@@ -757,24 +800,18 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                     );
                 }
 
-                // 5️⃣ Bookkeeping
-                nodeMap.set(o.context_id, {
-                    data: o,
-                    pos: new THREE.Vector3(x, localY, z),
-                    connectivity: conn,
-                    mesh: instMesh,
-                    _instanceIndex: idx
-                });
                 console.info('[spawn]', o.context_id, '→ instance', idx);
             }
 
-            // 6️⃣ Commit GPU updates & rebuild edges incrementally
+            // 4️⃣ Commit GPU updates
             instMesh.count = freeNodeIx;
             instMesh.instanceMatrix.needsUpdate = true;
             instMesh.instanceColor.needsUpdate = true;
-            rebuildEdgesIncremental(fresh.map(o => o.context_id));
-        }
 
+            // 5️⃣ Rebuild JUST these edges & fire upstream flash
+            rebuildEdgesIncremental(fresh.map(o => o.context_id));
+            fresh.forEach(o => cascadeChain(o.context_id));
+        }
 
         /** super-fast colour setter used by both add + later filter tweaks */
         function colourNode(idx, obj) {
@@ -784,71 +821,71 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             instMesh.instanceColor.setXYZ(idx,
                 ...new THREE.Color().setHSL(hue, sat, lgt).toArray());
         }
-       function appendEdgesFast(srcObjs) {
-  ensureEdgeMesh();
+        function appendEdgesFast(srcObjs) {
+            ensureEdgeMesh();
 
-  const mat = new THREE.Matrix4();
-  const yAxis = new THREE.Vector3(0, 1, 0);
+            const mat = new THREE.Matrix4();
+            const yAxis = new THREE.Vector3(0, 1, 0);
 
-  for (const o of srcObjs) {
-    const entry = nodeMap.get(o.context_id);
-    if (!entry) continue;
+            for (const o of srcObjs) {
+                const entry = nodeMap.get(o.context_id);
+                if (!entry) continue;
 
-    const srcPos = entry.pos.clone();
-    const cIdx = entry._instanceIndex;
-    const refs = Array.isArray(o.references) ? o.references : [];
-    const assocs = o.association_strengths
-      ? Object.keys(o.association_strengths)
-      : [];
-    const targets = [...refs, ...assocs];
+                const srcPos = entry.pos.clone();
+                const cIdx = entry._instanceIndex;
+                const refs = Array.isArray(o.references) ? o.references : [];
+                const assocs = o.association_strengths
+                    ? Object.keys(o.association_strengths)
+                    : [];
+                const targets = [...refs, ...assocs];
 
-    for (const tgtId of targets) {
-      const tgtEntry = nodeMap.get(tgtId);
-      if (!tgtEntry) continue;
+                for (const tgtId of targets) {
+                    const tgtEntry = nodeMap.get(tgtId);
+                    if (!tgtEntry) continue;
 
-      const tgtPos = tgtEntry.pos.clone();
-      const dir = new THREE.Vector3().subVectors(tgtPos, srcPos);
-      const len = dir.length();
-      if (len === 0) continue;
+                    const tgtPos = tgtEntry.pos.clone();
+                    const dir = new THREE.Vector3().subVectors(tgtPos, srcPos);
+                    const len = dir.length();
+                    if (len === 0) continue;
 
-      // if we're about to overflow, grow capacity now
-      if (freeEdgeIx + 1 > instEdge.countCapacity) {
-        growMeshCapacity(instEdge);
-      }
+                    // if we're about to overflow, grow capacity now
+                    if (freeEdgeIx + 1 > instEdge.countCapacity) {
+                        growMeshCapacity(instEdge);
+                    }
 
-      // build the edge transform
-      const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.normalize());
-      const s = new THREE.Vector3(0.2, len, 0.2);
-      mat.compose(srcPos, q, s);
-      instEdge.setMatrixAt(freeEdgeIx, mat);
+                    // build the edge transform
+                    const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.normalize());
+                    const s = new THREE.Vector3(0.2, len, 0.2);
+                    mat.compose(srcPos, q, s);
+                    instEdge.setMatrixAt(freeEdgeIx, mat);
 
-      // copy the source node's color
-      const r = instMesh.instanceColor.getX(cIdx);
-      const g = instMesh.instanceColor.getY(cIdx);
-      const b = instMesh.instanceColor.getZ(cIdx);
-      instEdge.instanceColor.setXYZ(freeEdgeIx, r, g, b);
+                    // copy the source node's color
+                    const r = instMesh.instanceColor.getX(cIdx);
+                    const g = instMesh.instanceColor.getY(cIdx);
+                    const b = instMesh.instanceColor.getZ(cIdx);
+                    instEdge.instanceColor.setXYZ(freeEdgeIx, r, g, b);
 
-      // record edge metadata
-      edges[freeEdgeIx] = {
-        source: o.context_id,
-        target: tgtId,
-        index: freeEdgeIx,
-        weight: (o.association_strengths?.[tgtId] || 1)
-      };
+                    // record edge metadata
+                    edges[freeEdgeIx] = {
+                        source: o.context_id,
+                        target: tgtId,
+                        index: freeEdgeIx,
+                        weight: (o.association_strengths?.[tgtId] || 1)
+                    };
 
-      freeEdgeIx++;
-    }
+                    freeEdgeIx++;
+                }
 
-    // **after** wiring up all the new edges for this node,
-    // light up its entire upstream‐chain:
-    highlightPathFrom(o.context_id);
-  }
+                // **after** wiring up all the new edges for this node,
+                // light up its entire upstream‐chain:
+                highlightPathFrom(o.context_id);
+            }
 
-  // commit to GPU
-  instEdge.count = freeEdgeIx;
-  instEdge.instanceMatrix.needsUpdate = true;
-  instEdge.instanceColor.needsUpdate = true;
-}
+            // commit to GPU
+            instEdge.count = freeEdgeIx;
+            instEdge.instanceMatrix.needsUpdate = true;
+            instEdge.instanceColor.needsUpdate = true;
+        }
 
 
 
@@ -1478,133 +1515,134 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                 }
             }
         }
-        async function pollForNew() {
-            const url = getContextFileUrl();
-            console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
 
-            /* ── ①  cheap HEAD to decide whether to GET at all ─────────────────── */
-            let head;
-            try {
-                head = await fetch(url, { method: "HEAD", cache: "no-store" });
-            } catch (e) {
-                console.warn("HEAD failed", e);
-                console.groupEnd();
-                return;
+       async function pollForNew() {
+  const url = getContextFileUrl(true);
+  console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
+
+  // ① HEAD → check length / etag
+  let head;
+  try {
+    head = await fetch(url, { method: "HEAD", cache: "no-store" });
+  } catch (e) {
+    console.warn("HEAD failed", e);
+    console.groupEnd();
+    return;
+  }
+  const size = Number(head.headers.get("Content-Length") || 0);
+  const etag = head.headers.get("ETag") || "";
+
+  // no change?
+  if (size === lastSize && etag === lastETag) {
+    console.debug("no change – skipping GET");
+    console.groupEnd();
+    return;
+  }
+  // file was rotated (shrunk)?
+  if (size < lastSize) lastContextId = null;
+
+  // ② GET the tail
+  const rangeStart = Math.max(0, size - LAST_KB * 1024);
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Range: `bytes=${rangeStart}-` },
+      cache: "no-store"
+    });
+  } catch (e) {
+    console.warn("GET failed", e);
+    console.groupEnd();
+    return;
+  }
+
+  const rangeHonoured = res.status === 206;
+  console.debug(`GET ${res.status} (Range honoured? ${rangeHonoured})`);
+
+  let chunk = "";
+  if (rangeHonoured) {
+    chunk = await res.text();
+  } else if (res.body && res.body.getReader) {
+    // fallback streaming until enough lines
+    const rdr = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", lines = [], seen = lastContextId === null;
+    try {
+      while (true) {
+        const { value, done } = await rdr.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split(/\r?\n/);
+        buf = parts.pop();
+        for (const ln of parts) {
+          if (!ln) continue;
+          if (!seen) {
+            if (lastContextId === null || ln.includes(lastContextId)) {
+              seen = true;
             }
-
-            const size = Number(head.headers.get("Content-Length") || 0);
-            const etag = head.headers.get("ETag") || "";
-
-            if (size === lastSize && etag === lastETag) {
-                console.debug("no change – skipping GET");
-                console.groupEnd();
-                return;
-            }
-            /* file rotated (shrunk)?  → reset offset pointer */
-            if (size < lastSize) lastContextId = null;
-
-            /* ── ②  GET with Range (tail) ──────────────────────────────────────── */
-            const rangeStart = Math.max(0, size - LAST_KB * 1024);
-            let res;
-            try {
-                res = await fetch(url, {
-                    headers: { Range: `bytes=${rangeStart}-` },
-                    cache: "no-store"
-                });
-            } catch (e) {
-                console.warn("GET failed", e);
-                console.groupEnd();
-                return;
-            }
-
-            const rangeHonoured = res.status === 206;
-            console.debug(`GET ${res.status} (Range honoured? ${rangeHonoured})`);
-
-            let tailText = "";
-
-            /* ②-A  happy path – server sent only the tail */
-            if (rangeHonoured) {
-                tailText = await res.text();
-
-                /* ②-B  fallback – server ignored Range (200) → stream & abort early  */
-            } else {
-                if (!res.body || !res.body.getReader) {
-                    console.warn("Stream API not available → bailing");
-                    console.groupEnd();
-                    return;
-                }
-
-                const rdr = res.body.getReader();
-                const dec = new TextDecoder();
-                let buf = "";
-                const lines = [];
-                let seenSentinel = lastContextId === null;
-
-                try {
-                    while (true) {
-                        const { value, done } = await rdr.read();
-                        if (done) break;
-
-                        buf += dec.decode(value, { stream: true });
-                        const parts = buf.split(/\r?\n/);
-                        buf = parts.pop();
-
-                        for (const ln of parts) {
-                            if (!ln) continue;
-
-                            /* ①  wait until we bump into the sentinel row */
-                            if (!seenSentinel) {
-                                if (lastContextId === null || ln.includes(lastContextId)) {
-                                    seenSentinel = true;             // ← got it
-                                }
-                                continue;                          // keep reading; nothing to store yet
-                            }
-
-                            /* ②  after sentinel → collect new rows */
-                            lines.push(ln);
-
-                            /* ③  now we’re allowed to stop once we have enough */
-                            if (lines.length >= WANT_LINES) {
-                                console.debug(`early abort after ${lines.length} NEW lines`);
-                                await rdr.cancel();
-                                break;
-                            }
-                        }
-                        if (lines.length >= WANT_LINES) break;
-                    }
-                    if (buf && seenSentinel) lines.push(buf);    // flush tail
-                    tailText = lines.join("\n");
-                } catch (e) {
-                    console.warn("stream error", e);
-                    try { await rdr.cancel(); } catch { }
-                }
-            }
-
-            /* ── ③  parse, dedupe, inject ─────────────────────────────────────── */
-            const fresh = [];
-            tailText.split(/\r?\n/).forEach(ln => {
-                if (!ln.trim()) return;
-                try {
-                    const o = JSON.parse(ln);
-                    if (o.context_id && !seenIds.has(o.context_id)) {
-                        seenIds.add(o.context_id);
-                        fresh.push(o);
-                    }
-                } catch { /* ignore malformed */ }
-            });
-
-            console.debug("fresh objects:", fresh.length);
-            if (fresh.length) {
-                appendNodesFast(fresh, true);
-                appendEdgesFast(fresh);
-                lastContextId = fresh[fresh.length - 1].context_id;
-            }
-
-            /* ── ④  remember state for next tick ───────────────────────────────── */
-            lastSize = size;
-            lastETag = etag;
-            console.groupEnd();
+            continue;
+          }
+          lines.push(ln);
+          if (lines.length >= WANT_LINES) {
+            await rdr.cancel();
+            break;
+          }
         }
+        if (lines.length >= WANT_LINES) break;
+      }
+      if (buf && seen) lines.push(buf);
+      chunk = lines.join("\n");
+    } catch (err) {
+      console.warn("stream error", err);
+      try { await rdr.cancel(); } catch {}
+    }
+  } else {
+    console.warn("Stream API not available → bailing");
+    console.groupEnd();
+    return;
+  }
+
+  // ③ parse & dedupe
+  const fresh = [];
+  chunk.split(/\r?\n/).forEach(ln => {
+    if (!ln.trim()) return;
+    try {
+      const o = JSON.parse(ln);
+      if (o.context_id && !seenIds.has(o.context_id)) {
+        seenIds.add(o.context_id);
+        fresh.push(o);
+      }
+    } catch {}
+  });
+
+  console.debug("fresh objects:", fresh.length);
+  if (fresh.length) {
+    // update 3D graph
+    appendNodesFast(fresh, true);
+    appendEdgesFast(fresh);
+
+    // bump sentinel
+    lastContextId = fresh[fresh.length - 1].context_id;
+
+    // merge & rebuild sidebar
+    allData.push(...fresh);
+    buildSidebarList(allData);
+
+    // auto-scroll if allowed
+    if (autoScrollEnabled) {
+      sidebar.scrollTop = sidebar.scrollHeight;
+    }
+
+    // re-apply filters so new nodes get correct coloring
+    applyFilters();
+  }
+
+  // ④ remember state
+  lastSize = size;
+  lastETag = etag;
+  console.groupEnd();
+}
+
+
         // ─── BUILD SCENE ──────────────────────────────────────────────────
         function buildScene(objects) {
             // sort by timestamp (newest first)
@@ -1736,7 +1774,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
 
         // ─── CAMERA ──────────────────────────────────────────────────────────
         const camera = new THREE.PerspectiveCamera(
-            60,
+            85,
             window.innerWidth / window.innerHeight,
             0.1,
             2e6
@@ -2244,66 +2282,119 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         //////////////////////////////////////////////////////////////////////
         // CHAIN REACTION
         //////////////////////////////////////////////////////////////////////
-/**
- * Starting from `nodeId`, walk *all* references upstream
- * (breadth‐first) and pulse every connecting edge white.
- * Uses your existing pulseEdge(idx, baseGrey) which fades it back.
- */
-function highlightPathFrom(nodeId) {
-  if (!instEdge || !edges.length) return;
-  const seen = new Set([ nodeId ]);
-  const queue = [ nodeId ];
-  const axisY = new THREE.Vector3(0,1,0);
+        /**
+         * Starting from `nodeId`, walk *all* references upstream
+         * (breadth‐first) and pulse every connecting edge white.
+         * Uses your existing pulseEdge(idx, baseGrey) which fades it back.
+         */
+        function highlightPathFrom(nodeId) {
+            if (!instEdge || !edges.length) return;
+            const seen = new Set([nodeId]);
+            const queue = [nodeId];
+            const axisY = new THREE.Vector3(0, 1, 0);
 
-  while (queue.length) {
-    const srcId = queue.shift();
-    const srcNode = nodeMap.get(srcId);
-    if (!srcNode) continue;
+            while (queue.length) {
+                const srcId = queue.shift();
+                const srcNode = nodeMap.get(srcId);
+                if (!srcNode) continue;
 
-    // collect both references[] + association_strengths keys
-    const ups = [
-      ...(srcNode.data.references||[]),
-      ...Object.keys(srcNode.data.association_strengths||{})
-    ];
+                // collect both references[] + association_strengths keys
+                const ups = [
+                    ...(srcNode.data.references || []),
+                    ...Object.keys(srcNode.data.association_strengths || {})
+                ];
 
-    for (const tgtId of ups) {
-      if (!nodeMap.has(tgtId) || seen.has(tgtId)) continue;
-      seen.add(tgtId);
-      queue.push(tgtId);
+                for (const tgtId of ups) {
+                    if (!nodeMap.has(tgtId) || seen.has(tgtId)) continue;
+                    seen.add(tgtId);
+                    queue.push(tgtId);
 
-      // find the edge index that joins srcId -> tgtId
-      const e = edges.find(e =>
-        (e.source===srcId && e.target===tgtId) ||
-        (e.source===tgtId && e.target===srcId)
-      );
-      if (e) {
-        // pulse white, then fade back to its original grey
-        const baseGrey = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1,e.weight);
-        pulseEdge(e.index, baseGrey);
-      }
-    }
-  }
-}
+                    // find the edge index that joins srcId -> tgtId
+                    const e = edges.find(e =>
+                        (e.source === srcId && e.target === tgtId) ||
+                        (e.source === tgtId && e.target === srcId)
+                    );
+                    if (e) {
+                        // pulse white, then fade back to its original grey
+                        const baseGrey = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, e.weight);
+                        pulseEdge(e.index, baseGrey);
+                    }
+                }
+            }
+        }
 
 
         /***********************************************************************
      *  Bright-flash a single edge, then fade back to its original dim value
      **********************************************************************/
-        function pulseEdge(idx, baseGrey = BASE_EDGE_GREY) {
+        // ─── 1) Improved pulseEdge that restores *both* color & alpha ─────────
+        function pulseEdge(edgeIdx, peakAlpha = 1) {
             if (!instEdge) return;
-            const c = instEdge.instanceColor;
+            const cAttr = instEdge.instanceColor;
+            const aAttr = instEdge.geometry.attributes.alpha;
 
-            // flash to white
-            c.setXYZ(idx, 1, 1, 1);
-            c.needsUpdate = true;
+            // stash original
+            const r0 = cAttr.getX(edgeIdx),
+                g0 = cAttr.getY(edgeIdx),
+                b0 = cAttr.getZ(edgeIdx),
+                a0 = aAttr.getX(edgeIdx);
 
-            // fade back
+            // flash to white & full alpha
+            cAttr.setXYZ(edgeIdx, 1, 1, 1);
+            aAttr.setX(edgeIdx, peakAlpha);
+            cAttr.needsUpdate = true;
+            aAttr.needsUpdate = true;
+
+            // fade back after fadeOutDuration
             setTimeout(() => {
-                if (!instEdge) return;        // scene might have reloaded
-                instEdge.instanceColor.setXYZ(idx, baseGrey, baseGrey, baseGrey);
-                instEdge.instanceColor.needsUpdate = true;
+                if (!instEdge) return;
+                cAttr.setXYZ(edgeIdx, r0, g0, b0);
+                aAttr.setX(edgeIdx, a0);
+                cAttr.needsUpdate = true;
+                aAttr.needsUpdate = true;
             }, DISPLAY_CONFIG.fadeOutDuration);
         }
+        // ─── 2) Full upstream cascade with per-hop delay ────────────────────────
+        function cascadeChain(originId, maxDepth = 10, delayStep = 200) {
+            const visited = new Set([originId]);
+
+            function walk(id, depth) {
+                if (depth >= maxDepth) return;
+                const node = nodeMap.get(id);
+                if (!node) return;
+
+                // gather *all* upstream neighbors
+                const neighbors = [
+                    ... (node.data.references || []),
+                    ...Object.keys(node.data.association_strengths || {})
+                ];
+
+                neighbors.forEach(tgtId => {
+                    if (visited.has(tgtId)) return;
+                    visited.add(tgtId);
+
+                    // find the edge object (bi-directional)
+                    const edgeObj = edges.find(e =>
+                        (e.source === id && e.target === tgtId) ||
+                        (e.source === tgtId && e.target === id)
+                    );
+                    if (!edgeObj) return;
+
+                    // schedule a pulse with increasing delay
+                    setTimeout(() => {
+                        const peak = DISPLAY_CONFIG.lineBaseOpacity * Math.min(1, edgeObj.weight);
+                        pulseEdge(edgeObj.index, peak);
+                    }, depth * delayStep);
+
+                    // recurse upstream from this neighbor
+                    walk(tgtId, depth + 1);
+                });
+            }
+
+            // start the cascade
+            walk(originId, 1);
+        }
+
 
         function flashNeighbours(nodeId) {
             edges.forEach(e => {
@@ -2339,37 +2430,46 @@ function highlightPathFrom(nodeId) {
         renderer.domElement.addEventListener('pointermove', onPointerMove);
         renderer.domElement.addEventListener('click', onClick);
 
-
         function onClick(ev) {
-            /* ── pick the instance that was clicked ────────────────────────────── */
+            // update pointer & do the raycast
             onPointerMove(ev);
-            if (!instMesh) return;
+            if (!instMesh) {
+                // clicked without any mesh loaded → re-enable auto-scroll
+                autoScrollEnabled = true;
+                return;
+            }
 
             scene.updateMatrixWorld();
             raycaster.setFromCamera(pointer, camera);
-
             const hit = raycaster.intersectObject(instMesh, false)[0];
-            if (!hit || hit.instanceId === undefined) return;
 
+            // if you clicked empty space (or missed), re-enable auto-scroll
+            if (!hit || hit.instanceId === undefined) {
+                autoScrollEnabled = true;
+                return;
+            }
+
+            // you clicked a node → pause auto-scroll
+            autoScrollEnabled = false;
+
+            // identify which context_id
             const clickedIdx = hit.instanceId;
             const ctxEntry = [...nodeMap.entries()]
                 .find(([, n]) => n._instanceIndex === clickedIdx);
             if (!ctxEntry) return;
-
             const [ctxId, node] = ctxEntry;
 
-            /* ── remember selection & recolour immediately ─────────────────────── */
+            // remember selection & recolour immediately
             hovered = selectedId = ctxId;
             applyFilters();
 
-            /* ── show JSON preview ─────────────────────────────────────────────── */
+            // show JSON preview
             selPane.textContent = JSON.stringify(node.data, null, 2);
 
-            /* ── build the detail table ────────────────────────────────────────── */
+            // build the detail table
             detailPanel.innerHTML = '';
             const ts0 = parseTimestamp(node.data.timestamp).getTime();
             const tbl = document.createElement('table');
-
             for (const [k, v] of Object.entries(node.data)) {
                 const tr = document.createElement('tr');
                 const tdK = document.createElement('td');
@@ -2413,23 +2513,19 @@ function highlightPathFrom(nodeId) {
             }
             detailPanel.appendChild(tbl);
 
-            /* ── visual feedback on graph ───────────────────────────────────────── */
-highlightPathFrom(ctxId);
-
-// optionally still do the breadth-first “chain reaction” if you like:
-triggerChain(ctxId, 0);
+            // visual feedback on graph
+            highlightPathFrom(ctxId);
+            triggerChain(ctxId, 0);
             tweenToNode(ctxId);
+            cascadeChain(ctxId);
 
-            /* ── scroll & highlight in sidebar ─────────────────────────────────── */
-            // remove previous highlights
+            // scroll & highlight in sidebar
             document.querySelectorAll('.sidebar-item-highlight')
                 .forEach(el => el.classList.remove('sidebar-item-highlight'));
 
-            // expand the dropdown for this ctxId
             const dropdown = document.getElementById(`dropdown-${ctxId}`);
             if (dropdown) dropdown.style.display = 'block';
 
-            // scroll to the header for this ctxId
             const header = document.getElementById(`header-${ctxId}`);
             if (header) {
                 header.classList.add('sidebar-item-highlight');
@@ -2472,47 +2568,74 @@ triggerChain(ctxId, 0);
          *******************************************************************/
         function animate() {
             requestAnimationFrame(animate);
-
             controls.update();
 
+            // ——— 1) smooth scroll/drift —————————————————————————————
             if (Math.abs(scrollVelocity) > 1e-4) {
                 yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
                 scrollVelocity *= SCROLL_FRICTION;
             } else {
                 scrollVelocity = 0;
             }
-
-            graphGroup.position.y = yScrollOffset;
-
-            // ── recalc view clock by subtracting the negative offset ────────────
-            const nowDate = new Date();
-            // Option A: flip the sign on elapsedMs
-            const elapsedMs = -yScrollOffset * MS_PER_UNIT;
-            const viewDate = new Date(nowDate - elapsedMs);
-            // ── decay the boost multiplier ────────────────────────────────────
-            scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
-
-            // ── optional conveyor-belt drift ─────────────────────────────────
             const nowMs = Date.now();
             const dt = nowMs - lastDriftT;
             yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / MS_PER_UNIT;
             lastDriftT = nowMs;
-
             graphGroup.position.y = yScrollOffset;
 
-            // ── update header clocks ──────────────────────────────────────────
+            // update header clocks
+            const nowDate = new Date();
+            const elapsedMs = -yScrollOffset * MS_PER_UNIT;
+            const viewDate = new Date(nowDate - elapsedMs);
             nowLbl.textContent = 'Now:  ' + nowDate.toLocaleString();
             viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
+            scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
 
-            // ── camera tween (fly-to) ────────────────────────────────────────
+            // ——— 2) camera fly-to tween —————————————————————————————
             if (cameraTween) {
-                const t = Math.min((performance.now() - cameraTween.start) / cameraTween.duration, 1);
-                camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, t);
-                controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, t);
-                if (t >= 1) cameraTween = null;
+                const tCam = Math.min((performance.now() - cameraTween.start) / cameraTween.duration, 1);
+                camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, tCam);
+                controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, tCam);
+                if (tCam >= 1) cameraTween = null;
             }
 
-            // ── pointer-hover handling ───────────────────────────────────────
+            // ——— 3) node-position tween + scale-tween + edge update —————————————————
+            const nowT = performance.now();
+            let moved = false;
+
+            // a) any D3/tween position updates?
+            nodeMap.forEach(entry => {
+                if (!entry.tweenStart) return;
+                const t = Math.min((nowT - entry.tweenStart) / entry.tweenDuration, 1);
+                const ip = entry.prevPos.clone().lerp(entry.pos, t);
+                const mat = new THREE.Matrix4().compose(ip, new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
+                instMesh.setMatrixAt(entry._instanceIndex, mat);
+                moved = true;
+                if (t === 1) {
+                    delete entry.tweenStart;
+                    entry.prevPos.copy(entry.pos);
+                }
+            });
+
+            // b) scale-tween for new nodes
+            nodeMap.forEach(entry => {
+                if (!entry.scaleTweenStart) return;
+                const t2 = Math.min((nowT - entry.scaleTweenStart) / entry.scaleTweenDuration, 1);
+                const scale = entry.scalePrev.clone().lerp(entry.scaleTarget, t2);
+                const mat = new THREE.Matrix4().compose(entry.pos, new THREE.Quaternion(), scale);
+                instMesh.setMatrixAt(entry._instanceIndex, mat);
+                moved = true;
+                if (t2 === 1) {
+                    delete entry.scaleTweenStart;
+                }
+            });
+
+            if (moved) {
+                instMesh.instanceMatrix.needsUpdate = true;
+                updateEdgeMeshes();
+            }
+
+            // ——— 4) hover & click feedback —————————————————————————————
             if (instMesh) {
                 scene.updateMatrixWorld();
                 raycaster.setFromCamera(pointer, camera);
@@ -2525,22 +2648,13 @@ triggerChain(ctxId, 0);
                         if (found) {
                             const [ctxId, node] = found;
                             hovered = ctxId;
-
-                            // live JSON preview & detail
                             selPane.textContent = JSON.stringify(node.data, null, 2);
                             populateDetail(ctxId);
-
-                            // visual feedback on graph
                             flashNeighbours(ctxId);
-
-                            // NEW → scroll & highlight sidebar entry
                             const el = document.querySelector(`[id^="sidebar-item-container-${ctxId}-"]`);
                             if (el) {
-                                // clear prior highlights
-                                document
-                                    .querySelectorAll('.sidebar-item-highlight')
+                                document.querySelectorAll('.sidebar-item-highlight')
                                     .forEach(e => e.classList.remove('sidebar-item-highlight'));
-                                // highlight this one
                                 el.classList.add('sidebar-item-highlight');
                                 el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                             }
@@ -2548,22 +2662,20 @@ triggerChain(ctxId, 0);
                     }
                 } else {
                     hoveredIdx = hovered = null;
-                    // remove highlight when not hovering any node
-                    document
-                        .querySelectorAll('.sidebar-item-highlight')
+                    document.querySelectorAll('.sidebar-item-highlight')
                         .forEach(e => e.classList.remove('sidebar-item-highlight'));
                 }
             }
-
-            // ── reset any leftover emissive flashes if hover left node ───────
             if (hovered !== previousHoveredId) {
                 previousHoveredId = hovered;
                 if (instMesh) instMesh.material.emissiveIntensity = 0;
             }
 
-            // ── final render ─────────────────────────────────────────────────
+            // ——— 5) final render —————————————————————————————
             renderer.render(scene, camera);
         }
+
+
 
         // start it up
         animate();

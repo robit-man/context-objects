@@ -2664,95 +2664,96 @@ class Tools:
     
     @staticmethod
     def get_chat_history(
-        arg1=None,
-        arg2=None,
-        time=None,
-        n=None,
-        domain: Union[str, List[str]] = None,
-        component: Union[str, List[str]] = None,
-        semantic_label: Union[str, List[str]] = None,
-        keyword: str = None,
-        query: str = None,
-        count: int = None
-    ) -> str:
+        repository: str = "active_repo",
+        limit:     int   | None = None,
+        direction: str   | None = None,
+        time:      str   | None = None,
+        n:         int   | None = None,
+        domain:    str   | list[str] | None = None,
+        component: str   | list[str] | None = None,
+        semantic_label: str | list[str] | None = None,
+        keyword:   str   | None = None,
+        query:     str   | None = None,
+        count:     int   | None = None,
+    ) -> dict[str, Any]:
         """
-        Retrieve context objects from *the* active repository (JSONL / SQLite hybrid),
-        not a hard-coded `context.jsonl` file.
+        Retrieve chat/context objects from the specified repository file.
 
-        Legacy positional modes:
-          • get_chat_history("today"/"yesterday"/"last N days")
-          • get_chat_history(n) → last n entries
-          • get_chat_history(n, "2 days") → last n entries from the last 2 days
-          • get_chat_history("query", n) → top-n by relevance to 'query'
+        - `repository`: either "active_repo" (uses the default JSONL+SQLite on disk)
+                        or a path to a .jsonl file (it will look for the same-stem .db).
+        - `limit` / `count`: number of entries to return (alias for `n`).
+        - `direction`: "forward" (oldest→newest) or "backward" (newest→oldest; default).
+        - `time`: a period like "today", "yesterday", or "last N days".
+        - `n`: also controls count when `time` is numeric or missing.
+        - `keyword` / `query`: free-text to run a simple substring + embedding rerank.
+        - `domain` / `component` / `semantic_label`: exact-match or list filters.
 
-        New keyword modes:
-          • keyword or query → as first positional arg
-          • count            → as second positional arg
-
-        Optionally filter by:
-          • domain
-          • component
-          • semantic_label
-
-        Returns JSON: {"results": [ {timestamp, role, content, score}, … ] }
+        Returns:
+            {"output": {"results": [
+                {"timestamp": str, "role": str, "content": str}, …
+            ]}}
         """
         import re, json
         from datetime import datetime, timedelta
         from numpy import dot, linalg
-        from context import ContextObject, HybridContextRepository
+        from context import HybridContextRepository, Utils
 
-        # --- Normalize legacy vs. new args ---
-        if keyword is not None:
-            arg1 = keyword
-        if query is not None:
-            arg1 = query
+        # normalize count alias
+        if limit is not None:
+            n = limit
         if count is not None:
-            arg2 = count
-        if time is not None:
-            arg1 = time
-        if n is not None:
-            arg2 = n
+            n = count
 
-        # ─── LOAD *FROM THE ACTIVE REPO* ────────────────────────────────
-        repo = HybridContextRepository.instance()
+        # pick free-text arg
+        txt_arg = query or keyword or time if time and not re.fullmatch(r"\d+", time) else query or keyword
+
+        # — load the repo instance —
+        if repository == "active_repo":
+            repo = HybridContextRepository.instance()
+        else:
+            # assume `repository` is a path to a .jsonl file
+            sqlite = repository.replace(".jsonl", ".db")
+            repo = HybridContextRepository(jsonl_path=repository, sqlite_path=sqlite)
+
+        # — fetch every context object and project to a simple dict —
         entries = []
-        for ctx in repo.query(lambda c: True):
+        for c in repo.query(lambda c: True):
             entries.append({
-                "timestamp":      ctx.timestamp,
-                "role":           ctx.metadata.get("role"),
-                "content":        ctx.metadata.get("content", ctx.summary or ""),
-                "domain":         ctx.domain,
-                "component":      ctx.component,
-                "semantic_label": ctx.semantic_label
+                "timestamp":      c.timestamp,
+                "role":           c.metadata.get("role", ""),
+                "content":        c.metadata.get("content", c.summary or ""),
+                "domain":         c.domain,
+                "component":      c.component,
+                "semantic_label": c.semantic_label
             })
 
-        # --- Apply domain/component/semantic_label filters ---
-        def _in(val, flt):
+        # — helper for exact-or-list matching —
+        def match(value, flt):
             if flt is None: return True
-            if isinstance(flt, (list, tuple)): return val in flt
-            return val == flt
+            if isinstance(flt, (list, tuple)): return value in flt
+            return value == flt
 
+        # — apply domain/component/label filters —
         entries = [
             e for e in entries
-            if _in(e["domain"],         domain)
-            and _in(e["component"],     component)
-            and _in(e["semantic_label"],semantic_label)
+            if match(e["domain"],         domain)
+            and match(e["component"],     component)
+            and match(e["semantic_label"],semantic_label)
         ]
 
-        # --- Timestamp parser ---
-        def _parse_ts(s: str) -> datetime:
+        # — timestamp parser —
+        def parse_ts(s: str) -> datetime:
             try:
-                # allow both ISO and our YYYYMMDD…Z form
                 return datetime.fromisoformat(s.rstrip("Z"))
-            except Exception:
+            except:
                 return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
 
-        # --- 1) Timeframe-only mode ---
-        if isinstance(arg1, str) and not re.fullmatch(r"\d+", arg1):
-            period = arg1.lower().strip()
-            now    = datetime.utcnow()
-            today  = now.date()
-            start = end = None
+        # — timeframe filtering (“today”, “last N days”, etc.) —
+        results: list[dict] = []
+        if isinstance(time, str) and not re.fullmatch(r"\d+", time):
+            period = time.lower().strip()
+            now   = datetime.utcnow()
+            today = now.date()
 
             if period == "today":
                 start = datetime.combine(today, datetime.min.time())
@@ -2765,96 +2766,61 @@ class Tools:
                 if m:
                     d = int(m.group(1))
                     start = datetime.combine(today - timedelta(days=d), datetime.min.time())
-                    end   = datetime.combine(today + timedelta(days=1), datetime.min.time())
+                    end   = now
+                else:
+                    start = end = None
 
-            if start is not None:
-                results = []
+            if start and end:
                 for e in entries:
                     try:
-                        ts = _parse_ts(e["timestamp"])
+                        ts = parse_ts(e["timestamp"])
                     except:
                         continue
                     if start <= ts < end:
-                        results.append({
-                            "timestamp": e["timestamp"],
-                            "role":      e["role"],
-                            "content":   e["content"]
-                        })
-                return json.dumps({"results": results}, indent=2)
+                        results.append(e)
+            else:
+                results = entries
 
-        # --- 2) Count-based or query mode ---
-        top_n    = None
-        since_dt = None
-        qtext    = None
-
-        # If first arg is numeric → count mode
-        if isinstance(arg1, (int, str)) and re.fullmatch(r"\d+", str(arg1)):
-            top_n = int(arg1)
-            # optional second arg = period
-            if arg2:
-                m = re.match(r"(\d+)\s*(day|hour|minute|week)s?", str(arg2), re.I)
-                if m:
-                    val, unit = int(m.group(1)), m.group(2).lower()
-                    now = datetime.utcnow()
-                    if unit.startswith("day"):    since_dt = now - timedelta(days=val)
-                    elif unit.startswith("hour"): since_dt = now - timedelta(hours=val)
-                    elif unit.startswith("minute"): since_dt = now - timedelta(minutes=val)
-                    elif unit.startswith("week"):  since_dt = now - timedelta(weeks=val)
-                else:
-                    try:
-                        since_dt = _parse_ts(arg2)
-                    except:
-                        since_dt = None
         else:
-            # treat first arg as query text
-            if arg1 is not None:
-                qtext = str(arg1)
-                if arg2 and re.fullmatch(r"\d+", str(arg2)):
-                    top_n = int(arg2)
-            if top_n is None:
-                top_n = 5
+            # — count & relevance mode —
+            top_n = int(n) if n is not None else len(entries)
 
-        # --- Filter by since_dt ---
-        filtered = []
-        for e in entries:
-            try:
-                ts = _parse_ts(e["timestamp"])
-            except:
-                continue
-            if since_dt and ts < since_dt:
-                continue
-            filtered.append(e)
+            # if `time` was purely numeric, treat it as count override
+            if isinstance(time, str) and re.fullmatch(r"\d+", time):
+                top_n = int(time)
 
-        # --- Score & rank ---
-        scored = []
-        if qtext:
-            qv = Utils.embed_text(qtext)
-            candidates = filtered[-100:]
-            for e in candidates:
-                txt   = e["content"]
-                score = 1.0 if qtext.lower() in txt.lower() else 0.0
-                vv    = Utils.embed_text(txt)
-                if linalg.norm(qv) and linalg.norm(vv):
-                    score += float(dot(qv, vv) / (linalg.norm(qv) * linalg.norm(vv)))
-                scored.append((score, e))
-            scored.sort(key=lambda x: x[0], reverse=True)
-        else:
-            # pure recency
-            scored = [(0.0, e) for e in reversed(filtered)]
+            # filter by recency if desired (could add a `since` arg here)
 
-        # --- Build output ---
-        top = scored[:top_n]
-        out = []
-        for score, e in top:
-            out.append({
-                "timestamp": e["timestamp"],
-                "role":      e["role"],
-                "content":   e["content"],
-                "score":     round(score, 3)
-            })
+            # relevance ranking if we have free text
+            if txt_arg:
+                qv = Utils.embed_text(txt_arg)
+                # only score the most recent 100 to save time
+                candidates = entries[-100:]
+                scored = []
+                for e in candidates:
+                    text = e["content"]
+                    score = float(txt_arg.lower() in text.lower())
+                    vv = Utils.embed_text(text)
+                    if linalg.norm(qv) and linalg.norm(vv):
+                        score += float(dot(qv, vv) / (linalg.norm(qv) * linalg.norm(vv)))
+                    scored.append((score, e))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                results = [e for _, e in scored[:top_n]]
+            else:
+                # pure recency
+                results = list(reversed(entries))[:top_n]
 
-        return json.dumps({"results": out}, indent=2)
+        # — apply direction ordering —
+        reverse = not (direction and direction.lower().startswith("fwd"))
+        results.sort(key=lambda e: parse_ts(e["timestamp"]), reverse=reverse)
 
+        # — finally, strip to only the three allowed fields —
+        out = [
+            {"timestamp": e["timestamp"], "role": e["role"], "content": e["content"]}
+            for e in results
+        ]
+
+        return {"output": {"results": out}}
 
 
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
