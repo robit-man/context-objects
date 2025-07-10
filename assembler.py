@@ -311,6 +311,7 @@ class ContextQueryEngine:
         stage_id: Optional[str] = None,
         time_range: Optional[Tuple[str, str]] = None,
         tags: Optional[List[str]] = None,
+        include_tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
         domain: Optional[List[str]] = None,
         component: Optional[List[str]] = None,
@@ -325,8 +326,10 @@ class ContextQueryEngine:
         if time_range:
             start, end = time_range
             ctxs = [c for c in ctxs if start <= c.timestamp <= end]
-        if tags:
-            ctxs = [c for c in ctxs if set(tags) & set(c.tags)]
+        real_include = include_tags if include_tags is not None else tags
+        if real_include:
+            ctxs = [c for c in ctxs if set(real_include) & set(c.tags)]
+
         if exclude_tags:
             ctxs = [c for c in ctxs if not (set(exclude_tags) & set(c.tags))]
         if domain:
