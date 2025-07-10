@@ -7,7 +7,7 @@ from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
 from context import ContextRepository, ContextObject, default_clock
-from inspect import signature, _empty
+
 import os, json, re, difflib
 from datetime import datetime, timedelta
 
@@ -2634,14 +2634,13 @@ class Tools:
     ) -> dict[str, list[dict[str, str]]]:
         """
         Retrieve a slice of past chat/context entries from the in-memory repository.
-
+        (TESTING SEEDING)
         Parameters
         ----------
         assembler
             An Assembler instance (must have a .repo attribute to query).
         limit, n, count : int, optional
             Alias for the maximum number of entries to return.
-            BIGFUCKMONEY
         direction : str, optional
             "fwd" or "forward" to sort oldest→newest, anything else (or None)
             for newest→oldest.
@@ -3347,8 +3346,7 @@ class Tools:
         }
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
-
-
+    
     @staticmethod
     def auxiliary_inference(
         prompt: str,
@@ -3463,50 +3461,21 @@ class Tools:
             return json.dumps({"error": str(e)})
         
     @staticmethod
-    def generate_tool_schema(tool_name: str) -> dict[str, Any]:
+    def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
         """
-        Inspect Tools.<tool_name> and generate/store its JSON-schema,
-        but prune out any parameters that aren’t actual Python kwargs.
+        Inspect Tools.<tool_name> and generate/store its JSON-schema.
         """
         fn = getattr(Tools, tool_name, None)
         if not callable(fn):
             raise KeyError(f"Unknown tool '{tool_name}'")
-        
-        # build the unconstrained schema
         schema = _create_tool_schema(fn)
-
-        # figure out which parameters are genuine kwargs
-        sig = signature(fn)
-        allowed = {
-            name
-            for name, param in sig.parameters.items()
-            # we allow everything *after* the first positional-only (assembler)
-            # that has a default value—that’s your real kwargs.
-            if param.default is not _empty
-        }
-
-        # prune properties
-        props = schema["parameters"]["properties"]
-        schema["parameters"]["properties"] = {
-            k: v for k, v in props.items() 
-            if k in allowed
-        }
-
-        # also remove from `required` if present
-        if "required" in schema["parameters"]:
-            schema["parameters"]["required"] = [
-                p for p in schema["parameters"]["required"]
-                if p in allowed
-            ]
-
         TOOL_SCHEMAS[tool_name] = schema
         return schema
 
     @staticmethod
     def generate_all_tool_schemas() -> None:
         """
-        Walk all public callables on Tools and populate TOOL_SCHEMAS,
-        using the above pruning logic.
+        Walk all public callables on Tools and populate TOOL_SCHEMAS.
         """
         for name, fn in inspect.getmembers(Tools, predicate=callable):
             if name.startswith("_"):
@@ -3514,10 +3483,11 @@ class Tools:
             try:
                 Tools.generate_tool_schema(name)
             except KeyError:
+                # skip non-tool callables
                 continue
 
     @staticmethod
-    def get_tool_schema(tool_name: str) -> dict[str, Any]:
+    def get_tool_schema(tool_name: str) -> Dict[str, Any]:
         """
         Return the JSON-schema for the given tool, generating it on demand.
         """
