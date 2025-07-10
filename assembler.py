@@ -13,6 +13,7 @@ import random
 import tempfile
 import threading
 import re
+import json, hashlib, tempfile, os
 
 import stages
 from pathlib import Path
@@ -745,30 +746,19 @@ class Assembler:
         os.replace(tmp_path, path)
         print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} unique, {bad} malformed → wrote {path}")
 
-   
+    
     def _seed_tool_schemas(self) -> None:
         """
-        Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
-        and clean out any obsolete schemas that are no longer defined.
-
-        Behaviour
-        ---------
-        • INSERT        – if the tool isn’t in the repo yet.
-        • UPDATE        – if the stored JSON differs from canonical.
-        • DEDUPE in-repo– keep only the newest, delete extras.
-        • PURGE/ARCHIVE – if a schema exists for a tool name
-                          that's been removed from TOOL_SCHEMAS.
-        • DISK-CLEANUP  – rewrite context.jsonl to remove duplicate lines.
+        Upsert only new or changed schemas, archive removed ones, and leave
+        untouched those that haven’t changed.
         """
-        import json
-        from context import sanitize_jsonl
-
         from tools import Tools, TOOL_SCHEMAS
-        # make sure any edits to tools.py are reflected
+
+        # 0) Regenerate in-memory schemas from your latest docstrings
         TOOL_SCHEMAS.clear()
         Tools.generate_all_tool_schemas()
-        
-        # 1) bucket existing rows by tool name
+
+        # 1) load existing schema rows, bucketed by tool name
         buckets: dict[str, list[ContextObject]] = {}
         for ctx in self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
@@ -779,56 +769,66 @@ class Assembler:
             except Exception:
                 continue
 
-        # 2) upsert canonical entries
+        # 2) for each canonical schema…
+        seen = set()
         for name, canonical in TOOL_SCHEMAS.items():
-            blob = json.dumps(canonical, sort_keys=True)
-            rows = buckets.get(name, [])
+            seen.add(name)
 
-            # A) new → INSERT
-            if not rows:
+            # compute a stable checksum of your JSON (so we can detect “no-ops”)
+            blob     = json.dumps(canonical, sort_keys=True)
+            checksum = hashlib.sha256(blob.encode("utf8")).hexdigest()
+
+            existing = buckets.get(name, [])
+            if existing:
+                # pick the newest one as our keeper
+                existing.sort(key=lambda c: c.timestamp, reverse=True)
+                keeper = existing[0]
+
+                # pull the last recorded checksum (if any)
+                prev = keeper.metadata.get("schema_checksum")
+                if prev == checksum:
+                    # nothing changed → skip
+                    continue
+
+                # schema *did* change → update in place
+                keeper.metadata["schema"]          = blob
+                keeper.metadata["schema_checksum"] = checksum
+                keeper.touch()
+                self.repo.save(keeper)
+                self.memman.register_relationships(keeper, embed_text)
+
+                # delete any older duplicates
+                for dup in existing[1:]:
+                    self.repo.delete(dup.context_id)
+
+            else:
+                # brand-new tool → insert
                 new_ctx = ContextObject.make_schema(
                     label=name,
                     schema_def=blob,
                     tags=["artifact", "tool_schema"],
                 )
+                new_ctx.metadata["schema_checksum"] = checksum
                 new_ctx.touch()
                 self.repo.save(new_ctx)
                 self.memman.register_relationships(new_ctx, embed_text)
-                buckets[name] = [new_ctx]
-                continue
 
-            # B) dedupe in-repo: keep newest, delete the rest
-            rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper, *dups = rows
-            for dup in dups:
-                self.repo.delete(dup.context_id)
-
-            # C) update JSON if it changed
-            stored = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
-            if stored != blob:
-                keeper.metadata["schema"] = blob
+        # 3) any schemas for tools *no longer* in TOOL_SCHEMAS get archived
+        for name, existing in buckets.items():
+            if name not in seen:
+                # keep only the newest
+                existing.sort(key=lambda c: c.timestamp, reverse=True)
+                keeper, *extras = existing
+                # delete the old extras
+                for e in extras:
+                    self.repo.delete(e.context_id)
+                # mark the keeper as legacy
+                keeper.tags = [t for t in keeper.tags if t != "tool_schema"] + ["legacy_tool_schema"]
                 keeper.touch()
                 self.repo.save(keeper)
                 self.memman.register_relationships(keeper, embed_text)
 
-            buckets[name] = [keeper]
-
-        # 3) purge/archive orphaned schemas
-        for name, rows in list(buckets.items()):
-            if name not in TOOL_SCHEMAS:
-                # keep only the newest, archive the rest
-                rows.sort(key=lambda c: c.timestamp, reverse=True)
-                keep, *extras = rows
-                for e in extras:
-                    self.repo.delete(e.context_id)
-                if "legacy_tool_schema" not in keep.tags:
-                    keep.tags.append("legacy_tool_schema")
-                keep.tags = [t for t in keep.tags if t != "tool_schema"]
-                keep.touch()
-                self.repo.save(keep)
-                self.memman.register_relationships(keep, embed_text)
-
-        # 4) rewrite JSONL to remove any on-disk duplicates & ensure validity
+        # 4) clean up any on-disk JSONL dupes & invalid lines
         sanitize_jsonl(self.context_path)
         self._prune_jsonl_duplicates()
 
