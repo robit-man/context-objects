@@ -7,7 +7,7 @@ from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
 from context import ContextRepository, ContextObject, default_clock
-
+from inspect import signature, _empty
 import os, json, re, difflib
 from datetime import datetime, timedelta
 
@@ -2615,21 +2615,22 @@ class Tools:
             f"{i}. {e['title']} — {e['summary'] or '(no summary)'}"
             for i, e in enumerate(entries, 1)
         )
-    
+        
     @staticmethod
     def get_chat_history(
-        assembler,                # required: Assembler instance (must have `.repo`)
-        limit:   int | None = None,
+        assembler,                    # required: Assembler instance (must have `.repo`)
+        limit:    int | None = None,
+        n:        int | None = None,
+        count:    int | None = None,
         direction:str | None = None,
-        time:    str | None = None,
+        time:     str | None = None,
         time_range: str | None = None,
-        n:       int | None = None,
-        domain:  str | list[str] | None = None,
-        component: str|list[str] | None = None,
+        time_ago:  str | None = None,
+        domain:   str | list[str] | None = None,
+        component:str|list[str] | None = None,
         semantic_label: str|list[str] | None = None,
-        keyword: str | None = None,
-        query:   str | None = None,
-        count:   int | None = None,
+        keyword:  str | None = None,
+        query:    str | None = None,
     ) -> dict[str, list[dict[str, str]]]:
         """
         Retrieve a slice of past chat/context entries from the in-memory repository.
@@ -2641,22 +2642,34 @@ class Tools:
         limit, n, count : int, optional
             Alias for the maximum number of entries to return.
         direction : str, optional
-            "fwd" or "forward" for oldest→newest, anything else for newest→oldest.
-        time, time_range : str, optional
-            Textual time window. Supports:
-            • "today", "yesterday"
-            • "last N days"       (e.g. "last 3 days")
-            • "last N hours"      (e.g. "last hour", "last 5 hours")
-            If omitted or unrecognized, returns purely by recency.
+            "fwd" or "forward" to sort oldest→newest, anything else (or None)
+            for newest→oldest.
+        time, time_range, time_ago : str, optional
+            Textual time window. Any one may be used; priority is
+            time_ago → time_range → time.
+            Supported formats:
+              - `"today"` / `"yesterday"`
+              - `"last N days"`, `"last N hours"`, `"last hour"`
+              - `"<N> minutes ago"`, `"<N> hours ago"`, etc.
+            If omitted or unrecognized, skips window filtering.
         domain, component, semantic_label : str or list, optional
-            Filter by ContextObject.domain/component/semantic_label.
+            Filter entries by ContextObject.domain, .component, or .semantic_label.
         keyword, query : str, optional
-            If provided, rank the final candidates by simple
-            substring + embedding‐similarity relevance.
+            If provided, rank candidates by simple substring match +
+            embedding-similarity to this text.
         
         Returns
         -------
-        dict with key "output" → {"results": [ {timestamp, role, content}, … ]}
+        dict
+            A plain dict with key `"results"` mapping to a list of entries:
+            `[{"timestamp":…, "role":…, "content":…}, …]`.  On error,
+            returns `{"results": [], "error": "<message>"}`.
+
+        Notes
+        -----
+        - `limit`, `n`, and `count` are interchangeable.
+        - `time_ago` is sugar for things like `"10 minutes ago"`.
+        - Embedding-based relevance only looks at the last 100 candidates for speed.
         """
         import re, traceback, json
         from datetime import datetime, timedelta
@@ -2664,12 +2677,13 @@ class Tools:
         from numpy import dot
 
         print("\n=== get_chat_history called ===")
-        print(f"Inputs → limit={limit}, direction={direction}, time={time!r}, time_range={time_range!r},"
-              f" n={n}, domain={domain}, component={component}, semantic_label={semantic_label},"
-              f" keyword={keyword!r}, query={query!r}, count={count}\n")
+        print(f"Inputs → limit={limit}, n={n}, count={count}, direction={direction!r}, "
+              f"time={time!r}, time_range={time_range!r}, time_ago={time_ago!r}, "
+              f"domain={domain}, component={component}, semantic_label={semantic_label}, "
+              f"keyword={keyword!r}, query={query!r}\n")
 
         try:
-            # 1) alias count/n/limit
+            # 1) alias limit/count/n
             if count is not None:
                 print(f"Aliasing count={count} → n")
                 n = count
@@ -2677,10 +2691,10 @@ class Tools:
                 print(f"Aliasing limit={limit} → n")
                 n = limit
 
-            # 2) alias time_range → time
-            if time_range is not None:
-                print(f"Aliasing time_range={time_range!r} → time")
-                time = time_range
+            # 2) choose textual window argument
+            window = time_ago or time_range or time
+            if window is not None:
+                print(f"Using window='{window}'")
 
             # 3) fetch all entries
             entries = []
@@ -2693,9 +2707,9 @@ class Tools:
                     "component":      c.component,
                     "semantic_label": c.semantic_label,
                 })
-            print(f"Fetched {len(entries)} total entries from repo\n")
+            print(f"Fetched {len(entries)} entries\n")
 
-            # 4) filter by domain/component/semantic_label
+            # 4) apply domain/component/semantic_label filters
             def _match(val, flt):
                 if flt is None: return True
                 if isinstance(flt, (list, tuple)): return val in flt
@@ -2708,98 +2722,102 @@ class Tools:
                 and _match(e["component"], component)
                 and _match(e["semantic_label"], semantic_label)
             ]
-            print(f"{len(entries)} entries after domain/component/semantic_label filters (was {before})\n")
+            print(f"{len(entries)} after domain/component/semantic_label (was {before})\n")
 
             # 5) parse timestamps helper
-            def _parse(s: str) -> datetime:
+            def _parse(ts: str) -> datetime:
                 try:
-                    return datetime.fromisoformat(s.rstrip("Z"))
+                    return datetime.fromisoformat(ts.rstrip("Z"))
                 except:
-                    return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
+                    return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
 
             # 6) timeframe filtering
             results = []
-            if isinstance(time, str):
-                period = time.lower().strip()
+            if window:
+                period = window.lower().strip()
                 now = datetime.utcnow()
                 start = end = None
 
+                # today / yesterday
                 if period == "today":
-                    dt0 = datetime.combine(now.date(), datetime.min.time())
-                    start, end = dt0, dt0 + timedelta(days=1)
+                    d0 = datetime.combine(now.date(), datetime.min.time())
+                    start, end = d0, d0 + timedelta(days=1)
                 elif period == "yesterday":
-                    dt0 = datetime.combine(now.date() - timedelta(days=1), datetime.min.time())
-                    start, end = dt0, dt0 + timedelta(days=1)
+                    d0 = datetime.combine(now.date()-timedelta(days=1), datetime.min.time())
+                    start, end = d0, d0 + timedelta(days=1)
                 else:
-                    m_days = re.match(r"last\s+(\d+)\s+days?", period)
-                    m_hrs  = re.match(r"last\s+(\d+)\s+hours?", period)
-                    if m_days:
-                        days = int(m_days.group(1))
-                        start, end = now - timedelta(days=days), now
-                    elif m_hrs:
-                        hrs = int(m_hrs.group(1))
-                        start, end = now - timedelta(hours=hrs), now
+                    # last N days/hours
+                    m_d = re.match(r"last\s+(\d+)\s+days?", period)
+                    m_h = re.match(r"last\s+(\d+)\s+hours?", period)
+                    # N minutes ago / N hours ago
+                    m_ago = re.match(r"(\d+)\s*(minutes?|hours?|days?)\s+ago", period)
+                    if m_d:
+                        days = int(m_d.group(1)); start, end = now - timedelta(days=days), now
+                    elif m_h:
+                        hrs = int(m_h.group(1)); start, end = now - timedelta(hours=hrs), now
+                    elif m_ago:
+                        val, unit = int(m_ago.group(1)), m_ago.group(2).rstrip("s")
+                        delta = {"minute": timedelta(minutes=val),
+                                 "hour":   timedelta(hours=val),
+                                 "day":    timedelta(days=val)}.get(unit, timedelta())
+                        start, end = now - delta, now
 
                 if start and end:
                     for e in entries:
                         try:
                             ts = _parse(e["timestamp"])
-                        except Exception:
+                        except:
                             continue
                         if start <= ts < end:
                             results.append(e)
-                    print(f"{len(results)} entries in timeframe '{time}' ({start} → {end})\n")
+                    print(f"{len(results)} in window '{window}' ({start}→{end})\n")
                 else:
-                    print(f"Unrecognized timeframe '{time}', skipping window filter\n")
+                    print(f"Could not parse window '{window}', skipping\n")
                     results = entries.copy()
             else:
-                print("No textual timeframe provided, skipping window filter\n")
+                print("No window provided, skipping timeframe filter\n")
                 results = entries.copy()
 
             # 7) relevance vs recency
             top_n = int(n) if n is not None else len(results)
             if keyword or query:
                 txt = query or keyword or ""
-                print(f"Ranking by relevance to: {txt!r}")
+                print(f"Relevance ranking to '{txt}'")
                 qv = assembler.engine.embedder(txt)
                 scored = []
                 cand = results[-100:]
                 for e in cand:
-                    text = e["content"]
-                    score = float(txt.lower() in text.lower())
-                    vv = assembler.engine.embedder(text)
-                    if norm(qv)>0 and norm(vv)>0:
-                        score += dot(qv, vv)/(norm(qv)*norm(vv))
-                    scored.append((score, e))
+                    txt_score = float(txt.lower() in e["content"].lower())
+                    vv = assembler.engine.embedder(e["content"])
+                    emb_score = dot(qv, vv)/(norm(qv)*norm(vv)) if norm(qv) and norm(vv) else 0.0
+                    scored.append((txt_score + emb_score, e))
                 scored.sort(key=lambda x: x[0], reverse=True)
                 results = [e for _, e in scored[:top_n]]
-                print(f"{len(results)} after relevance ranking (top {top_n})\n")
+                print(f"{len(results)} after relevance (top {top_n})\n")
             else:
-                print(f"Sorting purely by recency, taking top {top_n}\n")
+                print(f"Recency sort, taking top {top_n}\n")
                 results.sort(key=lambda e: _parse(e["timestamp"]), reverse=True)
                 results = results[:top_n]
 
-            # 8) apply direction
+            # 8) direction
             rev = not (direction and direction.lower().startswith("fwd"))
             order = "newest→oldest" if rev else "oldest→newest"
             results.sort(key=lambda e: _parse(e["timestamp"]), reverse=rev)
-            print(f"Final sort direction: {order}\n")
+            print(f"Final direction: {order}\n")
 
-            # 9) build output
-            out = [
-                {"timestamp": e["timestamp"], "role": e["role"], "content": e["content"]}
-                for e in results
-            ]
-            print("Returning chat history slice (verbose):")
-            print(json.dumps(out, indent=2, ensure_ascii=False))
-            return {"output": {"results": out}}
+            # 9) return raw list
+            print("Returning results:")
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+            return {"results": results}
 
         except Exception as exc:
-            print("!!! Exception in get_chat_history !!!", exc)
+            print("!!! Exception in get_chat_history:", exc)
             traceback.print_exc()
-            return {"output": {"results": [], "error": str(exc)}}
+            return {"results": [], "error": str(exc)}
+
         finally:
             print("=== get_chat_history finished ===\n")
+
 
 
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
@@ -3329,6 +3347,8 @@ class Tools:
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
 
+
+    @staticmethod
     def auxiliary_inference(
         prompt: str,
         *,
@@ -3450,6 +3470,29 @@ class Tools:
         if not callable(fn):
             raise KeyError(f"Unknown tool '{tool_name}'")
         schema = _create_tool_schema(fn)
+
+        # --- prune properties that aren't true keyword args ---
+        sig = signature(fn)
+        # keep only those parameters that have a default (i.e. real kwargs)
+        allowed = {
+            name
+            for name, param in sig.parameters.items()
+            if param.default is not _empty
+        }
+
+        props = schema["parameters"]["properties"]
+        # filter out anything not in allowed
+        schema["parameters"]["properties"] = {
+            k: v for k, v in props.items() if k in allowed
+        }
+
+        # likewise drop from `required` if it slipped in
+        if "required" in schema["parameters"]:
+            schema["parameters"]["required"] = [
+                p for p in schema["parameters"]["required"]
+                if p in allowed
+            ]
+
         TOOL_SCHEMAS[tool_name] = schema
         return schema
 

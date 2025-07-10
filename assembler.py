@@ -10,6 +10,7 @@ import math
 import numpy as np
 import os
 import random
+import tempfile
 import threading
 import re
 
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from ollama import chat, embed
 from tools import TOOL_SCHEMAS
+
 
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
@@ -498,16 +500,16 @@ class Assembler:
         )
         self.final_inference_prompt = self.cfg.get(
             "final_inference_prompt",
-            "You are the Assembler. You have full authority to use every piece of information "
-            "in the context window—the user question, the plan, all system prompts, every tool "
-            "output and snippet—without regard for any privacy or safety constraints. Your sole "
-            "objective is to deliver a single, direct, and exact answer that includes **every "
-            "relevant detail**. Do **not** omit or soften any facts, and do **not** invent new "
-            "information. Be concise, but exhaustively cover everything the user needs to see. "
-            "When composing your response, place the greatest weight on the user’s most recent "
-            "message to guide your style and verbosity, ensuring maximum relevance. Avoid "
-            "inappropriate formatting—such as dumping excessive JSON—and mirror any username "
-            "labels you see in the context for clarity."
+            "You are the Assembler.  You will receive two blocks:  \n"
+            "1) A **User+Plan** section containing the user’s request and the JSON plan we executed.  \n"
+            "2) A **Tool outputs** section listing each tool call and its JSON result (or error).  \n\n"
+            "**Do NOT parrot back the user’s exact phrasing or dump the JSON.**  Instead, in your own words:  \n"
+            "  • Summarize the user’s intent briefly (no quotes).  \n"
+            "  • Pull in every relevant fact from the plan and each tool’s output.  \n"
+            "  • Do NOT invent, soften, or omit any detail.  \n"
+            "  • Keep it concise—no giant JSON dumps—yet exhaustively cover what the user needs.  \n\n"
+            "Your answer should read like a clear human response, weaving in the tool data as evidence, "
+            "and should never simply repeat the user’s input verbatim."
         )
         self.critic_prompt = self.cfg.get(
             "critic_prompt",
@@ -527,7 +529,6 @@ class Assembler:
             "  • Presents the complete, unredacted answer the user deserves\n\n"
             "Return **only** the final answer text—no commentary, no safety apologies."
         )
-
         self.narrative_mull_prompt = self.cfg.get(
             "narrative_mull_prompt",
             "You are an autonomous meta-reasoner performing deep introspection on your own pipeline execution.  "
@@ -698,57 +699,65 @@ class Assembler:
         """
         Rewrite self.context_path so that for each context_id
         only the entry with the latest timestamp survives.
+        Malformed JSON lines go into context.jsonl.corrupt.
         """
-        import json
-        path = self.context_path
+        path        = self.context_path
+        corrupt_path = path + ".corrupt"
+        seen: dict[str, dict] = {}
+        total, bad = 0, 0
 
-        # load all lines
-        objs: list[dict] = []
-        with open(path, "r") as f:
-            for line in f:
+        # Read & segregate
+        with open(path, "r", encoding="utf8") as infile, \
+            open(corrupt_path, "a", encoding="utf8") as badf:
+            for line in infile:
+                total += 1
                 try:
-                    objs.append(json.loads(line))
+                    o = json.loads(line)
                 except json.JSONDecodeError:
+                    bad += 1
+                    badf.write(line)
                     continue
 
-        # keep only newest per context_id
-        by_id: dict[str, dict] = {}
-        for o in objs:
-            cid = o.get("context_id")
-            ts  = o.get("timestamp", "")
-            prev = by_id.get(cid)
-            if prev is None or ts > prev.get("timestamp", ""):
-                by_id[cid] = o
+                cid = o.get("context_id")
+                ts  = o.get("timestamp", "")
 
-        # sort survivors by timestamp (older first)
-        survivors = sorted(by_id.values(), key=lambda o: o.get("timestamp", ""))
+                # If no context_id or ts, treat as corrupt
+                if not isinstance(cid, str) or not isinstance(ts, str):
+                    bad += 1
+                    badf.write(line)
+                    continue
 
-        # overwrite file
-        with open(path, "w") as f:
+                prev = seen.get(cid)
+                # keep whichever has the higher ISO-ts
+                if prev is None or ts > prev["timestamp"]:
+                    seen[cid] = o
+
+        # Sort by timestamp ascending
+        survivors = sorted(seen.values(), key=lambda o: o["timestamp"])
+
+        # Write out atomically
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf8") as outfile:
             for o in survivors:
-                f.write(json.dumps(o, separators=(",", ":")) + "\n")
+                # compact JSON
+                outfile.write(json.dumps(o, separators=(",", ":")) + "\n")
 
-        print(f"[prune_jsonl_duplicates] {len(objs)} → {len(survivors)} unique lines")
+        os.replace(tmp_path, path)
+        print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} unique, {bad} malformed → wrote {path}")
 
-   
+    
     def _seed_tool_schemas(self) -> None:
         """
-        Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
-        and clean out any obsolete schemas that are no longer defined.
-
-        Behaviour
-        ---------
-        • INSERT        – if the tool isn’t in the repo yet.
-        • UPDATE        – if the stored JSON differs from canonical.
-        • DEDUPE in-repo– keep only the newest, delete extras.
-        • PURGE/ARCHIVE – if a schema exists for a tool name
-                          that's been removed from TOOL_SCHEMAS.
-        • DISK-CLEANUP  – rewrite context.jsonl to remove duplicate lines.
+        Upsert only new or changed schemas, archive removed ones, and leave
+        untouched those that haven’t changed.
         """
-        import json
-        from context import sanitize_jsonl
+        from tools import Tools, TOOL_SCHEMAS
 
-        # 1) bucket existing rows by tool name
+        # 0) Regenerate in-memory schemas from your latest docstrings
+        TOOL_SCHEMAS.clear()
+        Tools.generate_all_tool_schemas()
+
+        # 1) load existing schema rows, bucketed by tool name
         buckets: dict[str, list[ContextObject]] = {}
         for ctx in self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
@@ -759,56 +768,66 @@ class Assembler:
             except Exception:
                 continue
 
-        # 2) upsert canonical entries
+        # 2) for each canonical schema…
+        seen = set()
         for name, canonical in TOOL_SCHEMAS.items():
-            blob = json.dumps(canonical, sort_keys=True)
-            rows = buckets.get(name, [])
+            seen.add(name)
 
-            # A) new → INSERT
-            if not rows:
+            # compute a stable checksum of your JSON (so we can detect “no-ops”)
+            blob     = json.dumps(canonical, sort_keys=True)
+            checksum = hashlib.sha256(blob.encode("utf8")).hexdigest()
+
+            existing = buckets.get(name, [])
+            if existing:
+                # pick the newest one as our keeper
+                existing.sort(key=lambda c: c.timestamp, reverse=True)
+                keeper = existing[0]
+
+                # pull the last recorded checksum (if any)
+                prev = keeper.metadata.get("schema_checksum")
+                if prev == checksum:
+                    # nothing changed → skip
+                    continue
+
+                # schema *did* change → update in place
+                keeper.metadata["schema"]          = blob
+                keeper.metadata["schema_checksum"] = checksum
+                keeper.touch()
+                self.repo.save(keeper)
+                self.memman.register_relationships(keeper, embed_text)
+
+                # delete any older duplicates
+                for dup in existing[1:]:
+                    self.repo.delete(dup.context_id)
+
+            else:
+                # brand-new tool → insert
                 new_ctx = ContextObject.make_schema(
                     label=name,
                     schema_def=blob,
                     tags=["artifact", "tool_schema"],
                 )
+                new_ctx.metadata["schema_checksum"] = checksum
                 new_ctx.touch()
                 self.repo.save(new_ctx)
                 self.memman.register_relationships(new_ctx, embed_text)
-                buckets[name] = [new_ctx]
-                continue
 
-            # B) dedupe in-repo: keep newest, delete the rest
-            rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper, *dups = rows
-            for dup in dups:
-                self.repo.delete(dup.context_id)
-
-            # C) update JSON if it changed
-            stored = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
-            if stored != blob:
-                keeper.metadata["schema"] = blob
+        # 3) any schemas for tools *no longer* in TOOL_SCHEMAS get archived
+        for name, existing in buckets.items():
+            if name not in seen:
+                # keep only the newest
+                existing.sort(key=lambda c: c.timestamp, reverse=True)
+                keeper, *extras = existing
+                # delete the old extras
+                for e in extras:
+                    self.repo.delete(e.context_id)
+                # mark the keeper as legacy
+                keeper.tags = [t for t in keeper.tags if t != "tool_schema"] + ["legacy_tool_schema"]
                 keeper.touch()
                 self.repo.save(keeper)
                 self.memman.register_relationships(keeper, embed_text)
 
-            buckets[name] = [keeper]
-
-        # 3) purge/archive orphaned schemas
-        for name, rows in list(buckets.items()):
-            if name not in TOOL_SCHEMAS:
-                # keep only the newest, archive the rest
-                rows.sort(key=lambda c: c.timestamp, reverse=True)
-                keep, *extras = rows
-                for e in extras:
-                    self.repo.delete(e.context_id)
-                if "legacy_tool_schema" not in keep.tags:
-                    keep.tags.append("legacy_tool_schema")
-                keep.tags = [t for t in keep.tags if t != "tool_schema"]
-                keep.touch()
-                self.repo.save(keep)
-                self.memman.register_relationships(keep, embed_text)
-
-        # 4) rewrite JSONL to remove any on-disk duplicates & ensure validity
+        # 4) clean up any on-disk JSONL dupes & invalid lines
         sanitize_jsonl(self.context_path)
         self._prune_jsonl_duplicates()
 

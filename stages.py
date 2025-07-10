@@ -1318,108 +1318,116 @@ def _stage9_invoke_with_retries(
     state["tool_ctxs"] = tool_ctxs
     return tool_ctxs
 
+
 # —————————————————————————————————————————————————————————————
-# 10) ASSEMBLE & INFER (print every tool_output)
+# 10) ASSEMBLE, CONDENSE & INFER
 # —————————————————————————————————————————————————————————————
 def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-    import json, itertools
+    import json, difflib
     from context import ContextObject
 
-    MAX_CTX_OBJS = 20
-    MAX_CHARS_PER_OBJ = 380
-    def snip(txt):
-        if not txt: return ""
-        if len(txt)<=MAX_CHARS_PER_OBJ: return txt
-        head=txt[:MAX_CHARS_PER_OBJ]
-        stop=max(head.rfind("."),head.rfind("!"),head.rfind("?"))
-        cut=head[:stop+1] if stop!=-1 else head
-        return cut.rstrip()+" …"
-
-    # 1) gather refs
-    refs=[]
-    for k in ("user_ctx","sys_ctx","tc_ctx","clar_ctx","know_ctx","plan_ctx"):
-        c=state.get(k)
-        if c: refs.append(c.context_id)
-    for lst,cap in (("wm_ids",6),("recent_ids",4)):
-        ids=state.get(lst,[])
-        ids=sorted(ids,key=lambda cid:self.repo.get(cid).timestamp,reverse=True)[:cap]
+    # 1) collect all relevant ContextObject IDs
+    refs = []
+    for key in ("user_ctx","sys_ctx","plan_ctx","clar_ctx","know_ctx","tc_ctx"):
+        ctx = state.get(key)
+        if ctx: refs.append(ctx.context_id)
+    # windowed memory + all tool outputs
+    for lst, cap in (("wm_ids",6),("recent_ids",4)):
+        ids = sorted(state.get(lst,[]),
+                     key=lambda cid:self.repo.get(cid).timestamp,
+                     reverse=True)[:cap]
         refs.extend(ids)
-    # include all tool_ctxs
     for t in state.get("tool_ctxs",[]):
         refs.append(t.context_id)
 
-    # dedupe
-    seen,ordered=set(),[]
+    # dedupe & fetch
+    seen = set(); ordered = []
     for r in refs:
-        if r not in seen:
-            seen.add(r)
-            ordered.append(r)
+        if r not in seen and self.repo.get(r):
+            seen.add(r); ordered.append(r)
+    ctxs = [self.repo.get(cid) for cid in ordered]
 
-    # load
-    ctxs=[self.repo.get(cid) for cid in ordered if self.repo.get(cid)]
+    # 2) turn each tool_output into a small snippet
+    def snip(txt, maxc=200):
+        if not txt: return ""
+        txt = txt.replace("\n"," ")
+        return (txt[:maxc].rsplit(" ",1)[0] + " …") if len(txt)>maxc else txt
 
-    # inline
-    parts=[]
+    raw_outputs = []
     for c in ctxs:
         if c.component=="tool_output":
-            raw=c.metadata.get("output")
-            txt=json.dumps(raw,ensure_ascii=False) if not isinstance(raw,str) else raw
-            parts.append(f"[{c.stage_id}]\n{snip(txt)}")
-        elif c.stage_id=="relevance_summary":
-            parts.insert(0,c.summary.strip())
-        elif c.semantic_label=="tool_chaining":
-            parts.append(f"[tool_schemas] {c.summary}")
-        else:
-            parts.append(f"[{c.stage_id}] {snip(c.summary or '')}")
+            out = c.metadata.get("output")
+            blob = json.dumps(out, ensure_ascii=False, default=str)
+            raw_outputs.append(f"[{c.stage_id}] {snip(blob)}")
 
-    parts=parts[:MAX_CTX_OBJS]
-    interm="\n\n".join(parts)
+    # 3) condense with a relevance‐extractor pass
+    extractor_sys = (
+        "You are a relevance extractor. From the following list of tool outputs, "
+        "pick the 4–6 most directly useful facts to answer the user’s question, each "
+        "as a bullet starting with “• ”."
+    )
+    extractor_user = (
+        f"USER QUESTION:\n{user_text}\n\n"
+        "TOOL OUTPUTS:\n" + "\n".join(raw_outputs)
+    )
+    bullets = self._stream_and_capture(
+        self.secondary_model,
+        [
+            {"role":"system","content":extractor_sys},
+            {"role":"user","content":extractor_user},
+        ],
+        tag="[RelevCondense]",
+        images=state.get("images"),
+    ).strip()
 
-    # debug print of every tool output object
-    print("🮕🮖🮖 TOOL OUTPUTS CAPTURED 🮖🮖\n")
-    for tc in state.get("tool_ctxs",[]):
-        print(f"🡶 {tc.stage_id} 🡷")
-        print(f"{tc.metadata.get('output')!r}\n")
-    print("🮕🮖🮖🮖 END TOOL OUTPUTS 🮖🮖🮖🮖\n\n")
+    # persist condensed summary
+    sum_ctx = ContextObject.make_stage("relevance_summary", [], {"summary": bullets})
+    sum_ctx.stage_id = "relevance_summary"; sum_ctx.summary = bullets
+    sum_ctx.touch(); self.repo.save(sum_ctx)
 
-    # 4) log
-    self._print_stage_context("assemble_and_infer", {
-        "user_question":[user_text],
-        "plan":[state.get("plan_output","(no plan)")],
-        "included_ids":ordered[:MAX_CTX_OBJS],
-        "snippets_count":len(parts),
-    })
+    # 4) assemble final LLM prompt
+    final_sys = self._get_prompt("final_inference_prompt")
+    plan_txt   = state.get("plan_output","(no plan)")
+    self._last_plan_output = plan_txt
 
-    # 5) call LLM
-    final_sys=self._get_prompt("final_inference_prompt")
-    plan_txt=state.get("plan_output","(no plan)")
-    self._last_plan_output=plan_txt
-
-    msgs=[
-        {"role":"system","content":final_sys},
-        {"role":"system","content":f"User question:\n{user_text}"},
-        {"role":"system","content":f"Plan:\n{plan_txt}"},
-        {"role":"system","content":self.inference_prompt},
-        {"role":"system","content":interm},
-        {"role":"user","content":user_text},
+    msgs = [
+        {"role":"system","content": final_sys},
+        {"role":"system","content": f"User question:\n{user_text}"},
+        {"role":"system","content": f"Plan:\n{plan_txt}"},
+        {"role":"system","content": "Relevant context (condensed):\n" + bullets},
+        {"role":"user",  "content": user_text},
     ]
-    reply=self._stream_and_capture(self.primary_model,msgs,tag="[Assistant]",images=state.get("images")).strip()
 
-    # 6) persist
-    refs=[t.context_id for t in state.get("tool_ctxs",[])]
+    # 5) call primary model
+    reply = self._stream_and_capture(
+        self.primary_model,
+        msgs,
+        tag="[Assistant]",
+        images=state.get("images")
+    ).strip()
+
+    # 6) persist final inference
+    tc_id_list = [t.context_id for t in state.get("tool_ctxs",[])]
     if state.get("tc_ctx"):
-        refs.insert(0,state["tc_ctx"].context_id)
+        tc_id_list.insert(0, state["tc_ctx"].context_id)
 
-    resp_ctx=ContextObject.make_stage("final_inference", refs, {"text":reply})
+    resp_ctx = ContextObject.make_stage(
+        "final_inference",
+        tc_id_list,
+        {"text": reply}
+    )
     resp_ctx.stage_id="final_inference"; resp_ctx.summary=reply
     resp_ctx.touch(); self.repo.save(resp_ctx)
 
-    seg=ContextObject.make_segment("assistant",[resp_ctx.context_id],tags=["assistant"])
-    seg.summary=reply; seg.stage_id="assistant"; seg.touch(); self.repo.save(seg)
+    seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
+    seg.stage_id="assistant"; seg.summary=reply; seg.touch(); self.repo.save(seg)
 
     return reply
 
 
+# —————————————————————————————————————————————————————————————
+# 10b) RE-CONDENSE & POLISH
+# —————————————————————————————————————————————————————————————
 def _stage10b_response_critique_and_safety(
     self,
     draft: str,
@@ -1427,106 +1435,58 @@ def _stage10b_response_critique_and_safety(
     tool_ctxs: list["ContextObject"],
     state: dict[str, Any],
 ) -> str:
-    """
-    1)  Run a *relevance-extraction* mini-pass that distils the raw window
-        down to ≤ 8 ultra-focused bullet points.
-    2)  Feed ONLY that bullet list (plus the user question & draft) to an
-        editor prompt whose sole job is to fix factual gaps, integrate the
-        bullets and produce a direct answer.  No disclaimers are asked for.
-    3)  Persist artefacts & diff exactly as before.
-    """
-    import json, difflib
+    import difflib
     from context import ContextObject
 
-    # ————————————————————————————————————————
-    # Gather plan text & tool outputs (unchanged)
-    # ————————————————————————————————————————
-    plan_text = getattr(self, "_last_plan_output", "(no plan)")
-    outputs   = []
-    for c in tool_ctxs:
-        try:
-            blob = json.dumps(c.metadata.get("output"), indent=2, ensure_ascii=False)
-        except Exception:
-            blob = repr(c.metadata.get("output"))
-        outputs.append(f"[{c.stage_id}]\n{blob}")
-
-    # ————————————————————————————————————————
-    # 1️⃣  RELEVANCE EXTRACTOR
-    # ————————————————————————————————————————
-    extractor_sys = (
-        "You are a relevance extractor.\n"
-        "Return ONLY the information that directly helps answer the user.\n"
-        "Strict format: at most 8 lines, each starting with the bullet '• '."
+    # 1) re-use the same condensed bullets from stage10
+    #    we assume the last relevance_summary is what we just saved
+    patches = self.repo.query(
+        lambda c: c.component=="stage" and c.semantic_label=="relevance_summary"
     )
-    extractor_user = "\n\n".join((
-        f"USER QUESTION:\n{user_text}",
-        f"PLAN EXECUTED:\n{plan_text}",
-        "RAW DRAFT:\n" + draft,
-        "RAW TOOL OUTPUTS:\n" + "\n\n".join(outputs),
-    ))
+    patches.sort(key=lambda c: c.timestamp, reverse=True)
+    bullets = patches[0].summary if patches else ""
 
-    bullets = self._stream_and_capture(
-        self.secondary_model,
-        [
-            {"role": "system", "content": extractor_sys},
-            {"role": "user",   "content": extractor_user},
-        ],
-        tag="[RelevExtract]",
-        images=state.get("images"),
-    ).strip()
-
-    # persist for traceability
-    sum_ctx = ContextObject.make_stage(
-        "relevance_summary", [], {"summary": bullets}
-    )
-    sum_ctx.stage_id = "relevance_summary"
-    sum_ctx.summary  = bullets
-    sum_ctx.touch(); self.repo.save(sum_ctx)
-
-    # ————————————————————————————————————————
-    # 2️⃣  POLISHER / CRITIC (NO extra guardrails)
-    # ————————————————————————————————————————
+    # 2) Polisher prompt: fix factual gaps, integrate bullets, no parroting
     editor_sys = (
-        "You are an expert editor.\n"
-        "Use ONLY the bullet list to fix or extend the draft so it answers the "
-        "user fully and directly. Do NOT invent extra content or apologies."
+        "You are an expert editor. Using ONLY the following condensed bullets "
+        "and the draft, rewrite so it fully answers the user without parroting "
+        "the question or plan. Do NOT invent new facts."
     )
-    editor_user = "\n\n".join((
-        f"USER QUESTION:\n{user_text}",
-        "RELEVANT BULLETS:\n" + bullets,
-        "CURRENT DRAFT:\n" + draft,
-    ))
+    editor_user = (
+        f"USER QUESTION:\n{user_text}\n\n"
+        "CONDENSED CONTEXT:\n" + bullets + "\n\n"
+        "CURRENT DRAFT:\n" + draft
+    )
 
     polished = self._stream_and_capture(
         self.secondary_model,
         [
-            {"role": "system", "content": editor_sys},
-            {"role": "user",   "content": editor_user},
+            {"role":"system","content":editor_sys},
+            {"role":"user","content":editor_user},
         ],
         tag="[Polisher]",
-        images=state.get("images"),
+        images=state.get("images")
     ).strip()
 
-    # short-circuit if unchanged
+    # 3) if unchanged, just return
     if polished == draft.strip():
         return polished
 
-    # ————————————————————————————————————————
-    # 3️⃣  Diff summary + dynamic-prompt patch
-    # ————————————————————————————————————————
-    diff = difflib.unified_diff(
-        draft.splitlines(), polished.splitlines(), lineterm="", n=1
+    # 4) record diff as dynamic patch
+    diff_lines = difflib.unified_diff(
+        draft.splitlines(), polished.splitlines(),
+        lineterm="", n=1
     )
-    diff_summary = "; ".join(
-        ln for ln in diff if ln.startswith(("+ ", "- "))
-    ) or "(minor re-formatting)"
+    diff_summary = "; ".join(l for l in diff_lines if l.startswith(("+ ","- ")))
+    if not diff_summary:
+        diff_summary = "(minor reformatting)"
 
-    # upsert / refresh the dynamic-prompt patch
-    patch_rows = self.repo.query(
-        lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
+    # update dynamic_prompt_patch policy
+    existing = self.repo.query(
+        lambda c: c.component=="policy" and c.semantic_label=="dynamic_prompt_patch"
     )
-    patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
-    patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
+    existing.sort(key=lambda c: c.timestamp, reverse=True)
+    patch = existing[0] if existing else ContextObject.make_policy(
         "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
     )
     if patch.summary != diff_summary:
@@ -1534,23 +1494,21 @@ def _stage10b_response_critique_and_safety(
         patch.metadata["policy"] = diff_summary
         patch.touch(); self.repo.save(patch)
 
-    # ————————————————————————————————————————
-    # 4️⃣  Persist polished reply + critique
-    # ————————————————————————————————————————
+    # 5) persist polished reply + critique artefacts
     resp_ctx = ContextObject.make_stage(
-        "response_critique", [sum_ctx.context_id], {"text": polished}
+        "response_critique",
+        [patch.context_id],
+        {"text": polished}
     )
-    resp_ctx.stage_id = "response_critique"
-    resp_ctx.summary  = polished
+    resp_ctx.stage_id="response_critique"; resp_ctx.summary=polished
     resp_ctx.touch(); self.repo.save(resp_ctx)
 
     critique_ctx = ContextObject.make_stage(
         "plan_critique",
         [resp_ctx.context_id] + [c.context_id for c in tool_ctxs],
-        {"critique": polished, "diff": diff_summary},
+        {"critique": polished, "diff": diff_summary}
     )
-    critique_ctx.component      = "analysis"
-    critique_ctx.semantic_label = "plan_critique"
+    critique_ctx.component="analysis"; critique_ctx.semantic_label="plan_critique"
     critique_ctx.touch(); self.repo.save(critique_ctx)
 
     return polished
