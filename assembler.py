@@ -1771,7 +1771,7 @@ class Assembler:
                 "You are attentive to the ongoing conversation, and if you should interject or reply. Bias to true if it seems like a request or question, otherwise false. "
                 "Answer exactly {arg1} or {arg2}."
             ),
-            history_size=8,
+            history_size=3,
             var_names=["arg1", "arg2"],
             record=False      # ← don’t persist this check
         )
@@ -1786,7 +1786,7 @@ class Assembler:
                 "You judge a binary decision based on the nature of the most recent message, you must decide whether or not the request might require additional stages to resolve, if there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
                 "Answer exactly {arg1} or {arg2}."
             ),
-            history_size=6,
+            history_size=3,
             var_names=["arg1", "arg2"],
             record=False      # ← don’t persist this check
         )

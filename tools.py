@@ -2679,14 +2679,15 @@ class Tools:
         """
         Retrieve chat/context objects from the specified repository file.
 
-        - `repository`: either "active_repo" (uses the default JSONL+SQLite on disk)
-                        or a path to a .jsonl file (it will look for the same-stem .db).
+
         - `limit` / `count`: number of entries to return (alias for `n`).
         - `direction`: "forward" (oldest→newest) or "backward" (newest→oldest; default).
         - `time`: a period like "today", "yesterday", or "last N days".
         - `n`: also controls count when `time` is numeric or missing.
-        - `keyword` / `query`: free-text to run a simple substring + embedding rerank.
+        - `keyword` / `query`: free-text to run a simple substring + embedding re-rank.
         - `domain` / `component` / `semantic_label`: exact-match or list filters.
+        - `repository`: either "active_repo" (uses the singleton JSONL+SQLite)
+                        or a path to a .jsonl file (it will look for the same-stem .db) There is no need to invoke this argument as it is automatic.
 
         Returns:
             {"output": {"results": [
@@ -2698,24 +2699,26 @@ class Tools:
         from numpy import dot, linalg
         from context import HybridContextRepository, Utils
 
-        # normalize count alias
-        if limit is not None:
-            n = limit
-        if count is not None:
-            n = count
+        # normalize count aliases
+        if limit  is not None: n = limit
+        if count  is not None: n = count
 
-        # pick free-text arg
-        txt_arg = query or keyword or time if time and not re.fullmatch(r"\d+", time) else query or keyword
+        # determine free-text arg (ignore pure numeric time)
+        txt_arg = None
+        if time and not re.fullmatch(r"\d+", time):
+            txt_arg = query or keyword or time
+        else:
+            txt_arg = query or keyword
 
-        # — load the repo instance —
+        # — instantiate the repo —
         if repository == "active_repo":
             repo = HybridContextRepository.instance()
         else:
-            # assume `repository` is a path to a .jsonl file
             sqlite = repository.replace(".jsonl", ".db")
-            repo = HybridContextRepository(jsonl_path=repository, sqlite_path=sqlite)
+            repo = HybridContextRepository(jsonl_path=repository,
+                                           sqlite_path=sqlite)
 
-        # — fetch every context object and project to a simple dict —
+        # — fetch and project into simple dicts —
         entries = []
         for c in repo.query(lambda c: True):
             entries.append({
@@ -2728,12 +2731,12 @@ class Tools:
             })
 
         # — helper for exact-or-list matching —
-        def match(value, flt):
+        def match(val, flt):
             if flt is None: return True
-            if isinstance(flt, (list, tuple)): return value in flt
-            return value == flt
+            if isinstance(flt, (list,tuple)): return val in flt
+            return val == flt
 
-        # — apply domain/component/label filters —
+        # — apply filters —
         entries = [
             e for e in entries
             if match(e["domain"],         domain)
@@ -2752,24 +2755,23 @@ class Tools:
         results: list[dict] = []
         if isinstance(time, str) and not re.fullmatch(r"\d+", time):
             period = time.lower().strip()
-            now   = datetime.utcnow()
-            today = now.date()
-
+            now, today = datetime.utcnow(), datetime.utcnow().date()
             if period == "today":
                 start = datetime.combine(today, datetime.min.time())
                 end   = start + timedelta(days=1)
             elif period == "yesterday":
-                start = datetime.combine(today - timedelta(days=1), datetime.min.time())
+                start = datetime.combine(today - timedelta(days=1),
+                                         datetime.min.time())
                 end   = datetime.combine(today, datetime.min.time())
             else:
                 m = re.match(r"last\s+(\d+)\s+days?", period)
                 if m:
                     d = int(m.group(1))
-                    start = datetime.combine(today - timedelta(days=d), datetime.min.time())
+                    start = datetime.combine(today - timedelta(days=d),
+                                             datetime.min.time())
                     end   = now
                 else:
                     start = end = None
-
             if start and end:
                 for e in entries:
                     try:
@@ -2784,17 +2786,11 @@ class Tools:
         else:
             # — count & relevance mode —
             top_n = int(n) if n is not None else len(entries)
-
-            # if `time` was purely numeric, treat it as count override
             if isinstance(time, str) and re.fullmatch(r"\d+", time):
                 top_n = int(time)
 
-            # filter by recency if desired (could add a `since` arg here)
-
-            # relevance ranking if we have free text
             if txt_arg:
                 qv = Utils.embed_text(txt_arg)
-                # only score the most recent 100 to save time
                 candidates = entries[-100:]
                 scored = []
                 for e in candidates:
@@ -2802,7 +2798,7 @@ class Tools:
                     score = float(txt_arg.lower() in text.lower())
                     vv = Utils.embed_text(text)
                     if linalg.norm(qv) and linalg.norm(vv):
-                        score += float(dot(qv, vv) / (linalg.norm(qv) * linalg.norm(vv)))
+                        score += float(dot(qv,vv)/(linalg.norm(qv)*linalg.norm(vv)))
                     scored.append((score, e))
                 scored.sort(key=lambda x: x[0], reverse=True)
                 results = [e for _, e in scored[:top_n]]
@@ -2811,12 +2807,14 @@ class Tools:
                 results = list(reversed(entries))[:top_n]
 
         # — apply direction ordering —
-        reverse = not (direction and direction.lower().startswith("fwd"))
-        results.sort(key=lambda e: parse_ts(e["timestamp"]), reverse=reverse)
+        rev = not (direction and direction.lower().startswith("fwd"))
+        results.sort(key=lambda e: parse_ts(e["timestamp"]), reverse=rev)
 
-        # — finally, strip to only the three allowed fields —
+        # — strip to allowed fields —
         out = [
-            {"timestamp": e["timestamp"], "role": e["role"], "content": e["content"]}
+            {"timestamp": e["timestamp"],
+             "role":      e["role"],
+             "content":   e["content"]}
             for e in results
         ]
 
@@ -3356,14 +3354,32 @@ class Tools:
         temperature: float = 0.7,
         system: str | None = None,
         context: object | None = None,
+        retrieval_count: int = 0,
         model_tier: str | None = None,
         images: list[bytes] | None = None
     ) -> str:
         """
-        Invoke an LLM with a prompt, optional system/context, configurable
-        model tier, and *optional* images (raw bytes). If you supply
-        `images=[b'...']`, those bytes go straight into the last user message.
-        Otherwise we fall back to scanning the prompt for .jpg/.png URLs or paths.
+        Invoke an LLM with a prompt, optional system instructions, and an
+        explicit *narrative/context injection* mechanism:
+
+        - `context`: supply a high-level narrative object (e.g. the output of
+            `_load_narrative_context()`) so the model can ground its response
+            in the overall story arc.
+        - `retrieval_count`: indicate how many of the most recent context snippets
+            the LLM should consider.  If >0, callers are encouraged to prepend
+            a block like:
+                “Here are the last {retrieval_count} context snippets: …”
+            to the `prompt` (or via `context=`) so that the model can weave them
+            into its auxiliary inference.
+        - `model_tier`: choose among "primary", "secondary", or "decision" tiers.
+        - `images`: raw bytes to embed directly in the final user message;
+            falls back to scanning `prompt` for image URLs or file paths.
+
+        This helper is designed both for programmatic use *and* as a tool that
+        an LLM can call when it wants to “pull in” narrative context and recent
+        retrievals before performing its reasoning.
+
+        Returns the raw string output from the chosen LLM.
         """
         import re, json, requests
 
@@ -3372,17 +3388,26 @@ class Tools:
             "primary":   config.get("primary_model"),
             "secondary": config.get("secondary_model", config.get("primary_model")),
             "decision":  config.get("decision_model",
-                          config.get("secondary_model", config.get("primary_model")))
+                        config.get("secondary_model", config.get("primary_model")))
         }
         model_selected = tier_map.get((model_tier or "primary").lower(),
-                                      config.get("primary_model"))
+                                    config.get("primary_model"))
 
         # 2) assemble messages
-        messages: list[dict[str,str]] = []
+        messages: list[dict[str, str]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
+
+        # if context is provided, treat it as a narrative block
         if context is not None:
-            messages.append({"role": "system", "content": str(context)})
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"### Narrative Context (last {retrieval_count} snippets) ###\n"
+                    f"{context}"
+                )
+            })
+
         messages.append({"role": "user", "content": prompt})
 
         # 3) load images if none explicitly provided
@@ -3404,7 +3429,7 @@ class Tools:
                 except Exception:
                     continue
 
-        # 4) inject images into the last message dict if we have any
+        # 4) inject images into the last message if present
         if images_data:
             messages[-1]["images"] = images_data
 
@@ -3413,7 +3438,7 @@ class Tools:
             log_message(
                 f"auxiliary_inference(model={model_selected}, "
                 f"temp={temperature}, tier={model_tier}, "
-                f"images={len(images_data)})",
+                f"retrievals={retrieval_count}, images={len(images_data)})",
                 "PROCESS"
             )
             content = ""
@@ -3434,8 +3459,6 @@ class Tools:
         except Exception as e:
             log_message(f"auxiliary_inference error: {e}", "ERROR")
             return json.dumps({"error": str(e)})
-
-
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
