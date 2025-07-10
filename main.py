@@ -384,7 +384,7 @@ if updated:
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
-    
+
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 import subprocess
 
@@ -682,7 +682,6 @@ def start_telegram_pipeline():
             tts_manager      = tts_tele,
         )
 
-        # ← previously you had notify_admin(asm_tele) by mistake
         telegram_input(asm_tele)
 
     except Exception:

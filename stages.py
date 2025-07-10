@@ -522,36 +522,33 @@ def _stage7_planning_summary(
         parts = desc.split(".", 1)
         return parts[0] + "." if len(parts) > 1 else desc
 
-    # 0) prior critiques
+    # 0) collect any prior plan_critique IDs
     critique_rows = self.repo.query(
         lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"
     )
     critique_rows.sort(key=lambda c: c.timestamp)
     critique_ids = [c.context_id for c in critique_rows]
 
-    # 1) planning prompt (keep only first two sentences)
+    # 1) load the two-sentence planning prompt
     prompt_rows = self.repo.query(
         lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"
     )
     prompt_rows.sort(key=lambda c: c.timestamp, reverse=True)
     raw_prompt = prompt_rows[0].summary if prompt_rows else self._get_prompt("planning_prompt")
-    # keep only first two sentences
     first_two = ".".join(raw_prompt.split(".", 2)[:2]) + "."
 
-    # 2) truncated tool list (first‐sentence descriptions)
+    # 2) build truncated tool list
     tool_lines = "\n".join(
         f"- **{t['name']}**: {_first_sentence(t['description'])}"
         for t in tools_list
     ) or "(none)"
-
-    # use the two-sentence prompt instead of the full summary
     base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
     replan_system = (
         "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.\n\n"
         f"Available tools:\n{tool_lines}"
     )
 
-    # 3) user block
+    # 3) prepare user block
     original_snips = (know_ctx.summary or "").splitlines()
     def build_user(snips):
         return "\n\n".join([
@@ -561,7 +558,7 @@ def _stage7_planning_summary(
         ])
     full_user = build_user(original_snips)
 
-    # 4) Planner passes
+    # 4) run up to 3 planner passes
     last_calls = None
     plan_obj = None
     for attempt in range(1, 4):
@@ -594,22 +591,28 @@ def _stage7_planning_summary(
         last_calls = [t["call"] for t in plan_obj["tasks"]]
         break
 
-    # 5) REFINE pass with explicit key instructions
+    # 5) REFINE pass: show bullets + schema without the big description
     selected = {t["call"] for t in plan_obj["tasks"]}
     schema_lines = []
-    for t in tools_list:
-        if t["name"] in selected:
-            schema_lines.append(f"**{t['name']}**\n```json\n{json.dumps(t['schema'], indent=2)}\n```")
+    for tool in tools_list:
+        if tool["name"] in selected:
+            schema = dict(tool["schema"])
+            desc_text = schema.pop("description", "")
+            desc_bullets = "\n".join(f"- {ln.strip()}" for ln in desc_text.splitlines() if ln.strip())
+            schema_json = json.dumps(schema, indent=2)
+            schema_lines.append(
+                f"**{tool['name']}**\n"
+                f"{desc_bullets}\n\n"
+                f"```json\n{schema_json}\n```"
+            )
 
     if schema_lines:
-        # Extract parameter names from the JSON schema
-        # (here hard-coded for search_internet, but you could parse from schema dict)
+        # list required params
         param_list = []
         for t in tools_list:
             if t["name"] in selected:
                 props = t["schema"]["parameters"]["properties"]
                 required = t["schema"]["parameters"]["required"]
-                # Only list required params
                 for p in required:
                     param_list.append(f"- `{p}`: {props[p].get('type')}")
         param_block = "\n".join(param_list)
@@ -617,10 +620,15 @@ def _stage7_planning_summary(
         refine_system = (
             "Now that you've selected your tool(s), please *use exactly* the following parameter names:\n"
             f"{param_block}\n\n"
-            "Fill in any missing `tool_input` entries and *rename* any incorrect keys (e.g. change `query` to `topic`).\n\n"
+            "Fill in any missing `tool_input` entries and *rename* any incorrect keys.\n\n"
             "Full schemas:\n\n" + "\n\n".join(schema_lines)
         )
         refine_user = json.dumps({"tasks": plan_obj["tasks"]})
+
+        # log it for visibility
+        print("\n── REFINE_SYSTEM START ──")
+        print(refine_system)
+        print("── REFINE_SYSTEM END ──\n")
 
         raw2 = self._stream_and_capture(
             self.secondary_model,
@@ -636,7 +644,7 @@ def _stage7_planning_summary(
         except:
             pass
 
-    # 6) flatten & serialize
+    # 6) flatten + build call strings
     def _flatten(task):
         out = [task]
         for sub in task.get("subtasks", []):
@@ -660,7 +668,7 @@ def _stage7_planning_summary(
     plan_json = json.dumps(plan_obj, ensure_ascii=False)
     plan_sig  = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
 
-    # 7) persist
+    # 7) persist everything
     ctx = ContextObject.make_stage(
         "planning_summary",
         clar_ctx.references + know_ctx.references + critique_ids,
@@ -694,6 +702,7 @@ def _stage7_planning_summary(
     tracker.touch(); self.repo.save(tracker)
 
     return ctx, plan_json
+
 
 
 def _stage7b_plan_validation(
@@ -828,6 +837,7 @@ def _stage7b_plan_validation(
 
     return fixed_calls, [], fixed_calls
 
+
 def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
@@ -838,62 +848,73 @@ def _stage8_tool_chaining(
     import json, re
     from tools import Tools
 
-    # 0) load schemas
+    # Ensure that Tools can always reach the current repo
+    Tools.repo = self.repo
+
+    # 0) load schemas from the repo
     schema_map = {
         json.loads(s.metadata["schema"])["name"]: json.loads(s.metadata["schema"])
         for s in self.repo.query(lambda c: c.component=="schema" and "tool_schema" in c.tags)
     }
 
-    # A) extract calls
-    calls = []
+    # A) extract flat list of calls from the JSON plan (or fallback via regex)
+    calls: List[str] = []
     try:
         plan = json.loads(plan_output)
         def flatten(tasks):
-            out=[]
+            out = []
             for t in tasks:
                 out.append(t)
-                out.extend(flatten(t.get("subtasks",[])))
+                out.extend(flatten(t.get("subtasks", [])))
             return out
-        for t in flatten(plan.get("tasks",[])):
-            name = t["call"].split("(",1)[0]
-            params = t.get("tool_input",{}) or {}
+
+        for t in flatten(plan.get("tasks", [])):
+            name   = t["call"].split("(", 1)[0]
+            params = t.get("tool_input", {}) or {}
             if params:
-                arg_s = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k,v in params.items())
+                arg_s = ",".join(
+                    f"{k}={json.dumps(v, ensure_ascii=False)}"
+                    for k, v in params.items()
+                )
                 calls.append(f"{name}({arg_s})")
             else:
                 calls.append(f"{name}()")
-    except:
-        # fallback regex extraction
+    except Exception:
         salvage = set()
         for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\(([^)]*)\)', plan_output):
             nm, raw = m.group(1), m.group(2).strip()
             salvage.add(f"{nm}({raw})" if raw else f"{nm}()")
         calls.extend(sorted(salvage))
 
-    # B) pick matching schemas
+    # B) pick matching schema ContextObjects
     wanted = {c.split("(",1)[0] for c in calls}
     selected_schemas = [
         s for s in self.repo.query(lambda c: c.component=="schema" and "tool_schema" in c.tags)
         if json.loads(s.metadata["schema"])["name"] in wanted
     ]
 
-    # C) actually call each tool
-    tool_ctxs = []
-    confirmed = []
+    # C) actually invoke each tool, injecting assembler & logging verbosely
+    tool_ctxs: List[ContextObject] = []
+    confirmed: List[str]  = []
     for call_str in calls:
         name, arg_blob = call_str.split("(",1)
-        arg_blob = arg_blob[:-1]  # strip trailing )
-        # parse kwargs
+        arg_blob = arg_blob.rstrip(")")
+
+        # parse kwargs from the call string
         try:
             kwargs = json.loads("{" + arg_blob + "}")
-        except:
-            # simple k=v fallback
+        except Exception:
             kwargs = {}
             for part in arg_blob.split(","):
                 if "=" in part:
-                    k,v = part.split("=",1)
-                    try: kwargs[k]=json.loads(v)
-                    except: kwargs[k]=v.strip('"\'')
+                    k, v = part.split("=", 1)
+                    try:
+                        kwargs[k] = json.loads(v)
+                    except Exception:
+                        kwargs[k] = v.strip('"\'')
+
+        # Inject the assembler itself so tools always have .repo
+        kwargs.setdefault("assembler", self)
 
         func = getattr(Tools, name)
         try:
@@ -902,20 +923,30 @@ def _stage8_tool_chaining(
         except Exception as e:
             output, exception = None, str(e)
 
-        # persist
-        sch_ctx = next((s for s in selected_schemas
-                        if json.loads(s.metadata["schema"])["name"]==name), None)
+        # Verbose log for debugging
+        print(f"[ToolInvocation] {name} called with {kwargs!r} → output={output!r}, exception={exception!r}")
+
+        # persist the tool_output context
+        sch_ctx = next(
+            (s for s in selected_schemas
+             if json.loads(s.metadata["schema"])["name"] == name),
+            None
+        )
         refs = [sch_ctx.context_id] if sch_ctx else []
-        ctx = ContextObject.make_stage("tool_output", refs, {"output": output, "exception": exception})
+        ctx = ContextObject.make_stage(
+            "tool_output",
+            refs,
+            {"tool_call": call_str, "output": output, "exception": exception}
+        )
         ctx.stage_id = f"tool_output_{name}"
         ctx.summary  = repr(output) if exception is None else f"ERROR: {exception}"
-        ctx.metadata.update({"tool_call": call_str, "output": output, "exception": exception})
-        ctx.touch(); self.repo.save(ctx)
+        ctx.touch()
+        self.repo.save(ctx)
 
         tool_ctxs.append(ctx)
         confirmed.append(call_str)
 
-    # D) persist chaining record
+    # D) record the chaining itself
     tc_ctx = ContextObject.make_stage(
         "tool_chaining",
         plan_ctx.references + [s.context_id for s in selected_schemas],
@@ -923,9 +954,10 @@ def _stage8_tool_chaining(
     )
     tc_ctx.stage_id = "tool_chaining"
     tc_ctx.summary  = json.dumps(confirmed, ensure_ascii=False)
-    tc_ctx.touch(); self.repo.save(tc_ctx)
+    tc_ctx.touch()
+    self.repo.save(tc_ctx)
 
-    # ★ stash for downstream
+    # make tool_ctxs available downstream
     state["tool_ctxs"] = tool_ctxs
 
     return tc_ctx, confirmed, tool_ctxs
@@ -1338,10 +1370,11 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     interm="\n\n".join(parts)
 
     # debug print of every tool output object
-    print(">>> [DEBUG] Tool outputs captured this turn:")
+    print("🮕🮖🮖 TOOL OUTPUTS CAPTURED 🮖🮖\n")
     for tc in state.get("tool_ctxs",[]):
-        print(f"  - {tc.stage_id}: {tc.metadata.get('output')!r}")
-    print(">>> end tool outputs\n\n")
+        print(f"🡶 {tc.stage_id} 🡷")
+        print(f"{tc.metadata.get('output')!r}\n")
+    print("🮕🮖🮖🮖 END TOOL OUTPUTS 🮖🮖🮖🮖\n\n")
 
     # 4) log
     self._print_stage_context("assemble_and_infer", {

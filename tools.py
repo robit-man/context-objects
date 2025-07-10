@@ -7,6 +7,10 @@ from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
 from context import ContextRepository, ContextObject, default_clock
+
+import os, json, re, difflib
+from datetime import datetime, timedelta
+
 from ollama import chat, embed
 import cv2
 import mss
@@ -402,191 +406,141 @@ class Tools:
 
         logging.debug("Parsed tool call from text: None (AST check failed)")
         return None
-
+    
+    @staticmethod
     def context_query(
-        time_range: Optional[List[str]]     = None,
-        tags: Optional[List[str]]           = None,
-        exclude_tags: Optional[List[str]]   = None,
-        domain: Optional[List[str]]         = None,
-        component: Optional[List[str]]      = None,
-        semantic_label: Optional[List[str]] = None,
-        summary_regex: Optional[str]        = None,
-        similarity_to: Optional[str]        = None,
-        query: Optional[str]                = None,
-        top_k: int                          = 5,
-        wm_only: bool                       = False,
-        wm_type: Optional[str]              = None,
-        window: Optional[str]               = None,
-        max_entries: Optional[int]          = None,
+        assembler,  # Instance of Assembler with .repo, .engine, .memman
+        time_range: list[str] | None = None,
+        tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        domain: list[str] | None = None,
+        component: list[str] | None = None,
+        semantic_label: list[str] | None = None,
+        summary_regex: str | None = None,
+        similarity_to: str | None = None,
+        query: str | None = None,
+        top_k: int = 5,
+        wm_only: bool = False,
+        wm_type: str | None = None,
+        window: str | None = None,
+        max_entries: int | None = None,
     ) -> str:
         """
-        Query the context store with flexible filters and retrieval options.
-
-        Positional arguments (all optional):
-        - time_range:     A two-element list [start_ts, end_ts] where each timestamp is in ISO format
-                            or "YYYYmmddTHHMMSSZ". Filters objects whose .timestamp falls within the range.
-        - tags:           List of tags; only objects containing ≥1 of these tags will be included.
-        - exclude_tags:   List of tags; objects containing ≥1 of these tags will be excluded.
-        - domain:         List of domain names to include (e.g. ["segment", "tool_output"]).
-        - component:      List of component names to include (e.g. ["memory", "analysis"]).
-        - semantic_label: List of semantic_label values to include (e.g. ["user_input", "final_inference"]).
-        - summary_regex:  A regular expression; only objects whose .summary matches (case-insensitive) will be kept.
-        - similarity_to:  A string; performs a similarity search. If available, uses your vector engine (engine.query),
-                            otherwise falls back to fuzzy matching via difflib. Alias: query.
-        - query:          Alias for similarity_to.
-        - top_k:          Maximum number of results to return (default 5).
-        - wm_only:        If True, restricts to the “working memory” buckets (raw segments + inferences).
-        - wm_type:        If "segments", only include raw segment entries; if "infers", only final_inference entries.
-        - window:         A human-readable duration (e.g. "5 minutes", "1 hour", "1 day"); filters to items newer
-                            than now minus that duration.
-        - max_entries:    After all other filters and ranking, keep only the last N items (oldest→newest).
-
-        Returns:
-        A JSON-formatted string:
-            {
-            "results": [
-                {
-                "context_id":     <str>,
-                "timestamp":      <str>,
-                "domain":         <str>,
-                "component":      <str>,
-                "semantic_label": <str>,
-                "summary":        <str>
-                },
-                ...
-            ]
-            }
-
-        Usage examples:
-
-        # 1) Get the last 10 working memory segments:
-        context_query(wm_type="segments", max_entries=10)
-
-        # 2) Get up to 20 items from the past hour, filtered by tag:
-        context_query(window="1 hour", max_entries=20, tags=["important"])
-
-        # 3) Perform a similarity search against your vector engine:
-        context_query(similarity_to="project deadline", top_k=5)
-
-        # 4) Combine time_range + domain + regex:
-        context_query(
-            time_range=["20250705T000000Z","20250706T235959Z"],
-            domain=["segment","tool_output"],
-            summary_regex="error"
-        )
+        Query the assembler's context store with flexible filters; never falls back on context.jsonl.
+        Prints verbose logs at each major step.
+        Returns JSON-formatted string with 'results'.
         """
-        import os, json, re, difflib
-        from datetime import datetime, timedelta
-        from typing import Any, Dict, List, Tuple
-        # adjust import path as needed:
-        from context import ContextRepository
-
-        # alias
+        print("=== context_query called ===")
+        print(f"Args: time_range={time_range}, tags={tags}, exclude_tags={exclude_tags}, "
+            f"domain={domain}, component={component}, semantic_label={semantic_label}, "
+            f"summary_regex={summary_regex}, similarity_to={similarity_to or query}, "
+            f"top_k={top_k}, wm_only={wm_only}, wm_type={wm_type}, window={window}, max_entries={max_entries}")
         if query and not similarity_to:
             similarity_to = query
+        ctxs = list(assembler.repo.query(lambda c: True))
+        print(f"Loaded {len(ctxs)} context objects from assembler.repo")
 
-        repo    = ContextRepository(os.path.join(os.getcwd(), "context.jsonl"))
-        all_ctx = repo.query(lambda c: True)
-
-        # ───── WM shortcuts ─────────────────────────────────────────
+        # WM shortcuts
         if wm_only:
-            all_ctx = [
-                c for c in all_ctx
-                if (c.domain=="segment" and c.semantic_label in ("user_input","assistant"))
-                or c.semantic_label=="final_inference"
-            ]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if (c.domain=="segment" and c.semantic_label in ("user_input","assistant")) or c.semantic_label=="final_inference"]
+            print(f"{len(ctxs)} of {before} after wm_only filter")
         if wm_type == "segments":
-            all_ctx = [
-                c for c in all_ctx
-                if c.domain=="segment" and c.semantic_label in ("user_input","assistant")
-            ]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.domain=="segment" and c.semantic_label in ("user_input","assistant")]
+            print(f"{len(ctxs)} of {before} after wm_type='segments'")
         if wm_type == "infers":
-            all_ctx = [c for c in all_ctx if c.semantic_label=="final_inference"]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.semantic_label=="final_inference"]
+            print(f"{len(ctxs)} of {before} after wm_type='infers'")
 
-        # ───── Timestamp parser ───────────────────────────────────────
+        # parse window
         def _parse(ts: str) -> datetime:
-            try:
-                return datetime.fromisoformat(ts)
-            except ValueError:
-                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+            try: return datetime.fromisoformat(ts)
+            except: return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
 
-        # ───── Time‐window filter ─────────────────────────────────────
         if window:
             m = re.match(r"(\d+)\s*(\w+)", window)
             if m:
                 val, unit = int(m.group(1)), m.group(2).lower().rstrip("s")
-                delta_map = {
-                    "minute": timedelta(minutes=val),
-                    "hour":   timedelta(hours=val),
-                    "day":    timedelta(days=val),
-                }
-                delta = delta_map.get(unit, timedelta())
+                delta = {"minute": timedelta(minutes=val), "hour": timedelta(hours=val), "day": timedelta(days=val)}.get(unit, timedelta())
                 cutoff = datetime.utcnow() - delta
-                all_ctx = [c for c in all_ctx if _parse(c.timestamp) >= cutoff]
+                before = len(ctxs)
+                ctxs = [c for c in ctxs if _parse(c.timestamp) >= cutoff]
+                print(f"{len(ctxs)} of {before} after window filter '{window}'")
 
-        # ───── Tag / domain / component / semantic_label filters ─────
+        # tag/domain/component filters
         if tags:
-            all_ctx = [c for c in all_ctx if set(tags) & set(c.tags)]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if set(tags) & set(c.tags)]
+            print(f"{len(ctxs)} of {before} after tags filter")
         if exclude_tags:
-            all_ctx = [c for c in all_ctx if not (set(exclude_tags) & set(c.tags))]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if not (set(exclude_tags) & set(c.tags))]
+            print(f"{len(ctxs)} of {before} after exclude_tags filter")
         if domain:
-            all_ctx = [c for c in all_ctx if c.domain in domain]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.domain in domain]
+            print(f"{len(ctxs)} of {before} after domain filter")
         if component:
-            all_ctx = [c for c in all_ctx if c.component in component]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.component in component]
+            print(f"{len(ctxs)} of {before} after component filter")
         if semantic_label:
-            all_ctx = [c for c in all_ctx if c.semantic_label in semantic_label]
-
-        # ───── Summary‐regex filter ───────────────────────────────────
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.semantic_label in semantic_label]
+            print(f"{len(ctxs)} of {before} after semantic_label filter")
         if summary_regex:
             pat = re.compile(summary_regex, re.IGNORECASE)
-            all_ctx = [c for c in all_ctx if c.summary and pat.search(c.summary)]
+            before = len(ctxs)
+            ctxs = [c for c in ctxs if c.summary and pat.search(c.summary)]
+            print(f"{len(ctxs)} of {before} after summary_regex filter")
 
-        # ───── Similarity / recency ranking ──────────────────────────
-        selected: List[Any] = []
+        # similarity or recency ranking
+        selected = []
         if similarity_to:
+            print(f"Performing similarity ranking to '{similarity_to}'")
             try:
-                # Vector‐search hook: replace with your engine API
-                results = engine.query(
+                results = assembler.engine.query(
                     similarity_to=similarity_to,
                     include_tags=tags,
                     exclude_tags=exclude_tags,
                     time_range=time_range,
                     top_k=top_k
                 )
-                selected = [repo.get(r.context_id) for r in results]
+                selected = [assembler.repo.get(r.context_id) for r in results]
+                print(f"Selected {len(selected)} via vector engine")
             except NameError:
-                # fallback fuzzy match
-                scored: List[Tuple[float, Any]] = []
-                key = similarity_to.lower()
-                for c in all_ctx:
-                    txt = (c.summary or "").lower()
-                    score = difflib.SequenceMatcher(None, key, txt).ratio()
-                    scored.append((score, c))
+                print("Vector engine unavailable, falling back to fuzzy matching")
+                scored = [(re.compile(re.escape(similarity_to), re.IGNORECASE).search((c.summary or "")) and 1.0 or 0.0, c) for c in ctxs]
                 scored.sort(key=lambda x: x[0], reverse=True)
                 selected = [c for _, c in scored[:top_k]]
+                print(f"Selected {len(selected)} via fallback fuzzy match")
         else:
-            # recency sort
-            all_ctx.sort(key=lambda c: _parse(c.timestamp), reverse=True)
-            selected = all_ctx[:top_k]
+            ctxs.sort(key=lambda c: _parse(c.timestamp), reverse=True)
+            selected = ctxs[:top_k]
+            print(f"Selected top {len(selected)} by recency")
 
-        # ───── Cap by max_entries ────────────────────────────────────
+        # cap by max_entries
         if max_entries is not None:
-            # keep the last `max_entries` from selected
+            before = len(selected)
             selected = selected[-max_entries:]
+            print(f"Capped to {len(selected)} entries by max_entries={max_entries}")
 
-        # ───── Format output ──────────────────────────────────────────
-        out: List[Dict[str, Any]] = []
+        # register recalls
         for c in selected:
-            out.append({
-                "context_id":     c.context_id,
-                "timestamp":      c.timestamp,
-                "domain":         c.domain,
-                "component":      c.component,
-                "semantic_label": c.semantic_label,
-                "summary":        c.summary or ""
-            })
+            c.record_recall(stage_id="context_query", coactivated_with=[])
+            assembler.repo.save(c)
+            assembler.memman.register_relationships(c, assembler.engine.embedder)
 
-        return json.dumps({"results": out}, indent=2)
+        # format output
+        out = [{"context_id": c.context_id, "timestamp": c.timestamp,
+                "domain": c.domain, "component": c.component,
+                "semantic_label": c.semantic_label, "summary": c.summary or ""}
+            for c in selected]
+        json_out = json.dumps({"results": out}, indent=2)
+        print("Returning context_query results")
+        return json_out
 
 
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
@@ -2664,161 +2618,188 @@ class Tools:
     
     @staticmethod
     def get_chat_history(
-        repository: str = "active_repo",
-        limit:     int   | None = None,
-        direction: str   | None = None,
-        time:      str   | None = None,
-        n:         int   | None = None,
-        domain:    str   | list[str] | None = None,
-        component: str   | list[str] | None = None,
-        semantic_label: str | list[str] | None = None,
-        keyword:   str   | None = None,
-        query:     str   | None = None,
-        count:     int   | None = None,
-    ) -> dict[str, Any]:
+        assembler,                # required: Assembler instance (must have `.repo`)
+        limit:   int | None = None,
+        direction:str | None = None,
+        time:    str | None = None,
+        time_range: str | None = None,
+        n:       int | None = None,
+        domain:  str | list[str] | None = None,
+        component: str|list[str] | None = None,
+        semantic_label: str|list[str] | None = None,
+        keyword: str | None = None,
+        query:   str | None = None,
+        count:   int | None = None,
+    ) -> dict[str, list[dict[str, str]]]:
         """
-        Retrieve chat/context objects from the specified repository file.
+        Retrieve a slice of past chat/context entries from the in-memory repository.
 
-
-        - `limit` / `count`: number of entries to return (alias for `n`).
-        - `direction`: "forward" (oldest→newest) or "backward" (newest→oldest; default).
-        - `time`: a period like "today", "yesterday", or "last N days".
-        - `n`: also controls count when `time` is numeric or missing.
-        - `keyword` / `query`: free-text to run a simple substring + embedding re-rank.
-        - `domain` / `component` / `semantic_label`: exact-match or list filters.
-        - `repository`: either "active_repo" (uses the singleton JSONL+SQLite)
-                        or a path to a .jsonl file (it will look for the same-stem .db) There is no need to invoke this argument as it is automatic.
-
-        Returns:
-            {"output": {"results": [
-                {"timestamp": str, "role": str, "content": str}, …
-            ]}}
+        Parameters
+        ----------
+        assembler
+            An Assembler instance (must have a .repo attribute to query).
+        limit, n, count : int, optional
+            Alias for the maximum number of entries to return.
+        direction : str, optional
+            "fwd" or "forward" for oldest→newest, anything else for newest→oldest.
+        time, time_range : str, optional
+            Textual time window. Supports:
+            • "today", "yesterday"
+            • "last N days"       (e.g. "last 3 days")
+            • "last N hours"      (e.g. "last hour", "last 5 hours")
+            If omitted or unrecognized, returns purely by recency.
+        domain, component, semantic_label : str or list, optional
+            Filter by ContextObject.domain/component/semantic_label.
+        keyword, query : str, optional
+            If provided, rank the final candidates by simple
+            substring + embedding‐similarity relevance.
+        
+        Returns
+        -------
+        dict with key "output" → {"results": [ {timestamp, role, content}, … ]}
         """
-        import re, json
+        import re, traceback, json
         from datetime import datetime, timedelta
-        from numpy import dot, linalg
-        from context import HybridContextRepository, Utils
+        from numpy.linalg import norm
+        from numpy import dot
 
-        # normalize count aliases
-        if limit  is not None: n = limit
-        if count  is not None: n = count
+        print("\n=== get_chat_history called ===")
+        print(f"Inputs → limit={limit}, direction={direction}, time={time!r}, time_range={time_range!r},"
+              f" n={n}, domain={domain}, component={component}, semantic_label={semantic_label},"
+              f" keyword={keyword!r}, query={query!r}, count={count}\n")
 
-        # determine free-text arg (ignore pure numeric time)
-        txt_arg = None
-        if time and not re.fullmatch(r"\d+", time):
-            txt_arg = query or keyword or time
-        else:
-            txt_arg = query or keyword
+        try:
+            # 1) alias count/n/limit
+            if count is not None:
+                print(f"Aliasing count={count} → n")
+                n = count
+            if limit is not None:
+                print(f"Aliasing limit={limit} → n")
+                n = limit
 
-        # — instantiate the repo —
-        if repository == "active_repo":
-            repo = HybridContextRepository.instance()
-        else:
-            sqlite = repository.replace(".jsonl", ".db")
-            repo = HybridContextRepository(jsonl_path=repository,
-                                           sqlite_path=sqlite)
+            # 2) alias time_range → time
+            if time_range is not None:
+                print(f"Aliasing time_range={time_range!r} → time")
+                time = time_range
 
-        # — fetch and project into simple dicts —
-        entries = []
-        for c in repo.query(lambda c: True):
-            entries.append({
-                "timestamp":      c.timestamp,
-                "role":           c.metadata.get("role", ""),
-                "content":        c.metadata.get("content", c.summary or ""),
-                "domain":         c.domain,
-                "component":      c.component,
-                "semantic_label": c.semantic_label
-            })
+            # 3) fetch all entries
+            entries = []
+            for c in assembler.repo.query(lambda c: True):
+                entries.append({
+                    "timestamp":      c.timestamp,
+                    "role":           c.metadata.get("role", ""),
+                    "content":        c.metadata.get("content", c.summary or ""),
+                    "domain":         c.domain,
+                    "component":      c.component,
+                    "semantic_label": c.semantic_label,
+                })
+            print(f"Fetched {len(entries)} total entries from repo\n")
 
-        # — helper for exact-or-list matching —
-        def match(val, flt):
-            if flt is None: return True
-            if isinstance(flt, (list,tuple)): return val in flt
-            return val == flt
+            # 4) filter by domain/component/semantic_label
+            def _match(val, flt):
+                if flt is None: return True
+                if isinstance(flt, (list, tuple)): return val in flt
+                return val == flt
 
-        # — apply filters —
-        entries = [
-            e for e in entries
-            if match(e["domain"],         domain)
-            and match(e["component"],     component)
-            and match(e["semantic_label"],semantic_label)
-        ]
+            before = len(entries)
+            entries = [
+                e for e in entries
+                if _match(e["domain"], domain)
+                and _match(e["component"], component)
+                and _match(e["semantic_label"], semantic_label)
+            ]
+            print(f"{len(entries)} entries after domain/component/semantic_label filters (was {before})\n")
 
-        # — timestamp parser —
-        def parse_ts(s: str) -> datetime:
-            try:
-                return datetime.fromisoformat(s.rstrip("Z"))
-            except:
-                return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
+            # 5) parse timestamps helper
+            def _parse(s: str) -> datetime:
+                try:
+                    return datetime.fromisoformat(s.rstrip("Z"))
+                except:
+                    return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
 
-        # — timeframe filtering (“today”, “last N days”, etc.) —
-        results: list[dict] = []
-        if isinstance(time, str) and not re.fullmatch(r"\d+", time):
-            period = time.lower().strip()
-            now, today = datetime.utcnow(), datetime.utcnow().date()
-            if period == "today":
-                start = datetime.combine(today, datetime.min.time())
-                end   = start + timedelta(days=1)
-            elif period == "yesterday":
-                start = datetime.combine(today - timedelta(days=1),
-                                         datetime.min.time())
-                end   = datetime.combine(today, datetime.min.time())
-            else:
-                m = re.match(r"last\s+(\d+)\s+days?", period)
-                if m:
-                    d = int(m.group(1))
-                    start = datetime.combine(today - timedelta(days=d),
-                                             datetime.min.time())
-                    end   = now
+            # 6) timeframe filtering
+            results = []
+            if isinstance(time, str):
+                period = time.lower().strip()
+                now = datetime.utcnow()
+                start = end = None
+
+                if period == "today":
+                    dt0 = datetime.combine(now.date(), datetime.min.time())
+                    start, end = dt0, dt0 + timedelta(days=1)
+                elif period == "yesterday":
+                    dt0 = datetime.combine(now.date() - timedelta(days=1), datetime.min.time())
+                    start, end = dt0, dt0 + timedelta(days=1)
                 else:
-                    start = end = None
-            if start and end:
-                for e in entries:
-                    try:
-                        ts = parse_ts(e["timestamp"])
-                    except:
-                        continue
-                    if start <= ts < end:
-                        results.append(e)
+                    m_days = re.match(r"last\s+(\d+)\s+days?", period)
+                    m_hrs  = re.match(r"last\s+(\d+)\s+hours?", period)
+                    if m_days:
+                        days = int(m_days.group(1))
+                        start, end = now - timedelta(days=days), now
+                    elif m_hrs:
+                        hrs = int(m_hrs.group(1))
+                        start, end = now - timedelta(hours=hrs), now
+
+                if start and end:
+                    for e in entries:
+                        try:
+                            ts = _parse(e["timestamp"])
+                        except Exception:
+                            continue
+                        if start <= ts < end:
+                            results.append(e)
+                    print(f"{len(results)} entries in timeframe '{time}' ({start} → {end})\n")
+                else:
+                    print(f"Unrecognized timeframe '{time}', skipping window filter\n")
+                    results = entries.copy()
             else:
-                results = entries
+                print("No textual timeframe provided, skipping window filter\n")
+                results = entries.copy()
 
-        else:
-            # — count & relevance mode —
-            top_n = int(n) if n is not None else len(entries)
-            if isinstance(time, str) and re.fullmatch(r"\d+", time):
-                top_n = int(time)
-
-            if txt_arg:
-                qv = Utils.embed_text(txt_arg)
-                candidates = entries[-100:]
+            # 7) relevance vs recency
+            top_n = int(n) if n is not None else len(results)
+            if keyword or query:
+                txt = query or keyword or ""
+                print(f"Ranking by relevance to: {txt!r}")
+                qv = assembler.engine.embedder(txt)
                 scored = []
-                for e in candidates:
+                cand = results[-100:]
+                for e in cand:
                     text = e["content"]
-                    score = float(txt_arg.lower() in text.lower())
-                    vv = Utils.embed_text(text)
-                    if linalg.norm(qv) and linalg.norm(vv):
-                        score += float(dot(qv,vv)/(linalg.norm(qv)*linalg.norm(vv)))
+                    score = float(txt.lower() in text.lower())
+                    vv = assembler.engine.embedder(text)
+                    if norm(qv)>0 and norm(vv)>0:
+                        score += dot(qv, vv)/(norm(qv)*norm(vv))
                     scored.append((score, e))
                 scored.sort(key=lambda x: x[0], reverse=True)
                 results = [e for _, e in scored[:top_n]]
+                print(f"{len(results)} after relevance ranking (top {top_n})\n")
             else:
-                # pure recency
-                results = list(reversed(entries))[:top_n]
+                print(f"Sorting purely by recency, taking top {top_n}\n")
+                results.sort(key=lambda e: _parse(e["timestamp"]), reverse=True)
+                results = results[:top_n]
 
-        # — apply direction ordering —
-        rev = not (direction and direction.lower().startswith("fwd"))
-        results.sort(key=lambda e: parse_ts(e["timestamp"]), reverse=rev)
+            # 8) apply direction
+            rev = not (direction and direction.lower().startswith("fwd"))
+            order = "newest→oldest" if rev else "oldest→newest"
+            results.sort(key=lambda e: _parse(e["timestamp"]), reverse=rev)
+            print(f"Final sort direction: {order}\n")
 
-        # — strip to allowed fields —
-        out = [
-            {"timestamp": e["timestamp"],
-             "role":      e["role"],
-             "content":   e["content"]}
-            for e in results
-        ]
+            # 9) build output
+            out = [
+                {"timestamp": e["timestamp"], "role": e["role"], "content": e["content"]}
+                for e in results
+            ]
+            print("Returning chat history slice (verbose):")
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return {"output": {"results": out}}
 
-        return {"output": {"results": out}}
+        except Exception as exc:
+            print("!!! Exception in get_chat_history !!!", exc)
+            traceback.print_exc()
+            return {"output": {"results": [], "error": str(exc)}}
+        finally:
+            print("=== get_chat_history finished ===\n")
 
 
     # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.

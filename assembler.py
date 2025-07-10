@@ -10,6 +10,7 @@ import math
 import numpy as np
 import os
 import random
+import threading
 import re
 
 import stages
@@ -26,10 +27,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from ollama import chat, embed
 from tools import TOOL_SCHEMAS
+
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
 import re, base64, requests
-
+from context import sanitize_jsonl
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _canon(call: str) -> str:
@@ -69,21 +71,38 @@ def _loggable_snippet(txt: str, n=_PREVIEW_LEN) -> str:
     snip = " ".join(txt.split())
     return (snip[: n] + "…") if len(snip) > n else snip
 
+# thread-safe cache
+_EMBED_CACHE: dict[str, np.ndarray] = {}
+_CACHE_LOCK = threading.Lock()
+_ZERO = np.zeros(768, dtype=float)
+
 def embed_text(text: str) -> np.ndarray:
     """
-    Wrapper around ollama.embed that also logs WHAT we embed.
-    Prints one line: length + preview (first 120 non-newline chars).
-    Falls back to zeros on any error.
+    Non-blocking embed: return a cached vector if available,
+    otherwise launch a background embed and return zeros.
     """
-    try:
-        _EMBED_LOG.info("⮕ EMBED %4d ch | %s", len(text), _loggable_snippet(text))
-        resp = embed(model="nomic-embed-text", input=text)
-        vec  = np.array(resp["embeddings"], dtype=float).flatten()
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
-    except Exception as err:
-        _EMBED_LOG.warning("⚠️  embed failed: %s", err)
-        return np.zeros(768, dtype=float)
+    with _CACHE_LOCK:
+        if text in _EMBED_CACHE:
+            return _EMBED_CACHE[text]
+
+    # not cached → kick off a background thread to populate it
+    def _worker(t: str):
+        try:
+            resp = embed(model="nomic-embed-text", input=t)
+            vec  = np.array(resp["embeddings"], dtype=float).flatten()
+            norm = np.linalg.norm(vec)
+            vec = vec / norm if norm > 0 else vec
+        except Exception:
+            vec = _ZERO
+        with _CACHE_LOCK:
+            _EMBED_CACHE[t] = vec
+
+    thr = threading.Thread(target=_worker, args=(text,), daemon=True)
+    thr.start()
+
+    # immediately return a zero vector;
+    # future calls (after the thread finishes) will return the real one
+    return _ZERO
 
 class RLController:
     """
@@ -384,6 +403,7 @@ class Assembler:
         rl_controller:    Any | None    = None,
         repo:             ContextRepository | None = None,
     ):
+        
         for name, func in inspect.getmembers(stages, inspect.isfunction):
             if name.startswith("_stage"):
                 setattr(self, name, MethodType(func, self))
@@ -549,10 +569,8 @@ class Assembler:
 
         # — init context store & memory manager —
         if repo is not None:
-            # use the injected per-chat repository
             self.repo = repo
         else:
-            # fallback: shard JSONL + SQLite alongside context_path
             sqlite_path = context_path.replace(".jsonl", ".db")
             self.repo = HybridContextRepository(
                 jsonl_path=context_path,
@@ -560,14 +578,17 @@ class Assembler:
                 archive_max_mb=self.cfg.get("archive_max_mb", 10.0),
             )
 
-        self.memman = MemoryManager(self.repo)
+        import tools
+        tools.repo = self.repo            # for module-level tools
+        tools.Tools.repo = self.repo      # for any methods on the Tools class
 
-        # Pass memman into the query engine so it can register recalls
+        self.memman = MemoryManager(self.repo)
         self.engine = ContextQueryEngine(
             repo=self.repo,
             embedder=embed_text,
             memman=self.memman
         )
+        # …
         
         from context import sanitize_jsonl
         sanitize_jsonl(self.context_path)
@@ -673,8 +694,43 @@ class Assembler:
             memman=self.memman
         )
 
+    def _prune_jsonl_duplicates(self) -> None:
+        """
+        Rewrite self.context_path so that for each context_id
+        only the entry with the latest timestamp survives.
+        """
+        import json
+        path = self.context_path
 
+        # load all lines
+        objs: list[dict] = []
+        with open(path, "r") as f:
+            for line in f:
+                try:
+                    objs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
 
+        # keep only newest per context_id
+        by_id: dict[str, dict] = {}
+        for o in objs:
+            cid = o.get("context_id")
+            ts  = o.get("timestamp", "")
+            prev = by_id.get(cid)
+            if prev is None or ts > prev.get("timestamp", ""):
+                by_id[cid] = o
+
+        # sort survivors by timestamp (older first)
+        survivors = sorted(by_id.values(), key=lambda o: o.get("timestamp", ""))
+
+        # overwrite file
+        with open(path, "w") as f:
+            for o in survivors:
+                f.write(json.dumps(o, separators=(",", ":")) + "\n")
+
+        print(f"[prune_jsonl_duplicates] {len(objs)} → {len(survivors)} unique lines")
+
+   
     def _seed_tool_schemas(self) -> None:
         """
         Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
@@ -682,14 +738,17 @@ class Assembler:
 
         Behaviour
         ---------
-        • INSERT   – if the tool isn’t in the repo yet.
-        • UPDATE   – if the stored JSON, label, or tags differ.
-        • DEDUPE   – keep newest, delete extras.
-        • PURGE/ARCHIVE – if a schema exists for a tool name that has been
-                        removed from TOOL_SCHEMAS.
+        • INSERT        – if the tool isn’t in the repo yet.
+        • UPDATE        – if the stored JSON differs from canonical.
+        • DEDUPE in-repo– keep only the newest, delete extras.
+        • PURGE/ARCHIVE – if a schema exists for a tool name
+                          that's been removed from TOOL_SCHEMAS.
+        • DISK-CLEANUP  – rewrite context.jsonl to remove duplicate lines.
         """
+        import json
+        from context import sanitize_jsonl
 
-        # ---------- 1) bucket existing rows by canonical tool name ----------
+        # 1) bucket existing rows by tool name
         buckets: dict[str, list[ContextObject]] = {}
         for ctx in self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
@@ -700,70 +759,58 @@ class Assembler:
             except Exception:
                 continue
 
-        # ---------- 2) upsert every canonical entry -------------------------
+        # 2) upsert canonical entries
         for name, canonical in TOOL_SCHEMAS.items():
-            canonical_blob = json.dumps(canonical, sort_keys=True)
+            blob = json.dumps(canonical, sort_keys=True)
             rows = buckets.get(name, [])
 
-            # A) entirely new tool → INSERT
+            # A) new → INSERT
             if not rows:
-                ctx = ContextObject.make_schema(
+                new_ctx = ContextObject.make_schema(
                     label=name,
-                    schema_def=canonical_blob,
+                    schema_def=blob,
                     tags=["artifact", "tool_schema"],
                 )
-                ctx.touch(); self.repo.save(ctx)
-                self.memman.register_relationships(ctx, embed_text)
-
+                new_ctx.touch()
+                self.repo.save(new_ctx)
+                self.memman.register_relationships(new_ctx, embed_text)
+                buckets[name] = [new_ctx]
                 continue
 
-            # B) keep newest row, delete duplicates
+            # B) dedupe in-repo: keep newest, delete the rest
             rows.sort(key=lambda c: c.timestamp, reverse=True)
             keeper, *dups = rows
-            for d in dups:
-                self.repo.delete(d.context_id)
+            for dup in dups:
+                self.repo.delete(dup.context_id)
 
-            # C) detect changes in JSON or metadata
-            changed = False
-            stored_blob = json.dumps(
-                json.loads(keeper.metadata["schema"]), sort_keys=True
-            )
-            if stored_blob != canonical_blob:
-                keeper.metadata["schema"] = canonical_blob
-                changed = True
-
-            if keeper.semantic_label != name:
-                keeper.semantic_label = name
-                changed = True
-
-            if "tool_schema" not in keeper.tags:
-                keeper.tags.append("tool_schema")
-                changed = True
-
-            if changed:
-                keeper.touch(); self.repo.save(keeper)
+            # C) update JSON if it changed
+            stored = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
+            if stored != blob:
+                keeper.metadata["schema"] = blob
+                keeper.touch()
+                self.repo.save(keeper)
                 self.memman.register_relationships(keeper, embed_text)
 
+            buckets[name] = [keeper]
 
-        # ---------- 3) purge / archive orphaned schemas ---------------------
-        obsolete = [
-            (name, rows)
-            for name, rows in buckets.items()
-            if name not in TOOL_SCHEMAS
-        ]
-        for name, rows in obsolete:
-            # strategy: keep ONE copy but mark it legacy, delete the rest
-            rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keep, *extras = rows
-            for e in extras:
-                self.repo.delete(e.context_id)
+        # 3) purge/archive orphaned schemas
+        for name, rows in list(buckets.items()):
+            if name not in TOOL_SCHEMAS:
+                # keep only the newest, archive the rest
+                rows.sort(key=lambda c: c.timestamp, reverse=True)
+                keep, *extras = rows
+                for e in extras:
+                    self.repo.delete(e.context_id)
+                if "legacy_tool_schema" not in keep.tags:
+                    keep.tags.append("legacy_tool_schema")
+                keep.tags = [t for t in keep.tags if t != "tool_schema"]
+                keep.touch()
+                self.repo.save(keep)
+                self.memman.register_relationships(keep, embed_text)
 
-            if "legacy_tool_schema" not in keep.tags:
-                keep.tags.append("legacy_tool_schema")
-            keep.tags = [t for t in keep.tags if t != "tool_schema"]
-            keep.touch(); self.repo.save(keep)
-            self.memman.register_relationships(keep, embed_text)
-
+        # 4) rewrite JSONL to remove any on-disk duplicates & ensure validity
+        sanitize_jsonl(self.context_path)
+        self._prune_jsonl_duplicates()
 
 
     def _seed_static_prompts(self) -> None:
@@ -922,6 +969,46 @@ class Assembler:
 
         return keeper
     
+    def _load_arbitrary_context(
+        self,
+        semantic_label: str = "narrative_context",
+        component: str = "stage",
+        tags: list[str] | None = None,
+    ) -> ContextObject:
+        # normalize tags and ensure we always include at least 'narrative'
+        tags = list({*(tags or []), "narrative"})
+
+        # get or create our singleton keeper
+        keeper = self._get_or_make_singleton(
+            label=semantic_label,
+            component=component,
+            tags=tags,
+        )
+
+        # pull all contexts of the requested component *and* matching any of our tags
+        ctx_objs = self.repo.query(
+            lambda c: c.component == component and any(t in c.tags for t in tags)
+        )
+        # sort chronologically
+        ctx_objs.sort(key=lambda c: c.timestamp)
+
+        # concatenate their summaries
+        joined = "\n".join((c.summary or "") for c in ctx_objs)
+
+        # write it back into metadata under our semantic_label key
+        keeper.metadata[semantic_label] = joined
+        keeper.summary = joined or f"(no {semantic_label} yet)"
+        keeper.references = [c.context_id for c in ctx_objs]
+
+        keeper.touch()
+        self.repo.save(keeper)
+
+        # re-embed the fresh blob so similarity searches reflect the update
+        self.memman.register_relationships(keeper, embed_text)
+        return keeper
+
+
+    
     def _load_system_prompts(self) -> ContextObject:
         keeper = self._get_or_make_singleton(
             label="system_prompts",
@@ -969,18 +1056,19 @@ class Assembler:
         return segs[-self.hist_k:]
 
     def _print_stage_context(self, name: str, sections: Dict[str, Any]):
-        print(f"\n\n\n██████▓▓▓▓▒▒▒▒▒░░░░ [START: {name}] Context window: ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████")
+        print(f"\n\n\n██████▓▓▓▓▒▒▒▒▒░░░░ [START: {name}] Context window ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████")
         for title, lines in sections.items():
-            print(f"  -- {title}:")
+            print(f"⮦ Start {title} ↴")
             if isinstance(lines, str):
                 for ln in lines.splitlines():
-                    print(f"     {ln}")
+                    print(f"→    {ln}")
             elif isinstance(lines, list):
                 for ln in lines:
                     print(f"     {ln}")
             else:
-                print(f"     {lines}")
-        print(f"██████▓▓▓▓▒▒▒▒▒░░░░░░ [END: {name}] Context window: ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████\n\n\n")
+                print(f"→    {lines}")
+            print(f"⮤  End {title}  ⮥\n")
+        print(f"██████▓▓▓▓▒▒▒▒▒░░░░░░ [END: {name}] Context window ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████\n\n\n")
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
@@ -1675,6 +1763,7 @@ class Assembler:
         options: List[str],
         system_template: str,
         history_size: int,
+        context_type: str,
         var_names: List[str],
         record: bool = True
     ) -> str:
@@ -1685,7 +1774,7 @@ class Assembler:
         system_msg = system_template.format(**mapping)
 
         # 2) Fetch the running narrative context instead of raw segments
-        narr_ctx = self._load_narrative_context()
+        narr_ctx = self._load_arbitrary_context(semantic_label=context_type)
         narrative = narr_ctx.summary or "(no narrative yet)"
 
         # 3) Show a brief snippet of recent turns as well (optional)
@@ -1699,12 +1788,18 @@ class Assembler:
             for c in segs
         )
         if snippet:
-            context_block = f"### Narrative So Far ###\n{narrative}\n\n### Recent Turns ###\n{snippet}"
+            context_block = f"### Narrative So Far, Use for contextual understanding: ###\n{narrative}\n\n### Recent Turns, Use for contextual understanding:  ###\n{snippet}"
         else:
-            context_block = f"### Narrative So Far ###\n{narrative}"
+            context_block = f"### Narrative So Far, Use for contextual understanding ###\n{narrative}"
+
+        system_msg_2 = f"Now that you have a clear understanding of the recent activity of your internal systems, please abide by this following ruleset instruction and respond accordingly: " + system_template.format(**mapping)
+
+        print('████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░ ↙ CONTEXT BLOCK FED INTO DECISION STAGE ↙')
+        print(context_block)
+        print('████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░ ↖ CONTEXT BLOCK FED INTO DECISION STAGE ↖')
 
         # 4) Build user-message
-        user_msg = f"{context_block}\n\n=== New Message ===\n{user_text}"
+        user_msg = f"{context_block}\n\nNOW THIS IS THE LATEST MESSAGE:\n{user_text}"
 
         # 5) Loop until a valid option is returned
         attempt = 0
@@ -1714,7 +1809,9 @@ class Assembler:
                 model=self.decision_model,
                 messages=[
                     {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": prompt_user}
+                    {"role": "user",   "content": prompt_user},
+                    {"role": "system", "content": system_msg_2},
+
                 ],
                 tag="[Decision]"
             ).strip()
@@ -1771,10 +1868,11 @@ class Assembler:
             user_text=user_text,
             options=["YES", "NO"],
             system_template=(
-                "You are attentive to the ongoing conversation, and if you should interject or reply. Bias to true if it seems like a request or question, otherwise false. "
+                "You are attentive to the ongoing conversation, and if you should interject or reply."
                 "Answer exactly {arg1} or {arg2}."
             ),
-            history_size=3,
+            context_type='narrative_context',
+            history_size=1,
             var_names=["arg1", "arg2"],
             record=False      # ← don’t persist this check
         )
@@ -1786,12 +1884,15 @@ class Assembler:
             user_text=user_text,
             options=["TOOLS", "NO_TOOLS"],
             system_template=(
-                "You judge a binary decision based on the nature of the most recent message, you must decide whether or not the request might require additional stages to resolve, if there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
+                "You judge a binary decision based on the nature of the most recent message, "
+                "you must decide whether or not the request might require additional stages to resolve, "
+                "if there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
                 "Answer exactly {arg1} or {arg2}."
             ),
-            history_size=3,
+            history_size=1,
+            context_type="narrative_context",
             var_names=["arg1", "arg2"],
-            record=False      # ← don’t persist this check
+            record=False      # don’t persist this check
         )
         return choice.upper() == "TOOLS"
     

@@ -38,7 +38,7 @@ from context import HybridContextRepository, ContextObject, _locked, sanitize_js
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
-
+from assembler import Assembler
 import whisper
 _WHISPER = whisper.load_model("base")  # load once
 
