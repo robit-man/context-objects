@@ -2641,6 +2641,7 @@ class Tools:
             An Assembler instance (must have a .repo attribute to query).
         limit, n, count : int, optional
             Alias for the maximum number of entries to return.
+            BIGFUCKMONEY
         direction : str, optional
             "fwd" or "forward" to sort oldest→newest, anything else (or None)
             for newest→oldest.
@@ -3462,31 +3463,36 @@ class Tools:
             return json.dumps({"error": str(e)})
         
     @staticmethod
-    def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
+    def generate_tool_schema(tool_name: str) -> dict[str, Any]:
         """
-        Inspect Tools.<tool_name> and generate/store its JSON-schema.
+        Inspect Tools.<tool_name> and generate/store its JSON-schema,
+        but prune out any parameters that aren’t actual Python kwargs.
         """
         fn = getattr(Tools, tool_name, None)
         if not callable(fn):
             raise KeyError(f"Unknown tool '{tool_name}'")
+        
+        # build the unconstrained schema
         schema = _create_tool_schema(fn)
 
-        # --- prune properties that aren't true keyword args ---
+        # figure out which parameters are genuine kwargs
         sig = signature(fn)
-        # keep only those parameters that have a default (i.e. real kwargs)
         allowed = {
             name
             for name, param in sig.parameters.items()
+            # we allow everything *after* the first positional-only (assembler)
+            # that has a default value—that’s your real kwargs.
             if param.default is not _empty
         }
 
+        # prune properties
         props = schema["parameters"]["properties"]
-        # filter out anything not in allowed
         schema["parameters"]["properties"] = {
-            k: v for k, v in props.items() if k in allowed
+            k: v for k, v in props.items() 
+            if k in allowed
         }
 
-        # likewise drop from `required` if it slipped in
+        # also remove from `required` if present
         if "required" in schema["parameters"]:
             schema["parameters"]["required"] = [
                 p for p in schema["parameters"]["required"]
@@ -3499,7 +3505,8 @@ class Tools:
     @staticmethod
     def generate_all_tool_schemas() -> None:
         """
-        Walk all public callables on Tools and populate TOOL_SCHEMAS.
+        Walk all public callables on Tools and populate TOOL_SCHEMAS,
+        using the above pruning logic.
         """
         for name, fn in inspect.getmembers(Tools, predicate=callable):
             if name.startswith("_"):
@@ -3507,11 +3514,10 @@ class Tools:
             try:
                 Tools.generate_tool_schema(name)
             except KeyError:
-                # skip non-tool callables
                 continue
 
     @staticmethod
-    def get_tool_schema(tool_name: str) -> Dict[str, Any]:
+    def get_tool_schema(tool_name: str) -> dict[str, Any]:
         """
         Return the JSON-schema for the given tool, generating it on demand.
         """
