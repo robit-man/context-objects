@@ -33,6 +33,13 @@ from context import (
 # import them too; adjust as needed.
 # ——— NEW helper ———
 
+def _persist_and_index(self, ctxs: list[ContextObject]):
+    for ctx in ctxs:
+        ctx.touch()
+        self.repo.save(ctx)
+    # one bulk ingest is cheaper than N singles
+    self.integrator.ingest(ctxs)
+
 def _utc_iso() -> str:
     """UTC timestamp ending with 'Z' (e.g. 2025-07-07T18:04:31.123456Z)."""
     from datetime import datetime
@@ -145,7 +152,8 @@ def _stage2_load_system_prompts(self) -> ContextObject:
     )
     ctx.stage_id = "system_prompt"
     ctx.summary  = prom
-    ctx.touch(); self.repo.save(ctx)
+    #ctx.touch(); self.repo.save(ctx)
+    self._persist_and_index([ctx])
     return ctx
 
 def _stage3_retrieve_and_merge_context(
@@ -305,64 +313,80 @@ def _stage3_retrieve_and_merge_context(
 
 
 
-def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
+def _stage4_intent_clarification(
+    self,
+    user_text: str,
+    state: Dict[str, Any],
+) -> "ContextObject":
     """
-    Build a clarifier prompt that includes:
-      • The full dialog since the last tool invocation (or last 8 turns)
-      • The last 3 tool outputs, truncated
-    Output contract: {"keywords": [], "notes": "", "debug_notes": []}
+    Ask the Clarifier model to restate / expand the user's intent.
+
+    Prompt includes:
+      • All post-tool dialogue (otherwise last 8 turns)
+      • The 8 turns *preceding* the current message (contextual glue)
+      • Last 3 tool outputs (truncated)
+      • Short semantic / associative / tool context snippets
+
+    Returned JSON must contain:
+        { "keywords": [], "notes": "", "debug_notes": [] }
     """
     import json, textwrap
     from context import ContextObject
 
-    # Safety
-    state = state or {}
-    merged   = state.get("merged", [])
-    tool_ctxs = state.get("tool_ctxs", [])
+    # ------------------------------------------------------------------ #
+    # 0) Guards & shorthands                                             #
+    # ------------------------------------------------------------------ #
+    state          = state or {}
+    merged         = state.get("merged", [])
+    tool_ctxs      = state.get("tool_ctxs", [])
+    semantic_ctxs  = state.get("semantic", [])
+    assoc_ctxs     = state.get("assoc", [])
+    tool_refs      = state.get("tools", [])
 
-    # 1) Gather post-tool dialogue
+    # keep dialog ContextObjects in chronological order
+    hist = [
+        c for c in merged
+        if c.semantic_label in ("user_input", "assistant")
+    ]
+    hist.sort(key=lambda c: c.timestamp)
+
+    # ------------------------------------------------------------------ #
+    # 1) Build “recent dialogue” (post-tool or fallback)                 #
+    # ------------------------------------------------------------------ #
     last_tool_ts = max((tc.timestamp for tc in tool_ctxs), default=None)
-    dialogue = []
-        # Fallback to last 8 turns if no post-tool dialogue
+    dialogue: list[str] = []
+
+    for c in hist:
+        if last_tool_ts and c.timestamp <= last_tool_ts:
+            # skip dialogue that happened *before* the last tool run
+            continue
+        role  = "User" if c.semantic_label == "user_input" else "Assistant"
+        text  = c.summary or c.metadata.get("text", "")
+        dialogue.append(f"{role}: {text}")
+
+    # Fallback → last 8 turns if post-tool block ended up empty
     if not dialogue:
-        hist = [c for c in merged
-                if c.semantic_label in ("user_input", "assistant")]
-        hist.sort(key=lambda c: c.timestamp)
         for c in hist[-8:]:
             role = "User" if c.semantic_label == "user_input" else "Assistant"
             dialogue.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
 
-    # ── NEW ▸ harvest the 8 turns *preceding* the current user message ─────────
-    prev_lines = []
-    hist.sort(key=lambda c: c.timestamp)
-    for c in hist[-9:-1]:                       # exclude the very last (current) turn
-        role = "User" if c.semantic_label == "user_input" else "Assistant"
-        prev_lines.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
+    # Hard truncate dialog block
+    dialog_block = "\n".join(dialogue)[-1500:] or "(none)"
+
+    # ------------------------------------------------------------------ #
+    # 2) Previous-turn snippet (8 lines before the current message)      #
+    # ------------------------------------------------------------------ #
+    prev_lines: list[str] = []
+    if len(hist) >= 2:                     # guarantee at least one earlier turn
+        for c in hist[-9:-1]:
+            role = "User" if c.semantic_label == "user_input" else "Assistant"
+            prev_lines.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
     prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
-    for ctx in merged:
-        if ctx.semantic_label not in ("user_input", "assistant"):
-            continue
-        if last_tool_ts and ctx.timestamp <= last_tool_ts:
-            continue
-        role = "User" if ctx.semantic_label == "user_input" else "Assistant"
-        text = ctx.summary or ctx.metadata.get("text", "")
-        dialogue.append(f"{role}: {text}")
 
-    # Fallback to last 8 turns if no post-tool dialogue
-    if not dialogue:
-        hist = [c for c in merged if c.semantic_label in ("user_input","assistant")]
-        hist.sort(key=lambda c: c.timestamp)
-        for c in hist[-8:]:
-            role = "User" if c.semantic_label=="user_input" else "Assistant"
-            dialogue.append(f"{role}: {c.summary or c.metadata.get('text','')}")
-
-    # Truncate long block
-    dialog_block = "\n".join(dialogue)
-    if len(dialog_block) > 1500:
-        dialog_block = dialog_block[-1500:]
-
-    # 2) Gather last 3 tool outputs, truncated
-    tool_lines = []
+    # ------------------------------------------------------------------ #
+    # 3) Last 3 tool outputs                                             #
+    # ------------------------------------------------------------------ #
+    tool_lines: list[str] = []
     for tc in sorted(tool_ctxs, key=lambda c: c.timestamp)[-3:]:
         payload = tc.metadata.get("output") or tc.metadata.get("exception") or ""
         try:
@@ -371,195 +395,269 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
                 if isinstance(payload, str)
                 else json.dumps(payload, ensure_ascii=False)
             )
-        except:
+        except Exception:
             blob = repr(payload)
         if len(blob) > 950:
             blob = blob[:950] + " …"
         tool_lines.append(f"[{tc.stage_id}] {blob}")
     tools_block = "\n".join(tool_lines) if tool_lines else "(none)"
 
-    # 3) Assemble clarifier prompt
+    # ------------------------------------------------------------------ #
+    # 4) Semantic / associative / tool reference snippets                #
+    # ------------------------------------------------------------------ #
+    def _first_n(ctxs, n=3):
+        out = []
+        for c in ctxs[:n]:
+            short = (c.summary or "")[:120].replace("\n", " ")
+            out.append(f"• {short}  (id={c.context_id[:8]})")
+        return out
+
+    semantic_block = "\n".join(_first_n(semantic_ctxs)) or "(none)"
+    assoc_block    = "\n".join(_first_n(assoc_ctxs))    or "(none)"
+    tools_block2   = "\n".join(_first_n(tool_refs))      or "(none)"
+
+    # ------------------------------------------------------------------ #
+    # 5) Assemble full system/context prompt                             #
+    # ------------------------------------------------------------------ #
     clar_sys = self.clarifier_prompt
     full_ctx = textwrap.dedent(f"""
         ### Recent Dialogue ###
         {dialog_block}
 
-        ### Previous User Turns ###
+        ### Previous User / Assistant Turns ###
         {prev_block}
 
         ### Recent Tool Outputs ###
         {tools_block}
 
+        ### Retrieved Semantic Context ###
+        {semantic_block}
+
+        ### Retrieved Associative Context ###
+        {assoc_block}
+
+        ### Tool Reference Context ###
+        {tools_block2}
+
         ### Current User Query ###
         {user_text}
     """).strip()
 
+    # cap entire context to 4 kB to protect model window
+    MAX_PROMPT_CHARS = 4096
+    if len(full_ctx) > MAX_PROMPT_CHARS:
+        full_ctx = full_ctx[-MAX_PROMPT_CHARS:]
 
+    # ------------------------------------------------------------------ #
+    # 6) Call the Clarifier model                                        #
+    # ------------------------------------------------------------------ #
     msgs = [
         {"role": "system", "content": clar_sys},
         {"role": "system", "content": full_ctx},
         {"role": "user",   "content": user_text},
     ]
     out = self._stream_and_capture(
-        self.secondary_model,
+        self.primary_model,                       # ← use primary model
         msgs,
         tag="[Clarifier]",
-        images=state.get("images")
+        images=state.get("images"),
     ).strip()
 
-    # 4) Enforce JSON schema
-    for attempt in (1, 2):
+    # ------------------------------------------------------------------ #
+    # 7) Parse / repair JSON                                             #
+    # ------------------------------------------------------------------ #
+    def _as_json(raw: str) -> dict | None:
         try:
-            clar = json.loads(out)
-            if isinstance(clar, dict) and "keywords" in clar and "notes" in clar:
-                break
-        except:
-            clar = None
+            data = json.loads(raw)
+            if (
+                isinstance(data, dict)
+                and "keywords" in data
+                and "notes"    in data
+            ):
+                return data
+        except Exception:
+            pass
+        return None
 
-        if attempt == 1:
-            retry_sys = (
-                "⚠️ Please output ONLY a JSON object with keys:\n"
-                "  • \"keywords\" (array)\n"
-                "  • \"notes\"    (string)\n"
-                "You may also include \"debug_notes\" (array of strings)."
-            )
-            out = self._stream_and_capture(
-                self.secondary_model,
-                [
-                    {"role": "system", "content": retry_sys},
-                    {"role": "user",   "content": out}
-                ],
-                tag="[ClarifierRetry]",
-                images=state.get("images")
-            ).strip()
-        else:
-            clar = {"keywords": [], "notes": out, "debug_notes": dialogue}
+    clar = _as_json(out)
+    if clar is None:
+        # one retry with minimal system reminder
+        retry_sys = (
+            "⚠️ Output MUST be valid JSON with keys "
+            '"keywords" (array) and "notes" (string). '
+            'Optionally "debug_notes" (array).'
+        )
+        out_retry = self._stream_and_capture(
+            self.primary_model,
+            [
+                {"role": "system", "content": retry_sys},
+                {"role": "user",   "content": out},
+            ],
+            tag="[ClarifierRetry]",
+            images=state.get("images"),
+        ).strip()
+        clar = _as_json(out_retry)
 
-    # Ensure debug_notes key
-    if "debug_notes" not in clar:
-        clar["debug_notes"] = dialogue
+    # Final fallback: wrap raw text
+    if clar is None:
+        clar = {
+            "keywords": [],
+            "notes": out,
+            "debug_notes": dialogue[-8:],
+        }
 
-    # 5) Persist Clarification Context
+    # guarantee debug_notes
+    clar.setdefault("debug_notes", dialogue[-8:])
+
+    # ------------------------------------------------------------------ #
+    # 8) Persist Clarifier Context                                       #
+    # ------------------------------------------------------------------ #
+    input_refs = [state["user_ctx"].context_id] if state.get("user_ctx") else []
     clar_ctx = ContextObject.make_stage(
         "intent_clarification",
-        input_refs=[state["user_ctx"].context_id] if state.get("user_ctx") else [],
-        output=clar
+        input_refs=input_refs,
+        output=clar,
     )
-    clar_ctx.metadata.update(clar)      # ✅ keep keywords / notes
-
+    clar_ctx.metadata.update(clar)            # keep keywords / notes
     clar_ctx.stage_id       = "intent_clarification"
-    clar_ctx.semantic_label = "clarifier_question"
-    clar_ctx.tags.append("clarifier_question")
+    clar_ctx.semantic_label = "intent_clarification"
+    clar_ctx.tags.append("clarifier")
+
+    # propagate conversation / user ids if available
     if state.get("user_ctx"):
-        clar_ctx.metadata.update({
-            "conversation_id": state["user_ctx"].metadata["conversation_id"],
-            "user_id":         state["user_ctx"].metadata["user_id"],
-        })
-    clar_ctx.summary = clar.get("notes", "")
-    
-    clar_ctx.touch(); self.repo.save(clar_ctx)
+        clar_ctx.metadata.update(
+            {
+                "conversation_id": state["user_ctx"].metadata["conversation_id"],
+                "user_id": state["user_ctx"].metadata["user_id"],
+            }
+        )
+
+    clar_ctx.summary = clar.get("notes", "")[:250]
+
+    clar_ctx.touch()
+    self.repo.save(clar_ctx)
+    # embed for later retrieval
+    self.memman.register_relationships(clar_ctx, embed_text)
 
     return clar_ctx
 
 
-
-
-
 def _stage5_external_knowledge(
     self,
-    clar_ctx: ContextObject,
+    clar_ctx: "ContextObject",
     state: Dict[str, Any] | None = None,
-) -> ContextObject:
+) -> "ContextObject":
     """
-    Build a compact “external knowledge” context for the planner using:
-      • the last few user/assistant turns (history)
-      • recent tool outputs (tools)
-      • semantic recalls (semantic)
-      • associative recalls (assoc)
-      • and fresh engine.query hits on the clarifier keywords
+    Build a compact “external knowledge” context for the planner from:
+      • recent dialogue/history
+      • recent tool outputs
+      • semantic recalls
+      • associative recalls
+      • fresh engine.query hits based on clarifier keywords
     """
-    import json
+    import json, textwrap
     from datetime import datetime
     from context import ContextObject
-    state = state or {}            #  ← ← ←   single-line guard
 
-    # 1) Gather clarifier keywords
+    state = state or {}
+
+    # ------------------------------------------------------------------ #
+    # 1) Clarifier keywords → fallback to summary if empty               #
+    # ------------------------------------------------------------------ #
     kws = clar_ctx.metadata.get("keywords") or []
     if not kws and clar_ctx.summary:
         kws = [clar_ctx.summary]
 
-    # 2) Pull fresh hits for each keyword
-    top_k = max(3, self.top_k)
-    fresh_hits = []
+    # ------------------------------------------------------------------ #
+    # 2) Fresh similarity hits                                           #
+    # ------------------------------------------------------------------ #
+    TOP_K = max(3, self.top_k)
+    fresh_hits: list[tuple["ContextObject", str]] = []
+    seen_ids: set[str] = set()
+
     for kw in kws:
         hits = self.engine.query(
             similarity_to=kw,
             stage_id="external_knowledge_query",
-            top_k=top_k
+            top_k=TOP_K,
         )
-        fresh_hits.extend(hits)
-    # de-dupe by context_id
-    seen = set()
-    fresh_snips = []
-    for h in fresh_hits:
-        if h.context_id not in seen:
-            seen.add(h.context_id)
-            snippet = h.summary or h.metadata.get("content","")
-            fresh_snips.append((h, snippet))
-        if len(fresh_snips) >= top_k:
+        for h in hits:
+            if h.context_id in seen_ids:
+                continue
+            seen_ids.add(h.context_id)
+            txt = (h.summary or h.metadata.get("content", "")).strip()
+            fresh_hits.append((h, txt))
+            if len(fresh_hits) >= TOP_K:
+                break
+        if len(fresh_hits) >= TOP_K:
             break
 
-    # 3) Build labeled snippet lines
-    lines = []
-    def _label_and_trim(ctx, label):
-        txt = (ctx.summary or ctx.metadata.get("content","")).strip()
-        if len(txt) > 200:
-            txt = txt[:200].rsplit(" ",1)[0] + " …"
-        return f"({label}) {txt}"
+    # ------------------------------------------------------------------ #
+    # 3) Helper to label + truncate                                      #
+    # ------------------------------------------------------------------ #
+    def _label_and_trim(text: str, lbl: str, limit: int = 200) -> str:
+        text = text.replace("\n", " ").strip()
+        if len(text) > limit:
+            text = text[: limit].rsplit(" ", 1)[0] + " …"
+        return f"({lbl}) {text}"
 
-    # a) last few turns
+    lines: list[str] = []
+
+    # a) dialogue / history
     for c in state.get("history", []):
-        role = "USER" if c.semantic_label=="user_input" else "ASSIST"
-        lines.append(_label_and_trim(c, role))
+        role = "USER" if c.semantic_label == "user_input" else "ASSIST"
+        lines.append(_label_and_trim(c.summary or c.metadata.get("text", ""), role))
 
-    # b) tool outputs
+    # b) recent tool outputs
     for c in state.get("tools", []):
-        out = c.metadata.get("output")
-        out_str = json.dumps(out, ensure_ascii=False) if not isinstance(out, str) else out
-        lines.append(f"(TOOL:{c.stage_id}) {out_str}")
+        payload = c.metadata.get("output") or c.metadata.get("exception") or ""
+        if not isinstance(payload, str):
+            try:
+                payload = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                payload = repr(payload)
+        lines.append(_label_and_trim(payload, f"TOOL:{c.stage_id}"))
 
     # c) semantic recalls
     for c in state.get("semantic", []):
-        lines.append(_label_and_trim(c, "SEM"))
+        lines.append(_label_and_trim(c.summary or "", "SEM"))
 
     # d) associative recalls
     for c in state.get("assoc", []):
-        lines.append(_label_and_trim(c, "ASSOC"))
+        lines.append(_label_and_trim(c.summary or "", "ASSOC"))
 
-    # e) fresh hits on clarifier keywords
-    for ctx, txt in fresh_snips:
-        lines.append(_label_and_trim(ctx, "FRESH"))
+    # e) fresh similarity hits
+    for ctx, txt in fresh_hits:
+        lines.append(_label_and_trim(txt, "FRESH"))
 
-    # cap total lines
-    lines = lines[: top_k * 4]
+    # Hard cap: keep the most recent ~4·TOP_K snippets
+    lines = lines[: TOP_K * 4]
 
-    # 4) Persist as one external_knowledge_retrieval ContextObject
-    combined = "\n".join(lines)
+    # ------------------------------------------------------------------ #
+    # 4) Persist ContextObject                                           #
+    # ------------------------------------------------------------------ #
     ext_ctx = ContextObject.make_stage(
         "external_knowledge_retrieval",
-        clar_ctx.references,
-        {"snippets": lines},
+        input_refs=[clar_ctx.context_id],
+        output={"snippets": lines},
     )
-    ext_ctx.stage_id = "external_knowledge_retrieval"
-    ext_ctx.summary  = combined
-    ext_ctx.touch(); self.repo.save(ext_ctx)
+    ext_ctx.stage_id       = "external_knowledge_retrieval"
+    ext_ctx.semantic_label = "external_knowledge"
+    ext_ctx.tags.append("external")
+    ext_ctx.summary = "\n".join(lines)[:1024]  # store a concise summary
 
+    ext_ctx.touch()
+    self.repo.save(ext_ctx)
+    # 🔑  **register embedding so future similarity queries can find it**
+    self.memman.register_relationships(ext_ctx, embed_text)
 
-    # (optional) log for debugging
-    self._print_stage_context("external_knowledge_retrieval", {
-        "lines": lines,
-        "count": len(lines),
-    })
+    # ------------------------------------------------------------------ #
+    # 5) Optional debug print                                            #
+    # ------------------------------------------------------------------ #
+    self._print_stage_context(
+        "external_knowledge_retrieval",
+        {"snippets": lines, "total": len(lines)},
+    )
 
     return ext_ctx
 
@@ -607,6 +705,7 @@ def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
 
     return tool_defs
 
+
 def _stage7_planning_summary(
     self,
     clar_ctx: ContextObject,
@@ -617,33 +716,45 @@ def _stage7_planning_summary(
 ) -> Tuple[ContextObject, str]:
     """
     1) Load the latest planning_prompt artifact (or fallback to config)
-    2) Inject truncated tool list (name + first sentence of description)
-    3) Run up to 3 JSON-only planning passes, halving snippets each retry
-    4) For each selected tool, refine the call against its schema
-    5) Persist artefacts & plan tracker; return (ctx, raw-JSON)
+    2) Inject a “Conversation so far” block from merged context
+    3) Inject truncated tool list (name + first sentence of description)
+    4) Run up to 3 JSON-only planning passes, halving snippets each retry
+    5) For each selected tool, refine the call against its schema
+    6) Persist artefacts & plan tracker; return (ctx, raw-JSON)
     """
 
+    import json, re, hashlib, datetime, textwrap
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     # ------------------------------------------------------------------ #
-    # 0️⃣  DIAGNOSTIC  – print what the planner *actually* receives      #
+    # 0️⃣  DIAGNOSTIC – what we actually received in state              #
     # ------------------------------------------------------------------ #
-    incoming_snapshot = {
-        "user_text":          user_text,
-        "clarifier_notes":    clar_ctx.summary,
-        "snippet_line_count": len((know_ctx.summary or "").splitlines()),
-        "history_len":        len(state.get("history",   [])),
-        "tools_len":          len(state.get("tools",     [])),
-        "semantic_len":       len(state.get("semantic",  [])),
-        "assoc_len":          len(state.get("assoc",     [])),
+    incoming = {
+        "user_text":       user_text,
+        "clarifier_notes": clar_ctx.summary,
+        "knowledge_snips": len((know_ctx.summary or "").splitlines()),
+        "merged_len":      len(state.get("merged", [])),
+        "history_len":     len(state.get("history",   [])),
+        "tools_len":       len(state.get("tools",     [])),
+        "semantic_len":    len(state.get("semantic",  [])),
+        "assoc_len":       len(state.get("assoc",     [])),
     }
-
-    banner = "=" * 25 + " PLANNER INPUT CONTEXT " + "=" * 25
+    banner = "=" * 20 + " PLANNER INPUT " + "=" * 20
     print("\n" + banner)
-    for k, v in incoming_snapshot.items():
-        print(f"{k:>18}: {v}")
+    for k, v in incoming.items():
+        print(f"{k:>15}: {v}")
     print("=" * len(banner) + "\n")
+    self._print_stage_context("planning_summary_incoming", incoming)
 
-    # Persist for later inspection
-    self._print_stage_context("planning_summary_incoming", incoming_snapshot)
+    # ------------------------------------------------------------------ #
+    # 1️⃣  Build “Conversation so far” from merged contexts             #
+    # ------------------------------------------------------------------ #
+    merged = state.get("merged", [])
+    # include last N summaries
+    N = min(10, len(merged))
+    convo_lines = [f"- {c.summary}" for c in merged[-N:]]
+    convo_block = "Conversation so far:\n" + "\n".join(convo_lines) if convo_lines else ""
+
 
     # ------------------------------------------------------------------ #
     # 1️⃣  Standard implementation (was previously here unchanged)       #
@@ -704,9 +815,14 @@ def _stage7_planning_summary(
     def build_user(snips):
         blocks = [
             f"User question:\n{user_text}",
-            f"Clarified intent:\n{clar_ctx.summary}",
+            f"Clarified intent:\n{clar_ctx.metadata.get('notes') or clar_ctx.summary or '(none)'}",
             "Snippets:\n" + ("\n".join(snips) if snips else "(none)"),
         ]
+                
+        # ▸ surface previous validation errors so the LLM can fix them
+        if state.get("plan_errors"):
+            err_lines = "\n".join(f"- {e}" for e in state["plan_errors"])
+            blocks.append("Previous validation errors:\n" + err_lines)
 
         # ► Inject last tool outputs
         tool_lines = []
@@ -774,104 +890,134 @@ def _stage7_planning_summary(
     schema_map = {t["name"]: t["schema"] for t in tools_list}
 
     def refine_single_tool(task: dict) -> dict:
-        name = task["call"]
-        schema = schema_map[name]
-        required = schema["parameters"].get("required", [])
-        props = schema["parameters"].get("properties", {})
-
+        name        = task["call"]
+        schema      = schema_map[name]
+        required    = schema["parameters"].get("required", [])
+        props       = schema["parameters"].get("properties", {})
         schema_json = json.dumps(schema, indent=2)
-        req_lines = [f"- `{p}`: {props[p]['type']}" for p in required] or [
-            "(no required params)"
-        ]
+
+        req_lines = [f"- `{p}`: {props[p]['type']}" for p in required] or ["(no required params)"]
         req_block = "\n".join(req_lines)
 
         refined = {
-            "call": name,
+            "call":       name,
             "tool_input": task.get("tool_input", {}) or {},
-            "subtasks": task.get("subtasks", []),
+            "subtasks":   task.get("subtasks", []),
         }
 
-        # log initial
+        # snapshot original schema + partial call
         self._print_stage_context(
             f"tool_refine_schema_{name}",
             {
-                "schema": schema_json.splitlines(),
+                "schema":       schema_json.splitlines(),
                 "partial_plan": [json.dumps(refined, ensure_ascii=False)],
             },
         )
 
         critic_sentence = ""
+        errors_acc      = []              # <-- NEW: running list of validation errors
+
         for retry in range(3):
-            # build prompt
-            sys_parts = []
+            # ── collect new validation info ────────────────────────────
+            missing_now = [p for p in required if p not in refined.get("tool_input", {})]
+            if missing_now:
+                errors_acc.append(f"⚠️ Missing required parameters: {missing_now}")
+
+            # ── build SYSTEM prompt ───────────────────────────────────
+            sys_parts: List[str] = []
+
             if critic_sentence:
                 sys_parts.append(f"💡 Critic note: {critic_sentence}")
-            missing_now = [p for p in required if p not in refined["tool_input"]]
-            if retry > 0 and missing_now:
-                sys_parts.append(f"⚠️ Missing required parameters: {missing_now}")
-            sys_parts.append(
-                "You must output ONLY a JSON object {'tasks':[<one task>]} that "
-                "matches the schema exactly.\n"
-                f"Required parameters:\n{req_block}\n\nFull schema:\n```json\n{schema_json}\n```"
+
+            if errors_acc:
+                sys_parts.append("=== VALIDATION ERRORS SO FAR ===\n" + "\n".join(errors_acc))
+
+            sys_parts.extend(
+                [
+                    "=== MALFORMED CALL ===\n```json\n"
+                    + json.dumps(refined, ensure_ascii=False, indent=2)
+                    + "\n```",
+                    "You must output **only** a JSON object of the form "
+                    "`{\"tasks\":[{...}]}` that exactly matches the tool schema.\n\n"
+                    f"Required parameters:\n{req_block}\n\n"
+                    "=== TOOL SCHEMA ===\n```json\n"
+                    + schema_json
+                    + "\n```",
+                ]
             )
-            sys_msg = "\n\n".join(sys_parts)
+
+            sys_msg  = "\n\n".join(sys_parts)
             user_msg = json.dumps({"tasks": [refined]}, ensure_ascii=False)
 
+            # ── DIAGNOSTIC DUMP ───────────────────────────────────────
+            banner = f"{'='*14} REFINE PROMPT [{name}] – retry {retry} {'='*14}"
+            print("\n" + banner)
+            print("🔹 SYSTEM MESSAGE:\n" + sys_msg)
+            print("\n🔸 USER MESSAGE:\n" + user_msg)
+            print("=" * len(banner) + "\n")
+
+            # ── model call ────────────────────────────────────────────
             raw_out = self._stream_and_capture(
                 self.secondary_model,
                 [
                     {"role": "system", "content": sys_msg},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user",   "content": user_msg},
                 ],
                 tag=f"[PlannerRefine_{name}]" + (f"_retry{retry}" if retry else ""),
                 images=state.get("images"),
             )
+
             cleaned = _clean_json_block(raw_out)
             try:
                 refined = json.loads(cleaned)["tasks"][0]
             except Exception:
                 pass  # keep previous best
 
+            # stop if fully valid
             missing_now = [p for p in required if p not in refined.get("tool_input", {})]
             if not missing_now:
                 return refined
 
-            # critic one-liner
-            critic_prompt = (
-                "You are a strict critic.\n"
-                "Review the JSON schema and the malformed call. "
-                "Reply with **one sentence** suggesting the fix."
-            )
-            critic_input = "\n\n".join(
-                [
-                    "=== SCHEMA ===",
-                    schema_json,
-                    "=== BAD CALL ===",
-                    json.dumps(refined, ensure_ascii=False),
-                ]
-            )
+            # ── critic one-liner for next retry ───────────────────────
             critic_sentence = self._stream_and_capture(
                 self.secondary_model,
                 [
-                    {"role": "system", "content": critic_prompt},
-                    {"role": "user", "content": critic_input},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict critic.\n"
+                            "Review the JSON schema and the malformed call. "
+                            "Reply with **one sentence** suggesting the fix."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "=== SCHEMA ===\n" + schema_json
+                            + "\n\n=== BAD CALL ===\n"
+                            + json.dumps(refined, ensure_ascii=False)
+                        ),
+                    },
                 ],
                 tag=f"[ToolCritic_{name}]",
                 images=state.get("images"),
             ).strip()
 
+            # log critic + latest error snapshot
             self._print_stage_context(
-                f"tool_refine_critique_{name}", {"critic": [critic_sentence]}
+                f"tool_refine_critique_{name}",
+                {"critic": [critic_sentence]},
             )
             self._print_stage_context(
                 f"tool_refine_error_{name}",
                 {
-                    "errors": [f"⚠️ Missing required parameters: {missing_now}"],
+                    "errors":       errors_acc.copy(),
                     "current_plan": [json.dumps(refined, ensure_ascii=False)],
                 },
             )
 
-        return refined  # best-effort after 3 retries
+        return refined  # best effort after 3 retries
+
 
     # parallel refinement
     tasks_in = plan_obj.get("tasks", [])
@@ -882,6 +1028,22 @@ def _stage7_planning_summary(
     # restore original order
     order_map = {t["call"]: t for t in refined_tasks}
     plan_obj["tasks"] = [order_map[t["call"]] for t in tasks_in]
+    invalid_stuff = []
+    for t in plan_obj["tasks"]:
+        call = t["call"]
+        if call not in schema_map:
+            invalid_stuff.append(f"unknown tool '{call}'")
+            continue
+        required = schema_map[call]["parameters"].get("required", [])
+        missing  = [p for p in required if p not in (t.get("tool_input") or {})]
+        if missing:
+            invalid_stuff.append(f"tool '{call}' missing {missing}")
+
+    # record for downstream stages
+    if invalid_stuff:
+        state.setdefault("errors", []).append(("plan_validation", "; ".join(invalid_stuff)))
+        state["plan_errors"]       = invalid_stuff                  # ⇦  for Stage 8 prompt
+        state["plan_output_prev"]  = json.dumps(plan_obj, ensure_ascii=False)
 
     # 6) flatten → call_strings ----------------------------------------
     def _flatten(task: dict) -> list:
@@ -904,6 +1066,8 @@ def _stage7_planning_summary(
             call_strings.append(f"{t['call']}({arg_str})")
         else:
             call_strings.append(f"{t['call']}()")
+
+    state["plan_calls"] = call_strings 
 
     # 7) persist artefacts ---------------------------------------------
     plan_json = json.dumps(plan_obj, ensure_ascii=False)
@@ -937,19 +1101,28 @@ def _stage7_planning_summary(
         "plan_tracker",
         [ctx.context_id],
         {
-            "plan_id": plan_sig,
+            "plan_id":     plan_sig,
+            "plan_calls":  call_strings,            # ★ key line
             "total_calls": len(call_strings),
-            "succeeded": 0,
-            "attempts": 0,
-            "status": "in_progress",
-            "started_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "succeeded":   0,
+            "attempts":    0,
+            "status":      "in_progress",
+            "started_at":  datetime.datetime.utcnow().isoformat() + "Z",
         },
     )
+
     tracker.semantic_label = plan_sig
     tracker.stage_id = f"plan_tracker_{plan_sig}"
     tracker.summary = "initialized plan tracker"
     tracker.touch()
     self.repo.save(tracker)
+    state["plan_ctx"]      = ctx          # required by _stage8_tool_chaining
+    state["plan_output"]   = plan_json    # full JSON string
+    state["tools_list"]    = tools_list   # convenience; some calls rely on it
+    state["plan_calls"]    = call_strings # used by reflection/retries
+    state["valid_calls"]   = call_strings # ← dispatcher flag for Stage 8
+    state["fixed_calls"]   = call_strings # ← alias some retries look for
+    state["tc_ctx"]        = None         # ensures tool_chaining is queued
 
     return ctx, plan_json
 
@@ -1082,7 +1255,8 @@ def _stage7b_plan_validation(
     pv_ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
     pv_ctx.stage_id = "plan_validation"
     pv_ctx.summary  = "OK" if not missing else f"Repaired {len(missing)} task(s)"
-    pv_ctx.touch(); self.repo.save(pv_ctx)
+    #pv_ctx.touch(); self.repo.save(pv_ctx)
+    self._persist_and_index([pv_ctx])
     self._print_stage_context("plan_validation", meta)
 
     return fixed_calls, [], fixed_calls
@@ -1165,8 +1339,12 @@ def _stage8_tool_chaining(
                     except Exception:
                         kwargs[k] = v.strip('"\'')
 
-        func = getattr(Tools, name)
-        sig  = inspect.signature(func)
+        if hasattr(Tools, name):
+            func = getattr(Tools, name)
+        else:
+            import tools as _pkg
+            func = getattr(_pkg, name)
+        sig = inspect.signature(func)
 
         # only inject assembler if the tool actually declares it
         if "assembler" in sig.parameters:
@@ -1262,7 +1440,8 @@ def _stage8_5_user_confirmation(
     )
     ctx.stage_id = "user_confirmation"
     ctx.summary  = f"Auto-approved: {confirmed}"
-    ctx.touch(); self.repo.save(ctx)
+    #ctx.touch(); self.repo.save(ctx)
+    self._persist_and_index([ctx])
 
     return confirmed
 
@@ -1333,7 +1512,8 @@ def _stage9b_reflection_and_replan(
                 description="Reflection confirmed plan (identical echo)",
                 refs=[c.context_id for c in tool_ctxs]
             )
-            ok_ctx.touch(); self.repo.save(ok_ctx)
+            #ok_ctx.touch(); self.repo.save(ok_ctx)
+            self._persist_and_index([ok_ctx])
             return None
     except:
         pass
@@ -1344,7 +1524,8 @@ def _stage9b_reflection_and_replan(
             description="Reflection confirmed plan satisfied intent",
             refs=[c.context_id for c in tool_ctxs]
         )
-        ok_ctx.touch(); self.repo.save(ok_ctx)
+        #ok_ctx.touch(); self.repo.save(ok_ctx)
+        self._persist_and_index([ok_ctx])
         return None
 
     # ── Else record replan
@@ -1352,7 +1533,8 @@ def _stage9b_reflection_and_replan(
         description="Reflection triggered replan",
         refs=[c.context_id for c in tool_ctxs]
     )
-    fail_ctx.touch(); self.repo.save(fail_ctx)
+    #fail_ctx.touch(); self.repo.save(fail_ctx)
+    self._persist_and_index([fail_ctx])
 
     repl = ContextObject.make_stage(
         "reflection_and_replan",
@@ -1461,8 +1643,10 @@ def _stage9_invoke_with_retries(
                 matches.sort(key=lambda c: c.timestamp,reverse=True)
                 existing.append(matches[0])
 
-        state["tool_ctxs"] = existing
-        return existing
+        state["tool_ctxs"] = tool_ctxs           # ← already there
+        self.integrator.ingest(tool_ctxs)        # ← ★ NEW
+        state["merged"].extend(tool_ctxs)        # ← ★ NEW
+        return tool_ctxs
 
     # retry loop
     max_retries, prev = 10, None
@@ -1598,7 +1782,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     from context import ContextObject
 
     # ─── 1) Conversation snippets ────────────────────────────────────
-    MAX_CTX_OBJS = 128
+    MAX_CTX_OBJS = 32
     merged = state.get("merged", [])
     recent = merged[-MAX_CTX_OBJS:]
     convo_lines = [c.summary or "" for c in recent]
@@ -1693,7 +1877,8 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
-    resp_ctx.touch(); self.repo.save(resp_ctx)
+    #resp_ctx.touch(); self.repo.save(resp_ctx)
+    self._persist_and_index([resp_ctx])
 
     seg = ContextObject.make_segment("assistant",
                                      [resp_ctx.context_id],
@@ -1757,7 +1942,8 @@ def _stage10b_response_critique_and_safety(
     sum_ctx = ContextObject.make_stage("relevance_summary", [], {"summary": bullets})
     sum_ctx.stage_id = "relevance_summary"
     sum_ctx.summary  = bullets
-    sum_ctx.touch(); self.repo.save(sum_ctx)
+    #sum_ctx.touch(); self.repo.save(sum_ctx)
+    self._persist_and_index([sum_ctx])
 
     # 3️⃣  Polisher / Critic
     editor_sys = (
@@ -1803,7 +1989,8 @@ def _stage10b_response_critique_and_safety(
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
     resp_ctx.stage_id = "response_critique"
     resp_ctx.summary  = polished
-    resp_ctx.touch(); self.repo.save(resp_ctx)
+    #resp_ctx.touch(); self.repo.save(resp_ctx)
+    self._persist_and_index([resp_ctx])
 
     critique_ctx = ContextObject.make_stage(
         "plan_critique",
@@ -1812,7 +1999,8 @@ def _stage10b_response_critique_and_safety(
     )
     critique_ctx.component      = "analysis"
     critique_ctx.semantic_label = "plan_critique"
-    critique_ctx.touch(); self.repo.save(critique_ctx)
+    #critique_ctx.touch(); self.repo.save(critique_ctx)
+    self._persist_and_index([critique_ctx])
 
     return polished
 
@@ -2081,7 +2269,8 @@ def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
                 {"area": area, "diagnosis": diag, "question": q_text}
             )
             q_ctx.component="narrative"; q_ctx.tags.append("narrative")
-            q_ctx.touch(); self.repo.save(q_ctx)
+            #q_ctx.touch(); self.repo.save(q_ctx)
+            self._persist_and_index([q_ctx])
 
             # get answer
             answer = ""
@@ -2104,7 +2293,8 @@ def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
                 {"answer": answer}
             )
             a_ctx.component="narrative"; a_ctx.tags.append("narrative")
-            a_ctx.touch(); self.repo.save(a_ctx)
+            #a_ctx.touch(); self.repo.save(a_ctx)
+            self._persist_and_index([a_ctx])
 
             # apply prompt patch
             if patch:
@@ -2126,7 +2316,8 @@ def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
                     ]}
                     pj = json.dumps(plan_obj)
                     p_ctx = ContextObject.make_stage("internal_plan",[a_ctx.context_id],{"plan":plan_obj})
-                    p_ctx.touch(); self.repo.save(p_ctx)
+                    #p_ctx.touch(); self.repo.save(p_ctx)
+                    self._persist_and_index([p_ctx])
 
                     tools = self._stage6_prepare_tools()
                     fixed,_,_ = self._stage7b_plan_validation(p_ctx,pj,tools)

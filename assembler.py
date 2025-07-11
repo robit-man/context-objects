@@ -11,6 +11,7 @@ import numpy as np
 import os
 import random
 import tempfile
+import traceback
 import threading
 import re
 
@@ -34,6 +35,7 @@ from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Callable
 import re, base64, requests
 from context import sanitize_jsonl
+from grand_integrator import GrandIntegrator
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _canon(call: str) -> str:
@@ -63,15 +65,6 @@ def _done_calls(repo) -> set[str]:
             done.add(obj.metadata["tool_call"])
     return done
 
-
-import logging
-_EMBED_LOG = logging.getLogger("embed_preview")          # configure in main if you want colour etc.
-_PREVIEW_LEN = 120                                       # chars to print
-
-def _loggable_snippet(txt: str, n=_PREVIEW_LEN) -> str:
-    """Collapse whitespace + truncate for neat one-line preview."""
-    snip = " ".join(txt.split())
-    return (snip[: n] + "…") if len(snip) > n else snip
 
 # thread-safe cache
 _EMBED_CACHE: dict[str, np.ndarray] = {}
@@ -522,7 +515,6 @@ class Assembler:
             "  • Keep it concise—no giant JSON dumps—yet exhaustively cover what the user needs.  \n\n"
             "Your answer should read like a clear human response, weaving in the tool data as evidence, "
             "and should never simply repeat the user’s input verbatim.\n\n"
-            "Please reply appropriately, dont reply with analysis of the prior polished refinement, that was just meant to help you better understand what is going on, reply coherent and conversationally."
         )
         self.critic_prompt = self.cfg.get(
             "critic_prompt",
@@ -602,7 +594,22 @@ class Assembler:
             embedder=embed_text,
             memman=self.memman
         )
-        # …
+
+        integrator_config = {
+            # maximum number of nodes to keep in the graph at once
+            "max_nodes": self.cfg.get("max_total_context", 50),
+            # how many days before a context node expires
+            "ttl_days": self.cfg.get("context_ttl_days", 30),
+            # how many hops (or edges) to expand around your focus
+            "expand_k": self.cfg.get("integrator_expand_k", 5),
+        }
+
+        # instantiate once, so it persists across turns
+        self.integrator = GrandIntegrator(
+            repo=self.repo,
+            memory_manager=self.memman,
+            config=integrator_config
+        )
         
         from context import sanitize_jsonl
         sanitize_jsonl(self.context_path)
@@ -1122,19 +1129,81 @@ class Assembler:
         return segs[-self.hist_k:]
 
     def _print_stage_context(self, name: str, sections: Dict[str, Any]):
-        print(f"\n\n\n██████▓▓▓▓▒▒▒▒▒░░░░ [START: {name}] Context window ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████")
-        for title, lines in sections.items():
-            print(f"⮦ Start {title} ↴")
-            if isinstance(lines, str):
-                for ln in lines.splitlines():
-                    print(f"→    {ln}")
-            elif isinstance(lines, list):
-                for ln in lines:
-                    print(f"     {ln}")
-            else:
-                print(f"→    {lines}")
-            print(f"⮤  End {title}  ⮥\n")
-        print(f"██████▓▓▓▓▒▒▒▒▒░░░░░░ [END: {name}] Context window ░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓██████\n\n\n")
+        """
+        Pretty-prints the stage-debug context.
+
+        ── Features ───────────────────────────────────────────────────────────
+        • Console width auto-detected (fallback 120 columns).
+        • BEGIN / END banners use a █ ▓ ▒ ░ gradient.
+        • Every subsection is isolated inside a boxed block:
+            ▛▀▀ START … ▀▀▜
+            ▌  …content…  ▐
+            ▙▄▄ END   … ▄▄▟
+        • All lines are wrapped and padded to fit neatly inside the box.
+        """
+        import shutil, textwrap, json
+
+        # ── 1) Console dimensions ────────────────────────────────────────────
+        W = max(60, shutil.get_terminal_size(fallback=(120, 20)).columns)
+        INNER = W - 4                       # room for "▌ " … " ▐"
+
+        # ── 2) Gradient helpers for main banners ─────────────────────────────
+        SHADES = ['█', '▓', '▒', '░']       # heavy → light
+
+        def _gradient(n: int, rev: bool = False) -> str:
+            if n <= 0:
+                return ''
+            seq = SHADES[::-1] if rev else SHADES
+            steps = len(seq) - 1
+            return ''.join(seq[round(i * steps / (n - 1))] for i in range(n))
+
+        def _main_banner(text: str, tag: str) -> str:
+            label = f"[{tag}: {text}]"
+            if len(label) >= W:
+                return label[:W]
+            remain = W - len(label)
+            left = _gradient(remain // 2, rev=False)
+            right = _gradient(remain - len(left), rev=True)
+            return left + label + right
+
+        # ── 3) Box helpers for subsections ───────────────────────────────────
+        # Corners: ▛ ▜  (top)   ▙ ▟ (bottom)   verticals: ▌ ▐
+        def _top_box(label: str) -> str:
+            lbl = f" START {label} "
+            fill = max(0, W - len(lbl) - 2)
+            left, right = fill // 2, fill - (fill // 2)
+            return "▛" + "▀" * left + lbl + "▀" * right + "▜"
+
+        def _bot_box(label: str) -> str:
+            lbl = f" END   {label} "
+            fill = max(0, W - len(lbl) - 2)
+            left, right = fill // 2, fill - (fill // 2)
+            return "▙" + "▄" * left + lbl + "▄" * right + "▟"
+
+        def _boxed_lines(raw: Any) -> None:
+            # Convert raw → list[str]
+            if isinstance(raw, str):
+                lines = raw.splitlines() or ["(empty)"]
+            elif isinstance(raw, list):
+                lines = [str(x) for x in (raw or ["(empty)"])]
+            else:                      # pretty-print dicts / objects
+                try:
+                    lines = json.dumps(raw, ensure_ascii=False, indent=2).splitlines()
+                except Exception:
+                    lines = textwrap.dedent(repr(raw)).splitlines()
+
+            for ln in lines:
+                for seg in textwrap.wrap(ln, width=INNER) or ['']:
+                    print(f"▌ {seg.ljust(INNER)} ▐")
+
+        # ── 4) Print everything ──────────────────────────────────────────────
+        print("\n" + _main_banner(name, "BEGIN"))
+        for title, content in sections.items():
+            print(_top_box(title))
+            _boxed_lines(content)
+            print(_bot_box(title) + "\n")
+        print(_main_banner(name, "END") + "\n")
+
 
     def _save_stage(self, ctx: ContextObject, stage: str):
         ctx.stage_id = stage
@@ -1828,42 +1897,73 @@ class Assembler:
         var_names: List[str],
         record: bool = True
     ) -> str:
+        """
+        Ask `self.decision_model` to choose exactly one item from `options`.
+        The helper `_print_stage_context` is used to render a clean, boxed view
+        of all context that is fed into the model.
+        """
         import re, json
+        from context import ContextObject
 
-        # 1) Build mapping and fill in the system prompt
-        mapping   = {vn: opt for vn, opt in zip(var_names, options)}
-        system_msg = system_template.format(**mapping)
+        # ── 1) Build mapping & system prompt ────────────────────────────────
+        mapping     = {vn: opt for vn, opt in zip(var_names, options)}
+        system_msg  = system_template.format(**mapping)
 
-        # 2) Fetch the running narrative context instead of raw segments
-        narr_ctx = self._load_arbitrary_context(semantic_label=context_type)
+        # ── 2) Narrative (loaded by semantic label) ─────────────────────────
+        narr_ctx  = self._load_arbitrary_context(semantic_label=context_type)
         narrative = narr_ctx.summary or "(no narrative yet)"
 
-        # 3) Show a brief snippet of recent turns as well (optional)
+        # ── 3) Recent user / assistant turns ───────────────────────────────
         segs = sorted(
-            [c for c in self.repo.query(lambda c: c.domain=="segment"
-                                    and c.semantic_label in ("user_input","assistant"))],
+            [c for c in self.repo.query(
+                lambda c: c.domain == "segment"
+                and c.semantic_label in ("user_input", "assistant")
+            )],
             key=lambda c: c.timestamp
         )[-history_size:]
+
         snippet = "\n".join(
-            f"{'User' if c.semantic_label=='user_input' else 'Assistant'}: {c.summary}"
+            f"{'User' if c.semantic_label == 'user_input' else 'Assistant'}: {c.summary}"
             for c in segs
         )
+
         if snippet:
-            context_block = f"### Narrative So Far, Use for contextual understanding: ###\n{narrative}\n\n### Recent Turns, Use for contextual understanding:  ###\n{snippet}"
+            context_block = (
+                "### Narrative So Far (use for context) ###\n"
+                f"{narrative}\n\n"
+                "### Recent Turns (use for context) ###\n"
+                f"{snippet}"
+            )
         else:
-            context_block = f"### Narrative So Far, Use for contextual understanding ###\n{narrative}"
+            context_block = (
+                "### Narrative So Far (use for context) ###\n"
+                f"{narrative}"
+            )
 
-        system_msg_2 = f"Now that you have a clear understanding of the recent activity of your internal systems, please abide by this following ruleset instruction and respond accordingly: " + system_template.format(**mapping)
+        # Second system message (unchanged logic)
+        system_msg_2 = (
+            "Now that you have a clear understanding of the recent activity of "
+            "your internal systems, please abide by this ruleset and respond "
+            "accordingly: "
+            + system_template.format(**mapping)
+        )
 
-        print('████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░ ↙ CONTEXT BLOCK FED INTO DECISION STAGE ↙')
-        print(context_block)
-        print('████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░ ↖ CONTEXT BLOCK FED INTO DECISION STAGE ↖')
+        # ── 4) Debug output via helper ──────────────────────────────────────
+        debug_payload = {
+            "narrative":      narrative,
+            "recent_turns":   snippet or "(none)",
+            "options":        ", ".join(options),
+            "system_prompt":  system_msg,
+            "ruleset_prompt": system_msg_2,
+            "user_text":      user_text,
+        }
+        self._print_stage_context("decision_callback", debug_payload)
 
-        # 4) Build user-message
+        # ── 5) Build user-facing prompt sent to the model ──────────────────
         user_msg = f"{context_block}\n\nNOW THIS IS THE LATEST MESSAGE:\n{user_text}"
 
-        # 5) Loop until a valid option is returned
-        attempt = 0
+        # ── 6) Loop until a valid option is returned ───────────────────────
+        attempt     = 0
         prompt_user = user_msg
         while True:
             full_resp = self._stream_and_capture(
@@ -1872,21 +1972,19 @@ class Assembler:
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": prompt_user},
                     {"role": "system", "content": system_msg_2},
-
                 ],
                 tag="[Decision]"
             ).strip()
 
-            # 6) Optionally record each Q&A
+            # ── 7) Optionally record Q & A pairs in memory ─────────────────
             if record:
-                # question
                 q_name = "decision_question" if attempt == 0 else "decision_feedback_question"
-                q_ctx = ContextObject.make_stage(
+                q_ctx  = ContextObject.make_stage(
                     stage_name=q_name,
                     input_refs=[narr_ctx.context_id],
                     output={
                         "prompt_system": system_msg,
-                        "prompt_user":   prompt_user
+                        "prompt_user":   prompt_user,
                     }
                 )
                 q_ctx.component      = "decision"
@@ -1895,9 +1993,8 @@ class Assembler:
                 q_ctx.touch(); self.repo.save(q_ctx)
                 self.memman.register_relationships(q_ctx, embed_text)
 
-                # answer
                 a_name = "decision_answer" if attempt == 0 else "decision_feedback_answer"
-                a_ctx = ContextObject.make_stage(
+                a_ctx  = ContextObject.make_stage(
                     stage_name=a_name,
                     input_refs=[q_ctx.context_id],
                     output={"answer": full_resp}
@@ -1908,12 +2005,12 @@ class Assembler:
                 a_ctx.touch(); self.repo.save(a_ctx)
                 self.memman.register_relationships(a_ctx, embed_text)
 
-            # 7) Check for a valid option
+            # ── 8) Return on valid choice ──────────────────────────────────
             for opt in options:
                 if re.search(rf"\b{re.escape(opt)}\b", full_resp, re.I):
                     return opt
 
-            # 8) Prepare feedback prompt
+            # ── 9) Otherwise ask for clarification again ───────────────────
             prompt_user = (
                 "Your response didn’t include one of the required options.\n"
                 f"Previous response:\n{full_resp}\n\n"
@@ -1972,7 +2069,10 @@ class Assembler:
         import logging, time, numpy as np
         from datetime import datetime
         from context import ContextObject, sanitize_jsonl
-
+        import logging
+        # quiet down httpx embed calls
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
         # ─── Bootstrap & sanitize ─────────────────────────────────────────
         sanitize_jsonl(self.context_path)
         if not user_text or not user_text.strip():
@@ -1995,10 +2095,10 @@ class Assembler:
 
         # ─── Stage 0: decision_to_respond ─────────────────────────────────
         try:
-            should = self.filter_callback(user_text)
+            should, _ = self.filter_callback(user_text)      # bool, text
             state["should_respond"] = should
             status_cb("decision_to_respond", should)
-            if not should:
+            if should is False:
                 status_cb("output", "…")
                 return ""
         except Exception as e:
@@ -2007,7 +2107,7 @@ class Assembler:
 
         # ─── Stage 0.5: decide_tool_usage ─────────────────────────────────
         try:
-            use_tools = self.tools_callback(user_text)
+            use_tools, _ = self.tools_callback(user_text) 
             state["use_tools"] = use_tools
             status_cb("decide_tool_usage", use_tools)
         except Exception as e:
@@ -2020,7 +2120,7 @@ class Assembler:
 
             # Stage 1: record_input
             try:
-                ctx1 = self._stage1_record_input(user_text)
+                ctx1 = self._stage1_record_input(user_text, state)
                 state["user_ctx"] = ctx1
                 status_cb("record_input", ctx1.summary)
             except Exception as e:
@@ -2035,32 +2135,48 @@ class Assembler:
             except Exception as e:
                 status_cb("load_system_prompts_error", str(e))
                 state["errors"].append(("load_system_prompts", str(e)))
-            # Stage 3: retrieve_and_merge_context
+            # ─── Stage 3: retrieve_and_merge_context ──────────────────────────
             try:
                 extra = self._get_history()
                 state["recent_ids"] = [c.context_id for c in extra]
 
-                out3 = self._stage3_retrieve_and_merge_context(
-                    user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
-                )
+                # ----- RETRIEVER -----
+                try:
+                    out3 = self._stage3_retrieve_and_merge_context(
+                        user_text,
+                        state.get("user_ctx"),
+                        state.get("sys_ctx"),
+                        extra_ctx=extra,
+                    )
+                except Exception:
+                    # log but keep pipeline alive
+                    status_cb("retrieve_error", traceback.format_exc(limit=5))
+                    out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
                 state.update(out3)
 
-                # ─── copy slices for downstream stages ───
-                state["history"]  = out3.get("history",  [])
-                state["tools"]    = out3.get("tools",    [])
-                state["semantic"] = out3.get("semantic", [])
-                state["assoc"]    = out3.get("assoc",    [])
+                # ----- INTEGRATOR -----
+                try:
+                    self.integrator.ingest(state["merged"])
+                    keep_core = [state["user_ctx"].context_id] if state.get("user_ctx") else []
+                    if state.get("sys_ctx"):
+                        keep_core.append(state["sys_ctx"].context_id)
+                    self.integrator.ingest([c for c in (state.get("user_ctx"), state.get("sys_ctx")) if c])
+                    contracted = self.integrator.contract(keep_ids=keep_core)
+                    state["merged"]      = contracted
+                    state["merged_ids"]  = [c.context_id for c in contracted]
+                    state["wm_ids"] = [c.context_id for c in contracted[-20:]] if contracted else []
+                    hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
+                    hist.sort(key=lambda c: c.timestamp)
+                    state["history"] = hist[-8:]
+                except Exception:
+                    status_cb("integrator_error", traceback.format_exc(limit=5))
 
-                status_cb("retrieve_and_merge_context", "(merged)")
-            except Exception as e:
-                status_cb("retrieve_and_merge_context_error", str(e))
-                state["errors"].append(("retrieve_and_merge_context", str(e)))
+                status_cb("retrieve_and_merge_context", f"{len(state.get('merged',[]))} ctxs")
+            except Exception:
+                # truly unexpected outer error
+                status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
+                state["errors"].append(("retrieve_and_merge_context", "fatal"))
 
-                # safe fall-backs so later stages can still run
-                state["history"]  = []
-                state["tools"]    = []
-                state["semantic"] = []
-                state["assoc"]    = [] 
 
             # Stage 4: intent_clarification
             try:
@@ -2137,7 +2253,7 @@ class Assembler:
 
         # Stage 1: record_input
         try:
-            ctx1 = self._stage1_record_input(user_text)
+            ctx1 = self._stage1_record_input(user_text, state)
             state["user_ctx"] = ctx1
             status_cb("record_input", ctx1.summary)
         except Exception as e:
@@ -2158,27 +2274,43 @@ class Assembler:
             extra = self._get_history()
             state["recent_ids"] = [c.context_id for c in extra]
 
-            out3 = self._stage3_retrieve_and_merge_context(
-                user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
-            )
+            # ----- RETRIEVER -----
+            try:
+                out3 = self._stage3_retrieve_and_merge_context(
+                    user_text,
+                    state.get("user_ctx"),
+                    state.get("sys_ctx"),
+                    extra_ctx=extra,
+                )
+            except Exception:
+                # log but keep pipeline alive
+                status_cb("retrieve_error", traceback.format_exc(limit=5))
+                out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
             state.update(out3)
 
-            # ─── copy slices for downstream stages ───
-            state["history"]  = out3.get("history",  [])
-            state["tools"]    = out3.get("tools",    [])
-            state["semantic"] = out3.get("semantic", [])
-            state["assoc"]    = out3.get("assoc",    [])
+            # ----- INTEGRATOR -----
+            try:
+                self.integrator.ingest(state["merged"])
+                keep_core = [state["user_ctx"].context_id] if state.get("user_ctx") else []
+                if state.get("sys_ctx"):
+                    keep_core.append(state["sys_ctx"].context_id)
+                self.integrator.ingest([c for c in (state.get("user_ctx"), state.get("sys_ctx")) if c])
+                contracted = self.integrator.contract(keep_ids=keep_core)
+                state["merged"]      = contracted
+                state["merged_ids"]  = [c.context_id for c in contracted]
+                state["wm_ids"]      = [c.context_id for c in contracted[-20:]]
+                hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
+                hist.sort(key=lambda c: c.timestamp)
+                state["history"] = hist[-8:]
+            except Exception:
+                status_cb("integrator_error", traceback.format_exc(limit=5))
 
-            status_cb("retrieve_and_merge_context", "(merged)")
-        except Exception as e:
-            status_cb("retrieve_and_merge_context_error", str(e))
-            state["errors"].append(("retrieve_and_merge_context", str(e)))
+            status_cb("retrieve_and_merge_context", f"{len(state.get('merged',[]))} ctxs")
+        except Exception:
+            # truly unexpected outer error
+            status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
+            state["errors"].append(("retrieve_and_merge_context", "fatal"))
 
-            # safe fall-backs so later stages can still run
-            state["history"]  = []
-            state["tools"]    = []
-            state["semantic"] = []
-            state["assoc"]    = []
         # Stage 4: intent_clarification
         try:
             ctx4 = self._stage4_intent_clarification(user_text, state)
@@ -2247,7 +2379,7 @@ class Assembler:
                 state
             )
             state["fixed_calls"] = fixed
-            status_cb("plan_validation", f"{len(fixed)} calls")
+            status_cb("plan_validation", f"{fixed} calls")
         except Exception as e:
             status_cb("plan_validation_error", str(e))
             state["errors"].append(("plan_validation", str(e)))
