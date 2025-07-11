@@ -702,13 +702,32 @@ def _stage7_planning_summary(
     original_snips = (know_ctx.summary or "").splitlines()
 
     def build_user(snips):
-        return "\n\n".join(
-            [
-                f"User question:\n{user_text}",
-                f"Clarified intent:\n{clar_ctx.summary}",
-                "Snippets:\n" + ("\n".join(snips) if snips else "(none)"),
-            ]
-        )
+        blocks = [
+            f"User question:\n{user_text}",
+            f"Clarified intent:\n{clar_ctx.summary}",
+            "Snippets:\n" + ("\n".join(snips) if snips else "(none)"),
+        ]
+
+        # ► Inject last tool outputs
+        tool_lines = []
+        for c in state.get("tools", [])[-5:]:
+            # summary is already trimmed; timestamp helps too
+            ts = getattr(c, "timestamp", "")[:19].replace("T", " ")
+            tool_lines.append(f"- [{ts}] {c.stage_id}: {c.summary}")
+        if tool_lines:
+            blocks.append("Recent tool outputs:\n" + "\n".join(tool_lines))
+
+        # ► Inject previous plan JSON (if any)
+        prev_plan = state.get("plan_output_prev")
+        if prev_plan:
+            blocks.append("Previous plan:\n" + prev_plan)
+
+        # ► Inject assistant draft (if any)
+        draft = state.get("draft")
+        if draft:
+            blocks.append("Assistant draft:\n" + draft)
+
+        return "\n\n".join(blocks)
 
     full_user = build_user(original_snips)
 
@@ -1496,6 +1515,7 @@ def _stage9_invoke_with_retries(
                         tool_ctxs.append(ctx_i)
                     except StopIteration:
                         pass
+                    
             # ─── main call ─────────────────────────────────────────────────
             res = Tools.run_tool_once(call_str)
             ok, err = _validate(res)
