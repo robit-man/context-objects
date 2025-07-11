@@ -410,7 +410,8 @@ class Assembler:
             if name.startswith("_stage"):
                 setattr(self, name, MethodType(func, self))
 
-                
+        self.current_user_id: str = "anon"
+
         # 1) Remember your store paths
         self.context_path = context_path
         self.config_path  = config_path
@@ -439,9 +440,20 @@ class Assembler:
         # — system & stage prompts —
         self.clarifier_prompt = self.cfg.get(
             "clarifier_prompt",
-            "You are Clarifier. Expand the user’s intent into a JSON object with "
-            "two keys: 'keywords' (an array of concise keywords) and 'notes'. "
-            "Notes should produce NO value judgements or claims, and should only expand on what the user said. ignore irrelevant errors in context unrelated to the user’s intent. "
+            # ── UPDATED clarifier instruction: pull in prior turns if relevant ────
+            "You are Clarifier.  Expand the user’s intent into a JSON object with two keys:\n"
+            "  • 'keywords' (an array of concise keywords)\n"
+            "  • 'notes' (a short narrative expansion of what the user wants, "
+            "drawing *only* on the user’s latest message AND any immediately preceding "
+            "conversation turns that clarify or disambiguate that message)\n"
+            "Additionally:\n"
+            "- Under a key called 'debug_notes', include the last 3 turns of raw "
+            "conversation (both user and assistant) even if they seem redundant, "
+            "so we can diagnose mis‐clarifications.\n"
+            "- Notes should produce NO value judgments or claims, and should only "
+            "expand what the user actually said.\n"
+            "- Ignore irrelevant errors or tool outputs that do not bear on the "
+            "user’s expressed intent.\n"
             "Output only valid JSON."
         )
         self.assembler_prompt = self.cfg.get(
@@ -1950,30 +1962,24 @@ class Assembler:
         )
         return (choice_text.upper() == "TOOLS", choice_text)
 
-        
+            
     def run_with_meta_context(
         self,
         user_text: str,
         status_cb: Callable[[str, Any], None] = lambda *a: None,
         images: list[bytes] | None = None
     ) -> str:
-        # ─── Reset narrative cache ─────────────────────────────────────────
-        # ensures _load_narrative_context() rebuilds only once per turn
-        self._narrative_loaded = False
-        # (if you also cache the keeper object, clear that too)
-        if hasattr(self, "_narrative_cache"):
-            self._narrative_cache = None
-
-        # ─── Bootstrap & sanitize ─────────────────────────────────────────
         import logging, time, numpy as np
         from datetime import datetime
         from context import ContextObject, sanitize_jsonl
 
+        # ─── Bootstrap & sanitize ─────────────────────────────────────────
         sanitize_jsonl(self.context_path)
         if not user_text or not user_text.strip():
             status_cb("output", "")
             return ""
 
+        # ─── Initialize state ─────────────────────────────────────────────
         state: Dict[str, Any] = {
             "user_text":   user_text,
             "errors":      [],
@@ -1982,111 +1988,144 @@ class Assembler:
             "images":      images or [],
         }
         self._last_state = state
-
-        # ─── Perf recorder helper ──────────────────────────────────────────
-        def _record_perf(stage, summary, ok, ctx=None):
-            duration = (datetime.utcnow() - t0).total_seconds()
-            refs = [state["user_ctx"].context_id] if "user_ctx" in state else []
-            perf = ContextObject.make_stage(
-                "stage_performance", refs,
-                {"stage": stage, "duration": duration, "error": not ok}
-            )
-            perf.touch(); self.repo.save(perf)
-            self.memman.register_relationships(perf, embed_text)
-            status_cb(stage, summary)
+        import uuid
+        state["conversation_id"] = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
+        self._active_conversation_id = state["conversation_id"]
+        state["user_id"] = getattr(self, "current_user_id", "anon")
 
         # ─── Stage 0: decision_to_respond ─────────────────────────────────
-        t0 = datetime.utcnow()
         try:
             should = self.filter_callback(user_text)
             state["should_respond"] = should
-            _record_perf("decision_to_respond", str(should), True)
+            status_cb("decision_to_respond", should)
             if not should:
-                status_cb("output", "…")  # no reply
+                status_cb("output", "…")
                 return ""
         except Exception as e:
-            _record_perf("decision_to_respond", str(e), False)
+            status_cb("decision_to_respond_error", str(e))
+            # fall through
 
         # ─── Stage 0.5: decide_tool_usage ─────────────────────────────────
-        t0 = datetime.utcnow()
         try:
             use_tools = self.tools_callback(user_text)
             state["use_tools"] = use_tools
-            _record_perf("decide_tool_usage", str(use_tools), True)
+            status_cb("decide_tool_usage", use_tools)
         except Exception as e:
             state["use_tools"] = True
-            _record_perf("decide_tool_usage", str(e), False)
+            status_cb("decide_tool_usage_error", str(e))
 
-        # ─── Fast-path: no planning/tools ─────────────────────────────────
+        # ─── Fast-path: no tools ───────────────────────────────────────────
         if not state["use_tools"]:
-            # human-style “thinking…” dots
-            for _ in range(3):
-                print(".", end="", flush=True); time.sleep(0.25)
-            print()
+            status_cb("no_tools_start", "Skipping tool pipeline, going direct to assembly")
 
-            # build dynamic system prompt from narrative + last N
-            hist = self._get_history()
-            lines = []
-            for c in hist:
-                # first try metadata, then fall back to semantic_label
-                sender = c.metadata.get("sender")
-                if not sender:
-                    sender = "User" if c.semantic_label=="user_input" else "Assistant"
-                lines.append(f"{sender}: {c.summary}")
-            convo = "\n".join(lines)
+            # Stage 1: record_input
+            try:
+                ctx1 = self._stage1_record_input(user_text)
+                state["user_ctx"] = ctx1
+                status_cb("record_input", ctx1.summary)
+            except Exception as e:
+                status_cb("record_input_error", str(e))
+                state["errors"].append(("record_input", str(e)))
 
-            system_block = f"[Recent conversation]\n{convo}"
+            # Stage 2: load_system_prompts
+            try:
+                ctx2 = self._stage2_load_system_prompts()
+                state["sys_ctx"] = ctx2
+                status_cb("load_system_prompts", "(loaded)")
+            except Exception as e:
+                status_cb("load_system_prompts_error", str(e))
+                state["errors"].append(("load_system_prompts", str(e)))
+            # Stage 3: retrieve_and_merge_context
+            try:
+                extra = self._get_history()
+                state["recent_ids"] = [c.context_id for c in extra]
 
-            AUTO_THRESH = 0.5
-            descs = [(t["name"], t.get("description", "")) for t in state.get("tools_list", [])]
-
-            qv = self.engine.embedder(user_text)
-            sims = [
-                float(np.dot(qv, self.engine.embedder(d)) /
-                    (np.linalg.norm(qv)*np.linalg.norm(self.engine.embedder(d)) + 1e-9))
-                for _, d in descs
-            ]
-            auto_tools = sorted(
-                [descs[i][0] for i, s in enumerate(sims) if s >= AUTO_THRESH],
-                key=lambda n: -sims[[d[0] for d in descs].index(n)]
-            )[:3]
-
-            # invoke chosen tools in parallel
-            auto_outputs = []
-            for tool in auto_tools:
-                print(f"[AutoInvoke] {tool}()", flush=True)
-                out = self._stream_and_capture(
-                    self.secondary_model,
-                    [{"role":"system","content":f"Invoke tool: {tool}()"}],
-                    tag="[AutoTool]"
+                out3 = self._stage3_retrieve_and_merge_context(
+                    user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
                 )
-                auto_outputs.append((tool, out))
-                tc = ContextObject.make_stage(
-                    "tool_output",
-                    state.get("plan_ctx", []).references if "plan_ctx" in state else [],
-                    {"tool_name": tool, "output": out}
+                state.update(out3)
+
+                # ─── copy slices for downstream stages ───
+                state["history"]  = out3.get("history",  [])
+                state["tools"]    = out3.get("tools",    [])
+                state["semantic"] = out3.get("semantic", [])
+                state["assoc"]    = out3.get("assoc",    [])
+
+                status_cb("retrieve_and_merge_context", "(merged)")
+            except Exception as e:
+                status_cb("retrieve_and_merge_context_error", str(e))
+                state["errors"].append(("retrieve_and_merge_context", str(e)))
+
+                # safe fall-backs so later stages can still run
+                state["history"]  = []
+                state["tools"]    = []
+                state["semantic"] = []
+                state["assoc"]    = [] 
+
+            # Stage 4: intent_clarification
+            try:
+                ctx4 = self._stage4_intent_clarification(user_text, state)
+                state["clar_ctx"] = ctx4
+                status_cb("intent_clarification", ctx4.summary)
+            except Exception as e:
+                status_cb("intent_clarification_error", str(e))
+                state["errors"].append(("intent_clarification", str(e)))
+                dummy = ContextObject.make_stage(
+                    "intent_clarification_failed",
+                    [state["user_ctx"].context_id],
+                    {"summary": ""}
                 )
-                tc.component = "tool_output"
-                tc.semantic_label = tool
-                tc.touch(); self.repo.save(tc)
-                state["tool_ctxs"].append(tc)
+                dummy.touch(); self.repo.save(dummy)
+                state["clar_ctx"] = dummy
 
-            # collapse into small context window
-            snippet = "\n".join(f"{t}: {o[:80]}…" for t,o in auto_outputs)
-            msgs = [
-                {"role":"system", "content": system_block + "\n\n[Auto-tools]\n" + snippet},
-                {"role":"user",   "content": user_text}
-            ]
-            reply = self._stream_and_capture(
-                self.primary_model, msgs,
-                tag="[Assistant]"
-            ).strip()
+            # Stage 5: external_knowledge_retrieval
+            try:
+                ctx5 = self._stage5_external_knowledge(state["clar_ctx"], state)
+                state["know_ctx"] = ctx5
+                status_cb("external_knowledge", "(snippets)")
+            except Exception as e:
+                status_cb("external_knowledge_error", str(e))
+                state["errors"].append(("external_knowledge", str(e)))
+                dummy = ContextObject.make_stage(
+                    "external_knowledge_retrieval",
+                    state["clar_ctx"].references,
+                    {"snippets": []}
+                )
+                dummy.stage_id = "external_knowledge_retrieval"
+                dummy.summary  = "(no snippets)"
+                dummy.touch(); self.repo.save(dummy)
+                state["know_ctx"] = dummy
 
-            status_cb("output", reply)
-            return reply
+            # Ensure no tool contexts
+            state["tool_ctxs"] = []
 
-        # ─── If tools WILL be used, announce immediately ───────────────────
-        # prepare the tools list once for announcement
+            # Stage 10: assemble + infer
+            try:
+                final = self._stage10_assemble_and_infer(user_text, state)
+                state["final"] = final
+                status_cb("assemble_and_infer", final)
+            except Exception as e:
+                status_cb("assemble_and_infer_error", str(e))
+                state["errors"].append(("assemble_and_infer", str(e)))
+                final = ""
+                state["final"] = final
+
+            # Stage 11: memory_writeback
+            try:
+                self._stage11_memory_writeback(final, state["tool_ctxs"])
+                status_cb("memory_writeback", "(queued)")
+            except Exception as e:
+                status_cb("memory_writeback_error", str(e))
+                state["errors"].append(("memory_writeback", str(e)))
+
+            # Final output
+            out = final.strip()
+            status_cb("output", out)
+            return out
+
+        # ─── With-tools branch ────────────────────────────────────────────
+
+        # Announcement
         prepared = self._stage6_prepare_tools()
         tools_list = [t["name"] for t in prepared]
         announce = (
@@ -2096,70 +2135,73 @@ class Assembler:
         )
         status_cb("announcement", announce)
 
-
-        # ─── Stage 1: record_input ────────────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 1: record_input
         try:
             ctx1 = self._stage1_record_input(user_text)
             state["user_ctx"] = ctx1
-            _record_perf("record_input", ctx1.summary, True, ctx1)
+            status_cb("record_input", ctx1.summary)
         except Exception as e:
-            _record_perf("record_input", str(e), False)
+            status_cb("record_input_error", str(e))
             state["errors"].append(("record_input", str(e)))
 
-        # ─── Stage 2: load_system_prompts ───────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 2: load_system_prompts
         try:
             ctx2 = self._stage2_load_system_prompts()
             state["sys_ctx"] = ctx2
-            _record_perf("load_system_prompts", "(loaded)", True, ctx2)
+            status_cb("load_system_prompts", "(loaded)")
         except Exception as e:
-            _record_perf("load_system_prompts", str(e), False)
+            status_cb("load_system_prompts_error", str(e))
             state["errors"].append(("load_system_prompts", str(e)))
 
-        # ─── Stage 3: retrieve_and_merge_context ────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 3: retrieve_and_merge_context
         try:
             extra = self._get_history()
             state["recent_ids"] = [c.context_id for c in extra]
+
             out3 = self._stage3_retrieve_and_merge_context(
-                user_text,
-                state["user_ctx"],
-                state["sys_ctx"],
-                extra_ctx=extra
+                user_text, state["user_ctx"], state["sys_ctx"], extra_ctx=extra
             )
             state.update(out3)
-            _record_perf("retrieve_and_merge_context", "(merged)", True)
+
+            # ─── copy slices for downstream stages ───
+            state["history"]  = out3.get("history",  [])
+            state["tools"]    = out3.get("tools",    [])
+            state["semantic"] = out3.get("semantic", [])
+            state["assoc"]    = out3.get("assoc",    [])
+
+            status_cb("retrieve_and_merge_context", "(merged)")
         except Exception as e:
-            _record_perf("retrieve_and_merge_context", str(e), False)
+            status_cb("retrieve_and_merge_context_error", str(e))
             state["errors"].append(("retrieve_and_merge_context", str(e)))
 
-        # ─── Stage 4: intent_clarification ──────────────────────────────
-        t0 = datetime.utcnow()
+            # safe fall-backs so later stages can still run
+            state["history"]  = []
+            state["tools"]    = []
+            state["semantic"] = []
+            state["assoc"]    = []
+        # Stage 4: intent_clarification
         try:
             ctx4 = self._stage4_intent_clarification(user_text, state)
             state["clar_ctx"] = ctx4
-            _record_perf("intent_clarification", ctx4.summary, True, ctx4)
+            status_cb("intent_clarification", ctx4.summary)
         except Exception as e:
-            _record_perf("intent_clarification", str(e), False)
+            status_cb("intent_clarification_error", str(e))
             state["errors"].append(("intent_clarification", str(e)))
             dummy = ContextObject.make_stage(
                 "intent_clarification_failed",
-                [state["user_ctx"].context_id] if "user_ctx" in state else [],
+                [state["user_ctx"].context_id],
                 {"summary": ""}
             )
             dummy.touch(); self.repo.save(dummy)
-            
             state["clar_ctx"] = dummy
 
-        # ─── Stage 5: external_knowledge_retrieval ──────────────────────
-        t0 = datetime.utcnow()
+        # Stage 5: external_knowledge_retrieval
         try:
-            ctx5 = self._stage5_external_knowledge(state["clar_ctx"])
+            ctx5 = self._stage5_external_knowledge(state["clar_ctx"], state)
             state["know_ctx"] = ctx5
-            _record_perf("external_knowledge", "(snippets)", True, ctx5)
+            status_cb("external_knowledge", "(snippets)")
         except Exception as e:
-            _record_perf("external_knowledge", str(e), False)
+            status_cb("external_knowledge_error", str(e))
             state["errors"].append(("external_knowledge", str(e)))
             dummy = ContextObject.make_stage(
                 "external_knowledge_retrieval",
@@ -2171,20 +2213,17 @@ class Assembler:
             dummy.touch(); self.repo.save(dummy)
             state["know_ctx"] = dummy
 
-        # ─── Stage 6: prepare_tools ────────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 6: prepare_tools
         try:
-            tools = self._stage6_prepare_tools()
+            tools = prepared
             state["tools_list"] = tools
-            _record_perf("prepare_tools", f"{len(tools)} tools", True)
+            status_cb("prepare_tools", f"{len(tools)} tools")
         except Exception as e:
-            _record_perf("prepare_tools", str(e), False)
+            status_cb("prepare_tools_error", str(e))
             state["errors"].append(("prepare_tools", str(e)))
 
-        # ─── Stage 7: planning_summary ──────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 7: planning_summary
         try:
-            logging.debug("Planning with tools: %s", [t["name"] for t in state["tools_list"]])
             ctx7, plan_out = self._stage7_planning_summary(
                 state["clar_ctx"],
                 state["know_ctx"],
@@ -2194,13 +2233,12 @@ class Assembler:
             )
             state["plan_ctx"]    = ctx7
             state["plan_output"] = plan_out
-            _record_perf("planning_summary", "(planned)", True, ctx7)
+            status_cb("planning_summary", "(planned)")
         except Exception as e:
-            _record_perf("planning_summary", str(e), False)
+            status_cb("planning_summary_error", str(e))
             state["errors"].append(("planning_summary", str(e)))
 
-        # ─── Stage 7b: plan_validation ────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 7b: plan_validation
         try:
             _, _, fixed = self._stage7b_plan_validation(
                 state["plan_ctx"],
@@ -2209,13 +2247,12 @@ class Assembler:
                 state
             )
             state["fixed_calls"] = fixed
-            _record_perf("plan_validation", f"{len(fixed)} calls", True)
+            status_cb("plan_validation", f"{len(fixed)} calls")
         except Exception as e:
-            _record_perf("plan_validation", str(e), False)
+            status_cb("plan_validation_error", str(e))
             state["errors"].append(("plan_validation", str(e)))
 
-        # ─── Stage 8: tool_chaining ────────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 8: tool_chaining
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
@@ -2223,29 +2260,24 @@ class Assembler:
                 state["tools_list"],
                 state
             )
-            # unpack exactly as before
-            state["tc_ctx"]     = tc_ctx
-            state["raw_calls"]  = raw_calls
-            state["schemas"]    = schemas
-            # ─── NEW ─── preserve those initial tool-output ContextObjects
-            state["tool_ctxs"]  = schemas
-            _record_perf("tool_chaining", f"{len(raw_calls)} calls", True, tc_ctx)
+            state["tc_ctx"]    = tc_ctx
+            state["raw_calls"] = raw_calls
+            state["schemas"]   = schemas
+            status_cb("tool_chaining", f"{len(raw_calls)} calls")
         except Exception as e:
-            _record_perf("tool_chaining", str(e), False)
+            status_cb("tool_chaining_error", str(e))
             state["errors"].append(("tool_chaining", str(e)))
 
-        # ─── Stage 8.5: user_confirmation ─────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 8.5: user_confirmation
         try:
             confirmed = self._stage8_5_user_confirmation(state["raw_calls"], user_text)
             state["confirmed_calls"] = confirmed
-            _record_perf("user_confirmation", "(auto-approved)", True)
+            status_cb("user_confirmation", confirmed)
         except Exception as e:
-            _record_perf("user_confirmation", str(e), False)
+            status_cb("user_confirmation_error", str(e))
             state["errors"].append(("user_confirmation", str(e)))
 
-        # ─── Stage 9: invoke_with_retries ─────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 9: invoke_with_retries
         try:
             tcs = self._stage9_invoke_with_retries(
                 state["confirmed_calls"],
@@ -2255,16 +2287,14 @@ class Assembler:
                 state["clar_ctx"].metadata,
                 state
             )
-            # ─── only overwrite if we actually got back some results ───
             if tcs:
                 state["tool_ctxs"] = tcs
-            _record_perf("invoke_with_retries", f"{len(tcs)} runs", True)
+            status_cb("invoke_with_retries", f"{len(tcs)} runs")
         except Exception as e:
-            _record_perf("invoke_with_retries", str(e), False)
+            status_cb("invoke_with_retries_error", str(e))
             state["errors"].append(("invoke_with_retries", str(e)))
 
-        # ─── Stage 9b: reflection_and_replan ──────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 9b: reflection_and_replan
         try:
             rp = self._stage9b_reflection_and_replan(
                 state["tool_ctxs"],
@@ -2274,24 +2304,24 @@ class Assembler:
                 state
             )
             state["replan"] = rp
-            _record_perf("reflection_and_replan", f"replan={bool(rp)}", True)
+            status_cb("reflection_and_replan", rp)
         except Exception as e:
-            _record_perf("reflection_and_replan", str(e), False)
+            status_cb("reflection_and_replan_error", str(e))
             state["errors"].append(("reflection_and_replan", str(e)))
 
-        # ─── Stage 10: assemble + optional critique ─────────────────────
-        t0 = datetime.utcnow()
+        # Stage 10: assemble + infer (draft)
         try:
             draft = self._stage10_assemble_and_infer(user_text, state)
             state["draft"] = draft
-            _record_perf("assemble_and_infer", "(drafted)", True)
+            status_cb("assemble_and_infer", draft)
         except Exception as e:
-            _record_perf("assemble_and_infer", str(e), False)
+            status_cb("assemble_and_infer_error", str(e))
             state["errors"].append(("assemble_and_infer", str(e)))
-            state["draft"] = ""
+            draft = ""
+            state["draft"] = draft
 
+        # Stage 10b: response_critique (if errors)
         if state["errors"]:
-            t0 = datetime.utcnow()
             try:
                 patched = self._stage10b_response_critique_and_safety(
                     state["draft"],
@@ -2300,46 +2330,29 @@ class Assembler:
                     state
                 )
                 state["draft"] = patched or state["draft"]
-                _record_perf("response_critique", "(patched)", True)
+                status_cb("response_critique", state["draft"])
             except Exception as e:
-                _record_perf("response_critique", str(e), False)
+                status_cb("response_critique_error", str(e))
                 state["errors"].append(("response_critique", str(e)))
 
-        # ─── Stage 10b: final_inference ────────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 10b: final_inference
         try:
             final = self._stage10_assemble_and_infer(user_text, state)
             state["final"] = final
-            _record_perf("final_inference", "(completed)", True)
+            status_cb("final_inference", final)
         except Exception as e:
-            _record_perf("final_inference", str(e), False)
+            status_cb("final_inference_error", str(e))
             state["final"] = state.get("draft", "")
 
-
-        # ─── Stage 11: memory_writeback ───────────────────────────────
-        t0 = datetime.utcnow()
+        # Stage 11: memory_writeback
         try:
-            self._stage11_memory_writeback(
-                state["final"],
-                state["tool_ctxs"]
-            )
-            _record_perf("memory_writeback", "(queued)", True)
+            self._stage11_memory_writeback(state["final"], state["tool_ctxs"])
+            status_cb("memory_writeback", "(queued)")
         except Exception as e:
-            _record_perf("memory_writeback", str(e), False)
+            status_cb("memory_writeback_error", str(e))
             state["errors"].append(("memory_writeback", str(e)))
 
-        # one-off self-review & narrative-mull
-        try:
-            self._stage_system_prompt_refine(state)
-        except:
-            pass
-        try:
-            self._stage_narrative_mull(state)
-        except:
-            pass
-
-        # final output
+        # Final output
         out = state["final"].strip()
-        self._last_state = state
         status_cb("output", out)
         return out

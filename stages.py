@@ -38,6 +38,10 @@ def _utc_iso() -> str:
     from datetime import datetime
     return datetime.utcnow().isoformat() + "Z"
 
+def _stamp(ctx, state):
+    ctx.metadata.setdefault("conversation_id", state["conversation_id"])
+    ctx.metadata.setdefault("user_id",         state["user_id"])
+
 def squash_narrative(lines, keep_last=5, max_len=160):
     """
     lines : iterable[str]   (chronological order)
@@ -111,17 +115,27 @@ def _dump_ai_state(state: dict[str, Any]) -> None:
 ╚══════════════════════════════════════════════════════════════════╝
 """
     print(block.strip("\n"))
+import uuid
+def _ensure_ids(ctx, conv_id, user_id):
+    ctx.metadata.setdefault("conversation_id", conv_id)
+    ctx.metadata.setdefault("user_id",         user_id)
 
-
-
-def _stage1_record_input(self, user_text: str) -> ContextObject:
-    # record the new user input
+def _stage1_record_input(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
     ctx = ContextObject.make_segment("user_input", [], tags=["user_input"])
     ctx.summary = user_text
     ctx.stage_id = "user_input"
+
+    # 🔑  inject routing metadata so Stage 3 can find it later
+    ctx.metadata.update({
+        "conversation_id": state["conversation_id"],
+        "user_id":         state["user_id"],
+    })
+
     ctx.touch()
     self.repo.save(ctx)
     return ctx
+
+
 
 def _stage2_load_system_prompts(self) -> ContextObject:
     prom = self._get_prompt("system_prompt")   # or load from repo/artifact
@@ -137,30 +151,38 @@ def _stage2_load_system_prompts(self) -> ContextObject:
 def _stage3_retrieve_and_merge_context(
     self,
     user_text: str,
-    user_ctx: ContextObject,
-    sys_ctx: ContextObject,
-    extra_ctx: List[ContextObject] = None,
-    recall_ids: List[str] = None
+    user_ctx: "ContextObject",
+    sys_ctx: "ContextObject | None",
+    extra_ctx: List["ContextObject"] | None = None,
+    recall_ids:   List[str] | None = None,
 ) -> Dict[str, Any]:
     """
-    Merge per-conversation context (including extra_ctx), rewrite each ctx.summary as:
-       "<sender>: <original summary>"
-    so downstream stages know who said what.
+    Build the conversation memory window for downstream stages.
+
+    Returns ───────────────────────────────────────────────────────────────
+      merged        →  List[ContextObject]  (entire ordered context window)
+      merged_ids    →  List[str]            (ids of ^)
+      wm_ids        →  List[str]            (ids of working-memory slice)
+      history       →  last 8 user/assistant ContextObjects
+      tools         →  recent tool-output ContextObjects (≤ top_k)
+      semantic      →  semantic recall ContextObjects
+      assoc         →  associative recall ContextObjects
     """
     from datetime import datetime, timedelta
-
-    conv_id = user_ctx.metadata.get("conversation_id")
-    user_id = user_ctx.metadata.get("user_id")
     now = datetime.utcnow()
 
+    # ── 0. Helper: safe timestamp → datetime ──────────────────────────
     def _to_dt(ts):
         try:
             return datetime.fromisoformat(ts.rstrip("Z"))
-        except:
+        except Exception:
             return now
 
-    # 1) Load all raw user/assistant segments for this convo
-    all_segments = [
+    conv_id  = user_ctx.metadata.get("conversation_id")
+    user_id  = user_ctx.metadata.get("user_id")
+
+    # ── 1. Load raw convo segments ────────────────────────────────────
+    segs = [
         c for c in self.repo.query(lambda c:
             c.metadata.get("conversation_id") == conv_id
             and c.domain == "segment"
@@ -169,149 +191,215 @@ def _stage3_retrieve_and_merge_context(
         )
     ]
 
-    # 1a) Prepend any extra_ctx the caller provided
+    # ── 1a.  prepend any extra_ctx supplied by caller ─────────────────
     if extra_ctx:
-        # combine and dedupe by context_id
-        combined = list(extra_ctx) + all_segments
-        seen_ids = set()
-        deduped = []
-        for seg in combined:
-            if seg.context_id not in seen_ids:
-                deduped.append(seg)
-                seen_ids.add(seg.context_id)
-        all_segments = deduped
+        dedup = {c.context_id: c for c in segs}
+        for c in extra_ctx:
+            dedup.setdefault(c.context_id, c)
+        segs = list(dedup.values())
 
-    # 1b) Re-sort everything chronologically
-    all_segments.sort(key=lambda c: _to_dt(c.timestamp))
-
-    # 2) Working memory: last N turns
-    WM_TURNS   = 20    # keep more turns
-    segments_wm = all_segments[-WM_TURNS:]
-
-    # 3) Short-term memory: last M minutes
-    ST_MINUTES = 120   # wider time window
-    cutoff = now - timedelta(minutes=ST_MINUTES)
-    segments_st = [c for c in all_segments if _to_dt(c.timestamp) >= cutoff]
-
-    # 4) Semantic retrieval (as before)
-    semantic = []
-    if self.rl.should_run("semantic_retrieval", 0.0):
-        hits = self.engine.query(
-            stage_id="semantic_retrieval",
-            similarity_to=user_text,
-            include_tags=[],
-            exclude_tags=self.STAGES + ["tool_schema", "tool_output"],
-            top_k=self.top_k
-        )
-        semantic = [c for c in hits
-                    if c.metadata.get("conversation_id") == conv_id]
-
-    # 5) Associative recall (as before)
-    assoc = []
-    if self.rl.should_run("memory_retrieval", 0.0):
-        seeds = [user_ctx.context_id]
-        scores = self.memman.spread_activation(
-            seed_ids=seeds, hops=3, decay=0.7,
-            assoc_weight=1.0, recency_weight=1.0
-        )
-        for cid in sorted(scores, key=scores.get, reverse=True)[: self.top_k]:
+    # ── 1b.  bring in explicit recall_ids (if any) ────────────────────
+    if recall_ids:
+        for rid in recall_ids:
             try:
-                cobj = self.repo.get(cid)
-                if cobj.metadata.get("conversation_id") == conv_id:
-                    cobj.retrieval_score = scores[cid]
-                    assoc.append(cobj)
+                c = self.repo.get(rid)
+                if c.context_id not in {s.context_id for s in segs}:
+                    segs.append(c)
             except KeyError:
                 pass
 
-    # 6) Recent tool outputs (as before)
+    segs.sort(key=lambda c: _to_dt(c.timestamp))
+
+    # ── 2. Working-mem & short-term slices ────────────────────────────
+    WM_TURNS     = 20
+    ST_MINUTES   = 120
+    wm_slice     = segs[-WM_TURNS:]
+    st_cutoff    = now - timedelta(minutes=ST_MINUTES)
+    st_slice     = [c for c in segs if _to_dt(c.timestamp) >= st_cutoff]
+
+    # ── 3. Semantic & associative recall ──────────────────────────────
+    semantic, assoc = [], []
+    if self.rl.should_run("semantic_retrieval", 0.0):
+        sem_hits = self.engine.query(
+            stage_id="semantic_retrieval",
+            similarity_to=user_text,
+            exclude_tags=self.STAGES + ["tool_schema", "tool_output"],
+            top_k=self.top_k,
+        )
+        semantic = [h for h in sem_hits if h.metadata.get("conversation_id") == conv_id]
+
+    if self.rl.should_run("memory_retrieval", 0.0):
+        seeds  = [user_ctx.context_id]
+        scores = self.memman.spread_activation(seeds, hops=3, decay=0.7)
+        for cid in sorted(scores, key=scores.get, reverse=True)[: self.top_k]:
+            try:
+                c = self.repo.get(cid)
+                if c.metadata.get("conversation_id") == conv_id:
+                    c.retrieval_score = scores[cid]
+                    assoc.append(c)
+            except KeyError:
+                pass
+
+    # ── 4. Recent tool outputs ───────────────────────────────────────
     recent_tools = [
         c for c in self.repo.query(lambda c:
-            c.component == "tool_output"
-            and c.metadata.get("conversation_id") == conv_id
+            c.component == "tool_output" and
+            c.metadata.get("conversation_id") == conv_id
         )
     ]
     recent_tools.sort(key=lambda c: _to_dt(c.timestamp))
     recent_tools = recent_tools[-self.top_k:]
 
-    # 7) Prefix each summary with its sender
-    def _apply_sender(ctx: ContextObject):
-        sender = ctx.metadata.get("sender")
-        if not sender:
-            sender = "Assistant" if ctx.semantic_label=="assistant" else "User"
-        text = ctx.summary or ""
-        ctx.summary = f"{sender}: {text}"
+    # ── 5. Prefix each ctx.summary **exactly once** with sender ───────
+    def _prefix(ctx: "ContextObject"):
+        if ctx.summary and ctx.summary.lstrip().startswith(("User:", "Assistant:")):
+            return  # already prefixed
+        role = "Assistant" if ctx.semantic_label == "assistant" else "User"
+        ctx.summary = f"{role}: {ctx.summary or ''}"
 
-    # collect *all* candidate contexts
-    all_buckets = [sys_ctx, user_ctx] + segments_wm + segments_st + semantic + assoc + recent_tools
-    for ctx in all_buckets:
-        _apply_sender(ctx)
+    for bucket in (segs + semantic + assoc + recent_tools):
+        _prefix(bucket)
 
-    # 8) Merge in priority order, de-duping by (stage_id, summary)
+    # ── 6. Assemble merged list in priority order, de-duped ───────────
     merged, seen = [], set()
-    def _add(bucket):
-        for c in bucket:
-            key = (c.stage_id, c.summary)
+    def _add(items):
+        for c in items:
+            key = (c.context_id)
             if key not in seen:
                 merged.append(c)
                 seen.add(key)
 
-    _add([sys_ctx])
+    if sys_ctx:
+        _prefix(sys_ctx)
+        _add([sys_ctx])
     _add([user_ctx])
-    _add(segments_wm)
-    _add(segments_st)
+    _add(wm_slice)
+    _add(st_slice)
     _add(semantic)
     _add(assoc)
     _add(recent_tools)
 
-    # 9) Build return values
-    wm_ids     = [c.context_id for c in segments_wm]
-    merged_ids = [c.context_id for c in merged]
-
-    return {
-        "merged":     merged,
-        "merged_ids": merged_ids,
-        "wm_ids":     wm_ids,
+    # ── 7. Build returns ──────────────────────────────────────────────
+    out = {
+        "merged":      merged,
+        "merged_ids":  [c.context_id for c in merged],
+        "wm_ids":      [c.context_id for c in wm_slice],
+        # extra slices for downstream stages
+        "history":     merged[-8:],                 # last 8 conversational turns
+        "tools":       recent_tools,
+        "semantic":    semantic,
+        "assoc":       assoc,
     }
+
+    # ── 8.  Debug snapshot for tracing ────────────────────────────────
+    self._print_stage_context("retrieve_and_merge_context", {
+        "total_segments":   len(segs),
+        "merged_ids":       out["merged_ids"][:12],  # truncate for log
+        "wm_ids":           out["wm_ids"],
+        "semantic_ids":     [c.context_id for c in semantic],
+        "assoc_ids":        [c.context_id for c in assoc],
+        "tool_ids":         [c.context_id for c in recent_tools],
+    })
+
+    return out
+
 
 
 def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
+    """
+    Build a clarifier prompt that includes:
+      • The full dialog since the last tool invocation (or last 8 turns)
+      • The last 3 tool outputs, truncated
+    Output contract: {"keywords": [], "notes": "", "debug_notes": []}
+    """
     import json, textwrap
     from context import ContextObject
 
-    # 1) Fetch the last 4 user↔assistant turns from merged context (interlaced)
-    #    We take the pipeline’s merged list (which already prefixes sender),
-    #    filter to just user_input and assistant segments, then pick
-    #    the last 8 entries (4 turns of two messages each), and re-sort.
-    merged = state.get("merged", [])
-    history = [c for c in merged if c.semantic_label in ("user_input", "assistant")]
-    # keep only the last 8 msgs (4 full turns)
-    last_dialog = history[-8:]
-    last_dialog.sort(key=lambda c: c.timestamp)
+    # Safety
+    state = state or {}
+    merged   = state.get("merged", [])
+    tool_ctxs = state.get("tool_ctxs", [])
 
-    # 2) Build a simple "Recent Dialogue" block
-    dialog_lines = []
-    for c in last_dialog:
+    # 1) Gather post-tool dialogue
+    last_tool_ts = max((tc.timestamp for tc in tool_ctxs), default=None)
+    dialogue = []
+        # Fallback to last 8 turns if no post-tool dialogue
+    if not dialogue:
+        hist = [c for c in merged
+                if c.semantic_label in ("user_input", "assistant")]
+        hist.sort(key=lambda c: c.timestamp)
+        for c in hist[-8:]:
+            role = "User" if c.semantic_label == "user_input" else "Assistant"
+            dialogue.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
+
+    # ── NEW ▸ harvest the 8 turns *preceding* the current user message ─────────
+    prev_lines = []
+    hist.sort(key=lambda c: c.timestamp)
+    for c in hist[-9:-1]:                       # exclude the very last (current) turn
         role = "User" if c.semantic_label == "user_input" else "Assistant"
-        text = c.summary or c.metadata.get("text", "")
-        dialog_lines.append(f"{role}: {text}")
-    recent_dialog = "\n".join(dialog_lines) or "(no recent dialog)"
+        prev_lines.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
+    prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
+    for ctx in merged:
+        if ctx.semantic_label not in ("user_input", "assistant"):
+            continue
+        if last_tool_ts and ctx.timestamp <= last_tool_ts:
+            continue
+        role = "User" if ctx.semantic_label == "user_input" else "Assistant"
+        text = ctx.summary or ctx.metadata.get("text", "")
+        dialogue.append(f"{role}: {text}")
 
-    # 3) Build the clarifier prompt
-    clarifier_sys = self.clarifier_prompt
-    full_context_block = textwrap.dedent(f"""
+    # Fallback to last 8 turns if no post-tool dialogue
+    if not dialogue:
+        hist = [c for c in merged if c.semantic_label in ("user_input","assistant")]
+        hist.sort(key=lambda c: c.timestamp)
+        for c in hist[-8:]:
+            role = "User" if c.semantic_label=="user_input" else "Assistant"
+            dialogue.append(f"{role}: {c.summary or c.metadata.get('text','')}")
+
+    # Truncate long block
+    dialog_block = "\n".join(dialogue)
+    if len(dialog_block) > 1500:
+        dialog_block = dialog_block[-1500:]
+
+    # 2) Gather last 3 tool outputs, truncated
+    tool_lines = []
+    for tc in sorted(tool_ctxs, key=lambda c: c.timestamp)[-3:]:
+        payload = tc.metadata.get("output") or tc.metadata.get("exception") or ""
+        try:
+            blob = (
+                payload
+                if isinstance(payload, str)
+                else json.dumps(payload, ensure_ascii=False)
+            )
+        except:
+            blob = repr(payload)
+        if len(blob) > 950:
+            blob = blob[:950] + " …"
+        tool_lines.append(f"[{tc.stage_id}] {blob}")
+    tools_block = "\n".join(tool_lines) if tool_lines else "(none)"
+
+    # 3) Assemble clarifier prompt
+    clar_sys = self.clarifier_prompt
+    full_ctx = textwrap.dedent(f"""
         ### Recent Dialogue ###
-        {recent_dialog}
+        {dialog_block}
+
+        ### Previous User Turns ###
+        {prev_block}
+
+        ### Recent Tool Outputs ###
+        {tools_block}
 
         ### Current User Query ###
         {user_text}
     """).strip()
 
-    msgs = [
-        {"role": "system",  "content": clarifier_sys},
-        {"role": "system",  "content": full_context_block},
-        {"role": "user",    "content": user_text},
-    ]
 
+    msgs = [
+        {"role": "system", "content": clar_sys},
+        {"role": "system", "content": full_ctx},
+        {"role": "user",   "content": user_text},
+    ]
     out = self._stream_and_capture(
         self.secondary_model,
         msgs,
@@ -319,19 +407,21 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
         images=state.get("images")
     ).strip()
 
-    # 4) Enforce JSON shape (unchanged)
+    # 4) Enforce JSON schema
     for attempt in (1, 2):
         try:
             clar = json.loads(out)
             if isinstance(clar, dict) and "keywords" in clar and "notes" in clar:
                 break
-        except Exception:
+        except:
             clar = None
 
         if attempt == 1:
             retry_sys = (
-                "⚠️ Please output ONLY a JSON object with keys "
-                "\"keywords\" (array) and \"notes\" (string or array)."
+                "⚠️ Please output ONLY a JSON object with keys:\n"
+                "  • \"keywords\" (array)\n"
+                "  • \"notes\"    (string)\n"
+                "You may also include \"debug_notes\" (array of strings)."
             )
             out = self._stream_and_capture(
                 self.secondary_model,
@@ -343,27 +433,34 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
                 images=state.get("images")
             ).strip()
         else:
-            clar = {"keywords": [], "notes": out}
+            clar = {"keywords": [], "notes": out, "debug_notes": dialogue}
 
-    # 5) Persist the Clarifier ContextObject
+    # Ensure debug_notes key
+    if "debug_notes" not in clar:
+        clar["debug_notes"] = dialogue
+
+    # 5) Persist Clarification Context
     clar_ctx = ContextObject.make_stage(
         "intent_clarification",
-        input_refs=[state["user_ctx"].context_id],
+        input_refs=[state["user_ctx"].context_id] if state.get("user_ctx") else [],
         output=clar
     )
+    clar_ctx.metadata.update(clar)      # ✅ keep keywords / notes
+
     clar_ctx.stage_id       = "intent_clarification"
     clar_ctx.semantic_label = "clarifier_question"
     clar_ctx.tags.append("clarifier_question")
-    clar_ctx.metadata.update({
-        "conversation_id": state["user_ctx"].metadata["conversation_id"],
-        "user_id":         state["user_ctx"].metadata["user_id"],
-    })
+    if state.get("user_ctx"):
+        clar_ctx.metadata.update({
+            "conversation_id": state["user_ctx"].metadata["conversation_id"],
+            "user_id":         state["user_ctx"].metadata["user_id"],
+        })
     clar_ctx.summary = clar.get("notes", "")
-    clar_ctx.touch()
-    self.repo.save(clar_ctx)
-    #self.memman.register_relationships(clar_ctx, embed_text)
+    
+    clar_ctx.touch(); self.repo.save(clar_ctx)
 
     return clar_ctx
+
 
 
 
@@ -384,6 +481,7 @@ def _stage5_external_knowledge(
     import json
     from datetime import datetime
     from context import ContextObject
+    state = state or {}            #  ← ← ←   single-line guard
 
     # 1) Gather clarifier keywords
     kws = clar_ctx.metadata.get("keywords") or []
@@ -456,6 +554,7 @@ def _stage5_external_knowledge(
     ext_ctx.summary  = combined
     ext_ctx.touch(); self.repo.save(ext_ctx)
 
+
     # (optional) log for debugging
     self._print_stage_context("external_knowledge_retrieval", {
         "lines": lines,
@@ -508,7 +607,6 @@ def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
 
     return tool_defs
 
-
 def _stage7_planning_summary(
     self,
     clar_ctx: ContextObject,
@@ -521,13 +619,39 @@ def _stage7_planning_summary(
     1) Load the latest planning_prompt artifact (or fallback to config)
     2) Inject truncated tool list (name + first sentence of description)
     3) Run up to 3 JSON-only planning passes, halving snippets each retry
-    4) Take the raw plan, find which tools were selected
-    5) Inject full schemas for only those tools and do a second pass to fill missing args
-       and *explicitly* enforce correct key names per the schema
-    6) Serialize to plan_json (preserving tool_input keys) and persist
+    4) For each selected tool, refine the call against its schema
+    5) Persist artefacts & plan tracker; return (ctx, raw-JSON)
     """
-    import json, re, hashlib, datetime, textwrap
 
+    # ------------------------------------------------------------------ #
+    # 0️⃣  DIAGNOSTIC  – print what the planner *actually* receives      #
+    # ------------------------------------------------------------------ #
+    incoming_snapshot = {
+        "user_text":          user_text,
+        "clarifier_notes":    clar_ctx.summary,
+        "snippet_line_count": len((know_ctx.summary or "").splitlines()),
+        "history_len":        len(state.get("history",   [])),
+        "tools_len":          len(state.get("tools",     [])),
+        "semantic_len":       len(state.get("semantic",  [])),
+        "assoc_len":          len(state.get("assoc",     [])),
+    }
+
+    banner = "=" * 25 + " PLANNER INPUT CONTEXT " + "=" * 25
+    print("\n" + banner)
+    for k, v in incoming_snapshot.items():
+        print(f"{k:>18}: {v}")
+    print("=" * len(banner) + "\n")
+
+    # Persist for later inspection
+    self._print_stage_context("planning_summary_incoming", incoming_snapshot)
+
+    # ------------------------------------------------------------------ #
+    # 1️⃣  Standard implementation (was previously here unchanged)       #
+    # ------------------------------------------------------------------ #
+    import json, re, hashlib, datetime
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # helper utilities --------------------------------------------------
     def _clean_json_block(text: str) -> str:
         m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
         if m:
@@ -536,21 +660,26 @@ def _stage7_planning_summary(
         return (m2.group(1) if m2 else text).strip()
 
     def _first_sentence(desc: str) -> str:
-        parts = desc.split(".", 1)
-        return parts[0] + "." if len(parts) > 1 else desc
+        head = desc.split(".", 1)[0]
+        return head + ("." if not head.endswith(".") else "")
 
-    # 0) collect any prior plan_critique IDs
-    critique_rows = self.repo.query(
-        lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"
+    # 1A) fetch historical critiques -----------------------------------
+    critique_rows = sorted(
+        self.repo.query(
+            lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"
+        ),
+        key=lambda c: c.timestamp,
     )
-    critique_rows.sort(key=lambda c: c.timestamp)
     critique_ids = [c.context_id for c in critique_rows]
 
-    # 1) load the two-sentence planning prompt
-    prompt_rows = self.repo.query(
-        lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"
+    # 2) prepare planning prompt ---------------------------------------
+    prompt_rows = sorted(
+        self.repo.query(
+            lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"
+        ),
+        key=lambda c: c.timestamp,
+        reverse=True,
     )
-    prompt_rows.sort(key=lambda c: c.timestamp, reverse=True)
     raw_prompt = (
         prompt_rows[0].summary
         if prompt_rows
@@ -558,32 +687,33 @@ def _stage7_planning_summary(
     )
     first_two = ".".join(raw_prompt.split(".", 2)[:2]) + "."
 
-    # 2) build truncated tool list
+    # tool catalogue (first sentence per description)
     tool_lines = "\n".join(
-        f"- **{t['name']}**: {_first_sentence(t['description'])}"
-        for t in tools_list
+        f"- **{t['name']}**: {_first_sentence(t['description'])}" for t in tools_list
     ) or "(none)"
-    base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
+
+    base_system   = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
     replan_system = (
         "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.\n\n"
         f"Available tools:\n{tool_lines}"
     )
 
-    # 3) prepare user block
+    # 3) build USER message blocks -------------------------------------
     original_snips = (know_ctx.summary or "").splitlines()
 
     def build_user(snips):
-        return "\n\n".join([
-            f"User question:\n{user_text}",
-            f"Clarified intent:\n{clar_ctx.summary}",
-            "Snippets:\n" + ("\n".join(snips) if snips else "(none)")
-        ])
+        return "\n\n".join(
+            [
+                f"User question:\n{user_text}",
+                f"Clarified intent:\n{clar_ctx.summary}",
+                "Snippets:\n" + ("\n".join(snips) if snips else "(none)"),
+            ]
+        )
 
     full_user = build_user(original_snips)
 
-    # 4) run up to 3 planner passes
-    last_calls = None
-    plan_obj = None
+    # 4) high-level planning loop --------------------------------------
+    last_calls, plan_obj = None, None
     for attempt in range(1, 4):
         if attempt == 1:
             sys_p, user_p, tag = base_system, full_user, "[Planner]"
@@ -597,23 +727,20 @@ def _stage7_planning_summary(
 
         raw = self._stream_and_capture(
             self.secondary_model,
-            [{"role": "system", "content": sys_p},
-             {"role": "user",   "content": user_p}],
+            [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
             tag=tag,
             images=state.get("images"),
         )
+
         cleaned = _clean_json_block(raw)
         try:
             cand = json.loads(cleaned)
             assert isinstance(cand, dict) and "tasks" in cand
             plan_obj = cand
-        except:
+        except Exception:
             calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw)
             plan_obj = {
-                "tasks": [
-                    {"call": c, "tool_input": {}, "subtasks": []}
-                    for c in calls
-                ]
+                "tasks": [{"call": c, "tool_input": {}, "subtasks": []} for c in calls]
             }
 
         valid = {t["name"] for t in tools_list}
@@ -624,87 +751,145 @@ def _stage7_planning_summary(
         last_calls = [t["call"] for t in plan_obj["tasks"]]
         break
 
-    # 5) REFINE pass: inline entire JSON schema for every selected tool
-    selected = {t["call"] for t in plan_obj["tasks"]}
-    selected_tools = [t for t in tools_list if t["name"] in selected]
+    # 5) refine each tool call -----------------------------------------
+    schema_map = {t["name"]: t["schema"] for t in tools_list}
 
-    if selected_tools:
-        # build full‐schema blocks
-        schema_blocks: List[str] = []
-        for tool in selected_tools:
-            full_schema = tool["schema"]  # includes description, params, etc.
-            schema_json = json.dumps(full_schema, indent=2)
-            schema_blocks.append(
-                f"**{tool['name']}** full JSON schema:\n```json\n{schema_json}\n```"
+    def refine_single_tool(task: dict) -> dict:
+        name = task["call"]
+        schema = schema_map[name]
+        required = schema["parameters"].get("required", [])
+        props = schema["parameters"].get("properties", {})
+
+        schema_json = json.dumps(schema, indent=2)
+        req_lines = [f"- `{p}`: {props[p]['type']}" for p in required] or [
+            "(no required params)"
+        ]
+        req_block = "\n".join(req_lines)
+
+        refined = {
+            "call": name,
+            "tool_input": task.get("tool_input", {}) or {},
+            "subtasks": task.get("subtasks", []),
+        }
+
+        # log initial
+        self._print_stage_context(
+            f"tool_refine_schema_{name}",
+            {
+                "schema": schema_json.splitlines(),
+                "partial_plan": [json.dumps(refined, ensure_ascii=False)],
+            },
+        )
+
+        critic_sentence = ""
+        for retry in range(3):
+            # build prompt
+            sys_parts = []
+            if critic_sentence:
+                sys_parts.append(f"💡 Critic note: {critic_sentence}")
+            missing_now = [p for p in required if p not in refined["tool_input"]]
+            if retry > 0 and missing_now:
+                sys_parts.append(f"⚠️ Missing required parameters: {missing_now}")
+            sys_parts.append(
+                "You must output ONLY a JSON object {'tasks':[<one task>]} that "
+                "matches the schema exactly.\n"
+                f"Required parameters:\n{req_block}\n\nFull schema:\n```json\n{schema_json}\n```"
+            )
+            sys_msg = "\n\n".join(sys_parts)
+            user_msg = json.dumps({"tasks": [refined]}, ensure_ascii=False)
+
+            raw_out = self._stream_and_capture(
+                self.secondary_model,
+                [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                tag=f"[PlannerRefine_{name}]" + (f"_retry{retry}" if retry else ""),
+                images=state.get("images"),
+            )
+            cleaned = _clean_json_block(raw_out)
+            try:
+                refined = json.loads(cleaned)["tasks"][0]
+            except Exception:
+                pass  # keep previous best
+
+            missing_now = [p for p in required if p not in refined.get("tool_input", {})]
+            if not missing_now:
+                return refined
+
+            # critic one-liner
+            critic_prompt = (
+                "You are a strict critic.\n"
+                "Review the JSON schema and the malformed call. "
+                "Reply with **one sentence** suggesting the fix."
+            )
+            critic_input = "\n\n".join(
+                [
+                    "=== SCHEMA ===",
+                    schema_json,
+                    "=== BAD CALL ===",
+                    json.dumps(refined, ensure_ascii=False),
+                ]
+            )
+            critic_sentence = self._stream_and_capture(
+                self.secondary_model,
+                [
+                    {"role": "system", "content": critic_prompt},
+                    {"role": "user", "content": critic_input},
+                ],
+                tag=f"[ToolCritic_{name}]",
+                images=state.get("images"),
+            ).strip()
+
+            self._print_stage_context(
+                f"tool_refine_critique_{name}", {"critic": [critic_sentence]}
+            )
+            self._print_stage_context(
+                f"tool_refine_error_{name}",
+                {
+                    "errors": [f"⚠️ Missing required parameters: {missing_now}"],
+                    "current_plan": [json.dumps(refined, ensure_ascii=False)],
+                },
             )
 
-        # list required params only (to force renaming/filling)
-        param_list: List[str] = []
-        for tool in selected_tools:
-            props = tool["schema"]["parameters"]["properties"]
-            required = tool["schema"]["parameters"].get("required", [])
-            for p in required:
-                param_list.append(f"- `{p}`: {props[p].get('type')}")
+        return refined  # best-effort after 3 retries
 
-        param_block = "\n".join(param_list) or "(no required params)"
+    # parallel refinement
+    tasks_in = plan_obj.get("tasks", [])
+    with ThreadPoolExecutor(max_workers=len(tasks_in) or 1) as pool:
+        fut_map = {pool.submit(refine_single_tool, t): t["call"] for t in tasks_in}
+        refined_tasks = [f.result() for f in as_completed(fut_map)]
 
-        refine_system = (
-            "Now that you've selected your tool(s), please *use exactly* the following parameter names:\n"
-            f"{param_block}\n\n"
-            "Fill in any missing `tool_input` entries and *rename* any incorrect keys.\n\n"
-            "Here are the **entire** JSON schemas for your selected tools:\n\n"
-            + "\n\n".join(schema_blocks)
-        )
-        refine_user = json.dumps({"tasks": plan_obj["tasks"]})
+    # restore original order
+    order_map = {t["call"]: t for t in refined_tasks}
+    plan_obj["tasks"] = [order_map[t["call"]] for t in tasks_in]
 
-        # log it for visibility
-        print("\n── REFINE_SYSTEM START ──")
-        print(refine_system)
-        print("── REFINE_SYSTEM END ──\n")
-
-        raw2 = self._stream_and_capture(
-            self.secondary_model,
-            [{"role": "system", "content": refine_system},
-             {"role": "user",   "content": refine_user}],
-            tag="[PlannerRefine]",
-            images=state.get("images"),
-        )
-        cleaned2 = _clean_json_block(raw2)
-        try:
-            cand2 = json.loads(cleaned2)
-            assert isinstance(cand2, dict) and "tasks" in cand2
-            plan_obj = cand2
-        except:
-            pass
-
-    # 6) flatten + build call strings
-    def _flatten(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 6) flatten → call_strings ----------------------------------------
+    def _flatten(task: dict) -> list:
         out = [task]
         for sub in task.get("subtasks", []):
             out.extend(_flatten(sub))
         return out
 
-    flat: List[Dict[str, Any]] = []
-    for t in plan_obj.get("tasks", []):
-        flat.extend(_flatten(t))
+    flat_tasks: List[dict] = []
+    for t in plan_obj["tasks"]:
+        flat_tasks.extend(_flatten(t))
 
     call_strings: List[str] = []
-    for task in flat:
-        name = task["call"]
-        params = task.get("tool_input", {}) or {}
+    for t in flat_tasks:
+        params = t.get("tool_input", {}) or {}
         if params:
-            args = ",".join(
-                f"{k}={json.dumps(v, ensure_ascii=False)}"
-                for k, v in params.items()
+            arg_str = ",".join(
+                f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in params.items()
             )
-            call_strings.append(f"{name}({args})")
+            call_strings.append(f"{t['call']}({arg_str})")
         else:
-            call_strings.append(f"{name}()")
+            call_strings.append(f"{t['call']}()")
 
+    # 7) persist artefacts ---------------------------------------------
     plan_json = json.dumps(plan_obj, ensure_ascii=False)
-    plan_sig = hashlib.md5(plan_json.encode("utf-8")).hexdigest()[:8]
+    plan_sig = hashlib.md5(plan_json.encode()).hexdigest()[:8]
 
-    # 7) persist everything
     ctx = ContextObject.make_stage(
         "planning_summary",
         clar_ctx.references + know_ctx.references + critique_ids,
@@ -715,7 +900,9 @@ def _stage7_planning_summary(
     ctx.touch()
     self.repo.save(ctx)
 
-    succ_cls = ContextObject.make_success if call_strings else ContextObject.make_failure
+    succ_cls = (
+        ContextObject.make_success if call_strings else ContextObject.make_failure
+    )
     succ_msg = (
         f"Planner → {len(call_strings)} task(s)"
         if call_strings
@@ -726,21 +913,22 @@ def _stage7_planning_summary(
     succ.touch()
     self.repo.save(succ)
 
+    # tracker
     tracker = ContextObject.make_stage(
         "plan_tracker",
         [ctx.context_id],
         {
-            "plan_id":     plan_sig,
+            "plan_id": plan_sig,
             "total_calls": len(call_strings),
-            "succeeded":   0,
-            "attempts":    0,
-            "status":      "in_progress",
-            "started_at":  datetime.datetime.utcnow().isoformat() + "Z",
+            "succeeded": 0,
+            "attempts": 0,
+            "status": "in_progress",
+            "started_at": datetime.datetime.utcnow().isoformat() + "Z",
         },
     )
     tracker.semantic_label = plan_sig
-    tracker.stage_id       = f"plan_tracker_{plan_sig}"
-    tracker.summary        = "initialized plan tracker"
+    tracker.stage_id = f"plan_tracker_{plan_sig}"
+    tracker.summary = "initialized plan tracker"
     tracker.touch()
     self.repo.save(tracker)
 
@@ -881,6 +1069,8 @@ def _stage7b_plan_validation(
     return fixed_calls, [], fixed_calls
 
 
+
+
 def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
@@ -1011,7 +1201,6 @@ def _stage8_tool_chaining(
 
     return tc_ctx, confirmed, tool_ctxs
 
-
 def _stage8_5_user_confirmation(
     self,
     calls: list[Any],
@@ -1089,7 +1278,8 @@ def _stage9b_reflection_and_replan(
 
     # 3) Append every single tool output, unfiltered
     for c in tool_ctxs:
-        payload = c.metadata.get("output")
+        payload = c.metadata.get("output_short") or c.metadata.get("output_full")
+
         try:
             blob = json.dumps(payload, indent=2, ensure_ascii=False)
         except Exception:
@@ -1168,6 +1358,14 @@ def _stage9_invoke_with_retries(
 ) -> List[ContextObject]:
     import json, re, hashlib, datetime, logging
     from tools import Tools
+    # --- utilities -------------------------------------------------
+    def _smart_truncate(text: str, max_len: int = 4000) -> str:
+        """Trim without breaking JSON nor mid-token; keeps head+tail."""
+        if len(text) <= max_len:
+            return text
+        head = text[: max_len // 2]
+        tail = text[-max_len // 2 :]
+        return head + f"\n… ⟪{len(text)-max_len} chars elided⟫ …\n" + tail
 
     plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
     tracker = next(
@@ -1298,38 +1496,52 @@ def _stage9_invoke_with_retries(
                         tool_ctxs.append(ctx_i)
                     except StopIteration:
                         pass
-
-            # main call
+            # ─── main call ─────────────────────────────────────────────────
             res = Tools.run_tool_once(call_str)
-            ok,err = _validate(res)
-            key = normalize_key(call_str.split("(",1)[0])
-            last_results[key] = res.get("output")
+            ok, err = _validate(res)
+            raw_out = res.get("output")
 
-            # persist
+            # ─── prepare pretty / short views ────────────────────────────────
             try:
-                nm=original.split("(",1)[0]
-                sch=next(
-                    s for s in selected_schemas
-                    if json.loads(s.metadata["schema"])["name"]==nm
-                )
-                refs=[sch.context_id]
-            except StopIteration:
-                refs=[]
-            ctx=ContextObject.make_stage("tool_output",refs,res)
-            ctx.metadata["tool_call"]=original
-            ctx.metadata.update(res)
-            ctx.stage_id=f"tool_output_{nm}"
-            ctx.summary=str(res.get("output")) if ok else f"ERROR: {err}"
-            ctx.touch(); self.repo.save(ctx)
+                pretty = json.dumps(raw_out, ensure_ascii=False, indent=2)
+            except Exception:
+                pretty = repr(raw_out)
+            short = _smart_truncate(pretty)
+
+            # ─── pick schema ref if any ──────────────────────────────────────
+            name = original.split("(", 1)[0]
+            refs = []
+            for s in selected_schemas:
+                if json.loads(s.metadata["schema"])["name"] == name:
+                    refs = [s.context_id]
+                    break
+
+            # ─── persist a single tool_output with **all** metadata fields ───
+            meta = {
+                "tool_call":    original,
+                "output_full":  pretty,
+                "output_short": short,
+                "output":       raw_out,
+                "exception":    res.get("exception"),
+            }
+            ctx = ContextObject.make_stage("tool_output", refs, meta)
+            ctx.stage_id = f"tool_output_{name}"
+            ctx.summary  = ("ERROR: " + str(err)) if not ok else repr(raw_out)
+            ctx.touch()
+            self.repo.save(ctx)
             tool_ctxs.append(ctx)
 
-            # record
-            call_status[original]=ok
-            tracker.metadata["succeeded"]+=int(ok)
-            if ok: pending.remove(original)
-            else:
-                tracker.metadata["errors_by_call"][original]=err
-            tracker.touch(); self.repo.save(tracker)
+            # ─── record success/failure ─────────────────────────────────────
+            call_status[original] = ok
+            tracker.metadata["succeeded"] += int(ok)
+            if not ok:
+                tracker.metadata["errors_by_call"][original] = err
+            tracker.touch()
+            self.repo.save(tracker)
+
+            if ok:
+                pending.remove(original)
+
 
         if not pending:
             tracker.metadata["status"]="success"
@@ -1361,108 +1573,94 @@ def _stage9_invoke_with_retries(
     state["tool_ctxs"] = tool_ctxs
     return tool_ctxs
 
-
 def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-    import json, textwrap
+    import json
     from context import ContextObject
 
+    # ─── 1) Conversation snippets ────────────────────────────────────
     MAX_CTX_OBJS = 128
-    MAX_CHARS_PER_OBJ = 1000
+    merged = state.get("merged", [])
+    recent = merged[-MAX_CTX_OBJS:]
+    convo_lines = [c.summary or "" for c in recent]
+    conversation_block = (
+        "[Conversation so far]\n" + "\n".join(convo_lines)
+        if convo_lines else ""
+    )
 
-    def snip(txt: str) -> str:
-        if not txt:
-            return ""
-        if len(txt) <= MAX_CHARS_PER_OBJ:
-            return txt
-        head = txt[:MAX_CHARS_PER_OBJ]
-        stop = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
-        return (head[:stop+1] if stop != -1 else head).rstrip() + " …"
-
-    # ─── 1) Pull in the merged conversation contexts ─────────────────
-    merged_ctxs = state.get("merged", [])
-    # Only keep the last MAX_CTX_OBJS for inlining
-    recent_merged = merged_ctxs[-MAX_CTX_OBJS:]
-
-    # Build “Conversation so far” block
-    convo_lines = [snip(c.summary or "") for c in recent_merged]
-    conversation_block = ""
-    if convo_lines:
-        conversation_block = "[Conversation so far]\n" + "\n".join(convo_lines)
-
-    # ─── 2) Gather & unpack any tool outputs ─────────────────────────
+    # ─── 2) Tool outputs ─────────────────────────────────────────────
+    tool_ctxs = state.get("tool_ctxs", []) or []
     tool_blocks = []
-    for tc in state.get("tool_ctxs", []):
-        raw = tc.metadata.get("output")
-        if isinstance(raw, dict) and "results" in raw:
-            for r in raw["results"]:
-                ts   = r.get("timestamp", "")
-                role = r.get("role", "")
-                content = r.get("content", "")
-                tool_blocks.append(f"{ts} {role}: {snip(content)}")
-        else:
-            out = json.dumps(raw, ensure_ascii=False) if not isinstance(raw, str) else raw
-            tool_blocks.append(f"{tc.stage_id}: {snip(out)}")
+    for tc in tool_ctxs:
+        # Dump every metadata field
+        meta = tc.metadata.copy()
+        # Always include the original tool_call if present
+        if "tool_call" in meta:
+            meta["tool_call"] = meta["tool_call"]
+        # Format as prettified JSON
+        try:
+            payload = json.dumps(meta, ensure_ascii=False, indent=2)
+        except Exception:
+            payload = repr(meta)
+        # Header includes stage_id, tool_call and timestamp
+        call_name = meta.get("tool_call", tc.stage_id)
+        ts = getattr(tc, "timestamp", "")
+        header = f"--- {tc.stage_id} ({call_name}) @ {ts} ---"
+        tool_blocks.append(header)
+        tool_blocks.append(payload)
 
-    tools_block = ""
-    if tool_blocks:
-        tools_block = "\n\n[Tool outputs]\n" + "\n".join(tool_blocks)
+    tools_block = (
+        "[Tool outputs]\n" + "\n\n".join(tool_blocks)
+        if tool_blocks else ""
+    )
 
-    # ─── 3) Debug print of raw tool outputs ───────────────────────────
-    print("🮕🮖🮖 TOOL OUTPUTS CAPTURED 🮖🮖\n")
-    for tc in state.get("tool_ctxs", []):
-        print(f"🡶 {tc.stage_id} 🡷")
-        print(f"{tc.metadata.get('output')!r}\n")
-    print("🮕🮖🮖🮖 END TOOL OUTPUTS 🮖🮖🮖🮖\n\n")
-
-    # ─── 4) Logging context snapshot ─────────────────────────────────
-    included_ids = [c.context_id for c in recent_merged]
-    self._print_stage_context("assemble_and_infer", {
-        "user_question": [user_text],
-        "plan":         [state.get("plan_output", "(no plan)")],
-        "included_ids": included_ids,
-        "snippets_count": len(convo_lines) + len(tool_blocks),
-    })
-
-    # ─── 5) Build the LLM messages (with full narrative + convo context) ────
-    final_sys = self._get_prompt("final_inference_prompt")
-    plan_txt   = state.get("plan_output", "(no plan)")
-    self._last_plan_output = plan_txt
-
-    # Fetch the up-to-date narrative context
+    # ─── 3) Narrative ────────────────────────────────────────────────
     narr_ctx = self._load_narrative_context()
-    full_narrative = narr_ctx.summary or "(no narrative yet)"
+    narrative_block = "[Narrative]\n" + (narr_ctx.summary or "")
 
+    # ─── 4) Recent history bullets ──────────────────────────────────
+    recent_hist = merged[-5:]
+    bullets = [f"- {c.semantic_label}: {c.summary}" for c in recent_hist]
+    recent_hist_block = (
+        "[Recent History]\n" + "\n".join(bullets)
+        if bullets else ""
+    )
+
+    # ─── 5) Plan & user question ────────────────────────────────────
+    plan_txt = state.get("plan_output", "(no plan)")
+    plan_block = "[Plan]\n" + plan_txt
+    user_block = "[User question]\n" + user_text
+
+    # ─── 6) Build debug payload ────────────────────────────────────
+    debug_payload = {
+        "conversation_block": conversation_block,
+        "tools_block":        tools_block,
+        "narrative_block":    narrative_block,
+        "recent_hist_block":  recent_hist_block,
+        "plan_block":         plan_block,
+        "user_block":         user_block,
+        "merged_ids":         [c.context_id for c in recent],
+        "tool_ctx_ids":       [tc.context_id for tc in tool_ctxs],
+    }
+    self._print_stage_context("assemble_and_infer", debug_payload)
+
+    # ─── 7) Compose messages for the LLM ───────────────────────────
+    final_sys = self._get_prompt("final_inference_prompt")
     msgs = [
         {"role": "system", "content": final_sys},
-        {"role": "system", "content": "[Narrative]\n" + full_narrative},
+        {"role": "system", "content": narrative_block},
     ]
-
-    # Include the merged conversation snippets
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
-
-    # Include any tool outputs
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
-
-    # Include our standard inference prompt
     msgs.append({"role": "system", "content": self.inference_prompt})
+    if recent_hist_block:
+        msgs.append({"role": "system", "content": recent_hist_block})
+    msgs.append({"role": "system", "content": plan_block})
+    msgs.append({"role": "system", "content": user_block})
+    msgs.append({"role": "user",   "content": user_text})
 
-    # Additionally supply the raw user query and a brief recent-history block
-    recent_hist = "\n".join(
-        f"- {c.semantic_label}: {c.summary}"
-        for c in state.get("merged", [])[-5:]
-    )
-    if recent_hist:
-        msgs.append({
-            "role": "system",
-            "content": "[Recent History]\n" + recent_hist
-        })
-
-    # Finally, the user’s latest request
-    msgs.append({"role": "user", "content": user_text})
-
-    # ─── 6) Call the model ────────────────────────────────────────────
+    # ─── 8) Call the model ───────────────────────────────────────────
     reply = self._stream_and_capture(
         self.primary_model,
         msgs,
@@ -1470,14 +1668,16 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         images=state.get("images")
     ).strip()
 
-    # ─── 7) Persist the assistant’s reply ────────────────────────────
-    refs = included_ids + [tc.context_id for tc in state.get("tool_ctxs", [])]
+    # ─── 9) Persist assistant reply ─────────────────────────────────
+    refs = debug_payload["merged_ids"] + debug_payload["tool_ctx_ids"]
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
     resp_ctx.touch(); self.repo.save(resp_ctx)
 
-    seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
+    seg = ContextObject.make_segment("assistant",
+                                     [resp_ctx.context_id],
+                                     tags=["assistant"])
     seg.summary   = reply
     seg.stage_id  = "assistant"
     seg.touch(); self.repo.save(seg)

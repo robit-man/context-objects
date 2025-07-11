@@ -2644,8 +2644,7 @@ class Tools:
         (TESTING SEEDING)
         Parameters
         ----------
-        assembler
-            An Assembler instance (must have a .repo attribute to query).
+    
         limit, n, count : int, optional
             Alias for the maximum number of entries to return.
         direction : str, optional
@@ -2664,6 +2663,8 @@ class Tools:
         keyword, query : str, optional
             If provided, rank candidates by simple substring match +
             embedding-similarity to this text.
+
+            (Ignore assembler arg, it is automatically passed in.)
         
         Returns
         -------
