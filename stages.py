@@ -278,18 +278,15 @@ def _stage4_intent_clarification(self, user_text: str, state: Dict[str, Any]) ->
     import json, textwrap
     from context import ContextObject
 
-    # 1) Fetch the last 4 user/assistant segments from the store
-    conv_id = state["user_ctx"].metadata["conversation_id"]
-    segs = [
-        c for c in self.repo.query(lambda c:
-            c.domain == "segment"
-            and c.metadata.get("conversation_id") == conv_id
-            and c.semantic_label in ("user_input", "assistant")
-        )
-    ]
-    # sort by timestamp, keep only the last 4
-    segs.sort(key=lambda c: c.timestamp)
-    last_dialog = segs[-4:]
+    # 1) Fetch the last 4 user↔assistant turns from merged context (interlaced)
+    #    We take the pipeline’s merged list (which already prefixes sender),
+    #    filter to just user_input and assistant segments, then pick
+    #    the last 8 entries (4 turns of two messages each), and re-sort.
+    merged = state.get("merged", [])
+    history = [c for c in merged if c.semantic_label in ("user_input", "assistant")]
+    # keep only the last 8 msgs (4 full turns)
+    last_dialog = history[-8:]
+    last_dialog.sort(key=lambda c: c.timestamp)
 
     # 2) Build a simple "Recent Dialogue" block
     dialog_lines = []
@@ -1369,8 +1366,8 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     import json, textwrap
     from context import ContextObject
 
-    MAX_CTX_OBJS = 20
-    MAX_CHARS_PER_OBJ = 380
+    MAX_CTX_OBJS = 128
+    MAX_CHARS_PER_OBJ = 1000
 
     def snip(txt: str) -> str:
         if not txt:
@@ -1426,24 +1423,44 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         "snippets_count": len(convo_lines) + len(tool_blocks),
     })
 
-    # ─── 5) Build the LLM messages ───────────────────────────────────
+    # ─── 5) Build the LLM messages (with full narrative + convo context) ────
     final_sys = self._get_prompt("final_inference_prompt")
     plan_txt   = state.get("plan_output", "(no plan)")
     self._last_plan_output = plan_txt
 
+    # Fetch the up-to-date narrative context
+    narr_ctx = self._load_narrative_context()
+    full_narrative = narr_ctx.summary or "(no narrative yet)"
+
     msgs = [
         {"role": "system", "content": final_sys},
+        {"role": "system", "content": "[Narrative]\n" + full_narrative},
     ]
+
+    # Include the merged conversation snippets
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
+
+    # Include any tool outputs
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
 
-    # Then the standard inference prompt + user query
-    msgs += [
-        {"role": "system", "content": self.inference_prompt},
-        {"role": "user",   "content": user_text},
-    ]
+    # Include our standard inference prompt
+    msgs.append({"role": "system", "content": self.inference_prompt})
+
+    # Additionally supply the raw user query and a brief recent-history block
+    recent_hist = "\n".join(
+        f"- {c.semantic_label}: {c.summary}"
+        for c in state.get("merged", [])[-5:]
+    )
+    if recent_hist:
+        msgs.append({
+            "role": "system",
+            "content": "[Recent History]\n" + recent_hist
+        })
+
+    # Finally, the user’s latest request
+    msgs.append({"role": "user", "content": user_text})
 
     # ─── 6) Call the model ────────────────────────────────────────────
     reply = self._stream_and_capture(
