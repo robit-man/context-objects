@@ -3,6 +3,18 @@
 import heapq
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
+import re
+from datetime import datetime
+
+_ISO_SHORT = re.compile(r"^\d{8}T\d{6}$")        # 20250711T203918
+
+def _parse_ts(ts: str) -> datetime:
+    """Accept either full ISO-8601 or compact YYYYMMDDTHHMMSS[Z] format."""
+    ts = ts.rstrip("Z")
+    if _ISO_SHORT.match(ts):
+        # convert 20250711T203918 → 2025-07-11T20:39:18
+        ts = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}T{ts[9:11]}:{ts[11:13]}:{ts[13:]}"
+    return datetime.fromisoformat(ts)
 
 class GrandIntegrator:
     """
@@ -47,7 +59,7 @@ class GrandIntegrator:
             cid = c.context_id
             ts = getattr(c, "timestamp", now)
             if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.rstrip("Z"))
+                ts = _parse_ts(ts)
             meta = {
                 "edges": set(),  # populated externally (e.g., by memory manager)
                 "obj": c,
