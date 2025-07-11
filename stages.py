@@ -530,7 +530,7 @@ def _stage4_intent_clarification(
     clar_ctx.touch()
     self.repo.save(clar_ctx)
     # embed for later retrieval
-    self.memman.register_relationships(clar_ctx, embed_text)
+    self.memman.register_relationships(clar_ctx, self.embed_text)
 
     return clar_ctx
 
@@ -642,7 +642,7 @@ def _stage5_external_knowledge(
     ext_ctx.touch()
     self.repo.save(ext_ctx)
     # 🔑  **register embedding so future similarity queries can find it**
-    self.memman.register_relationships(ext_ctx, embed_text)
+    self.memman.register_relationships(ext_ctx, self.embed_text)
 
     # ------------------------------------------------------------------ #
     # 5) Optional debug print                                            #
