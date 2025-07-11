@@ -509,7 +509,8 @@ class Assembler:
             "  • Do NOT invent, soften, or omit any detail.  \n"
             "  • Keep it concise—no giant JSON dumps—yet exhaustively cover what the user needs.  \n\n"
             "Your answer should read like a clear human response, weaving in the tool data as evidence, "
-            "and should never simply repeat the user’s input verbatim."
+            "and should never simply repeat the user’s input verbatim.\n\n"
+            "Please reply appropriately, dont reply with analysis of the prior polished refinement, that was just meant to help you better understand what is going on, reply coherent and conversationally."
         )
         self.critic_prompt = self.cfg.get(
             "critic_prompt",
@@ -792,7 +793,7 @@ class Assembler:
                 )
                 new_ctx.touch()
                 self.repo.save(new_ctx)
-                self.memman.register_relationships(new_ctx, embed_text)
+                #self.memman.register_relationships(new_ctx, embed_text)
                 buckets[name] = [new_ctx]
                 continue
 
@@ -808,7 +809,7 @@ class Assembler:
                 keeper.metadata["schema"] = blob
                 keeper.touch()
                 self.repo.save(keeper)
-                self.memman.register_relationships(keeper, embed_text)
+                #self.memman.register_relationships(keeper, embed_text)
 
             buckets[name] = [keeper]
 
@@ -825,7 +826,7 @@ class Assembler:
                 keep.tags = [t for t in keep.tags if t != "tool_schema"]
                 keep.touch()
                 self.repo.save(keep)
-                self.memman.register_relationships(keep, embed_text)
+                #self.memman.register_relationships(keep, embed_text)
 
         # 4) rewrite JSONL to remove any on-disk duplicates & ensure validity
         sanitize_jsonl(self.context_path)
@@ -884,7 +885,7 @@ class Assembler:
                 )
                 new_ctx.touch()
                 self.repo.save(new_ctx)
-                self.memman.register_relationships(new_ctx, embed_text)
+                #self.memman.register_relationships(new_ctx, embed_text)
 
                 continue
 
@@ -908,10 +909,7 @@ class Assembler:
             if changed:
                 keeper.touch()
                 self.repo.save(keeper)
-                self.memman.register_relationships(keeper, embed_text)
-
-
-
+                #self.memman.register_relationships(keeper, embed_text)
 
 
     def _ensure_str(self, x: Any) -> str:
@@ -970,23 +968,63 @@ class Assembler:
 
 
     def _load_narrative_context(self) -> ContextObject:
+        """
+        Build (or fetch) the singleton narrative_context exactly once per turn,
+        then dedupe and purge any vestigial narrative entries before
+        reassembling the keeper’s narrative.
+        """
+        # If we've already built it this turn, return the cached keeper.
+        if getattr(self, "_narrative_loaded", False):
+            return self._narrative_cache  # type: ignore[attr-defined]
+
+        # Mark as built for this turn
+        self._narrative_loaded = True
+
+        # 1) get or create the one true keeper
         keeper = self._get_or_make_singleton(
             label="narrative_context",
             component="stage",
             tags=["narrative"],
         )
 
-        narr_objs = self.repo.query(lambda c: c.component == "narrative")
-        narr_objs.sort(key=lambda c: c.timestamp)
-        # coerce None→"" so join never fails
-        keeper.metadata["narrative"] = "\n".join((n.summary or "") for n in narr_objs)
-        keeper.summary = keeper.metadata["narrative"] or "(no narrative yet)"
-        keeper.references = [n.context_id for n in narr_objs]
+        # 2) fetch all raw narrative entries (exclude the keeper itself)
+        raw = [
+            c for c in self.repo.query(lambda c: c.component == "narrative")
+            if c.context_id != keeper.context_id
+        ]
+        raw.sort(key=lambda c: c.timestamp)
+
+        # 3) dedupe by summary text, collect duplicates for deletion
+        seen: set[str] = set()
+        unique: list[ContextObject] = []
+        duplicates: list[ContextObject] = []
+        for entry in raw:
+            text = entry.summary or ""
+            if text in seen:
+                duplicates.append(entry)
+            else:
+                seen.add(text)
+                unique.append(entry)
+
+        # 4) purge any duplicate ContextObjects from the repo
+        for dup in duplicates:
+            self.repo.delete(dup.context_id)
+
+        # 5) stitch together the keeper’s metadata from the deduped list
+        narrative_text = "\n".join(n.summary or "" for n in unique)
+        keeper.metadata["narrative"] = narrative_text
+        keeper.summary = narrative_text or "(no narrative yet)"
+        keeper.references = [n.context_id for n in unique]
+
+        # 6) persist and re-embed
         keeper.touch()
         self.repo.save(keeper)
         self.memman.register_relationships(keeper, embed_text)
 
+        # cache it so subsequent calls in this turn are no-ops
+        self._narrative_cache = keeper  # type: ignore[attr-defined]
         return keeper
+
     
     def _load_arbitrary_context(
         self,
@@ -1035,7 +1073,6 @@ class Assembler:
             tags=["system"],
         )
 
-        narr_ctx = self._load_narrative_context()
         static_objs = self.repo.query(
             lambda c: c.domain == "artifact" and c.component in ("prompt", "policy")
         )[: self.top_k]
@@ -1044,7 +1081,7 @@ class Assembler:
         )[-5:]
 
         # build the text *fresh* each turn
-        block = "---\n**My Narrative So Far:**\n" + narr_ctx.summary + "\n---\n"
+        block = ""
         block += "\n".join(
             f"{c.semantic_label}: {c.metadata.get('prompt') or c.metadata.get('policy')}"
             for c in static_objs
@@ -1054,16 +1091,14 @@ class Assembler:
 
         keeper.metadata["prompts"] = block
         keeper.summary = block
-        keeper.references = (
-            [narr_ctx.context_id]
-            + [c.context_id for c in static_objs]
-            + [c.context_id for c in dyn]
-        )
+        keeper.references = [c.context_id for c in static_objs] + [c.context_id for c in dyn]
+
         keeper.touch()
         self.repo.save(keeper)
         self.memman.register_relationships(keeper, embed_text)
 
         return keeper
+
 
 
     def _get_history(self) -> List[ContextObject]:
@@ -1651,10 +1686,7 @@ class Assembler:
                 })
             ),
         }
-
-        # 4B) Running narrative
-        narr_ctx = self._load_narrative_context()
-        full_narr = narr_ctx.metadata.get("history_text", narr_ctx.summary or "(empty)")
+        
 
         # 4C) Last round of tool contexts
         tool_ctxs = state.get("tool_ctxs", [])
@@ -1679,8 +1711,6 @@ class Assembler:
             f"{prompt_block}\n\n"
             "### Recent Evaluation History ###\n"
             f"{eval_block}\n\n"
-            "### Running Narrative History ###\n"
-            f"{textwrap.shorten(full_narr, width=2000, placeholder='…')}\n\n"
             "### Architecture Snapshot ###\n"
             f"{textwrap.shorten(arch, width=2000, placeholder='…')}\n\n"
             "### Recent Tool Activity ###\n"
@@ -1882,50 +1912,63 @@ class Assembler:
 
 
 
-    def filter_callback(self, user_text: str) -> bool:
-        choice = self.decision_callback(
+    def filter_callback(self, user_text: str) -> tuple[bool,str]:
+        """
+        Returns (should_respond, decision_string)
+        """
+        choice_text = self.decision_callback(
             user_text=user_text,
             options=["YES", "NO"],
             system_template=(
-                "You are attentive to the ongoing conversation, and if you should interject or reply."
+                "You are attentive to the ongoing conversation, and if you should interject or reply. "
                 "Answer exactly {arg1} or {arg2}."
             ),
-            context_type='narrative_context',
+            context_type="narrative_context",
             history_size=1,
             var_names=["arg1", "arg2"],
-            record=False      # ← don’t persist this check
+            record=False
         )
-        return choice.upper() == "YES"
+        return (choice_text.upper() == "YES", choice_text)
 
 
-    def tools_callback(self, user_text: str) -> bool:
-        choice = self.decision_callback(
+    def tools_callback(self, user_text: str) -> tuple[bool,str]:
+        """
+        Returns (use_tools, decision_string)
+        """
+        choice_text = self.decision_callback(
             user_text=user_text,
             options=["TOOLS", "NO_TOOLS"],
             system_template=(
-                "You judge a binary decision based on the nature of the most recent message, "
-                "you must decide whether or not the request might require additional stages to resolve, "
-                "if there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
+                "You judge a binary decision based on the nature of the most recent message. "
+                "If there is even the slightest hint at a request or inquiry, bias towards {arg1}. "
                 "Answer exactly {arg1} or {arg2}."
             ),
-            history_size=1,
             context_type="narrative_context",
+            history_size=1,
             var_names=["arg1", "arg2"],
-            record=False      # don’t persist this check
+            record=False
         )
-        return choice.upper() == "TOOLS"
-    
+        return (choice_text.upper() == "TOOLS", choice_text)
+
+        
     def run_with_meta_context(
         self,
         user_text: str,
         status_cb: Callable[[str, Any], None] = lambda *a: None,
         images: list[bytes] | None = None
     ) -> str:
+        # ─── Reset narrative cache ─────────────────────────────────────────
+        # ensures _load_narrative_context() rebuilds only once per turn
+        self._narrative_loaded = False
+        # (if you also cache the keeper object, clear that too)
+        if hasattr(self, "_narrative_cache"):
+            self._narrative_cache = None
+
+        # ─── Bootstrap & sanitize ─────────────────────────────────────────
         import logging, time, numpy as np
         from datetime import datetime
         from context import ContextObject, sanitize_jsonl
 
-        # ─── Bootstrap & sanitize ─────────────────────────────────────────
         sanitize_jsonl(self.context_path)
         if not user_text or not user_text.strip():
             status_cb("output", "")
@@ -1983,15 +2026,16 @@ class Assembler:
 
             # build dynamic system prompt from narrative + last N
             hist = self._get_history()
-            convo = "\n".join(
-                ("User: " if c.semantic_label=="user_input" else "Assistant: ") + c.summary
-                for c in hist
-            )
-            narr = self._load_narrative_context().summary
-            system_block = (
-                f"[System prompt—your narrative so far]\n{narr}\n\n"
-                f"[Recent conversation]\n{convo}"
-            )
+            lines = []
+            for c in hist:
+                # first try metadata, then fall back to semantic_label
+                sender = c.metadata.get("sender")
+                if not sender:
+                    sender = "User" if c.semantic_label=="user_input" else "Assistant"
+                lines.append(f"{sender}: {c.summary}")
+            convo = "\n".join(lines)
+
+            system_block = f"[Recent conversation]\n{convo}"
 
             AUTO_THRESH = 0.5
             descs = [(t["name"], t.get("description", "")) for t in state.get("tools_list", [])]
@@ -2022,7 +2066,8 @@ class Assembler:
                     state.get("plan_ctx", []).references if "plan_ctx" in state else [],
                     {"tool_name": tool, "output": out}
                 )
-                tc.component="tool_output"; tc.semantic_label=tool
+                tc.component = "tool_output"
+                tc.semantic_label = tool
                 tc.touch(); self.repo.save(tc)
                 state["tool_ctxs"].append(tc)
 
@@ -2041,13 +2086,16 @@ class Assembler:
             return reply
 
         # ─── If tools WILL be used, announce immediately ───────────────────
-        tools_list = [t["name"] for t in self._stage6_prepare_tools()]
+        # prepare the tools list once for announcement
+        prepared = self._stage6_prepare_tools()
+        tools_list = [t["name"] for t in prepared]
         announce = (
             "Got it! This may take a moment—I’ll be using: "
             + ", ".join(tools_list[:3])
             + " …"
         )
         status_cb("announcement", announce)
+
 
         # ─── Stage 1: record_input ────────────────────────────────────────
         t0 = datetime.utcnow()
@@ -2175,7 +2223,12 @@ class Assembler:
                 state["tools_list"],
                 state
             )
-            state.update({"tc_ctx": tc_ctx, "raw_calls": raw_calls, "schemas": schemas})
+            # unpack exactly as before
+            state["tc_ctx"]     = tc_ctx
+            state["raw_calls"]  = raw_calls
+            state["schemas"]    = schemas
+            # ─── NEW ─── preserve those initial tool-output ContextObjects
+            state["tool_ctxs"]  = schemas
             _record_perf("tool_chaining", f"{len(raw_calls)} calls", True, tc_ctx)
         except Exception as e:
             _record_perf("tool_chaining", str(e), False)
@@ -2202,7 +2255,9 @@ class Assembler:
                 state["clar_ctx"].metadata,
                 state
             )
-            state["tool_ctxs"] = tcs
+            # ─── only overwrite if we actually got back some results ───
+            if tcs:
+                state["tool_ctxs"] = tcs
             _record_perf("invoke_with_retries", f"{len(tcs)} runs", True)
         except Exception as e:
             _record_perf("invoke_with_retries", str(e), False)
@@ -2259,6 +2314,7 @@ class Assembler:
         except Exception as e:
             _record_perf("final_inference", str(e), False)
             state["final"] = state.get("draft", "")
+
 
         # ─── Stage 11: memory_writeback ───────────────────────────────
         t0 = datetime.utcnow()

@@ -2357,22 +2357,34 @@ class Tools:
         return filename
 
     @staticmethod
-    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, **kwargs) -> list:
+    def search_internet(topic: str,
+                        num_results: int = 5,
+                        wait_sec: int = 1,
+                        deep_scrape: bool = True,
+                        summarize: bool = True,
+                        bs4_verbose: bool = False,
+                        **kwargs) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
-        THIS RETURNS A RAW MASSIVE EXTRACTED WEBPAGE, call summarize_search(topic="content") instead IF YOU WANT BRIEF SUMMARIES!
+        THIS RETURNS A LIST OF RESULTS WITH OPTIONAL MODEL-GENERATED SUMMARIES.
 
-        1. Call search_internet(topic=str, top_n=int)
-        - topic (str): the search term, use `topic`
-        - top_n (int): how many results, use `top_n`
+        1. Call search_internet(topic=str, top_n=int, summarize=bool, bs4_verbose=bool)
+           - topic (str): the search term
+           - top_n, n, or limit (int): how many results
+           - summarize (bool): if True, generate a brief summary in 'aux_summary'; if False, skip summarization
+           - bs4_verbose (bool): if True, bs4_scrape returns full raw HTML; if False, only visible text
 
         • Opens the first *num_results* links in separate tabs and deep-scrapes each.
-        • Returns: title, url, snippet, summary, and full page HTML (`content`).
-        • Never blocks more than 5 s on any wait—everything is aggressively polled.
+        • Returns a list of dicts, each containing:
+            - title: the page title
+            - url: the page URL
+            - snippet: the search result snippet
+            - content: page text (raw HTML if bs4_verbose=True, otherwise only visible text)
+            - aux_summary: (only if summarize=True) a brief model-generated summary guided by `topic`
+        • Never blocks more than 5s on any wait—everything is aggressively polled.
         """
 
         # ——— Argument‐alias handling ——————————————
-        # allow users to pass top_n, n, limit, etc.
         if 'top_n' in kwargs:
             num_results = kwargs.pop('top_n')
         if 'n' in kwargs:
@@ -2383,7 +2395,7 @@ class Tools:
         if kwargs:
             log_message(f"[search_internet] Ignoring unexpected args: {list(kwargs.keys())!r}", "WARNING")
 
-        log_message(f"[search_internet] ▶ {topic!r} (num_results={num_results})", "INFO")
+        log_message(f"[search_internet] ▶ {topic!r} (num_results={num_results}, summarize={summarize}, bs4_verbose={bs4_verbose})", "INFO")
 
         # clamp waits to max 5 s
         wait_sec = min(wait_sec, 5)
@@ -2464,10 +2476,9 @@ class Tools:
                     except NoSuchElementException:
                         snippet = ""
 
-                    summary = snippet
                     page_content = ""
 
-                    # 6️⃣ Deep scrape in new tab  (hard 10-second cap)
+                    # 6️⃣ Deep scrape in new tab (hard 10-second cap)
                     if deep_scrape and href:
                         drv.switch_to.new_window("tab")
 
@@ -2501,42 +2512,37 @@ class Tools:
                             time.sleep(POLL_DELAY)
 
                         # grab whatever is available and move on
-                        page_content = drv.page_source or ""
-                        if not page_content.startswith("<"):
-                            # fallback to bs4 helper if primary is empty / error
-                            maybe = Tools.bs4_scrape(href)
-                            if not maybe.startswith("Error"):
-                                page_content = maybe
-
-                        # quick summary extraction
-                        summary = snippet
-                        try:
-                            pg = BeautifulSoup(page_content, "html5lib")
-                            meta = pg.find("meta", attrs={"name":"description"})
-                            ptag = pg.find("p")
-                            if meta and meta.get("content"):
-                                summary = meta["content"].strip()
-                            elif ptag:
-                                summary = ptag.get_text(strip=True)
-                        except Exception:
-                            pass
-
-                        drv.close()                               # always close the tab
+                        # note: we discard raw page_source and rely on bs4_scrape
+                        drv.close()
                         drv.switch_to.window(main_handle)
 
-                    clean_content = (
-                        BeautifulSoup(page_content, "html.parser")
-                        .get_text(separator=" ", strip=True)
-                        if page_content else ""
-                    )
+                        # extract via bs4_scrape, with verbosity flag
+                        page_content = Tools.bs4_scrape(href, verbosity=bs4_verbose)
 
-                    results.append({
+                    # 7️⃣ Model‐guided auxiliary summary (if requested)
+                    aux_summary = ""
+                    if summarize:
+                        try:
+                            aux_prompt = (
+                                f"Using the search topic «{topic}» as your guide, "
+                                "extract and summarize the most relevant information from this page text:\n\n"
+                                f"{page_content}"
+                            )
+                            aux_summary = Tools.auxiliary_inference(prompt=aux_prompt)
+                        except Exception as ex:
+                            log_message(f"[search_internet] auxiliary_inference error: {ex}", "WARNING")
+
+                    # assemble the result entry
+                    entry = {
                         "title":   title,
                         "url":     href,
                         "snippet": snippet,
-                        "summary": summary,
-                        "content": clean_content,
-                    })
+                        "content": page_content,
+                    }
+                    if summarize:
+                        entry["aux_summary"] = aux_summary
+
+                    results.append(entry)
 
                 except Exception as ex:
                     log_message(f"[search_internet] result error: {ex}", "WARNING")
@@ -2549,6 +2555,7 @@ class Tools:
 
         log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
         return results
+
 
 
     # This static method extracts a summary from a webpage using two stages:
@@ -3284,26 +3291,89 @@ class Tools:
         return "\n".join(summaries)
 
 
-
-    # This static method scrapes a webpage using BeautifulSoup and requests. It fetches the content of the URL, parses it with BeautifulSoup, and returns the prettified HTML. If an error occurs during scraping, it logs the error and returns an error message.
     @staticmethod
-    def bs4_scrape(url):
-        headers = {
-            'User-Agent': ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/42.0.2311.135 Safari/537.36 Edge/12.246")
-        }
-        try:
-            import requests
-            log_message(f"Scraping URL: {url}", "PROCESS")
-            response = requests.get(url, headers=headers, timeout=5)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html5lib')
-            log_message("Webpage scraped successfully.", "SUCCESS")
-            return soup.prettify()
-        except Exception as e:
-            log_message("Error during scraping: " + str(e), "ERROR")
-            return f"Error during scraping: {e}"
+    def bs4_scrape(url: str, verbosity: bool = False) -> str:
+        """
+        Scrape a webpage, mimicking a real browser to avoid blocking.
+
+        Args:
+            url (str): the page URL to scrape.
+            verbosity (bool): if False (default), strip out JS/HTML tags and return only visible text.
+                              if True, return the full raw HTML.
+
+        Returns:
+            str: the scraped content (raw HTML or visible text).
+        """
+        import random
+        import time
+        import requests
+        from bs4 import BeautifulSoup
+        from selenium import webdriver
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+
+        USER_AGENTS = [
+            # A small sample; feel free to expand
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/14.0 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/114.0.0.0 Safari/537.36",
+        ]
+
+        session = requests.Session()
+        html = ""
+        for attempt in range(3):
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "keep-alive",
+                "Referer": url,
+            }
+            try:
+                resp = session.get(url, headers=headers, timeout=5)
+                resp.raise_for_status()
+                html = resp.text
+                break
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                if code in (403, 429):
+                    log_message(f"[bs4_scrape] HTTP {code} for {url!r}, retrying with different headers…", "WARNING")
+                    time.sleep(random.uniform(1.0, 2.0))
+                    continue
+                else:
+                    log_message(f"[bs4_scrape] HTTP error for {url!r}: {e}", "ERROR")
+                    break
+            except Exception as e:
+                log_message(f"[bs4_scrape] Error during scraping {url!r}: {e}", "ERROR")
+                break
+        else:
+            # fallback to headless Selenium if all requests attempts blocked
+            try:
+                opts = FirefoxOptions()
+                opts.add_argument("--headless")
+                driver = webdriver.Firefox(options=opts)
+                driver.get(url)
+                html = driver.page_source
+                driver.quit()
+            except Exception as e:
+                log_message(f"[bs4_scrape] Selenium fallback failed for {url!r}: {e}", "ERROR")
+                html = ""
+
+        if not html:
+            return ""
+
+        if not verbosity:
+            # strip out non-visual elements
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
+                tag.decompose()
+            return soup.get_text(separator=" ", strip=True)
+
+        # verbose = True → full raw HTML
+        return html
+
 
     # This static method finds a file by name in a specified search path. It walks through the directory tree, checking each file against the given filename. If the file is found, it logs the success and returns the directory path; otherwise, it logs a warning and returns None.
     @staticmethod

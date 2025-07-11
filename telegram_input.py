@@ -768,8 +768,26 @@ def telegram_input(asm):
             # ── Lazy-init per-chat Assembler & utilities ──────────────────────
             chat_asm = assemblers.get(chat_id)
             if chat_asm is None:
-                repo = make_per_chat_repo(chat_id)
-                tts  = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
+                import sqlite3, time
+
+                # Retry if the SQLite DB is locked (e.g. after a hard kill)
+                for attempt in range(5):
+                    try:
+                        repo = make_per_chat_repo(chat_id)
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "database is locked" in str(e):
+                            time.sleep(0.1)
+                            continue
+                        raise
+                else:
+                    # All retries failed → fall back to JSON-only store
+                    from context import ContextRepository, sanitize_jsonl
+                    path = f"context_{chat_id}.jsonl"
+                    sanitize_jsonl(path)
+                    repo = ContextRepository(jsonl_path=path)
+
+                tts = TTSManager(logger=asm.tts.log, cfg=asm.cfg, audio_service=None)
                 tts.set_mode("file")
                 chat_asm = Assembler(
                     context_path=f"context_{chat_id}.jsonl",
@@ -780,6 +798,7 @@ def telegram_input(asm):
                     repo=repo,
                 )
                 assemblers[chat_id] = chat_asm
+
             chat_asm._chat_contexts.add(chat_id)
 
             # ── User & group registries ───────────────────────────────────────
@@ -821,7 +840,11 @@ def telegram_input(asm):
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
                 if msg.reply_to_message.from_user.id == bot.id:
                     metadata["in_reply_to_bot_message_id"] = msg.reply_to_message.message_id
-
+           
+           
+            sender = user.username or user.first_name or str(user.id)
+            metadata["sender"] = sender
+           
             # ── Create & save ContextObject segment ───────────────────────────
             seg = ContextObject.make_segment(
                 semantic_label=f"tg_{kind}",
@@ -829,7 +852,8 @@ def telegram_input(asm):
                 tags=tags,
                 metadata=metadata,
             )
-            seg.summary  = metadata["text"]
+            # prefix the summary with the sender’s name
+            seg.summary = f"{sender}: {metadata['text']}"
             seg.stage_id = "telegram_update"
             seg.touch()
             chat_asm.repo.save(seg)
@@ -862,52 +886,11 @@ def telegram_input(asm):
             # ── Decide if we should respond / run inference ────────────────────
             sender = user.username or user.first_name
             if image_paths:
-                user_text = f"{sender} sent image(s): " + " ".join(image_paths)
+                user_text = text + f"[image(s) attached]"
             else:
-                user_text = f"{sender}: {text}"
+                user_text = text
 
             trigger_id = msg.message_id
-
-            # 1️⃣ filter_callback
-            try:
-                wants_reply, filter_text = await asyncio.to_thread(
-                    chat_asm.filter_callback, user_text
-                )
-                logger.info("✅ filter_callback → %s", filter_text)
-            except Exception as err:
-                logger.error("❌ filter_callback error: %s", err)
-                wants_reply, filter_text = True, "<error>"
-
-            # 2️⃣ tools_callback
-            try:
-                use_tools, tools_text = await asyncio.to_thread(
-                    chat_asm.tools_callback, user_text
-                )
-                logger.info("✅ tools_callback → %s", tools_text)
-            except Exception as err:
-                logger.error("❌ tools_callback error: %s", err)
-                use_tools, tools_text = True, "<error>"
-            # 3️⃣ mention‐me check
-            mention_me = any(
-                ent.type == "mention"
-                and msg.text[ent.offset : ent.offset + ent.length]
-                    .lstrip("@").lower() == bot_name
-                for ent in (msg.entities or [])
-            )
-
-            # ── Final decision ───────────────────────────────────────────────
-            # ‘should_respond’ is about WHETHER to reply at all.
-            # ‘use_tools’ merely hints HOW the Assembler may reply (full pipeline vs fast-path).
-            should_respond = (
-                chat_type == "private"
-                or msg.voice
-                or wants_reply
-                or mention_me
-                or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
-            )
-
-            if not should_respond:
-                return  # nothing to do, quietly exit
 
 
             # ── Queue / run the Assembler for this chat/user pair ─────────────
