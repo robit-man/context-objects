@@ -1216,6 +1216,15 @@ class Assembler:
         self.repo.save(ctx)
         self.memman.register_relationships(ctx, embed_text)
 
+
+    def _persist_and_index(self, ctxs: list[ContextObject]):
+        for ctx in ctxs:
+            ctx.touch()
+            self.repo.save(ctx)
+        # one bulk ingest is cheaper than N singles
+        self.integrator.ingest(ctxs)
+
+
     # ————————————————————————————————————————————————————————————
     # Gemma-3 prompt builder
     def _gemma_format(self, messages: list[dict[str, str]]) -> str:

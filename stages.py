@@ -33,13 +33,6 @@ from context import (
 # import them too; adjust as needed.
 # ——— NEW helper ———
 
-def _persist_and_index(self, ctxs: list[ContextObject]):
-    for ctx in ctxs:
-        ctx.touch()
-        self.repo.save(ctx)
-    # one bulk ingest is cheaper than N singles
-    self.integrator.ingest(ctxs)
-
 def _utc_iso() -> str:
     """UTC timestamp ending with 'Z' (e.g. 2025-07-07T18:04:31.123456Z)."""
     from datetime import datetime
@@ -937,14 +930,18 @@ def _stage7_planning_summary(
                     "=== MALFORMED CALL ===\n```json\n"
                     + json.dumps(refined, ensure_ascii=False, indent=2)
                     + "\n```",
-                    "You must output **only** a JSON object of the form "
-                    "`{\"tasks\":[{...}]}` that exactly matches the tool schema.\n\n"
-                    f"Required parameters:\n{req_block}\n\n"
+                    "You must output **only** a JSON object `{\"tasks\":[...]}` that "
+                    "matches the schema *exactly*:\n"
+                    "• If you used any key **not in the schema**, rename it to the "
+                    "correct schema key or delete it.\n"
+                    "• Do **not** invent new keys.\n",
+                    f"Required parameters:\n{req_block}\n\n",
                     "=== TOOL SCHEMA ===\n```json\n"
                     + schema_json
                     + "\n```",
                 ]
             )
+
 
             sys_msg  = "\n\n".join(sys_parts)
             user_msg = json.dumps({"tasks": [refined]}, ensure_ascii=False)
@@ -985,9 +982,10 @@ def _stage7_planning_summary(
                     {
                         "role": "system",
                         "content": (
-                            "You are a strict critic.\n"
-                            "Review the JSON schema and the malformed call. "
-                            "Reply with **one sentence** suggesting the fix."
+                            "You are a strict critic. In **one sentence** tell the planner "
+                            "the exact change needed so the tool call conforms to the schema: "
+                            "rename any wrong keys, add all missing required keys with dummy "
+                            "values, and delete any extra keys. Do not output anything else."
                         ),
                     },
                     {
