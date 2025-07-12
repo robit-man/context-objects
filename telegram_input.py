@@ -960,17 +960,58 @@ def telegram_input(asm):
                 _GREG.add(title, chat_id)
 
             # ── Build tags & *define metadata up-front* ───────────────────────
+            # ── Build tags & define metadata up-front ───────────────────────
+            metadata = {
+                "chat_id":       chat_id,
+                "from_user_id":  user.id,
+                "from_username": user.username,
+                "message_id":    msg.message_id,
+                "text":          msg.text or msg.caption or "",
+            }
+
             tags = [
                 "telegram_update",
                 kind,
                 "group" if chat_type in ("group", "supergroup") else "private",
                 f"user:{user.username or user.id}",
             ]
+
+            # ── Record reply-to info if applicable ──────────────────────────
             if msg.reply_to_message:
+                reply = msg.reply_to_message
+                rt_user = reply.from_user.username or str(reply.from_user.id)
+                rt_text = reply.text or reply.caption or ""
+                # add to metadata
+                metadata["reply_to_username"]     = rt_user
+                metadata["reply_to_message_text"] = rt_text
+                metadata["reply_to_message_id"]   = reply.message_id
+                # add tags
+                tags.append(f"reply_to_user:{rt_user}")
                 tags.append("reply")
-                if msg.reply_to_message.from_user.id == bot.id:
+                if reply.from_user.id == bot.id:
                     tags.append("reply_to_bot")
 
+            sender = user.username or user.first_name or str(user.id)
+            metadata["sender"] = sender
+
+            # ── Create & save ContextObject segment ─────────────────────────
+            seg = ContextObject.make_segment(
+                semantic_label=f"tg_{kind}",
+                content_refs=[],
+                tags=tags,
+                metadata=metadata,
+            )
+            # include reply chain in summary if present
+            if metadata.get("reply_to_username"):
+                seg.summary = (
+                    f"{sender} replied to {metadata['reply_to_username']}: "
+                    f"{metadata['text']}"
+                )
+            else:
+                seg.summary = f"{sender}: {metadata['text']}"
+            seg.stage_id = "telegram_update"
+            seg.touch()
+            chat_asm.repo.save(seg)
 
             # ── If we have photos, store paths & notify user ──────────────────
             if image_paths:
@@ -986,8 +1027,8 @@ def telegram_input(asm):
                     await bot.send_message(
                         chat_id=chat_id,
                         text=(
-                            "🖼️✅ Saved image(s) to disk:\n"
-                            + "\n".join(f"- `{p}`" for p in image_paths)
+                            "🖼️ Saved image(s) to disk:\n"
+                            + "\n✅".join(f"- `{p}`" for p in image_paths)
                             + "\n\nYou can now run `/analyze_image <path>` to inspect any of these."
                         ),
                         reply_to_message_id=msg.message_id,
