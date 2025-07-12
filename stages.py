@@ -807,10 +807,12 @@ def _stage7_planning_summary(
 
     def build_user(snips):
         blocks = [
+            convo_block,                       # ← ADD THIS
             f"User question:\n{user_text}",
             f"Clarified intent:\n{clar_ctx.metadata.get('notes') or clar_ctx.summary or '(none)'}",
             "Snippets:\n" + ("\n".join(snips) if snips else "(none)"),
         ]
+
                 
         # ▸ surface previous validation errors so the LLM can fix them
         if state.get("plan_errors"):
@@ -900,12 +902,11 @@ def _stage7_planning_summary(
 
         # snapshot original schema + partial call
         self._print_stage_context(
-            f"tool_refine_schema_{name}",
-            {
-                "schema":       schema_json.splitlines(),
-                "partial_plan": [json.dumps(refined, ensure_ascii=False)],
-            },
+            "planner_final_prompt",
+            {"system_msg": sys_p.splitlines(),
+            "user_msg":   user_p.splitlines()}
         )
+
 
         critic_sentence = ""
         errors_acc      = []              # <-- NEW: running list of validation errors
@@ -1557,9 +1558,9 @@ def _stage9_invoke_with_retries(
 ) -> List[ContextObject]:
     import json, re, hashlib, datetime, logging
     from tools import Tools
+
     # --- utilities -------------------------------------------------
     def _smart_truncate(text: str, max_len: int = 4000) -> str:
-        """Trim without breaking JSON nor mid-token; keeps head+tail."""
         if len(text) <= max_len:
             return text
         head = text[: max_len // 2]
@@ -1569,21 +1570,23 @@ def _stage9_invoke_with_retries(
     plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
     tracker = next(
         (c for c in self.repo.query(
-            lambda c: c.component=="plan_tracker" and c.semantic_label==plan_sig
+            lambda c: c.component == "plan_tracker" and c.semantic_label == plan_sig
         )), None
     )
+
+    # initialize or refresh tracker
     if not tracker:
         tracker = ContextObject.make_stage(
             "plan_tracker", [], {
-                "plan_id":plan_sig,
-                "plan_calls":raw_calls.copy(),
-                "total_calls":len(raw_calls),
-                "succeeded":0,
-                "attempts":0,
-                "call_status_map":{},
-                "errors_by_call":{},
-                "status":"in_progress",
-                "started_at":datetime.datetime.utcnow().isoformat()+"Z"
+                "plan_id":       plan_sig,
+                "plan_calls":    raw_calls.copy(),
+                "total_calls":   len(raw_calls),
+                "succeeded":     0,
+                "attempts":      0,
+                "call_status_map": {},
+                "errors_by_call": {},
+                "status":        "in_progress",
+                "started_at":    datetime.datetime.utcnow().isoformat() + "Z"
             }
         )
         tracker.semantic_label = plan_sig
@@ -1600,56 +1603,60 @@ def _stage9_invoke_with_retries(
         meta.setdefault("status", "in_progress")
         tracker.touch(); self.repo.save(tracker)
 
-    tracker.metadata["attempts"] += 1
-    tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+    tracker.metadata["attempts"] = tracker.metadata.get("attempts", 0) + 1
+    tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     tracker.touch(); self.repo.save(tracker)
 
+    # normalize and helper funcs
     def _norm(calls):
-        out=[]
+        out = []
         for c in calls:
-            if isinstance(c,dict) and "tool_call" in c: out.append(c["tool_call"])
-            elif isinstance(c,str): out.append(c)
+            if isinstance(c, dict) and "tool_call" in c:
+                out.append(c["tool_call"])
+            elif isinstance(c, str):
+                out.append(c)
         return out
 
     def _validate(res):
         exc = res.get("exception")
         return (exc is None, exc or "")
 
-    def normalize_key(k): return re.sub(r"\W+","",k).lower()
+    def normalize_key(k):
+        return re.sub(r"\W+", "", k).lower()
 
-    all_calls   = _norm(raw_calls)
-    call_status = tracker.metadata["call_status_map"]
-    pending     = [c for c in all_calls if not call_status.get(c,False)]
+    all_calls = _norm(raw_calls)
+    call_status = tracker.metadata.setdefault("call_status_map", {})
+    pending = [c for c in all_calls if not call_status.get(c, False)]
     last_results = {}
     tool_ctxs = []
 
-    # fast‐path if nothing to run
+    # ─── fast‐path: nothing to run ─────────────────────────────
     if not pending:
         tracker.metadata["status"] = "success"
-        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+        tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
 
-        existing=[]
+        existing = []
         for call in all_calls:
             matches = [
                 c for c in self.repo.query(
-                    lambda c: c.component=="tool_output"
-                              and c.metadata.get("tool_call")==call
+                    lambda c: c.component == "tool_output"
+                              and c.metadata.get("tool_call") == call
                 )
             ]
             if matches:
-                matches.sort(key=lambda c: c.timestamp,reverse=True)
+                matches.sort(key=lambda c: c.timestamp, reverse=True)
                 existing.append(matches[0])
 
-        state["tool_ctxs"] = tool_ctxs           # ← already there
-        self.integrator.ingest(tool_ctxs)        # ← ★ NEW
-        state["merged"].extend(tool_ctxs)        # ← ★ NEW
-        return tool_ctxs
+        state["tool_ctxs"] = existing
+        self.integrator.ingest(existing)
+        state["merged"].extend(existing)
+        return existing
 
-    # retry loop
+    # ─── retry loop ────────────────────────────────────────────
     max_retries, prev = 10, None
     for _ in range(max_retries):
-        if prev is not None and pending==prev:
+        if prev is not None and pending == prev:
             logging.warning("plateau, giving up retries")
             break
         prev = pending.copy()
@@ -1659,58 +1666,52 @@ def _stage9_invoke_with_retries(
             call_str = original
 
             # placeholder chaining
-            for ph in re.findall(r"\[([^\]]+)\]",call_str):
-                if ph.endswith(".output"):
-                    key=normalize_key(ph[:-7])
-                    if key in last_results:
-                        call_str=call_str.replace(f"[{ph}]",repr(last_results[key]))
-                else:
-                    phn=normalize_key(ph)
-                    m=next((k for k in last_results if phn in normalize_key(k)),None)
-                    if m: call_str=call_str.replace(f"[{ph}]",repr(last_results[m]))
+            for ph in re.findall(r"\[([^\]]+)\]", call_str):
+                key = normalize_key(ph[:-7]) if ph.endswith(".output") else normalize_key(ph)
+                if key in last_results:
+                    call_str = call_str.replace(f"[{ph}]", repr(last_results[key]))
 
             # alias chaining
-            for ph in re.findall(r"\{\{([^}]+)\}\}",call_str):
-                phn=normalize_key(ph)
-                m=next((k for k in last_results if phn in normalize_key(k)),None)
-                if m: call_str=call_str.replace(f"{{{{{ph}}}}}",repr(last_results[m]))
+            for ph in re.findall(r"\{\{([^}]+)\}\}", call_str):
+                phn = normalize_key(ph)
+                if phn in last_results:
+                    call_str = call_str.replace(f"{{{{{ph}}}}}", repr(last_results[phn]))
 
-            # nested zero-arg
-            for inner in re.findall(r"\B([A-Za-z_]\w*)\(\)",call_str):
-                nested=f"{inner}()"
-                if nested in call_str and inner not in last_results:
-                    r_i=Tools.run_tool_once(nested)
-                    ok_i,err_i=_validate(r_i)
-                    last_results[inner]=r_i.get("output")
-                    call_str=re.sub(rf"\b{inner}\(\)",repr(last_results[inner]),call_str)
-                    # persist nested
+            # nested zero-arg calls
+            for inner in re.findall(r"\b([A-Za-z_]\w*)\(\)", call_str):
+                if inner not in last_results:
+                    r_i = Tools.run_tool_once(f"{inner}()")
+                    ok_i, err_i = _validate(r_i)
+                    last_results[inner] = r_i.get("output")
+                    call_str = re.sub(rf"\b{inner}\(\)", repr(last_results[inner]), call_str)
+                    # persist nested result
                     try:
-                        sch_i=next(
+                        sch_i = next(
                             s for s in selected_schemas
-                            if json.loads(s.metadata["schema"])["name"]==inner
+                            if json.loads(s.metadata["schema"])["name"] == inner
                         )
-                        ctx_i=ContextObject.make_stage("tool_output",[sch_i.context_id],r_i)
-                        ctx_i.stage_id=f"tool_output_nested_{inner}"
-                        ctx_i.summary=str(r_i.get("output")) if ok_i else f"ERROR: {err_i}"
+                        ctx_i = ContextObject.make_stage("tool_output", [sch_i.context_id], r_i)
+                        ctx_i.stage_id = f"tool_output_nested_{inner}"
+                        ctx_i.summary = str(r_i.get("output")) if ok_i else f"ERROR: {err_i}"
                         ctx_i.metadata.update(r_i)
                         ctx_i.touch(); self.repo.save(ctx_i)
                         tool_ctxs.append(ctx_i)
                     except StopIteration:
                         pass
-                    
-            # ─── main call ─────────────────────────────────────────────────
+
+            # ─── invoke main call ─────────────────────────────────
             res = Tools.run_tool_once(call_str)
             ok, err = _validate(res)
             raw_out = res.get("output")
 
-            # ─── prepare pretty / short views ────────────────────────────────
+            # pretty/short formatting
             try:
                 pretty = json.dumps(raw_out, ensure_ascii=False, indent=2)
-            except Exception:
+            except:
                 pretty = repr(raw_out)
             short = _smart_truncate(pretty)
 
-            # ─── pick schema ref if any ──────────────────────────────────────
+            # find schema ref
             name = original.split("(", 1)[0]
             refs = []
             for s in selected_schemas:
@@ -1718,7 +1719,7 @@ def _stage9_invoke_with_retries(
                     refs = [s.context_id]
                     break
 
-            # ─── persist a single tool_output with **all** metadata fields ───
+            # persist final tool_output
             meta = {
                 "tool_call":    original,
                 "output_full":  pretty,
@@ -1729,51 +1730,54 @@ def _stage9_invoke_with_retries(
             ctx = ContextObject.make_stage("tool_output", refs, meta)
             ctx.stage_id = f"tool_output_{name}"
             ctx.summary  = ("ERROR: " + str(err)) if not ok else repr(raw_out)
-            ctx.touch()
-            self.repo.save(ctx)
+            ctx.touch(); self.repo.save(ctx)
             tool_ctxs.append(ctx)
 
-            # ─── record success/failure ─────────────────────────────────────
+            # track success/failure
             call_status[original] = ok
-            tracker.metadata["succeeded"] += int(ok)
+            tracker.metadata["succeeded"] = tracker.metadata.get("succeeded", 0) + int(ok)
             if not ok:
-                tracker.metadata["errors_by_call"][original] = err
-            tracker.touch()
-            self.repo.save(tracker)
+                tracker.metadata.setdefault("errors_by_call", {})[original] = err
+            tracker.touch(); self.repo.save(tracker)
 
             if ok:
                 pending.remove(original)
 
-
         if not pending:
-            tracker.metadata["status"]="success"
-            tracker.metadata["completed_at"]=datetime.datetime.utcnow().isoformat()+"Z"
+            # ─── on successful retry ────────────────────────────
+            tracker.metadata["status"] = "success"
+            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
             self.repo.save(tracker)
-            existing=[]
+
+            existing = []
             for call in all_calls:
-                matches=[
+                matches = [
                     c for c in self.repo.query(
-                        lambda c: c.component=="tool_output"
-                                  and c.metadata.get("tool_call")==call
+                        lambda c: c.component == "tool_output"
+                                  and c.metadata.get("tool_call") == call
                     )
                 ]
                 if matches:
-                    matches.sort(key=lambda c: c.timestamp,reverse=True)
+                    matches.sort(key=lambda c: c.timestamp, reverse=True)
                     existing.append(matches[0])
-            state["tool_ctxs"]=existing
+
+            state["tool_ctxs"] = existing
+            self.integrator.ingest(existing)    # ★ ensure integrator knows them
+            state["merged"].extend(existing)    # ★ and Stage10 sees them
             return existing
 
-        # ask LLM to repair pending...
-        break  # for brevity, assume no further retries in this drop-in
+        # if still pending, abort retry loop
+        break
 
-    # final fail
-    tracker.metadata["status"]="failed"
-    tracker.metadata["last_errors"] = list(tracker.metadata.get("errors_by_call",{}).values())
-    tracker.metadata["completed_at"]=datetime.datetime.utcnow().isoformat()+"Z"
+    # ─── final fail ───────────────────────────────────────────────
+    tracker.metadata["status"] = "failed"
+    tracker.metadata["last_errors"] = list(tracker.metadata.get("errors_by_call", {}).values())
+    tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     tracker.touch(); self.repo.save(tracker)
 
     state["tool_ctxs"] = tool_ctxs
     return tool_ctxs
+
 
 def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
     import json
