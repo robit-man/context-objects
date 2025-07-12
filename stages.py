@@ -161,161 +161,195 @@ def _stage2_load_system_prompts(self) -> List[ContextObject]:
     self._persist_and_index(prompts)
 
     return prompts
-
 def _stage3_retrieve_and_merge_context(
     self,
     user_text: str,
-    user_ctx: "ContextObject",
-    sys_ctx: "ContextObject | None",
+    user_ctx: "ContextObject | None",
+    sys_ctx: "ContextObject | List[ContextObject] | None",
     extra_ctx: List["ContextObject"] | None = None,
-    recall_ids:   List[str] | None = None,
+    recall_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Build the conversation memory window for downstream stages.
 
-    Returns ───────────────────────────────────────────────────────────────
+    Returns:
       merged        →  List[ContextObject]  (entire ordered context window)
       merged_ids    →  List[str]            (ids of ^)
       wm_ids        →  List[str]            (ids of working-memory slice)
       history       →  last 8 user/assistant ContextObjects
-      tools         →  recent tool-output ContextObjects (≤ top_k)
+      tools         →  recent tool-output ContextObjects
       semantic      →  semantic recall ContextObjects
       assoc         →  associative recall ContextObjects
     """
     from datetime import datetime, timedelta
     now = datetime.utcnow()
 
-    # ── 0. Helper: safe timestamp → datetime ──────────────────────────
-    def _to_dt(ts):
+    # If there's no user context, nothing to build
+    if user_ctx is None:
+        return {
+            "merged":       [],
+            "merged_ids":   [],
+            "wm_ids":       [],
+            "history":      [],
+            "tools":        [],
+            "semantic":     [],
+            "assoc":        [],
+        }
+
+    # Helpers
+    def _to_dt(ts: str) -> datetime:
         try:
             return datetime.fromisoformat(ts.rstrip("Z"))
         except Exception:
             return now
 
-    conv_id  = user_ctx.metadata.get("conversation_id")
-    user_id  = user_ctx.metadata.get("user_id")
+    def _ensure_list(x):
+        if x is None:
+            return []
+        return x if isinstance(x, list) else [x]
 
-    # ── 1. Load raw convo segments ────────────────────────────────────
+    # Flatten inputs
+    user_list  = _ensure_list(user_ctx)
+    sys_list   = _ensure_list(sys_ctx)
+    extra_list = extra_ctx or []
+
+    # Pull conversation & user IDs from the first user_ctx
+    primary = user_list[0]
+    conv_id = (
+        primary.metadata.get("conversationid")
+        or primary.metadata.get("conversation_id")
+    )
+    user_id = primary.metadata.get("user_id")
+
+    # 1. Load raw conversation segments
     segs = [
         c for c in self.repo.query(lambda c:
-            c.metadata.get("conversation_id") == conv_id
-            and c.domain == "segment"
-            and c.metadata.get("user_id") in (user_id, None)
-            and c.semantic_label in ("user_input", "assistant")
+            c.metadata.get("conversationid") == conv_id
+            or c.metadata.get("conversation_id") == conv_id
         )
+        if c.domain == "segment"
+        and c.metadata.get("user_id") in (user_id, None)
+        and c.semantic_label in ("user_input", "assistant")
     ]
 
-    # ── 1a.  prepend any extra_ctx supplied by caller ─────────────────
-    if extra_ctx:
-        dedup = {c.context_id: c for c in segs}
-        for c in extra_ctx:
-            dedup.setdefault(c.context_id, c)
-        segs = list(dedup.values())
+    # 1a. Prepend extra_ctx
+    seen_ids = {c.context_id for c in segs}
+    for c in extra_list:
+        if c.context_id not in seen_ids:
+            segs.append(c)
+            seen_ids.add(c.context_id)
 
-    # ── 1b.  bring in explicit recall_ids (if any) ────────────────────
+    # 1b. Include explicit recall_ids
     if recall_ids:
         for rid in recall_ids:
             try:
                 c = self.repo.get(rid)
-                if c.context_id not in {s.context_id for s in segs}:
+                if c.context_id not in seen_ids:
                     segs.append(c)
+                    seen_ids.add(c.context_id)
             except KeyError:
                 pass
 
     segs.sort(key=lambda c: _to_dt(c.timestamp))
 
-    # ── 2. Working-mem & short-term slices ────────────────────────────
-    WM_TURNS     = 20
-    ST_MINUTES   = 120
-    wm_slice     = segs[-WM_TURNS:]
-    st_cutoff    = now - timedelta(minutes=ST_MINUTES)
-    st_slice     = [c for c in segs if _to_dt(c.timestamp) >= st_cutoff]
+    # 2. Working-memory & short-term slices
+    WM_TURNS   = 20
+    ST_MINUTES = 120
+    wm_slice   = segs[-WM_TURNS:]
+    cutoff     = now - timedelta(minutes=ST_MINUTES)
+    st_slice   = [c for c in segs if _to_dt(c.timestamp) >= cutoff]
 
-    # ── 3. Semantic & associative recall ──────────────────────────────
+    # 3. Semantic & associative recall
     semantic, assoc = [], []
     if self.rl.should_run("semantic_retrieval", 0.0):
-        sem_hits = self.engine.query(
+        hits = self.engine.query(
             stage_id="semantic_retrieval",
             similarity_to=user_text,
             exclude_tags=self.STAGES + ["tool_schema", "tool_output"],
             top_k=self.top_k,
         )
-        semantic = [h for h in sem_hits if h.metadata.get("conversation_id") == conv_id]
+        semantic = [
+            h for h in hits
+            if (h.metadata.get("conversationid") == conv_id
+                or h.metadata.get("conversation_id") == conv_id)
+        ]
 
     if self.rl.should_run("memory_retrieval", 0.0):
-        seeds  = [user_ctx.context_id]
+        seeds  = [primary.context_id]
         scores = self.memman.spread_activation(seeds, hops=3, decay=0.7)
         for cid in sorted(scores, key=scores.get, reverse=True)[: self.top_k]:
             try:
                 c = self.repo.get(cid)
-                if c.metadata.get("conversation_id") == conv_id:
+                if (c.metadata.get("conversationid") == conv_id
+                    or c.metadata.get("conversation_id") == conv_id):
                     c.retrieval_score = scores[cid]
                     assoc.append(c)
             except KeyError:
                 pass
 
-    # ── 4. Recent tool outputs ───────────────────────────────────────
+    # 4. Recent tool outputs
     recent_tools = [
         c for c in self.repo.query(lambda c:
-            c.component == "tool_output" and
-            c.metadata.get("conversation_id") == conv_id
+            c.component == "tool_output"
+            and ((c.metadata.get("conversationid") == conv_id)
+                 or (c.metadata.get("conversation_id") == conv_id))
         )
     ]
     recent_tools.sort(key=lambda c: _to_dt(c.timestamp))
     recent_tools = recent_tools[-self.top_k:]
 
-    # ── 5. Prefix each ctx.summary **exactly once** with sender ───────
-    def _prefix(ctx: "ContextObject"):
-        if ctx.summary and ctx.summary.lstrip().startswith(("User:", "Assistant:")):
-            return  # already prefixed
+    # 5. Prefix summaries once
+    def _prefix(ctx):
+        if not getattr(ctx, "summary", None):
+            return
+        if ctx.summary.lstrip().startswith(("User:", "Assistant:")):
+            return
         role = "Assistant" if ctx.semantic_label == "assistant" else "User"
         ctx.summary = f"{role}: {ctx.summary or ''}"
 
-    for bucket in (segs + semantic + assoc + recent_tools):
-        _prefix(bucket)
+    for c in sys_list + user_list + segs + semantic + assoc + recent_tools:
+        _prefix(c)
 
-    # ── 6. Assemble merged list in priority order, de-duped ───────────
+    # 6. Assemble merged list, de-duped
     merged, seen = [], set()
-    def _add(items):
-        for c in items:
-            key = (c.context_id)
-            if key not in seen:
+    def _add(objs):
+        for c in objs:
+            cid = c.context_id
+            if cid not in seen:
                 merged.append(c)
-                seen.add(key)
+                seen.add(cid)
 
-    if sys_ctx:
-        _prefix(sys_ctx)
-        _add([sys_ctx])
-    _add([user_ctx])
+    _add(sys_list)
+    _add(user_list)
     _add(wm_slice)
     _add(st_slice)
     _add(semantic)
     _add(assoc)
     _add(recent_tools)
 
-    # ── 7. Build returns ──────────────────────────────────────────────
-    out = {
+    # 7. Build return dict
+    result = {
         "merged":      merged,
         "merged_ids":  [c.context_id for c in merged],
         "wm_ids":      [c.context_id for c in wm_slice],
-        # extra slices for downstream stages
-        "history":     merged[-8:],                 # last 8 conversational turns
+        "history":     merged[-8:],
         "tools":       recent_tools,
         "semantic":    semantic,
         "assoc":       assoc,
     }
 
-    # ── 8.  Debug snapshot for tracing ────────────────────────────────
+    # 8. Debug logging
     self._print_stage_context("retrieve_and_merge_context", {
-        "total_segments":   len(segs),
-        "merged_ids":       out["merged_ids"][:12],  # truncate for log
-        "wm_ids":           out["wm_ids"],
-        "semantic_ids":     [c.context_id for c in semantic],
-        "assoc_ids":        [c.context_id for c in assoc],
-        "tool_ids":         [c.context_id for c in recent_tools],
+        "total_segments": len(segs),
+        "merged_ids":     result["merged_ids"][:12],
+        "wm_ids":         result["wm_ids"],
+        "semantic_ids":   [c.context_id for c in semantic],
+        "assoc_ids":      [c.context_id for c in assoc],
+        "tool_ids":       [c.context_id for c in recent_tools],
     })
 
-    return out
+    return result
+
 
 
 

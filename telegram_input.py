@@ -634,8 +634,6 @@ async def _on_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-
-        
 def telegram_input(asm):
     global _default_asm
     _default_asm = asm
@@ -649,9 +647,6 @@ def telegram_input(asm):
     asyncio.set_event_loop(loop)
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
     app = ApplicationBuilder().token(token).request(req).build()
-
-
-
 
     try:
         from assembler import Assembler

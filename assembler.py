@@ -2215,47 +2215,80 @@ class Assembler:
             except Exception as e:
                 status_cb("load_system_prompts_error", str(e))
                 state["errors"].append(("load_system_prompts", str(e)))
-            # ─── Stage 3: retrieve_and_merge_context ──────────────────────────
+        # Stage 3: retrieve_and_merge_context
+        try:
+            extra = self._get_history()
+            state["recent_ids"] = [c.context_id for c in extra]
+
+            # ----- RETRIEVER -----
             try:
-                extra = self._get_history()
-                state["recent_ids"] = [c.context_id for c in extra]
-
-                # ----- RETRIEVER -----
-                try:
-                    out3 = self._stage3_retrieve_and_merge_context(
-                        user_text,
-                        state.get("user_ctx"),
-                        state.get("sys_ctx"),
-                        extra_ctx=extra,
-                    )
-                except Exception:
-                    # log but keep pipeline alive
-                    status_cb("retrieve_error", traceback.format_exc(limit=5))
-                    out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
-                state.update(out3)
-
-                # ----- INTEGRATOR -----
-                try:
-                    self.integrator.ingest(state["merged"])
-                    keep_core = [state["user_ctx"].context_id] if state.get("user_ctx") else []
-                    if state.get("sys_ctx"):
-                        keep_core.append(state["sys_ctx"].context_id)
-                    self.integrator.ingest([c for c in (state.get("user_ctx"), state.get("sys_ctx")) if c])
-                    contracted = self.integrator.contract(keep_ids=keep_core)
-                    state["merged"]      = contracted
-                    state["merged_ids"]  = [c.context_id for c in contracted]
-                    state["wm_ids"] = [c.context_id for c in contracted[-20:]] if contracted else []
-                    hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
-                    hist.sort(key=lambda c: c.timestamp)
-                    state["history"] = hist[-8:]
-                except Exception:
-                    status_cb("integrator_error", traceback.format_exc(limit=5))
-
-                status_cb("retrieve_and_merge_context", f"{len(state.get('merged',[]))} ctxs")
+                out3 = self._stage3_retrieve_and_merge_context(
+                    user_text,
+                    state.get("user_ctx"),
+                    state.get("sys_ctx"),
+                    extra_ctx=extra,
+                )
             except Exception:
-                # truly unexpected outer error
-                status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
-                state["errors"].append(("retrieve_and_merge_context", "fatal"))
+                status_cb("retrieve_error", traceback.format_exc(limit=5))
+                out3 = {
+                    "merged":   [],
+                    "history":  [],
+                    "tools":    [],
+                    "semantic": [],
+                    "assoc":    [],
+                }
+            state.update(out3)
+
+            # ----- INTEGRATOR -----
+            try:
+                # ingest everything we retrieved
+                self.integrator.ingest(state["merged"])
+
+                # build list of core IDs to keep
+                keep_core: List[str] = []
+                user_ctx = state.get("user_ctx")
+                if user_ctx is not None:
+                    keep_core.append(user_ctx.context_id)
+
+                # sys_ctx may be a single ContextObject or a list
+                sys_val = state.get("sys_ctx") or []
+                if not isinstance(sys_val, list):
+                    sys_list = [sys_val]
+                else:
+                    sys_list = sys_val
+
+                for sc in sys_list:
+                    keep_core.append(sc.context_id)
+
+                # ingest user+system contexts so they won't be pruned
+                core_ctxs: List[ContextObject] = []
+                if user_ctx is not None:
+                    core_ctxs.append(user_ctx)
+                core_ctxs.extend(sys_list)
+                if core_ctxs:
+                    self.integrator.ingest(core_ctxs)
+
+                # contract down to fit max_nodes, preserving keep_core
+                contracted = self.integrator.contract(keep_ids=keep_core)
+
+                # update state with contracted window
+                state["merged"]     = contracted
+                state["merged_ids"] = [c.context_id for c in contracted]
+                state["wm_ids"]     = [c.context_id for c in contracted[-20:]]
+                hist = [
+                    c
+                    for c in contracted
+                    if c.semantic_label in ("user_input", "assistant")
+                ]
+                hist.sort(key=lambda c: c.timestamp)
+                state["history"] = hist[-8:]
+            except Exception:
+                status_cb("integrator_error", traceback.format_exc(limit=5))
+
+            status_cb("retrieve_and_merge_context", f"{len(state.get('merged', []))} ctxs")
+        except Exception:
+            status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
+            state["errors"].append(("retrieve_and_merge_context", "fatal"))
 
 
             # Stage 4: intent_clarification
@@ -2349,7 +2382,6 @@ class Assembler:
         except Exception as e:
             status_cb("load_system_prompts_error", str(e))
             state["errors"].append(("load_system_prompts", str(e)))
-
         # Stage 3: retrieve_and_merge_context
         try:
             extra = self._get_history()
@@ -2364,34 +2396,66 @@ class Assembler:
                     extra_ctx=extra,
                 )
             except Exception:
-                # log but keep pipeline alive
                 status_cb("retrieve_error", traceback.format_exc(limit=5))
-                out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
+                out3 = {
+                    "merged":   [],
+                    "history":  [],
+                    "tools":    [],
+                    "semantic": [],
+                    "assoc":    [],
+                }
             state.update(out3)
 
             # ----- INTEGRATOR -----
             try:
+                # ingest everything we retrieved
                 self.integrator.ingest(state["merged"])
-                keep_core = [state["user_ctx"].context_id] if state.get("user_ctx") else []
-                if state.get("sys_ctx"):
-                    keep_core.append(state["sys_ctx"].context_id)
-                self.integrator.ingest([c for c in (state.get("user_ctx"), state.get("sys_ctx")) if c])
+
+                # build list of core IDs to keep
+                keep_core: List[str] = []
+                user_ctx = state.get("user_ctx")
+                if user_ctx is not None:
+                    keep_core.append(user_ctx.context_id)
+
+                # sys_ctx may be a single ContextObject or a list
+                sys_val = state.get("sys_ctx") or []
+                if not isinstance(sys_val, list):
+                    sys_list = [sys_val]
+                else:
+                    sys_list = sys_val
+
+                for sc in sys_list:
+                    keep_core.append(sc.context_id)
+
+                # ingest user+system contexts so they won't be pruned
+                core_ctxs: List[ContextObject] = []
+                if user_ctx is not None:
+                    core_ctxs.append(user_ctx)
+                core_ctxs.extend(sys_list)
+                if core_ctxs:
+                    self.integrator.ingest(core_ctxs)
+
+                # contract down to fit max_nodes, preserving keep_core
                 contracted = self.integrator.contract(keep_ids=keep_core)
-                state["merged"]      = contracted
-                state["merged_ids"]  = [c.context_id for c in contracted]
-                state["wm_ids"]      = [c.context_id for c in contracted[-20:]]
-                hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
+
+                # update state with contracted window
+                state["merged"]     = contracted
+                state["merged_ids"] = [c.context_id for c in contracted]
+                state["wm_ids"]     = [c.context_id for c in contracted[-20:]]
+                hist = [
+                    c
+                    for c in contracted
+                    if c.semantic_label in ("user_input", "assistant")
+                ]
                 hist.sort(key=lambda c: c.timestamp)
                 state["history"] = hist[-8:]
             except Exception:
                 status_cb("integrator_error", traceback.format_exc(limit=5))
 
-            status_cb("retrieve_and_merge_context", f"{len(state.get('merged',[]))} ctxs")
+            status_cb("retrieve_and_merge_context", f"{len(state.get('merged', []))} ctxs")
         except Exception:
-            # truly unexpected outer error
             status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
             state["errors"].append(("retrieve_and_merge_context", "fatal"))
-
         # Stage 4: intent_clarification
         try:
             ctx4 = self._stage4_intent_clarification(user_text, state)
