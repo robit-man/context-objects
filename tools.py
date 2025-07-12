@@ -3654,37 +3654,6 @@ class Tools:
         return _REG.list_all()
 
     @staticmethod
-    def message_user(username: str, message: str) -> str:
-        """
-        Send a DM to a known user.
-        
-        Parameters:
-        - username: their @username (with or without the leading '@')
-        - message: the text to deliver
-        
-        Returns:
-        - "OK" on success
-        - "ERROR: <reason>" if something goes wrong
-        """
-        uname = username.lstrip("@").lower()
-        user_id = _REG.id_for(uname)
-        if user_id is None:
-            return f"ERROR: user @{uname} not found"
-        token = os.getenv("BOT_TOKEN")
-        if not token:
-            return "ERROR: BOT_TOKEN missing"
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": user_id, "text": message}
-        try:
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code == 200:
-                return "OK"
-            else:
-                return f"ERROR: HTTP {resp.status_code} – {resp.text}"
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    @staticmethod
     def get_known_groups() -> list[dict]:
         """
         Returns a list of all registered groups.
@@ -3699,16 +3668,72 @@ class Tools:
             return []
 
     @staticmethod
-    def message_group(group_name: str, message: str) -> dict:
+    def message_user(username: str, message: str, image: Optional[str] = None) -> str:
         """
-        Send a message into a previously-registered group.
+        Send a DM to a known user, optionally with a photo.
+
+        Parameters:
+        - username: their @username (with or without the leading '@')
+        - message: the text to deliver (used as caption if image is sent)
+        - image:   optional path or URL of an image to send
+
+        Returns:
+        - "OK" on success
+        - "ERROR: <reason>" if something goes wrong
+        """
+        uname = username.lstrip("@").lower()
+        user_id = _REG.id_for(uname)
+        if user_id is None:
+            return f"ERROR: user @{uname} not found"
+
+        token = os.getenv("BOT_TOKEN")
+        if not token:
+            return "ERROR: BOT_TOKEN missing"
+
+        # choose endpoint + payload
+        if image:
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            # sending by URL
+            if image.startswith("http://") or image.startswith("https://"):
+                payload = {
+                    "chat_id": user_id,
+                    "photo": image,
+                    "caption": message
+                }
+                resp = requests.post(url, json=payload, timeout=10)
+            else:
+                # sending by file upload
+                try:
+                    with open(image, "rb") as img_file:
+                        files = {"photo": img_file}
+                        data = {"chat_id": user_id, "caption": message}
+                        resp = requests.post(url, data=data, files=files, timeout=10)
+                except FileNotFoundError:
+                    return f"ERROR: image file not found: {image}"
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": user_id, "text": message}
+            resp = requests.post(url, json=payload, timeout=10)
+
+        if resp.status_code == 200:
+            return "OK"
+        else:
+            return f"ERROR: HTTP {resp.status_code} – {resp.text}"
+
+
+    @staticmethod
+    def message_group(group_name: str, message: str, image: Optional[str] = None) -> dict:
+        """
+        Send a message or photo into a previously-registered group.
 
         Parameters
         ----------
         group_name : str
-            The exact group name as recorded (via title) in group_registry.
+            The exact group name as recorded in group_registry.
         message : str
-            The text to send into that group.
+            The text to send (used as caption if image is sent).
+        image : str, optional
+            Path or URL of an image to send.
 
         Returns
         -------
@@ -3722,20 +3747,37 @@ class Tools:
         RuntimeError
             If BOT_TOKEN is not set.
         """
-        import os, requests
         token = os.getenv("BOT_TOKEN")
         if not token:
             raise RuntimeError("BOT_TOKEN not set")
-        from group_registry import _GREG
 
         gid = _GREG.id_for(group_name)
         if gid is None:
             raise ValueError(f"Group '{group_name}' not found")
 
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        resp = requests.post(url, json={"chat_id": gid, "text": message})
-        resp.raise_for_status()
+        # choose endpoint + payload
+        if image:
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            if image.startswith("http://") or image.startswith("https://"):
+                payload = {
+                    "chat_id": gid,
+                    "photo": image,
+                    "caption": message
+                }
+                resp = requests.post(url, json=payload, timeout=10)
+            else:
+                try:
+                    with open(image, "rb") as img_file:
+                        files = {"photo": img_file}
+                        data = {"chat_id": gid, "caption": message}
+                        resp = requests.post(url, data=data, files=files, timeout=10)
+                except FileNotFoundError:
+                    raise ValueError(f"Image file not found: {image}")
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            resp = requests.post(url, json={"chat_id": gid, "text": message}, timeout=10)
 
+        resp.raise_for_status()
         return {"group_name": group_name, "chat_id": gid, "status": "sent"}
 
     @staticmethod
