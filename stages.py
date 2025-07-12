@@ -135,19 +135,32 @@ def _stage1_record_input(self, user_text: str, state: Dict[str, Any]) -> Context
     self.repo.save(ctx)
     return ctx
 
+def _stage2_load_system_prompts(self) -> List[ContextObject]:
+    """
+    Load each static system-prompt ContextObject (never evicted)
+    and return them as a list, in label order.
+    """
+    # 1) make sure we’ve seeded/updated the on-disk prompt artifacts
+    self._seed_static_prompts()
 
+    # 2) for each prompt label we know about, grab the newest ContextObject
+    prompts: List[ContextObject] = []
+    for label in self.system_prompts.keys():
+        # find all saved prompts with this semantic_label
+        candidates = sorted(
+            self.repo.query(lambda c: c.semantic_label == label),
+            key=lambda c: c.timestamp,
+            reverse=True
+        )
+        if not candidates:
+            # (shouldn’t happen, since seed just inserted it)
+            continue
+        prompts.append(candidates[0])
 
-def _stage2_load_system_prompts(self) -> ContextObject:
-    prom = self._get_prompt("system_prompt")   # or load from repo/artifact
-    ctx = ContextObject.make_stage(
-        "system_prompt",
-        [], {"prompt": prom}
-    )
-    ctx.stage_id = "system_prompt"
-    ctx.summary  = prom
-    #ctx.touch(); self.repo.save(ctx)
-    self._persist_and_index([ctx])
-    return ctx
+    # 3) Persist & index them so retrieval/integrator never prunes them
+    self._persist_and_index(prompts)
+
+    return prompts
 
 def _stage3_retrieve_and_merge_context(
     self,

@@ -872,6 +872,7 @@ def telegram_input(asm):
                 kind, data = "text", msg.text
 
             elif msg.photo:
+                kind = "photo"
                 # only take the largest size
                 p = msg.photo[-1]
                 file = await bot.get_file(p.file_id)
@@ -880,6 +881,8 @@ def telegram_input(asm):
                 import base64
                 img_b64 = base64.b64encode(bytes(b)).decode("ascii")
                 metadata["image_b64"] = [img_b64]
+                # mark that we have an image for inference
+                image_paths = ["inline"]
                 data = f"{len(metadata['image_b64'])} image(s)"
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
@@ -972,16 +975,35 @@ def telegram_input(asm):
             # ── If we have photos, store paths & notify user ──────────────────
             if image_paths:
                 metadata["image_paths"] = image_paths
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "✅ Saved image(s) to disk:\n"
-                        + "\n".join(f"- `{p}`" for p in image_paths)
-                        + "\n\nYou can now run `/analyze_image <path>` to inspect any of these."
-                    ),
-                    reply_to_message_id=msg.message_id,
-                    parse_mode="Markdown",
-                )
+                try:
+                    with open("config.json","r") as _f:
+                        _cfg = json.load(_f)
+                except FileNotFoundError:
+                    _cfg = {}
+                debug_enabled = _cfg.get("debug", False)
+
+                if debug_enabled:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "🖼️✅ Saved image(s) to disk:\n"
+                            + "\n".join(f"- `{p}`" for p in image_paths)
+                            + "\n\nYou can now run `/analyze_image <path>` to inspect any of these."
+                        ),
+                        reply_to_message_id=msg.message_id,
+                        parse_mode="Markdown",
+                    )
+
+                else:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "🖼️ Processing Image..."
+                        ),
+                        reply_to_message_id=msg.message_id,
+                        parse_mode="Markdown",
+                    )
+
 
             if msg.reply_to_message:
                 metadata["reply_to_message_id"] = msg.reply_to_message.message_id
@@ -1032,8 +1054,9 @@ def telegram_input(asm):
                                 pass
             # ── Decide if we should respond / run inference ────────────────────
             sender = user.username or user.first_name
-            if image_paths:
-                user_text = text + f"[image(s) attached]"
+            if metadata.get("image_b64"):
+                # if there's any image, attach a stub so .run_with_meta_context() sees it
+                user_text = (text or "") + "[image(s) attached]"
             else:
                 user_text = text
 
