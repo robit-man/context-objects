@@ -651,8 +651,6 @@ def telegram_input(asm):
     app = ApplicationBuilder().token(token).request(req).build()
 
     # conversation states
-
-    # conversation states
     SELECT_KEY, EDIT_VALUE, ADD_KEY, ADD_VALUE = range(4)
 
     def load_cfg():
@@ -670,7 +668,8 @@ def telegram_input(asm):
         """
         Build the main menu text + keyboard.
         """
-        btns = [
+        # one button per key, mark edited ones with ✎
+        key_btns = [
             InlineKeyboardButton(
                 f"{k}: {cfg[k]}" + (" ✎" if k in pending else ""),
                 callback_data=f"CFG|{k}"
@@ -681,8 +680,8 @@ def telegram_input(asm):
         save_btn = InlineKeyboardButton("💾 Save changes", callback_data="CFG|__SAVE__")
         exit_btn = InlineKeyboardButton("❌ Exit",        callback_data="CFG|__EXIT__")
 
-        rows = [btns[i:i+2] for i in range(0, len(btns), 2)]
-        # bottom row
+        rows = [key_btns[i:i+2] for i in range(0, len(key_btns), 2)]
+        # bottom row: add & save (if pending)
         bot_row = [add_btn] + ([save_btn] if pending else [])
         rows.append(bot_row)
         # exit row
@@ -697,7 +696,7 @@ def telegram_input(asm):
 
         if update.effective_chat.type != "private":
             return ConversationHandler.END
-        cfg   = load_cfg()
+        cfg = load_cfg()
         if update.effective_user.id != cfg.get("admin_chat_id"):
             await update.message.reply_text("❌ You are not authorized.")
             return ConversationHandler.END
@@ -705,24 +704,23 @@ def telegram_input(asm):
         pending = context.user_data.get("CFG_PENDING", {})
         text, kb = _build_menu(cfg, pending)
 
-        # first time or on refresh from messages
+        # first invocation vs callback
         if update.callback_query:
             q = update.callback_query
             await q.answer()
             await q.edit_message_text(text, reply_markup=kb)
         else:
             sent = await update.message.reply_text(text, reply_markup=kb)
-            # remember this message for in-place edits
             context.user_data["CFG_MSG_ID"] = sent.message_id
 
         return SELECT_KEY
 
     async def config_button(update, context):
         q    = update.callback_query
-        await q.answer()
         data = q.data.split("|", 1)[1]
+        await q.answer()
 
-        # ── Exit ───────────────────────────────────────────────────────────
+        # Exit
         if data == "__EXIT__":
             context.user_data.pop("IN_CONFIG_MODE", None)
             context.user_data.pop("CFG_PENDING", None)
@@ -732,7 +730,7 @@ def telegram_input(asm):
                 pass
             return ConversationHandler.END
 
-        # ── Save ───────────────────────────────────────────────────────────
+        # Save changes
         if data == "__SAVE__":
             pending = context.user_data.pop("CFG_PENDING", {})
             cfg     = load_cfg()
@@ -760,7 +758,7 @@ def telegram_input(asm):
 
             return ConversationHandler.END
 
-        # ── Back ───────────────────────────────────────────────────────────
+        # Back to main menu
         if data == "__BACK__":
             cfg     = load_cfg()
             pending = context.user_data.get("CFG_PENDING", {})
@@ -768,7 +766,7 @@ def telegram_input(asm):
             await q.edit_message_text(text, reply_markup=kb)
             return SELECT_KEY
 
-        # ── Add new key ────────────────────────────────────────────────────
+        # Add new key
         if data == "__ADD__":
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("⬅️ Back", callback_data="CFG|__BACK__"),
@@ -777,7 +775,7 @@ def telegram_input(asm):
             await q.edit_message_text("Enter the new key name:", reply_markup=kb)
             return ADD_KEY
 
-        # ── Edit existing key ──────────────────────────────────────────────
+        # Edit existing key
         key = data
         cfg = load_cfg()
         val = cfg.get(key, "<missing>")
@@ -825,7 +823,6 @@ def telegram_input(asm):
             InlineKeyboardButton("⬅️ Back", callback_data="CFG|__BACK__"),
             InlineKeyboardButton("❌ Exit", callback_data="CFG|__EXIT__"),
         ]])
-        # in-place prompt
         chat_id = update.effective_chat.id
         msg_id  = context.user_data["CFG_MSG_ID"]
         await context.bot.edit_message_text(
@@ -875,13 +872,23 @@ def telegram_input(asm):
             await update.message.reply_text("Configuration edit cancelled.")
         return ConversationHandler.END
 
+    # Register the conversation handler
     config_conv = ConversationHandler(
         entry_points=[CommandHandler("config", config_entry_point)],
         states={
             SELECT_KEY: [CallbackQueryHandler(config_button, pattern=r"^CFG\|")],
-            EDIT_VALUE: [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_edit)],
-            ADD_KEY:    [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_key)],
-            ADD_VALUE:  [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_val)],
+            EDIT_VALUE: [
+                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
+                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_edit),
+            ],
+            ADD_KEY: [
+                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
+                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_key),
+            ],
+            ADD_VALUE: [
+                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
+                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_val),
+            ],
         },
         fallbacks=[CommandHandler("cancel", config_cancel)],
         per_user=True,
