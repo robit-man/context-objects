@@ -651,6 +651,8 @@ def telegram_input(asm):
     app = ApplicationBuilder().token(token).request(req).build()
 
     # conversation states
+
+    # conversation states
     SELECT_KEY, EDIT_VALUE, ADD_KEY, ADD_VALUE = range(4)
 
     def load_cfg():
@@ -666,62 +668,64 @@ def telegram_input(asm):
 
     def _build_menu(cfg, pending):
         """
-        Returns (text, InlineKeyboardMarkup) for the main menu.
+        Build the main menu text + keyboard.
         """
-        # one button per key, mark edited ones with ✎
-        key_btns = [
+        btns = [
             InlineKeyboardButton(
                 f"{k}: {cfg[k]}" + (" ✎" if k in pending else ""),
                 callback_data=f"CFG|{k}"
             )
             for k in cfg
         ]
-        # Add + and (maybe) Save
         add_btn  = InlineKeyboardButton("➕ Add new key", callback_data="CFG|__ADD__")
         save_btn = InlineKeyboardButton("💾 Save changes", callback_data="CFG|__SAVE__")
         exit_btn = InlineKeyboardButton("❌ Exit",        callback_data="CFG|__EXIT__")
 
-        rows = []
-        # two‐per‐row for keys
-        for i in range(0, len(key_btns), 2):
-            rows.append(key_btns[i : i + 2])
-        # bottom row: add & save (if pending)
+        rows = [btns[i:i+2] for i in range(0, len(btns), 2)]
+        # bottom row
         bot_row = [add_btn] + ([save_btn] if pending else [])
         rows.append(bot_row)
-        # final row: exit
+        # exit row
         rows.append([exit_btn])
 
         text = "Select a key to edit,\n➕ to add, 💾 to save, or ❌ to exit:"
         return text, InlineKeyboardMarkup(rows)
 
     async def config_entry_point(update, context):
-        # mark we're in config mode
+        # mark config mode
         context.user_data["IN_CONFIG_MODE"] = True
 
         if update.effective_chat.type != "private":
             return ConversationHandler.END
-        cfg     = load_cfg()
-        admin   = cfg.get("admin_chat_id")
-        if update.effective_user.id != admin:
+        cfg   = load_cfg()
+        if update.effective_user.id != cfg.get("admin_chat_id"):
             await update.message.reply_text("❌ You are not authorized.")
             return ConversationHandler.END
 
         pending = context.user_data.get("CFG_PENDING", {})
         text, kb = _build_menu(cfg, pending)
-        await update.message.reply_text(text, reply_markup=kb)
+
+        # first time or on refresh from messages
+        if update.callback_query:
+            q = update.callback_query
+            await q.answer()
+            await q.edit_message_text(text, reply_markup=kb)
+        else:
+            sent = await update.message.reply_text(text, reply_markup=kb)
+            # remember this message for in-place edits
+            context.user_data["CFG_MSG_ID"] = sent.message_id
+
         return SELECT_KEY
 
     async def config_button(update, context):
         q    = update.callback_query
-        data = q.data.split("|", 1)[1]
         await q.answer()
+        data = q.data.split("|", 1)[1]
 
         # ── Exit ───────────────────────────────────────────────────────────
         if data == "__EXIT__":
-            # clear buffers
             context.user_data.pop("IN_CONFIG_MODE", None)
             context.user_data.pop("CFG_PENDING", None)
-            # delete the menu message
             try:
                 await q.message.delete()
             except:
@@ -737,14 +741,12 @@ def telegram_input(asm):
                 cfg[k] = v
                 lines.append(f"✔️ *{k}* → `{v}`")
             save_cfg(cfg)
-            # clear mode flag
             context.user_data.pop("IN_CONFIG_MODE", None)
 
-            # confirm in‐place
             text = "Saved config:\n" + "\n".join(lines)
             await q.edit_message_text(text, parse_mode="Markdown")
 
-            # auto‐delete after 10s
+            # auto-delete confirmation after 10s
             async def _cleanup():
                 await asyncio.sleep(10)
                 try:
@@ -760,7 +762,6 @@ def telegram_input(asm):
 
         # ── Back ───────────────────────────────────────────────────────────
         if data == "__BACK__":
-            # just rebuild the main menu
             cfg     = load_cfg()
             pending = context.user_data.get("CFG_PENDING", {})
             text, kb = _build_menu(cfg, pending)
@@ -793,31 +794,44 @@ def telegram_input(asm):
         return EDIT_VALUE
 
     async def config_received_edit(update, context):
+        # buffer the new value
         key = context.user_data.pop("CFG_KEY")
         txt = update.message.text.strip()
-        # parse bool/num or keep as str
         if txt.lower() in ("true","false"):
             parsed = txt.lower()=="true"
         else:
             try:    parsed = int(txt)
-            except: 
+            except:
                 try: parsed = float(txt)
                 except: parsed = txt
 
         pending = context.user_data.setdefault("CFG_PENDING", {})
         pending[key] = parsed
 
-        return await config_entry_point(update, context)
+        # refresh main menu in-place
+        cfg     = load_cfg()
+        pending = context.user_data.get("CFG_PENDING", {})
+        text, kb = _build_menu(cfg, pending)
+        chat_id = update.effective_chat.id
+        msg_id  = context.user_data["CFG_MSG_ID"]
+        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+        return SELECT_KEY
 
     async def config_received_new_key(update, context):
         key = update.message.text.strip()
         context.user_data["CFG_NEWKEY"] = key
+
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Back", callback_data="CFG|__BACK__"),
             InlineKeyboardButton("❌ Exit", callback_data="CFG|__EXIT__"),
         ]])
-        await update.message.reply_text(
+        # in-place prompt
+        chat_id = update.effective_chat.id
+        msg_id  = context.user_data["CFG_MSG_ID"]
+        await context.bot.edit_message_text(
             f"Enter the value for new key *{key}*:",
+            chat_id=chat_id,
+            message_id=msg_id,
             parse_mode="Markdown",
             reply_markup=kb
         )
@@ -837,32 +851,37 @@ def telegram_input(asm):
         pending = context.user_data.setdefault("CFG_PENDING", {})
         pending[key] = parsed
 
-        return await config_entry_point(update, context)
+        # refresh main menu in-place
+        cfg     = load_cfg()
+        pending = context.user_data.get("CFG_PENDING", {})
+        text, kb = _build_menu(cfg, pending)
+        chat_id = update.effective_chat.id
+        msg_id  = context.user_data["CFG_MSG_ID"]
+        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+        return SELECT_KEY
 
     async def config_cancel(update, context):
+        # exit & delete menu
+        chat_id = update.effective_chat.id
+        msg_id  = context.user_data.get("CFG_MSG_ID")
         context.user_data.pop("IN_CONFIG_MODE", None)
         context.user_data.pop("CFG_PENDING", None)
-        await update.message.reply_text("Configuration edit cancelled.")
+        if msg_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except:
+                pass
+        else:
+            await update.message.reply_text("Configuration edit cancelled.")
         return ConversationHandler.END
 
     config_conv = ConversationHandler(
         entry_points=[CommandHandler("config", config_entry_point)],
         states={
-            SELECT_KEY: [
-                CallbackQueryHandler(config_button, pattern=r"^CFG\|")
-            ],
-            EDIT_VALUE: [
-                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
-                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_edit),
-            ],
-            ADD_KEY: [
-                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
-                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_key),
-            ],
-            ADD_VALUE: [
-                CallbackQueryHandler(config_button, pattern=r"^CFG\|"),
-                MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_val),
-            ],
+            SELECT_KEY: [CallbackQueryHandler(config_button, pattern=r"^CFG\|")],
+            EDIT_VALUE: [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_edit)],
+            ADD_KEY:    [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_key)],
+            ADD_VALUE:  [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_val)],
         },
         fallbacks=[CommandHandler("cancel", config_cancel)],
         per_user=True,
