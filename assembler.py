@@ -715,6 +715,41 @@ class Assembler:
             memman=self.memman
         )
 
+
+
+    # thread-safe cache
+    _EMBED_CACHE: dict[str, np.ndarray] = {}
+    _CACHE_LOCK = threading.Lock()
+    _ZERO = np.zeros(768, dtype=float)
+
+    def embed_text(text: str) -> np.ndarray:
+        """
+        Non-blocking embed: return a cached vector if available,
+        otherwise launch a background embed and return zeros.
+        """
+        with _CACHE_LOCK:
+            if text in _EMBED_CACHE:
+                return _EMBED_CACHE[text]
+
+        # not cached → kick off a background thread to populate it
+        def _worker(t: str):
+            try:
+                resp = embed(model="nomic-embed-text", input=t)
+                vec  = np.array(resp["embeddings"], dtype=float).flatten()
+                norm = np.linalg.norm(vec)
+                vec = vec / norm if norm > 0 else vec
+            except Exception:
+                vec = _ZERO
+            with _CACHE_LOCK:
+                _EMBED_CACHE[t] = vec
+
+        thr = threading.Thread(target=_worker, args=(text,), daemon=True)
+        thr.start()
+
+        # immediately return a zero vector;
+        # future calls (after the thread finishes) will return the real one
+        return _ZERO
+    
     def _prune_jsonl_duplicates(self) -> None:
         """
         Rewrite self.context_path so that for each context_id
