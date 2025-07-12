@@ -34,12 +34,21 @@ from telegram import Update, Bot, error as tg_error
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 from telegram.request import HTTPXRequest
 from telegram.constants import ChatAction
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters as _flt,
+    CommandHandler,
+)
 from context import HybridContextRepository, ContextObject, _locked, sanitize_jsonl
 from tts_service import TTSManager
 from user_registry import _REG
 from group_registry import _GREG
 from assembler import Assembler
 import whisper
+
 _WHISPER = whisper.load_model("base")  # load once
 
 CAPTURE_DIR = Path(__file__).parent / "captures"
@@ -640,6 +649,144 @@ def telegram_input(asm):
     asyncio.set_event_loop(loop)
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
     app = ApplicationBuilder().token(token).request(req).build()
+
+    # conversation states
+    SELECT_KEY, EDIT_VALUE, ADD_KEY, ADD_VALUE = range(4)
+
+    def load_cfg():
+        try:
+            with open("config.json", "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def save_cfg(cfg):
+        with open("config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+
+    async def config_entry_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /config — show inline list of keys + [+] """
+        if update.effective_chat.type != "private":
+            return  # only in DMs
+
+        user_id = update.effective_user.id
+        cfg = load_cfg()
+        admin = cfg.get("admin_chat_id")
+        if user_id != admin:
+            await update.message.reply_text("❌ You are not authorized to view or edit config.")
+            return ConversationHandler.END
+
+        # build keyboard
+        buttons = [
+            InlineKeyboardButton(f"{k}: {v}", callback_data=f"CFG|{k}")
+            for k, v in cfg.items()
+        ]
+        # append add-new
+        buttons.append(InlineKeyboardButton("➕ Add new key", callback_data="CFG|__ADD__"))
+        # two-column layout
+        kb = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+
+        await update.message.reply_text(
+            "Select a key to edit, or ➕ to add a new one:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return SELECT_KEY
+
+    async def config_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle clicks on a config key or Add button"""
+        q = update.callback_query
+        await q.answer()
+        data = q.data.split("|", 1)[1]
+
+        if data == "__ADD__":
+            await q.edit_message_text("Enter the new key name:")
+            return ADD_KEY
+
+        # editing existing key
+        key = data
+        cfg = load_cfg()
+        val = cfg.get(key, "<missing>")
+        await q.edit_message_text(
+            f"Current value for *{key}* is:\n```\n{val}\n```\n\nSend me the new value.",
+            parse_mode="Markdown",
+        )
+        # stash which key we're editing
+        context.user_data["CFG_KEY"] = key
+        return EDIT_VALUE
+
+    async def config_received_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive new value for an existing key"""
+        key = context.user_data.pop("CFG_KEY")
+        new_val = update.message.text.strip()
+
+        cfg = load_cfg()
+        # try to interpret booleans or numbers
+        if new_val.lower() in ("true", "false"):
+            parsed = new_val.lower() == "true"
+        else:
+            try:
+                parsed = int(new_val)
+            except ValueError:
+                try:
+                    parsed = float(new_val)
+                except ValueError:
+                    parsed = new_val
+
+        cfg[key] = parsed
+        save_cfg(cfg)
+
+        await update.message.reply_text(f"✔️ *{key}* set to `{parsed}`.", parse_mode="Markdown")
+        # loop back to list
+        return await config_entry_point(update, context)
+
+    async def config_received_new_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive the name of a new key"""
+        key = update.message.text.strip()
+        context.user_data["CFG_NEWKEY"] = key
+        await update.message.reply_text(f"Enter the value for new key *{key}*:", parse_mode="Markdown")
+        return ADD_VALUE
+
+    async def config_received_new_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive the value for that new key"""
+        key = context.user_data.pop("CFG_NEWKEY")
+        new_val = update.message.text.strip()
+        # parse as above
+        if new_val.lower() in ("true", "false"):
+            parsed = new_val.lower() == "true"
+        else:
+            try:
+                parsed = int(new_val)
+            except ValueError:
+                try:
+                    parsed = float(new_val)
+                except ValueError:
+                    parsed = new_val
+
+        cfg = load_cfg()
+        cfg[key] = parsed
+        save_cfg(cfg)
+
+        await update.message.reply_text(f"✔️ Added *{key}*: `{parsed}`.", parse_mode="Markdown")
+        return await config_entry_point(update, context)
+
+    async def config_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Configuration edit cancelled.")
+        return ConversationHandler.END
+
+    # ─ add this handler when building `app` ──────────────────────────────
+    config_conv = ConversationHandler(
+        entry_points=[CommandHandler("config", config_entry_point)],
+        states={
+            SELECT_KEY: [CallbackQueryHandler(config_button, pattern=r"^CFG\|")],
+            EDIT_VALUE: [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_edit)],
+            ADD_KEY:    [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_key)],
+            ADD_VALUE:  [MessageHandler(_flt.TEXT & ~_flt.COMMAND, config_received_new_val)],
+        },
+        fallbacks=[CommandHandler("cancel", config_cancel)],
+        per_user=True,
+        per_chat=False,
+    )
+    app.add_handler(config_conv, group=0)
 
     try:
         from assembler import Assembler
