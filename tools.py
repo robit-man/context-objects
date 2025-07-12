@@ -2555,7 +2555,87 @@ class Tools:
 
         log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
         return results
+   
+    @staticmethod
+    def search_images(
+        topic: str,
+        num_results: int = 5,
+        wait_sec: int = 1,
+        headless: bool = True,
+        **kwargs
+    ) -> List[str]:
+        """
+        Search DuckDuckGo Images for `topic`, download up to `num_results` images,
+        and return a list of file paths to the downloaded images.
 
+        Args:
+            topic (str): Search query.
+            num_results (int): Number of images to retrieve.
+            wait_sec (int): Seconds to wait for page loads and elements.
+            headless (bool): Whether to run the browser in headless mode.
+        """
+        # Handle unexpected kwargs
+        if kwargs:
+            print(f"[search_images] Ignoring unexpected args: {list(kwargs.keys())!r}")
+
+        # Ensure fresh browser session
+        Tools.close_browser()
+        Tools.open_browser(headless=headless, force_new=True)
+        drv = Tools._driver
+        wait = WebDriverWait(drv, wait_sec, poll_frequency=0.1)
+        downloaded_paths: List[str] = []
+
+        try:
+            # 1️⃣ Navigate to DuckDuckGo Images
+            url = f"https://duckduckgo.com/?iax=images&ia=images&q={topic}"
+            drv.get(url)
+            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+            # 2️⃣ Wait for thumbnails to appear
+            thumb_selector = "div.tile--img__media img"
+            wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, thumb_selector))
+
+            # 3️⃣ Scroll until we have enough thumbnails
+            thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_selector)
+            while len(thumbs) < num_results:
+                drv.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(0.5)
+                thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_selector)
+                if len(thumbs) >= num_results:
+                    break
+
+            # 4️⃣ For each thumbnail, click to open full image and download
+            for thumb in thumbs[:num_results]:
+                try:
+                    thumb.click()
+                    # wait for the detail pane image
+                    full_selector = "img.detail__media img"
+                    wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, full_selector))
+                    full_img = drv.find_element(By.CSS_SELECTOR, full_selector)
+                    src_url = full_img.get_attribute("src")
+                except Exception:
+                    # fallback to thumbnail src if detail fails
+                    src_url = thumb.get_attribute("src")
+
+                # download the image
+                try:
+                    resp = requests.get(src_url, timeout=5)
+                    resp.raise_for_status()
+                    ext = os.path.splitext(src_url.split("?")[0])[1] or ".jpg"
+                    path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}{ext}")
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                    downloaded_paths.append(path)
+                except Exception as download_err:
+                    print(f"[search_images] Download failed for {src_url}: {download_err}")
+                    continue
+
+        except Exception as e:
+            print(f"[search_images] Fatal error: {e}\n{traceback.format_exc()}")
+        finally:
+            Tools.close_browser()
+
+        return downloaded_paths
 
 
     # This static method extracts a summary from a webpage using two stages:

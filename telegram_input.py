@@ -1196,6 +1196,29 @@ def telegram_input(asm):
                                 )
                             else:
                                 await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+                        # suppose tcs is the list of tool results, and one of them is our image search:
+                        last_state = getattr(chat_asm, "_last_state", {}) or {}
+                        for tool_ctx in last_state.get("tool_ctxs", []):
+                            # your ContextObject tool contexts store the tool name and the result
+                            tool_name = tool_ctx.metadata.get("tool") or getattr(tool_ctx, "name", None)
+                            results   = tool_ctx.metadata.get("result") or getattr(tool_ctx, "result", None)
+                            if tool_name == "search_images" and isinstance(results, list):
+                                for img_path in results:
+                                    try:
+                                        # try sending as a local file
+                                        with open(img_path, "rb") as img_file:
+                                            await bot.send_photo(
+                                                chat_id=chat_id,
+                                                photo=img_file,
+                                                reply_to_message_id=reply_to_id
+                                            )
+                                    except (FileNotFoundError, IsADirectoryError):
+                                        # fallback: send by URL or whatever string remains
+                                        await bot.send_photo(
+                                            chat_id=chat_id,
+                                            photo=img_path,
+                                            reply_to_message_id=reply_to_id
+                                        )
 
                         # pin/unpin
                         if 'sent' in locals():
