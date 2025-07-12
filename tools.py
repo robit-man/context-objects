@@ -2108,6 +2108,8 @@ class Tools:
         return _cond
 
     # This static method opens a Chrome/Chromium browser using Selenium WebDriver. It tries multiple methods to find a suitable chromedriver, including Selenium-Manager, system-wide chromedriver, and webdriver-manager. It handles different CPU architectures and returns a message indicating success or failure.
+
+    # This static method opens a Chrome/Chromium browser using Selenium WebDriver. It tries multiple methods to find a suitable chromedriver, including Selenium-Manager, system-wide chromedriver, and webdriver-manager. It handles different CPU architectures and returns a message indicating success or failure.
     @staticmethod
     def open_browser(headless: bool = False, force_new: bool = False) -> str:
         """

@@ -4,6 +4,7 @@ import heapq
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 import re
+from collections.abc import Iterable
 from datetime import datetime
 
 _ISO_SHORT = re.compile(r"^\d{8}T\d{6}$")        # 20250711T203918
@@ -56,6 +57,10 @@ class GrandIntegrator:
         """
         now = datetime.utcnow()
         for c in ctx_objs:
+            if isinstance(c, Iterable) and not hasattr(c, "context_id"):
+                # It's a list/tuple/etc.  Recurse once to flatten.
+                self.ingest(list(c))
+                continue
             cid = c.context_id
             ts = getattr(c, "timestamp", now)
             if isinstance(ts, str):
