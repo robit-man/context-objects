@@ -806,7 +806,6 @@ class Assembler:
         os.replace(tmp_path, path)
         print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} unique, {bad} malformed → wrote {path}")
 
-   
     def _seed_tool_schemas(self) -> None:
         """
         Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
@@ -824,11 +823,14 @@ class Assembler:
         import json
         from context import sanitize_jsonl
 
+        # ── regenerate the canonical schemas and cache them ───────────────
         from tools import Tools, TOOL_SCHEMAS
-        # make sure any edits to tools.py are reflected
         TOOL_SCHEMAS.clear()
         Tools.generate_all_tool_schemas()
-        # 1) bucket existing rows by tool name
+        # cache for introspection or later use
+        self.tool_schemas = {name: schema for name, schema in TOOL_SCHEMAS.items()}
+
+        # ── 1) bucket existing ContextObjects by tool name ────────────────
         buckets: dict[str, list[ContextObject]] = {}
         for ctx in self.repo.query(
             lambda c: c.component == "schema" and "tool_schema" in c.tags
@@ -839,7 +841,7 @@ class Assembler:
             except Exception:
                 continue
 
-        # 2) upsert canonical entries
+        # ── 2) upsert each canonical schema ────────────────────────────────
         for name, canonical in TOOL_SCHEMAS.items():
             blob = json.dumps(canonical, sort_keys=True)
             rows = buckets.get(name, [])
@@ -853,7 +855,6 @@ class Assembler:
                 )
                 new_ctx.touch()
                 self.repo.save(new_ctx)
-                #self.memman.register_relationships(new_ctx, embed_text)
                 buckets[name] = [new_ctx]
                 continue
 
@@ -863,32 +864,32 @@ class Assembler:
             for dup in dups:
                 self.repo.delete(dup.context_id)
 
-            # C) update JSON if it changed
+            # C) update if JSON changed
             stored = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
             if stored != blob:
                 keeper.metadata["schema"] = blob
                 keeper.touch()
                 self.repo.save(keeper)
-                #self.memman.register_relationships(keeper, embed_text)
 
             buckets[name] = [keeper]
 
-        # 3) purge/archive orphaned schemas
+        # ── 3) purge/archive any schemas no longer in TOOL_SCHEMAS ─────────
         for name, rows in list(buckets.items()):
             if name not in TOOL_SCHEMAS:
-                # keep only the newest, archive the rest
                 rows.sort(key=lambda c: c.timestamp, reverse=True)
                 keep, *extras = rows
+                # delete extras
                 for e in extras:
                     self.repo.delete(e.context_id)
+                # mark the keeper as legacy
                 if "legacy_tool_schema" not in keep.tags:
                     keep.tags.append("legacy_tool_schema")
+                # remove the old tag
                 keep.tags = [t for t in keep.tags if t != "tool_schema"]
                 keep.touch()
                 self.repo.save(keep)
-                #self.memman.register_relationships(keep, embed_text)
 
-        # 4) rewrite JSONL to remove any on-disk duplicates & ensure validity
+        # ── 4) cleanup the on-disk JSONL ───────────────────────────────────
         sanitize_jsonl(self.context_path)
         self._prune_jsonl_duplicates()
 

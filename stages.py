@@ -1828,6 +1828,7 @@ def _stage9_invoke_with_retries(
 
 def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
     import json
+    from collections import OrderedDict
     from context import ContextObject
 
     # ─── 1) Conversation snippets ────────────────────────────────────
@@ -1844,17 +1845,13 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     tool_ctxs = state.get("tool_ctxs", []) or []
     tool_blocks = []
     for tc in tool_ctxs:
-        # Dump every metadata field
         meta = tc.metadata.copy()
-        # Always include the original tool_call if present
         if "tool_call" in meta:
             meta["tool_call"] = meta["tool_call"]
-        # Format as prettified JSON
         try:
             payload = json.dumps(meta, ensure_ascii=False, indent=2)
         except Exception:
             payload = repr(meta)
-        # Header includes stage_id, tool_call and timestamp
         call_name = meta.get("tool_call", tc.stage_id)
         ts = getattr(tc, "timestamp", "")
         header = f"--- {tc.stage_id} ({call_name}) @ {ts} ---"
@@ -1883,20 +1880,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     plan_block = "[Plan]\n" + plan_txt
     user_block = "[User question]\n" + user_text
 
-    # ─── 6) Build debug payload ────────────────────────────────────
-    debug_payload = {
-        "conversation_block": conversation_block,
-        "tools_block":        tools_block,
-        "narrative_block":    narrative_block,
-        "recent_hist_block":  recent_hist_block,
-        "plan_block":         plan_block,
-        "user_block":         user_block,
-        "merged_ids":         [c.context_id for c in recent],
-        "tool_ctx_ids":       [tc.context_id for tc in tool_ctxs],
-    }
-    self._print_stage_context("assemble_and_infer", debug_payload)
-
-    # ─── 7) Compose messages for the LLM ───────────────────────────
+    # ─── 6) Compose the exact messages for the LLM ──────────────────
     final_sys = self._get_prompt("final_inference_prompt")
     msgs = [
         {"role": "system", "content": final_sys},
@@ -1904,14 +1888,28 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     ]
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
-    if tools_block:
-        msgs.append({"role": "system", "content": tools_block})
     msgs.append({"role": "system", "content": self.inference_prompt})
     if recent_hist_block:
         msgs.append({"role": "system", "content": recent_hist_block})
     msgs.append({"role": "system", "content": plan_block})
     msgs.append({"role": "system", "content": user_block})
     msgs.append({"role": "user",   "content": user_text})
+    if tools_block:
+        msgs.append({"role": "system", "content": tools_block})
+
+    # ─── 7) DEBUG PRINT: show all blocks *and* the assembled msgs ────
+    debug_payload = OrderedDict([
+        ("conversation_block", conversation_block),
+        ("tools_block",        tools_block),
+        ("narrative_block",    narrative_block),
+        ("recent_hist_block",  recent_hist_block),
+        ("plan_block",         plan_block),
+        ("user_block",         user_block),
+        ("assembled_msgs",     json.dumps(msgs, ensure_ascii=False, indent=2)),
+        ("merged_ids",         [c.context_id for c in recent]),
+        ("tool_ctx_ids",       [tc.context_id for tc in tool_ctxs]),
+    ])
+    self._print_stage_context("assemble_and_infer", debug_payload)
 
     # ─── 8) Call the model ───────────────────────────────────────────
     reply = self._stream_and_capture(
@@ -1926,7 +1924,6 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
-    #resp_ctx.touch(); self.repo.save(resp_ctx)
     self._persist_and_index([resp_ctx])
 
     seg = ContextObject.make_segment("assistant",
