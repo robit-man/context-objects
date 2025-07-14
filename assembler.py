@@ -762,10 +762,7 @@ class Assembler:
         only the entry with the latest timestamp survives.
         Malformed JSON lines go into context.jsonl.corrupt.
 
-        On POSIX: uses os.replace(tmp, path) for atomic swap.
-        On Windows: if replace fails due to a lock, renames the
-        locked context.jsonl → context.jsonl.bak, then moves the
-        tmp file into place, then deletes the .bak.
+        On Windows we skip the actual file‐swap because of lock issues.
         """
         import os, sys, json, tempfile
 
@@ -774,7 +771,7 @@ class Assembler:
         seen: dict[str, dict] = {}
         total, bad = 0, 0
 
-        # ── 1) Read & bucket latest by (context_id, timestamp)
+        # ── 1) Read & bucket by latest timestamp ───────────────────────
         with open(path, "r", encoding="utf8") as infile, \
              open(corrupt_path, "a", encoding="utf8") as badf:
             for line in infile:
@@ -788,7 +785,6 @@ class Assembler:
 
                 cid = obj.get("context_id")
                 ts  = obj.get("timestamp", "")
-                # invalid → corrupt
                 if not isinstance(cid, str) or not isinstance(ts, str):
                     bad += 1
                     badf.write(line)
@@ -798,45 +794,28 @@ class Assembler:
                 if prev is None or ts > prev["timestamp"]:
                     seen[cid] = obj
 
-        # ── 2) Sort survivors by timestamp ascending
+        # ── 2) Sort survivors and write to temp ────────────────────────
         survivors = sorted(seen.values(), key=lambda o: o["timestamp"])
-
-        # ── 3) Write out to a temp file in the same dir
         tmp_dir = os.path.dirname(path) or "."
         fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
         with os.fdopen(fd, "w", encoding="utf8") as out:
             for o in survivors:
-                # compact JSON (no spaces)
                 out.write(json.dumps(o, separators=(",", ":")) + "\n")
 
-        # ── 4) Try atomic replace; on Windows fallback to rename-swap
-        try:
-            os.replace(tmp_path, path)
-        except PermissionError:
-            # Windows often locks the target; do a rename‐swap
-            if sys.platform.startswith("win"):
-                backup = path + ".bak"
-                try:
-                    # step 1: move the locked original aside
-                    os.replace(path, backup)
-                except Exception:
-                    # if even that fails, re-raise so you know something's wrong
-                    raise
+        # ── 3) Swap (or skip on Windows) ───────────────────────────────
+        if sys.platform.startswith("win"):
+            # Windows often locks context.jsonl; skip the swap
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            print(f"[prune_jsonl_duplicates] Skipped on Windows: "
+                  f"{total} read, {len(survivors)} unique, {bad} malformed")
+            return
 
-                # step 2: move our new file into place
-                os.replace(tmp_path, path)
-
-                # step 3: attempt to clean up the .bak
-                try:
-                    os.remove(backup)
-                except Exception:
-                    # non‐fatal: leave the .bak around if deletion fails
-                    pass
-            else:
-                # re-raise on other platforms
-                raise
-
-        print(f"[prune_jsonl_duplicates] {total} lines read, "
+        # POSIX: atomic replace
+        os.replace(tmp_path, path)
+        print(f"[prune_jsonl_duplicates] {total} read, "
               f"{len(survivors)} unique, {bad} malformed → wrote {path}")
 
 
