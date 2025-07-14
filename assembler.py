@@ -900,44 +900,35 @@ class Assembler:
          - INSERT if missing
          - UPDATE if text differs
          - DEDUPE extras
+
+        Afterwards, rewrite context.jsonl so that every JSON line is minified
+        (no spaces between keys and values).
         """
-        # ── ADD THIS LINE ────────────────────────────────────────────
+        # ── 1) Build our table of desired prompts ───────────────────────
         self.system_prompts = {
-            "clarifier_prompt":       self.clarifier_prompt,
-            "assembler_prompt":       self.assembler_prompt,
-            "inference_prompt":       self.inference_prompt,
-            "planning_prompt":        self.planning_prompt,
-            "toolchain_prompt":       self.toolchain_prompt,
-            "reflection_prompt":      self.reflection_prompt,
-            "toolchain_retry_prompt": self.toolchain_retry_prompt,
-            "final_inference_prompt": self.final_inference_prompt,
-            "critic_prompt":          self.critic_prompt,
-            "narrative_mull_prompt":  self.narrative_mull_prompt,
+            "clarifier_prompt":        self.clarifier_prompt,
+            "assembler_prompt":        self.assembler_prompt,
+            "inference_prompt":        self.inference_prompt,
+            "planning_prompt":         self.planning_prompt,
+            "toolchain_prompt":        self.toolchain_prompt,
+            "reflection_prompt":       self.reflection_prompt,
+            "toolchain_retry_prompt":  self.toolchain_retry_prompt,
+            "final_inference_prompt":  self.final_inference_prompt,
+            "critic_prompt":           self.critic_prompt,
+            "narrative_mull_prompt":   self.narrative_mull_prompt,
         }
-        # ─────────────────────────────────────────────────────────────
+        static = dict(self.system_prompts)  # alias
 
-        static = {
-            "clarifier_prompt":       self.clarifier_prompt,
-            "assembler_prompt":       self.assembler_prompt,
-            "inference_prompt":       self.inference_prompt,
-            "planning_prompt":        self.planning_prompt,
-            "toolchain_prompt":       self.toolchain_prompt,
-            "reflection_prompt":      self.reflection_prompt,
-            "toolchain_retry_prompt": self.toolchain_retry_prompt,
-            "final_inference_prompt": self.final_inference_prompt,
-            "critic_prompt":          self.critic_prompt,
-            "narrative_mull_prompt":  self.narrative_mull_prompt,
-        }
-
-        # Bucket rows by semantic_label
+        # ── 2) Bucket existing ContextObjects by semantic_label ─────────
         buckets: Dict[str, List[ContextObject]] = {}
         for ctx in self.repo.query(lambda c: c.component == "prompt"):
             buckets.setdefault(ctx.semantic_label, []).append(ctx)
 
+        # ── 3) Upsert each prompt ────────────────────────────────────────
         for label, desired_text in static.items():
             rows = buckets.get(label, [])
 
-            # A) No existing row → insert
+            # A) None exist → INSERT
             if not rows:
                 new_ctx = ContextObject.make_prompt(
                     label=label,
@@ -946,35 +937,48 @@ class Assembler:
                 )
                 new_ctx.touch()
                 self.repo.save(new_ctx)
-                #self.memman.register_relationships(new_ctx, embed_text)
-
                 continue
 
-            # B) Keep only the newest, delete duplicates
+            # B) Dedupe in-repo: keep the newest
             rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper = rows[0]
-            for dup in rows[1:]:
+            keeper, *dups = rows
+            for dup in dups:
                 self.repo.delete(dup.context_id)
 
-            # C) Check for changes
+            # C) Update if text changed or missing tag
             changed = False
             if keeper.metadata.get("prompt") != desired_text:
                 keeper.metadata["prompt"] = desired_text
                 changed = True
-
             if "prompt" not in keeper.tags:
                 keeper.tags.append("prompt")
                 changed = True
-
-            # D) Only persist if we actually changed something
             if changed:
                 keeper.touch()
                 self.repo.save(keeper)
-                #self.memman.register_relationships(keeper, embed_text)
 
+        # ── 4) Sanitize + prune duplicates (this will already minify new entries) ─
         from context import sanitize_jsonl
         sanitize_jsonl(self.context_path)
         self._prune_jsonl_duplicates()
+
+        # ── 5) Finally, rewrite *every* line as compact JSON ────────────────
+        import json
+        minified = []
+        with open(self.context_path, "r", encoding="utf-8") as infile:
+            for line in infile:
+                try:
+                    obj = json.loads(line)
+                    minified.append(obj)
+                except json.JSONDecodeError:
+                    # skip malformed / corrupt lines
+                    continue
+
+        with open(self.context_path, "w", encoding="utf-8") as outfile:
+            for obj in minified:
+                # NO spaces between keys & values
+                outfile.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
 
 
     def _ensure_str(self, x: Any) -> str:

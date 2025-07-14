@@ -2557,87 +2557,124 @@ class Tools:
 
         log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
         return results
-   
+    
     @staticmethod
     def search_images(
         topic: str,
         num_results: int = 5,
         wait_sec: int = 1,
         headless: bool = True,
+        summarize: bool = False,
         **kwargs
-    ) -> List[str]:
+    ) -> list[dict]:
         """
-        Search DuckDuckGo Images for `topic`, download up to `num_results` images,
-        and return a list of file paths to the downloaded images.
+        Ultra-quick DuckDuckGo image search (event-driven, JS injection) with optional
+        model-generated captions.
 
-        Args:
-            topic (str): Search query.
-            num_results (int): Number of images to retrieve.
-            wait_sec (int): Seconds to wait for page loads and elements.
-            headless (bool): Whether to run the browser in headless mode.
+        1. Call search_images(topic=str, top_n=int, summarize=bool)
+           - topic (str): the search query
+           - top_n, n, or limit (int): how many images to retrieve
+           - summarize (bool): if True, generate a brief description in 'aux_summary'; if False, skip
+
+        • Navigates to DuckDuckGo Images, waits for JS to load thumbnails, scrolls until
+          at least num_results are visible, then clicks each to reveal the full-size image.
+        • Downloads up to num_results images into your system temp directory.
+        • Returns a list of dicts, each containing:
+            - file_path   (str): local path to the downloaded image
+            - src_url     (str): original image URL
+            - aux_summary (str): only if summarize=True, a model-generated caption
+        • Never blocks more than 5 s on any wait—everything is aggressively polled.
         """
-        # Handle unexpected kwargs
+        import os, time, uuid, tempfile, traceback, requests
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException
+
+        # ——— Argument-alias handling ——————————————
+        for alias in ("top_n", "n", "limit"):
+            if alias in kwargs:
+                num_results = int(kwargs.pop(alias))
         if kwargs:
-            print(f"[search_images] Ignoring unexpected args: {list(kwargs.keys())!r}")
+            log_message(f"[search_images] Ignoring unexpected args: {list(kwargs)}", "WARNING")
 
-        # Ensure fresh browser session
+        log_message(f"[search_images] ▶ {topic!r} (num_results={num_results}, summarize={summarize})", "INFO")
+
+        # clamp waits to max 5 s
+        wait_sec = min(wait_sec, 5)
+
+        # fresh browser session
         Tools.close_browser()
         Tools.open_browser(headless=headless, force_new=True)
-        drv = Tools._driver
+        drv  = Tools._driver
         wait = WebDriverWait(drv, wait_sec, poll_frequency=0.1)
-        downloaded_paths: List[str] = []
+        results: list[dict] = []
 
         try:
             # 1️⃣ Navigate to DuckDuckGo Images
             url = f"https://duckduckgo.com/?iax=images&ia=images&q={topic}"
             drv.get(url)
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            log_message("[search_images] page ready", "DEBUG")
 
-            # 2️⃣ Wait for thumbnails to appear
-            thumb_selector = "div.tile--img__media img"
-            wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, thumb_selector))
+            # 2️⃣ Wait for thumbnails
+            thumb_sel = "img.tile--img__img"
+            wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, thumb_sel)))
+            thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_sel)
 
-            # 3️⃣ Scroll until we have enough thumbnails
-            thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_selector)
-            while len(thumbs) < num_results:
+            # 3️⃣ Scroll until we have enough
+            scrolls = 0
+            while len(thumbs) < num_results and scrolls < 5:
                 drv.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(0.5)
-                thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_selector)
-                if len(thumbs) >= num_results:
-                    break
+                time.sleep(1)
+                thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_sel)
+                scrolls += 1
 
-            # 4️⃣ For each thumbnail, click to open full image and download
+            # 4️⃣ Click & download
             for thumb in thumbs[:num_results]:
                 try:
                     thumb.click()
-                    # wait for the detail pane image
-                    full_selector = "img.detail__media img"
-                    wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, full_selector))
-                    full_img = drv.find_element(By.CSS_SELECTOR, full_selector)
-                    src_url = full_img.get_attribute("src")
+                    full_sel = "img.detail__media__img"
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, full_sel)))
+                    full = drv.find_element(By.CSS_SELECTOR, full_sel)
+                    src = full.get_attribute("src")
+                except TimeoutException:
+                    src = thumb.get_attribute("src")
                 except Exception:
-                    # fallback to thumbnail src if detail fails
-                    src_url = thumb.get_attribute("src")
+                    src = thumb.get_attribute("src")
 
-                # download the image
+                # download file
                 try:
-                    resp = requests.get(src_url, timeout=5)
+                    resp = requests.get(src, timeout=5)
                     resp.raise_for_status()
-                    ext = os.path.splitext(src_url.split("?")[0])[1] or ".jpg"
+                    ext  = os.path.splitext(src.split("?")[0])[1] or ".jpg"
                     path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}{ext}")
                     with open(path, "wb") as f:
                         f.write(resp.content)
-                    downloaded_paths.append(path)
-                except Exception as download_err:
-                    print(f"[search_images] Download failed for {src_url}: {download_err}")
+                except Exception as down_err:
+                    log_message(f"[search_images] download failed: {src} → {down_err}", "WARNING")
                     continue
 
+                entry = {"file_path": path, "src_url": src}
+
+                # 5️⃣ Optional model caption
+                if summarize:
+                    try:
+                        prompt = f"Provide a concise description of the image at URL: {src}"
+                        entry["aux_summary"] = Tools.auxiliary_inference(prompt=prompt)
+                    except Exception as ex:
+                        log_message(f"[search_images] caption failed: {ex}", "WARNING")
+
+                results.append(entry)
+
         except Exception as e:
-            print(f"[search_images] Fatal error: {e}\n{traceback.format_exc()}")
+            log_message(f"[search_images] Fatal: {e}\n{traceback.format_exc()}", "ERROR")
         finally:
             Tools.close_browser()
 
-        return downloaded_paths
+        log_message(f"[search_images] Collected {len(results)} images", "SUCCESS")
+        return results
+
 
 
     # This static method extracts a summary from a webpage using two stages:

@@ -748,7 +748,7 @@ class HybridContextRepository:
                 continue
 
             # <<< NEW: skip tool-code artifacts entirely >>>
-            if obj.domain == "artifact" and obj.component == "tool_code":
+            if obj.domain == "artifact" and obj.component == "prompt":
                 continue
 
             # never archive schema artifacts either
