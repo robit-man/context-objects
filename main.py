@@ -16,9 +16,10 @@ Also integrates:
 import os
 import sys
 
-if sys.platform == "win32":
+if sys.platform.startswith("win"):
+    # Use the SelectorEventLoop instead of the ProactorEventLoop on Windows
     import asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import time
 import json

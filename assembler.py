@@ -1358,37 +1358,52 @@ class Assembler:
     ) -> str:
         """
         Stream a response from Ollama with:
-        • automatic image-inlining               (unchanged)
-        • *two-tier* runaway-repetition guard    (NEW)
-            – aborts & retries once if either guard trips
+         • automatic image‐inlining
+         • *four* runaway‐repetition guards:
+             1) TOKEN guard:       ≥ TOKEN_REPEAT_LIMIT identical tokens
+             2) LINE guard:        ≥ LINE_REPEAT_LIMIT identical lines
+             3) PATTERN guard:     ≥ PATTERN_REPEAT_THRESHOLD repeats of
+                                   ANY substring of length 1–50 chars
+             4) MULTI-TOKEN guard: any sequence of 2–10 tokens repeating
+                                   SEQ_REPEAT_LIMIT times
+           Any guard trips → abort & restart the chat from scratch, up to MAX_ATTEMPTS.
         """
-        import re, base64, os, time, requests
+        import re, time, requests
         from pathlib import Path
         from collections import deque
         from ollama import chat
 
         # ── tweakables ────────────────────────────────────────────────
-        TOKEN_WINDOW        = 1200          # last N whitespace-delimited tokens to watch
-        TOKEN_REPEAT_LIMIT  = 45            # ≥ N consecutive identical tokens → abort
-        LINE_REPEAT_LIMIT   = 10            # ≥ N identical (stripped) lines  → abort
-        RETRY_MAX           = 1             # we already retry once; avoid loops
+        TOKEN_WINDOW             = 1200
+        TOKEN_REPEAT_LIMIT       = 45
+        LINE_REPEAT_LIMIT        = 10
+        PATTERN_MAX_LEN          = 50
+        PATTERN_REPEAT_THRESHOLD = 10
+        SEQ_MIN                  = 2
+        SEQ_MAX                  = 10
+        SEQ_REPEAT_LIMIT         = 10
+        MAX_ATTEMPTS             = 10
         # ──────────────────────────────────────────────────────────────
 
-        # ---------- helper: inline images (unchanged) ----------------
+        # compile arbitrary‐pattern guard
+        pat_regex = re.compile(
+            rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
+            re.DOTALL
+        )
+
+        # ---------- inline images (unchanged) -------------------------
         path_pat = re.compile(
             r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\."
             r"(?:jpg|jpeg|png|bmp|gif|webp))",
             re.IGNORECASE,
         )
-        imgs_data: list[bytes] = images or []
+        imgs_data = images or []
         if not imgs_data:
-            all_paths = list({p for m in messages
-                              for p in path_pat.findall(m["content"])})
+            all_paths = {p for m in messages for p in path_pat.findall(m["content"])}
             for loc in all_paths:
                 try:
                     if loc.lower().startswith(("http://", "https://")):
-                        r = requests.get(loc, timeout=5)
-                        r.raise_for_status()
+                        r = requests.get(loc, timeout=5); r.raise_for_status()
                         imgs_data.append(r.content)
                     else:
                         p = Path(loc).expanduser().resolve()
@@ -1399,81 +1414,79 @@ class Assembler:
         if imgs_data:
             messages[-1]["images"] = imgs_data
 
-        # ---------- repetition detectors ----------------------------
-        def _token_guard(tokens: deque[str]) -> bool:
-            """
-            True ↔ the *exact* same token has appeared
-            TOKEN_REPEAT_LIMIT times in a row.
-            """
+        # ── repetition guards ──────────────────────────────────────────
+        def token_guard(tokens: deque[str]) -> bool:
             if len(tokens) < TOKEN_REPEAT_LIMIT:
                 return False
             last = tokens[-1]
-            for i in range(2, TOKEN_REPEAT_LIMIT + 1):
-                if tokens[-i] != last:
-                    return False
-            return True
+            return all(tok == last for tok in list(tokens)[-TOKEN_REPEAT_LIMIT:])
 
-        def _line_guard(lines: deque[str]) -> bool:
-            """
-            True ↔ the same stripped line has repeated
-            LINE_REPEAT_LIMIT times consecutively.
-            """
+        def line_guard(lines: deque[str]) -> bool:
             if len(lines) < LINE_REPEAT_LIMIT:
                 return False
             last = lines[-1]
-            for i in range(2, LINE_REPEAT_LIMIT + 1):
-                if lines[-i] != last:
-                    return False
-            return True
+            return all(ln == last for ln in list(lines)[-LINE_REPEAT_LIMIT:])
 
-        # ---------- core streaming wrapper --------------------------
-        def _one_pass() -> tuple[str, bool]:
-            """Run one streaming pass; return (text, hit_guard)."""
-            buffer_tokens: deque[str] = deque(maxlen=TOKEN_WINDOW)
-            buffer_lines:  deque[str] = deque(maxlen=LINE_REPEAT_LIMIT)
-            full_text = []
+        def multi_token_guard(tokens: deque[str]) -> bool:
+            arr = list(tokens)
+            n = len(arr)
+            for L in range(SEQ_MIN, min(SEQ_MAX, n // SEQ_REPEAT_LIMIT) + 1):
+                needed = L * SEQ_REPEAT_LIMIT
+                if n < needed:
+                    continue
+                seq = arr[-L:]
+                if all(arr[-r*L : - (r-1)*L] == seq for r in range(2, SEQ_REPEAT_LIMIT+1)):
+                    return True
+            return False
+
+        # ── one streaming pass ────────────────────────────────────────
+        def one_pass() -> tuple[str, bool]:
+            buf_tokens = deque(maxlen=TOKEN_WINDOW)
+            buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
+            chunks     = []
+
             print(f"{tag} ", end="", flush=True)
-
             for part in chat(model=model, messages=messages, stream=True):
                 chunk = part["message"]["content"]
                 print(chunk, end="", flush=True)
-                full_text.append(chunk)
+                chunks.append(chunk)
 
-                # update windows
                 for tok in chunk.split():
-                    buffer_tokens.append(tok)
+                    buf_tokens.append(tok)
                 for ln in chunk.splitlines():
-                    stripped = ln.strip()
-                    if stripped:
-                        buffer_lines.append(stripped)
+                    s = ln.strip()
+                    if s:
+                        buf_lines.append(s)
 
-                # guard checks
-                if _token_guard(buffer_tokens) or _line_guard(buffer_lines):
-                    print("\n[Run-away guard] Repetition detected – aborting stream.")
-                    return "".join(full_text), True
+                if token_guard(buf_tokens):
+                    print("\n[Run-away guard] token repetition → aborting pass.")
+                    return "".join(chunks), True
+                if line_guard(buf_lines):
+                    print("\n[Run-away guard] line repetition → aborting pass.")
+                    return "".join(chunks), True
+                if multi_token_guard(buf_tokens):
+                    print("\n[Run-away guard] multi-token repetition → aborting pass.")
+                    return "".join(chunks), True
 
-            print()  # final newline
-            return "".join(full_text), False
+                full = "".join(chunks)
+                if pat_regex.search(full):
+                    print("\n[Run-away guard] pattern repetition → aborting pass.")
+                    return full, True
 
-        # ---------- with a single retry -----------------------------
-        tries   = 0
-        text    = ""
-        guarded = True
-        while guarded and tries <= RETRY_MAX:
-            text, guarded = _one_pass()
-            if guarded:
-                tries += 1
-                if tries <= RETRY_MAX:
-                    print("[Run-away guard] Retrying stream …")
+            print()
+            return "".join(chunks), False
 
-        if guarded:
-            # still repetitive after retry → hard truncate by collapsing runs
-            pattern = re.compile(r"(.+?)(\1{5,})", re.DOTALL)  # 5+ exact repeats
-            text = pattern.sub(r"\1" * 3, text)                # keep 3 repetitions
-            print("[Run-away guard] Output truncated after second failure.")
+        # ── retry loop with MAX_ATTEMPTS ──────────────────────────────
+        for attempt in range(1, MAX_ATTEMPTS+1):
+            text, hit = one_pass()
+            if not hit:
+                return text
+            print(f"[Run-away guard] restarting inference (attempt {attempt}/{MAX_ATTEMPTS}) …")
+            time.sleep(0.1)
 
-        return text
-
+        # 10 attempts failed – hard abort
+        print(f"[Run-away guard] aborting after {MAX_ATTEMPTS} attempts → returning empty string.")
+        return ""
 
 
     def _parse_task_tree(
