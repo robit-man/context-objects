@@ -484,6 +484,7 @@ class Assembler:
             "}\n"
             "```\n"
             "If you cannot, just list the tool calls.  Only return exact objects from the list of Available tools:\n"
+            "Always ensure you wrap the tool calls in the task key, or it will not call the respective tools as they MUST be passed into a parent task!"
             # ────────────────────────────────────────────────────────────────────────
         )
         self.toolchain_prompt = self.cfg.get(
