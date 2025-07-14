@@ -715,15 +715,6 @@ def telegram_input(asm):
             # ── Who sent it? ─────────────────────────────────────────────────
             user = update.effective_user
 
-            # ── Now build metadata ────────────────────────────────────────────
-            metadata = {
-                "chat_id":       chat_id,
-                "from_user_id":  user.id,
-                "from_username": user.username,
-                "message_id":    msg.message_id,
-                "text":          msg.text or msg.caption or "",
-            }
-
             # ── Identify “kind” and pull raw content / files ──────────────────
             kind, data = "other", None
             image_paths: list[str] = []
