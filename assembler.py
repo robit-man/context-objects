@@ -761,32 +761,34 @@ class Assembler:
         Rewrite self.context_path so that for each context_id
         only the entry with the latest timestamp survives.
         Malformed JSON lines go into context.jsonl.corrupt.
-        On Windows, if os.replace() is blocked, falls back to remove+rename.
+
+        On POSIX: uses os.replace(tmp, path) for atomic swap.
+        On Windows: if replace fails due to a lock, renames the
+        locked context.jsonl → context.jsonl.bak, then moves the
+        tmp file into place, then deletes the .bak.
         """
-        import os
-        import sys
-        import json
-        import tempfile
+        import os, sys, json, tempfile
 
         path         = self.context_path
         corrupt_path = path + ".corrupt"
         seen: dict[str, dict] = {}
         total, bad = 0, 0
 
-        # 1) Read & segregate into `seen` (newest per context_id) and collect malformed
+        # ── 1) Read & bucket latest by (context_id, timestamp)
         with open(path, "r", encoding="utf8") as infile, \
              open(corrupt_path, "a", encoding="utf8") as badf:
             for line in infile:
                 total += 1
                 try:
-                    o = json.loads(line)
+                    obj = json.loads(line)
                 except json.JSONDecodeError:
                     bad += 1
                     badf.write(line)
                     continue
 
-                cid = o.get("context_id")
-                ts  = o.get("timestamp", "")
+                cid = obj.get("context_id")
+                ts  = obj.get("timestamp", "")
+                # invalid → corrupt
                 if not isinstance(cid, str) or not isinstance(ts, str):
                     bad += 1
                     badf.write(line)
@@ -794,32 +796,48 @@ class Assembler:
 
                 prev = seen.get(cid)
                 if prev is None or ts > prev["timestamp"]:
-                    seen[cid] = o
+                    seen[cid] = obj
 
-        # 2) Sort survivors by timestamp ascending
+        # ── 2) Sort survivors by timestamp ascending
         survivors = sorted(seen.values(), key=lambda o: o["timestamp"])
 
-        # 3) Write out to a temp file (compacted JSON)
-        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-        with os.fdopen(fd, "w", encoding="utf8") as outfile:
+        # ── 3) Write out to a temp file in the same dir
+        tmp_dir = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
+        with os.fdopen(fd, "w", encoding="utf8") as out:
             for o in survivors:
-                outfile.write(json.dumps(o, separators=(",", ":")) + "\n")
+                # compact JSON (no spaces)
+                out.write(json.dumps(o, separators=(",", ":")) + "\n")
 
-        # 4) Atomically replace on POSIX; on Windows, fall back if locked
+        # ── 4) Try atomic replace; on Windows fallback to rename-swap
         try:
             os.replace(tmp_path, path)
         except PermissionError:
-            # If on Windows, try remove + rename; otherwise re-raise
+            # Windows often locks the target; do a rename‐swap
             if sys.platform.startswith("win"):
+                backup = path + ".bak"
                 try:
-                    os.remove(path)
-                except FileNotFoundError:
+                    # step 1: move the locked original aside
+                    os.replace(path, backup)
+                except Exception:
+                    # if even that fails, re-raise so you know something's wrong
+                    raise
+
+                # step 2: move our new file into place
+                os.replace(tmp_path, path)
+
+                # step 3: attempt to clean up the .bak
+                try:
+                    os.remove(backup)
+                except Exception:
+                    # non‐fatal: leave the .bak around if deletion fails
                     pass
-                os.rename(tmp_path, path)
             else:
+                # re-raise on other platforms
                 raise
 
-        print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} unique, {bad} malformed → wrote {path}")
+        print(f"[prune_jsonl_duplicates] {total} lines read, "
+              f"{len(survivors)} unique, {bad} malformed → wrote {path}")
 
 
     def _seed_tool_schemas(self) -> None:
