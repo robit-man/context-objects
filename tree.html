@@ -1991,10 +1991,10 @@ sidebar.addEventListener('scroll', () => {
         }
         function unixNow() { return Date.now(); }
         function edgeThickness(w) {
-            const MIN = 0.1;   // thinnest possible edge
-            const MAX = 10;   // thickest possible edge
+            const MIN = 1;   // thinnest possible edge
+            const MAX = 2;   // thickest possible edge
             /* clamp & normalise:   0 → MIN,   1 or above → MAX  */
-            w = Math.min(Math.max(w, 0), 1);
+            w = Math.min(Math.max(w, 0.5), 2);
             return MIN + (MAX - MIN) * w;
         }
         function clearScene() {

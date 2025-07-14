@@ -2367,7 +2367,11 @@ class Assembler:
 
             # Stage 10: assemble + infer
             try:
-                final = self._stage10_assemble_and_infer(user_text, state)
+                final = self._stage10_assemble_and_infer(
+                    user_text,
+                    state,
+                    images=state.get("images", [])
+                )
                 state["final"] = final
                 status_cb("assemble_and_infer", final)
             except Exception as e:
@@ -2625,7 +2629,11 @@ class Assembler:
 
         # Stage 10: assemble + infer (draft)
         try:
-            draft = self._stage10_assemble_and_infer(user_text, state)
+            draft = self._stage10_assemble_and_infer(
+                user_text,
+                state,
+                images=state.get("images", [])
+            )
             state["draft"] = draft
             status_cb("assemble_and_infer", draft)
         except Exception as e:
@@ -2651,7 +2659,11 @@ class Assembler:
 
         # Stage 10b: final_inference
         try:
-            final = self._stage10_assemble_and_infer(user_text, state)
+            final = self._stage10_assemble_and_infer(
+                user_text,
+                state,
+                images=state.get("images", [])
+            )
             state["final"] = final
             status_cb("final_inference", final)
         except Exception as e:
