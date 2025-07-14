@@ -761,15 +761,21 @@ class Assembler:
         Rewrite self.context_path so that for each context_id
         only the entry with the latest timestamp survives.
         Malformed JSON lines go into context.jsonl.corrupt.
+        On Windows, if os.replace() is blocked, falls back to remove+rename.
         """
-        path        = self.context_path
+        import os
+        import sys
+        import json
+        import tempfile
+
+        path         = self.context_path
         corrupt_path = path + ".corrupt"
         seen: dict[str, dict] = {}
         total, bad = 0, 0
 
-        # Read & segregate
+        # 1) Read & segregate into `seen` (newest per context_id) and collect malformed
         with open(path, "r", encoding="utf8") as infile, \
-            open(corrupt_path, "a", encoding="utf8") as badf:
+             open(corrupt_path, "a", encoding="utf8") as badf:
             for line in infile:
                 total += 1
                 try:
@@ -781,30 +787,40 @@ class Assembler:
 
                 cid = o.get("context_id")
                 ts  = o.get("timestamp", "")
-
-                # If no context_id or ts, treat as corrupt
                 if not isinstance(cid, str) or not isinstance(ts, str):
                     bad += 1
                     badf.write(line)
                     continue
 
                 prev = seen.get(cid)
-                # keep whichever has the higher ISO-ts
                 if prev is None or ts > prev["timestamp"]:
                     seen[cid] = o
 
-        # Sort by timestamp ascending
+        # 2) Sort survivors by timestamp ascending
         survivors = sorted(seen.values(), key=lambda o: o["timestamp"])
 
-        # Write out atomically
+        # 3) Write out to a temp file (compacted JSON)
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
         with os.fdopen(fd, "w", encoding="utf8") as outfile:
             for o in survivors:
-                # compact JSON
                 outfile.write(json.dumps(o, separators=(",", ":")) + "\n")
 
-        os.replace(tmp_path, path)
+        # 4) Atomically replace on POSIX; on Windows, fall back if locked
+        try:
+            os.replace(tmp_path, path)
+        except PermissionError:
+            # If on Windows, try remove + rename; otherwise re-raise
+            if sys.platform.startswith("win"):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                os.rename(tmp_path, path)
+            else:
+                raise
+
         print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} unique, {bad} malformed → wrote {path}")
+
 
     def _seed_tool_schemas(self) -> None:
         """
