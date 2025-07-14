@@ -50,7 +50,7 @@
 
 
         // — blendshape map (original) —
-        const blendshapesMap = { /* … your full map here … */
+        const blendshapesMap = {
             browDownLeft: 'browDown_L', browDownRight: 'browDown_R',
             browInnerUp: 'browInnerUp', browOuterUpLeft: 'browOuterUp_L', browOuterUpRight: 'browOuterUp_R',
             cheekPuff: 'cheekPuff', cheekSquintLeft: 'cheekSquint_L', cheekSquintRight: 'cheekSquint_R',
@@ -98,7 +98,6 @@
         const spot = new THREE.SpotLight(0xffffff, 2, 10, Math.PI / 8, 0.2, 1);
         scene.add(spot);
         scene.add(spot.target);
-        // ensure it starts aimed at the face
         spot.target.position.copy(controls.target);
 
         // — realistic ground grid —
@@ -109,6 +108,12 @@
         // — environment for reflections —
         const pmrem = new THREE.PMREMGenerator(renderer);
         scene.environment = pmrem.fromScene(new RoomEnvironment()).texture;
+
+        // — fingertip spheres group —
+        const fingerGroup = new THREE.Group();
+        scene.add(fingerGroup);
+        // indices for thumb, index, middle, ring, pinky tips
+        const tipIndices = [4, 8, 12, 16, 20];
 
         // — load FaceCap GLTF with StandardMaterial —
         let faceMesh, eyeL, eyeR;
@@ -124,39 +129,29 @@
                 mesh.position.set(0, 1.6, 0);
                 scene.add(mesh);
 
-
-
-
-                // 1) Create your video texture once (after you start the webcam):
+                // video‐to‐material
                 const videoTex = new THREE.VideoTexture(video);
                 videoTex.minFilter = THREE.LinearFilter;
                 videoTex.magFilter = THREE.LinearFilter;
                 videoTex.format = THREE.RGBAFormat;
-                videoTex.flipY = false;  // depends on your UV orientation
+                videoTex.flipY = false;
 
-                // 2) When you load the GLTF and grab your head mesh:
                 const head = mesh.getObjectByName('mesh_2');
-
-                // 3) Replace its material (or clone-and-combine) with one that uses the video as its map:
                 head.material = new THREE.MeshStandardMaterial({
                     map: videoTex,
                     roughness: 0.7,
-                    metalness: 0.0,
-                    // you can still use normal/specular/emissive/etc.
+                    metalness: 0.0
                 });
 
-                eyeL = mesh.getObjectByName('eyeLeft');
-
-                eyeR = mesh.getObjectByName('eyeRight');
-
-
-                // eyes
                 ['eyeLeft', 'eyeRight'].forEach(name => {
                     const eye = mesh.getObjectByName(name);
-                    eye.material = new THREE.MeshPhongMaterial({ color: 0xaa0000, wireframe: true, shininess: 1 });
+                    eye.material = new THREE.MeshPhongMaterial({
+                        color: 0xaa0000,
+                        wireframe: true,
+                        shininess: 1
+                    });
                 });
 
-                // teeth — any mesh name containing "tooth"
                 mesh.traverse(node => {
                     if (node.isMesh && /tooth/i.test(node.name)) {
                         node.material = new THREE.MeshPhongMaterial({
@@ -165,25 +160,18 @@
                         });
                     }
                 });
+
                 faceMesh = head;
-
-
-
+                eyeL = mesh.getObjectByName('eyeLeft');
+                eyeR = mesh.getObjectByName('eyeRight');
 
                 renderer.setAnimationLoop(animate);
             });
 
-        // — optional video-plane (still BasicMaterial) —
+        // — hidden video element & plane (optional) —
         video = document.createElement('video');
         video.style.display = 'none';
         document.body.appendChild(video);
-        const vtex = new THREE.VideoTexture(video);
-        const plane = new THREE.Mesh(
-            new THREE.PlaneGeometry(1.6, 1.2),
-            new THREE.MeshBasicMaterial({ map: vtex, depthWrite: true })
-        );
-        plane.position.set(3, 1.6, 0);
-        //scene.add(plane);
 
         // — MediaPipe initialization —
         const fileset = await FilesetResolver.forVisionTasks(
@@ -191,7 +179,8 @@
         );
         faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
             baseOptions: {
-                modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+                modelAssetPath:
+                    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
                 delegate: 'GPU'
             },
             outputFaceBlendshapes: true,
@@ -201,7 +190,8 @@
         });
         handLandmarker = await HandLandmarker.createFromOptions(fileset, {
             baseOptions: {
-                modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+                modelAssetPath:
+                    'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
                 delegate: 'GPU'
             },
             outputHandLandmarks: true,
@@ -213,51 +203,54 @@
         // — start webcam —
         try {
             const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
-            video.srcObject = s; await video.play();
+            video.srcObject = s;
+            await video.play();
         } catch (e) { console.error(e); }
 
-        // — helpers —
+        // — helpers & state —
         const transform = new THREE.Object3D();
         const eyeLimit = THREE.MathUtils.degToRad(30);
         const prevEuler = new THREE.Euler();
 
-        function mapRange(v, a, b, c, d) { return c + (d - c) * ((v - a) / (b - a)); }
+        function mapRange(v, a, b, c, d) {
+            return c + (d - c) * ((v - a) / (b - a));
+        }
         function recreateGrid() {
             scene.remove(grid);
             grid = new THREE.GridHelper(gridSize, gridDivs, 0x444444, 0x444444);
             scene.add(grid);
         }
-
         function orbitCamera(dY, dP, dR) {
-            const T = controls.target, O = camera.position.clone().sub(T);
-            const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY);
-            O.applyQuaternion(qy);
+            const T = controls.target,
+                O = camera.position.clone().sub(T);
+            O.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY));
             const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
-            const qp = new THREE.Quaternion().setFromAxisAngle(R, dP);
-            O.applyQuaternion(qp);
+            O.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(R, dP));
             camera.position.copy(T).add(O);
-            // roll: tilt camera.up around forward
             const F = T.clone().sub(camera.position).normalize();
-            const qr = new THREE.Quaternion().setFromAxisAngle(F, dR);
-            camera.up.applyQuaternion(qr);
+            camera.up.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(F, dR));
             camera.lookAt(T);
         }
 
         // — main loop —
         function animate() {
+            // only once we have a live video frame
             if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
                 const t = performance.now();
                 const f = faceLandmarker.detectForVideo(video, t);
                 const h = handLandmarker.detectForVideo(video, t);
 
+                // ————————————————————————————————
+                // Face → blendshapes, pose, shake, light, FOV
+                // ————————————————————————————————
                 if (f.faceBlendshapes?.length) {
-
-
                     const cats = f.faceBlendshapes[0].categories;
                     const eyeScore = { lH: 0, rH: 0, lV: 0, rV: 0 };
+
                     cats.forEach(({ categoryName, score }) => {
                         const idx = faceMesh.morphTargetDictionary[blendshapesMap[categoryName]];
                         if (idx !== undefined) faceMesh.morphTargetInfluences[idx] = score;
+
                         switch (categoryName) {
                             case 'eyeLookInLeft': eyeScore.lH += score; break;
                             case 'eyeLookOutLeft': eyeScore.lH -= score; break;
@@ -269,45 +262,38 @@
                             case 'eyeLookDownRight': eyeScore.rV += score; break;
                         }
                     });
+
                     eyeL.rotation.z = eyeScore.lH * eyeLimit;
                     eyeR.rotation.z = eyeScore.rH * eyeLimit;
                     eyeL.rotation.x = eyeScore.lV * eyeLimit;
                     eyeR.rotation.x = eyeScore.rV * eyeLimit;
 
-                    // 1) capture the un-shaken “rest” position
+                    // shake
                     const restPos = camera.position.clone();
-
-                    // 2) read jaw openness
                     const jawOpen = cats.find(c => c.categoryName === 'jawOpen')?.score || 0;
-
-                    // 3) compute shake amplitude
-                    const MAX_SHAKE = 0.05;
-                    const shakeAmp = jawOpen * MAX_SHAKE;
-
+                    const MAX_SHAKE = 0.05, shakeAmp = jawOpen * MAX_SHAKE;
                     if (shakeAmp > 0) {
-                        // 4) apply jitter around restPos
                         camera.position.copy(restPos).add(new THREE.Vector3(
                             (Math.random() * 2 - 1) * shakeAmp,
                             (Math.random() * 2 - 1) * shakeAmp,
                             (Math.random() * 2 - 1) * shakeAmp
                         ));
                     } else {
-                        // 5) mouth closed → snap exactly back
                         camera.position.copy(restPos);
                     }
-                    // eyebrow → FOV
-                    const brow = (cats.find(c => c.categoryName === 'browInnerUp')?.score || 0);
+
+                    // FOV
+                    const brow = cats.find(c => c.categoryName === 'browInnerUp')?.score || 0;
                     camera.fov = THREE.MathUtils.lerp(camera.fov, 60 + brow * 40, 0.1);
                     camera.updateProjectionMatrix();
 
-                    // blink → spotlight intensity [0…2]
+                    // spotlight intensity
                     const bL = cats.find(c => c.categoryName === 'eyeBlinkLeft')?.score || 0;
                     const bR = cats.find(c => c.categoryName === 'eyeBlinkRight')?.score || 0;
                     const open = 1 - ((bL + bR) / 2);
                     spot.intensity = THREE.MathUtils.lerp(spot.intensity, open * 2 - 1, 0.1);
-                    console.log(spot.intensity)
 
-                    // head-pose → orbit+roll
+                    // head-pose → orbit + roll
                     if (f.facialTransformationMatrixes?.length) {
                         const m = f.facialTransformationMatrixes[0].data;
                         transform.matrix.fromArray(m);
@@ -316,33 +302,76 @@
                         const dY = e.y - prevEuler.y, dP = e.x - prevEuler.x, dR = e.z - prevEuler.z;
                         orbitCamera(-dY, -dP, -dR);
                         prevEuler.copy(e);
-                        // keep spotlight on camera & aimed at face
+
+                        // keep spotlight on the camera, aimed at the face
                         spot.position.copy(camera.position);
                         spot.target.position.copy(controls.target);
                         spot.target.updateMatrixWorld();
                     }
                 }
 
-                // hand pinch → grid size/divisions
+                // ————————————————————————————————
+                // Hand → clear old spheres, pinch to resize grid, spawn new spheres on ground
+                // ————————————————————————————————
+                // remove last frame’s spheres
+                while (fingerGroup.children.length) {
+                    fingerGroup.remove(fingerGroup.children[0]);
+                }
+
+                // a raycaster + horizontal plane at y=0 (the grid plane)
+                const raycaster = new THREE.Raycaster();
+                const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
                 if (h.landmarks?.length) {
                     h.landmarks.forEach((lm, i) => {
-                        const hand = h.handedness[i].categoryName;
-                        const t = lm[4], x = lm[8];
-                        const d = Math.hypot(t.x - x.x, t.y - x.y, t.z - x.z);
-                        if (hand === 'Left') {
-                            gridSize = mapRange(THREE.MathUtils.clamp(d, 0.05, 0.25), 0.05, 0.25, 5, 30);
+                        const handedness = h.handednesses[i].categoryName; // "Left" or "Right"
+
+                        // measure thumb–index pinch
+                        const thumb = lm[4], idx = lm[8];
+                        const d = Math.hypot(thumb.x - idx.x, thumb.y - idx.y, thumb.z - idx.z);
+
+                        if (handedness === 'Right') {
+                            gridSize = mapRange(
+                                THREE.MathUtils.clamp(d, 0.05, 0.25),
+                                0.05, 0.25,
+                                5, 30
+                            );
                             recreateGrid();
                         } else {
-                            gridDivs = Math.round(mapRange(THREE.MathUtils.clamp(d, 0.05, 0.25), 0.05, 0.25, 4, 64));
+                            gridDivs = Math.round(mapRange(
+                                THREE.MathUtils.clamp(d, 0.05, 0.25),
+                                0.05, 0.25,
+                                4, 64
+                            ));
                             recreateGrid();
                         }
+
+                        // for each fingertip, project its screen‐coords to y=0 and add a sphere
+                        tipIndices.forEach(tipIdx => {
+                            const lmPt = lm[tipIdx];
+                            const xN = lmPt.x * 2 - 1;
+                            const yN = -(lmPt.y * 2 - 1);
+
+                            raycaster.setFromCamera({ x: xN, y: yN }, camera);
+                            const pos = new THREE.Vector3();
+                            if (raycaster.ray.intersectPlane(groundPlane, pos)) {
+                                const sph = new THREE.Mesh(
+                                    new THREE.SphereGeometry(0.01, 8, 8),
+                                    new THREE.MeshBasicMaterial({ color: 0xffffff })
+                                );
+                                sph.position.copy(pos);
+                                fingerGroup.add(sph);
+                            }
+                        });
                     });
                 }
             }
 
+            // standard render
             controls.update();
             renderer.render(scene, camera);
         }
+
 
         window.addEventListener('resize', () => {
             renderer.setSize(innerWidth, innerHeight);
@@ -350,6 +379,7 @@
             camera.updateProjectionMatrix();
         });
     </script>
+
 </body>
 
 </html>
