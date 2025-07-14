@@ -2207,13 +2207,18 @@ class Assembler:
                 state["should_respond"] = True
                 status_cb("decision_to_respond_error", str(e))
         else:
-            # empty text (images‐only) → let filter say no
-            state["should_respond"] = False
-            status_cb("decision_to_respond", False)
+            # empty text → if we have images, still respond; otherwise skip
+            if state["images"]:
+                state["should_respond"] = True
+                status_cb("decision_to_respond", True)
+            else:
+                state["should_respond"] = False
+                status_cb("decision_to_respond", False)
 
         if not state["should_respond"]:
             status_cb("output", "…")
             return ""
+
 
 
         # ─── Stage 0.5: decide_tool_usage ─────────────────────────────────

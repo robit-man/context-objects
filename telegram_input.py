@@ -17,6 +17,8 @@ Features
 
 from __future__ import annotations
 import asyncio
+import base64
+
 import os
 import queue as _queue
 import tempfile
@@ -733,26 +735,32 @@ def telegram_input(asm):
 
             elif msg.photo:
                 kind = "photo"
-                # only take the largest size
+                # only take the largest size, download and save to disk
                 p = msg.photo[-1]
                 file = await bot.get_file(p.file_id)
                 b = await file.download_as_bytearray()
-                # base64-encode so it’s JSON-safe
-                import base64
-                img_b64 = base64.b64encode(bytes(b)).decode("ascii")
-                metadata["image_b64"] = [img_b64]
-                # mark that we have an image for inference
-                image_paths = ["inline"]
-                data = f"{len(metadata['image_b64'])} image(s)"
+                img_bytes = bytes(b)
+                # save to disk so we can reference it in context
+                filename = CAPTURE_DIR / f"{chat_id}_{msg.message_id}_{p.file_unique_id}.jpg"
+                with open(filename, "wb") as f_img:
+                    f_img.write(img_bytes)
+                image_paths.append(str(filename))
+                # also stash raw bytes for inline injection
+                metadata.setdefault("images", []).append(img_bytes)
+                data = f"{len(image_paths)} image(s)"
 
             elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image"):
                 kind = "photo"
+                # same for image‐typed documents
                 file = await bot.get_file(msg.document.file_id)
-                ext  = msg.document.mime_type.split("/")[-1]
-                local_path = CAPTURE_DIR / f"{uuid.uuid4().hex}.{ext}"
-                await file.download_to_drive(str(local_path))
-                image_paths.append(str(local_path.resolve()))
-                data = "1 image"
+                b = await file.download_as_bytearray()
+                img_bytes = bytes(b)
+                filename = CAPTURE_DIR / f"{chat_id}_{msg.message_id}_{msg.document.file_unique_id}.jpg"
+                with open(filename, "wb") as f_img:
+                    f_img.write(img_bytes)
+                image_paths.append(str(filename))
+                metadata.setdefault("images", []).append(img_bytes)
+                data = f"{len(image_paths)} image(s)"
 
             elif msg.document:
                 kind, data = "document", msg.document.file_id
@@ -1042,12 +1050,22 @@ def telegram_input(asm):
                                 except _queue.Empty: break
 
                         chat_asm.tts.set_mode("file")
+                        image_paths = metadata.get("image_paths", [])
+                        images_b64 = []
+                        for p in image_paths:
+                            try:
+                                data = Path(p).read_bytes()
+                                images_b64.append(base64.b64encode(data).decode("ascii"))
+                            except Exception:
+                                continue
+
                         try:
                             final = await asyncio.to_thread(
-                            chat_asm.run_with_meta_context,
-                            request_text, status_cb,
-                            images=metadata.get("image_b64")
-                        )
+                                chat_asm.run_with_meta_context,
+                                request_text,
+                                status_cb,
+                                images=images_b64
+                            )
                         except Exception:
                             logger.exception("run_with_meta_context failed")
                             final = ""
