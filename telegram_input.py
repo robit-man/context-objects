@@ -715,6 +715,15 @@ def telegram_input(asm):
             # ── Who sent it? ─────────────────────────────────────────────────
             user = update.effective_user
 
+            # ── Build metadata (needed by the photo/document handlers) ───────
+            metadata = {
+                "chat_id":       chat_id,
+                "from_user_id":  user.id,
+                "from_username": user.username,
+                "message_id":    msg.message_id,
+                "text":          msg.text or msg.caption or "",
+            }
+
             # ── Identify “kind” and pull raw content / files ──────────────────
             kind, data = "other", None
             image_paths: list[str] = []
@@ -945,19 +954,42 @@ def telegram_input(asm):
                             except:
                                 pass
             # ── Decide if we should respond / run inference ────────────────────
-            sender = user.username or user.first_name
-            if metadata.get("image_b64"):
-                # if there's any image, attach a stub so .run_with_meta_context() sees it
-                user_text = (text or "") + "[image(s) attached]"
+            sender = user.username or user.first_name or str(user.id)
+            if image_paths:
+                user_text = f"{sender} sent image(s): " + " ".join(image_paths)
             else:
-                user_text = text
+                user_text = text or ""
 
             trigger_id = msg.message_id
 
+            # Determine whether to run inference for image-only or mention events
+            wants_reply = False
+            try:
+                wants_reply = await asyncio.to_thread(chat_asm.filter_callback, user_text)
+            except Exception:
+                wants_reply = False
+
+            mention_me = any(
+                ent.type == "mention"
+                and msg.text
+                and msg.text[ent.offset : ent.offset + ent.length].lstrip("@").lower() == bot_name
+                for ent in (msg.entities or [])
+            )
+
+            do_infer = (
+                chat_type == "private"
+                or msg.voice
+                or wants_reply
+                or mention_me
+                or (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.id)
+            )
+            if not do_infer:
+                return
 
             # ── Queue / run the Assembler for this chat/user pair ─────────────
             key   = (chat_id, user.id)
             queue = _pending.setdefault(key, asyncio.Queue())
+
 
             if (prev := running.get(key)) and not prev.done():
                 await bot.send_message(
