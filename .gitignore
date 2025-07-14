@@ -8,6 +8,8 @@
 *.corrupt
 *.jsonl
 *.ogg
+*.pem
+venv
 agent_stack.json
 captures
 config.json

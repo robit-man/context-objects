@@ -1376,11 +1376,11 @@ class Assembler:
         # ── tweakables ────────────────────────────────────────────────
         TOKEN_WINDOW             = 1200
         TOKEN_REPEAT_LIMIT       = 45
-        LINE_REPEAT_LIMIT        = 10
-        PATTERN_MAX_LEN          = 50
+        LINE_REPEAT_LIMIT        = 20
+        PATTERN_MAX_LEN          = 100
         PATTERN_REPEAT_THRESHOLD = 10
         SEQ_MIN                  = 2
-        SEQ_MAX                  = 10
+        SEQ_MAX                  = 50
         SEQ_REPEAT_LIMIT         = 10
         MAX_ATTEMPTS             = 10
         # ──────────────────────────────────────────────────────────────
