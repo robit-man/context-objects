@@ -1380,13 +1380,14 @@ class Assembler:
         # ── tweakables ────────────────────────────────────────────────
         TOKEN_WINDOW             = 1200
         TOKEN_REPEAT_LIMIT       = 45
-        LINE_REPEAT_LIMIT        = 20
-        PATTERN_MAX_LEN          = 100
+        LINE_REPEAT_LIMIT        = 10
+        PATTERN_MAX_LEN          = 50
         PATTERN_REPEAT_THRESHOLD = 10
         SEQ_MIN                  = 2
-        SEQ_MAX                  = 50
+        SEQ_MAX                  = 10
         SEQ_REPEAT_LIMIT         = 10
         MAX_ATTEMPTS             = 10
+        SESSION_TIMEOUT_SEC      = 10 * 60   # ← NEW: 10‑minute session timeout
         # ──────────────────────────────────────────────────────────────
 
         # compile arbitrary‐pattern guard
@@ -1439,9 +1440,12 @@ class Assembler:
                 if n < needed:
                     continue
                 seq = arr[-L:]
-                if all(arr[-r*L : - (r-1)*L] == seq for r in range(2, SEQ_REPEAT_LIMIT+1)):
+                if all(arr[-r*L : -(r-1)*L] == seq for r in range(2, SEQ_REPEAT_LIMIT+1)):
                     return True
             return False
+
+        # record session start for timeout
+        session_start = time.time()
 
         # ── one streaming pass ────────────────────────────────────────
         def one_pass() -> tuple[str, bool]:
@@ -1451,6 +1455,11 @@ class Assembler:
 
             print(f"{tag} ", end="", flush=True)
             for part in chat(model=model, messages=messages, stream=True):
+                # ← NEW: abort this pass if we've been running over 10 minutes
+                if time.time() - session_start > SESSION_TIMEOUT_SEC:
+                    print("\n[Timeout guard] 10 min elapsed → aborting pass.")
+                    return "".join(chunks), True
+
                 chunk = part["message"]["content"]
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
@@ -1491,6 +1500,7 @@ class Assembler:
         # 10 attempts failed – hard abort
         print(f"[Run-away guard] aborting after {MAX_ATTEMPTS} attempts → returning empty string.")
         return ""
+
 
 
     def _parse_task_tree(
