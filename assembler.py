@@ -1382,11 +1382,11 @@ class Assembler:
         TOKEN_WINDOW             = 1200
         TOKEN_REPEAT_LIMIT       = 45
         LINE_REPEAT_LIMIT        = 4
-        PATTERN_MAX_LEN          = 50
-        PATTERN_REPEAT_THRESHOLD = 6
+        PATTERN_MAX_LEN          = 300
+        PATTERN_REPEAT_THRESHOLD = 12
         SEQ_MIN                  = 2
         SEQ_MAX                  = 25
-        SEQ_REPEAT_LIMIT         = 6
+        SEQ_REPEAT_LIMIT         = 8
         MAX_ATTEMPTS             = 10
         SESSION_TIMEOUT_SEC      = 5 * 60   # ← NEW: 10-minute session timeout
         # ──────────────────────────────────────────────────────────────
