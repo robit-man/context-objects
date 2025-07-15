@@ -9,6 +9,7 @@
 
         * {
             font-family: "Doto", sans-serif;
+            text-shadow: 0px 0px 3px black, 0px 0px 10px #fffa;
         }
 
         input,
@@ -59,6 +60,33 @@
             box-sizing: border-box;
             justify-content: space-between;
             z-index: 10;
+        }
+
+        #light2 {
+
+            position: fixed;
+            height: calc(100vh - 28rem);
+            bottom: 10rem;
+            left: 5rem;
+            width: 50px;
+            border-radius: 1rem;
+            filter: blur(5px) brightness(5);
+            display: block;
+            box-shadow: inset 0px -50px 20px #c8fff7aa, 0px 0px 100px #00ff04, 0px 0px 300px #2600ffbd, 0px 0px 500px #aeffd780, 0px 0px 700px #ff835aa3;
+            background: rgb(255, 255, 255);
+        }
+        #light1 {
+
+            position: fixed;
+            width: calc(100vw - 40rem);
+            bottom: 5rem;
+            left: 10rem;
+            height: 50px;
+            border-radius: 1rem;
+            filter: blur(5px) brightness(5);
+            display: block;
+            box-shadow: inset 0px -50px 20px #c8fff7aa, 0px 0px 100px #00ff04, 0px 0px 300px #2600ffbd, 0px 0px 500px #aeffd780, 0px 0px 700px #ff835aa3;
+            background: rgb(255, 255, 255);
         }
 
         .column {
@@ -231,8 +259,10 @@
 </head>
 
 <body>
+    <div id="light1"></div>
+    <div id="light2"></div>
     <!-- ─── CONTROL BAR ─────────────────────────────────────────────────── -->
-    <div id="ui">
+    <div id="ui" style="mix-blend-mode:difference;">
         <div class="column">
 
             <div class="row">
@@ -272,12 +302,17 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             </div>
         </div>
     </div>
+    <div id="datadrop" style="position:fixed;bottom:4px;left:4px;
+            font:600 0.8rem/1.2 monospace;
+            color:#0f0;pointer-events:none;z-index:999;">
+        (pinch delta x,y will appear here)
+    </div>
 
     <!-- ─── HOVER JSON PANE ─────────────────────────────────────────────── -->
-    <div id="selectednode">// Hover or click a node…</div>
+    <div id="selectednode" style="">// Hover or click a node…</div>
 
     <!-- ─── DETAIL TABLE PANEL ─────────────────────────────────────────── -->
-    <div id="detailPanel"></div>
+    <div id="detailPanel" style=""></div>
 
     <!-- ─── SIDEBAR MODULE LIST ─────────────────────────────────────────── -->
     <div id="sidebarList" style="
@@ -301,6 +336,8 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         import * as THREE from 'three';
         import { OrbitControls } from 'three/OrbitControls';
         import { FlyControls } from 'three/FlyControls';
+        import vision from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0';
+        const { FaceLandmarker, HandLandmarker, FilesetResolver } = vision;
 
         //////////////////////////////////////////////////////////////////////
         // CONFIG
@@ -333,7 +370,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             colorBy: 'component',
             // HSL constants:
             saturation: 0.7,
-            lightness: 0.5
+            lightness: 0.2
         };
         // ─── BRAIN MODE CONFIG ────────────────────────────────────────────────
         const BRAIN_CONFIG = {
@@ -390,11 +427,36 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let lastWheelDir = 0;
         let lastWheelTime = 0;
 
+        // ─── pinch‑zoom globals ───────────────────────────────────────────────
+
+        let leftPinchActive = false;           // “thumb & index are touching”
+        let leftPinchStartMid = null;            // {x,y} at the frame the pinch began
+        let leftPinchDelta = { x: 0, y: 0 };  // running Δ written to #datadrop
+        const HAND_RENDER_DEPTH = 5; // world units
+        let prevLeftMid = null;
+        let prevRightMid = null;
+        let prevHandsMidDist = null;
+        const HEAD_SMOOTH = 0.1;   // 0–1 low‑pass factor for head‐pose
+        const PINCH_THRESHOLD = 0.08;  // pinch detection threshold
+        const ZOOM_SENSITIVITY = 500.0;  // two‑hand pinch → zoom scale
+        const ROTATE_SENSITIVITY = 4.0;  // one‑hand pinch drag → orbit speed
+
+        const HAND_DRAW_DISTANCE = 5;     // how far in front of camera we project landmarks
+        let prevSingleMid = null;
+        const HEAD_SMOOTH_FACTOR = 0.1;
+        const headSmooth = { y: 0, p: 0, r: 0 };
+        const HEAD_ROTATION_SENSITIVITY = 0.8;
+
+        let headDY = 0, headDP = 0, headDR = 0;
+        let lastLeftPinchMid = null;
+        let lastTwoHandPinchDist = null;
+        const ROT_SENSITIVITY = 2.0;
+        const PAN_SENSITIVITY = 50.0;
         const BOOST_INCREMENT = 50;    // how much boost you gain per rapid event
         const BOOST_DECAY = 0.75;   // how quickly boost winds down
         const BOOST_MAX = 1000;      // cap on boost multiplier
         const MAX_INSTANCES_HARD = 0xFFFF;
-        const HARD_MAX_NODES = 1000;
+        const HARD_MAX_NODES = 5000;
         let prevCount = 0;
         let remoteSize = 0;
         let prevLineCount = 0;
@@ -2022,6 +2084,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         document.body.appendChild(renderer.domElement);
 
         let prevTime = performance.now();
+
         // maximum turn rate (rad/s) and damping
         const KEY_MAX_SPEED = Math.PI;
         const KEY_DAMPING = 5;    // higher = snappier, lower = floatier
@@ -2032,6 +2095,92 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             yawTarget = 0,
             pitchTarget = 0;
 
+
+        // — for head‑pose tracking —
+        let video, faceLandmarker, handLandmarker;
+        const poseTransform = new THREE.Object3D();
+        const prevEuler = new THREE.Euler();
+
+        // — for hand‑landmark spheres/lines —
+        const fingerGroup = new THREE.Group();
+        scene.add(fingerGroup);
+
+        // — orbitCamera helper (yaw, pitch, roll deltas) —
+        function orbitCamera(dY, dP, dR) {
+            const T = orbitControls.target;
+            const O = camera.position.clone().sub(T);
+
+            // yaw around world‑up
+            O.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY)
+            );
+
+            // pitch around camera‑right
+            const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
+            O.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(R, dP)
+            );
+
+            // roll around view direction
+            const F = O.clone().normalize();
+            camera.up.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(F, dR)
+            );
+
+            camera.position.copy(T).add(O);
+            camera.lookAt(T);
+        }
+
+        // — initialize webcam + MediaPipe models —
+        async function initVision() {
+            // hidden video
+            video = document.createElement('video');
+            video.style.display = 'none';
+            document.body.appendChild(video);
+
+            // start camera
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user' }
+                });
+                video.srcObject = stream;
+                await video.play();
+            } catch (err) {
+                console.warn('Camera failed:', err);
+                return;
+            }
+
+            // load the MediaPipe fileset
+            const fileset = await FilesetResolver.forVisionTasks(
+                'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm'
+            );
+
+            faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+                baseOptions: {
+                    modelAssetPath:
+                        'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+                    delegate: 'GPU'
+                },
+                outputFaceBlendshapes: true,
+                outputFacialTransformationMatrixes: true,
+                runningMode: 'VIDEO',
+                numFaces: 1
+            });
+
+            handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+                baseOptions: {
+                    modelAssetPath:
+                        'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+                    delegate: 'GPU'
+                },
+                outputHandLandmarks: true,
+                runningMode: 'VIDEO',
+                numHands: 2
+            });
+        }
+
+        // kick it off
+        initVision();
 
         // ─── CONTROLS ────────────────────────────────────────────────────────
         const orbitControls = new OrbitControls(camera, renderer.domElement);
@@ -2852,37 +3001,188 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         /********************************************************************
          *  Animation loop  (COMPLETE, SELF-CONTAINED)
          *******************************************************************/
+        // ─── replace your old animate() with this ───────────────────────────
         function animate() {
             requestAnimationFrame(animate);
 
-            // ——— drive active control with delta ——————————————————————
+            /* 0) timing & OrbitControls ------------------------------------------------ */
             const now = performance.now();
-            const delta = (now - prevTime) / 1000;  // seconds since last frame
+            const delta = (now - prevTime) / 1000;
             prevTime = now;
-
             orbitControls.update();
 
-            // ——— 1) smooth scroll/drift in Tree‑Mode only ——————————————————
+            /* 1) vision tracking (head pose + hands) ---------------------------------- */
+            if (video && faceLandmarker && handLandmarker &&
+                video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+
+                const fRes = faceLandmarker.detectForVideo(video, now);
+                const hRes = handLandmarker.detectForVideo(video, now);
+
+                /* 1a) head pose → camera (unchanged) ------------------------------------ */
+                if (fRes.facialTransformationMatrixes?.length) {
+                    const m = fRes.facialTransformationMatrixes[0].data;
+                    poseTransform.matrix.fromArray(m);
+                    poseTransform.matrix.decompose(
+                        poseTransform.position,
+                        poseTransform.quaternion,
+                        poseTransform.scale
+                    );
+                    const e = new THREE.Euler().setFromQuaternion(poseTransform.quaternion, 'YXZ');
+                    headSmooth.y = THREE.MathUtils.lerp(headSmooth.y, e.y - prevEuler.y, HEAD_SMOOTH_FACTOR);
+                    headSmooth.p = THREE.MathUtils.lerp(headSmooth.p, e.x - prevEuler.x, HEAD_SMOOTH_FACTOR);
+                    headSmooth.r = THREE.MathUtils.lerp(headSmooth.r, e.z - prevEuler.z, HEAD_SMOOTH_FACTOR);
+                    orbitCamera(-headSmooth.y, headSmooth.p, -headSmooth.r);
+                    prevEuler.copy(e);
+                }
+
+                /* 1b) HANDS -------------------------------------------------------------- */
+                if (hRes.landmarks?.length) {
+
+                    // clear previous hand meshes
+                    fingerGroup.clear();
+
+                    // plane in front of the camera to project the 2‑D MediaPipe coords
+                    const camDir = new THREE.Vector3();
+                    camera.getWorldDirection(camDir);
+                    const planePt = camera.position.clone().add(camDir.clone().multiplyScalar(HAND_DRAW_DISTANCE));
+                    const projPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camDir, planePt);
+
+                    // book‑keeping for both hands this frame
+                    const hands = { Left: null, Right: null };
+
+                    hRes.landmarks.forEach((lm, i) => {
+                        /* handedness */
+                        const handName = (hRes.handednesses[i][0] || hRes.handednesses[i]).categoryName; // 'Left'/'Right'
+                        const isLeft = handName === 'Left';
+
+                        /* simple grey for joints / bones */
+                        const jointMat = new THREE.MeshBasicMaterial({ color: isLeft ? 0x888888 : 0xaaaaaa });
+                        const boneMat = new THREE.LineBasicMaterial({ color: isLeft ? 0x888888 : 0xaaaaaa });
+
+                        /* draw joints & bones (unchanged) … ---------------------------------- */
+                        lm.forEach(pt => {
+                            const xN = (1 - pt.x) * 2 - 1, yN = -(pt.y * 2 - 1);
+                            raycaster.setFromCamera({ x: xN, y: yN }, camera);
+                            const P = new THREE.Vector3();
+                            if (raycaster.ray.intersectPlane(projPlane, P)) {
+                                const s = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 6), jointMat);
+                                s.position.copy(P);
+                                fingerGroup.add(s);
+                            }
+                        });
+
+                        const bones = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
+                        [0, 9], [9, 10], [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16],
+                        [0, 17], [17, 18], [18, 19], [19, 20]];
+                        bones.forEach(([a, b]) => {
+                            const pa = lm[a], pb = lm[b];
+                            const xa = (1 - pa.x) * 2 - 1, ya = -(pa.y * 2 - 1);
+                            const xb = (1 - pb.x) * 2 - 1, yb = -(pb.y * 2 - 1);
+                            raycaster.setFromCamera({ x: xa, y: ya }, camera);
+                            const A = new THREE.Vector3();
+                            const hitA = raycaster.ray.intersectPlane(projPlane, A);
+                            raycaster.setFromCamera({ x: xb, y: yb }, camera);
+                            const B = new THREE.Vector3();
+                            const hitB = raycaster.ray.intersectPlane(projPlane, B);
+                            if (hitA && hitB) {
+                                const geo = new THREE.BufferGeometry().setFromPoints([A, B]);
+                                fingerGroup.add(new THREE.Line(geo, boneMat));
+                            }
+                        });
+
+                        /* pinch metrics ------------------------------------------------------ */
+                        const t4 = lm[4], t8 = lm[8];
+                        const pinchDist = Math.hypot(t4.x - t8.x, t4.y - t8.y);
+                        const mid = { x: (t4.x + t8.x) / 2, y: (t4.y + t8.y) / 2 };
+                        hands[handName] = { dist: pinchDist, mid, lm };
+                    });
+
+                    /* ── LEFT‑hand single‑pinch tracking ➜ #datadrop ---------------------- */
+                    const dDrop = document.getElementById('datadrop') || (() => {
+                        const div = document.createElement('div'); div.id = 'datadrop';
+                        Object.assign(div.style, {
+                            position: 'fixed', bottom: '4px', left: '4px',
+                            font: '600 0.8rem/1.2 monospace', color: '#0f0', pointerEvents: 'none', zIndex: 999
+                        });
+                        document.body.appendChild(div); return div;
+                    })();
+
+                    const L = hands.Left;
+                    if (L && L.dist < PINCH_THRESHOLD) {          // pinch is **ON**
+                        if (!leftPinchActive) {                     // …just started
+                            leftPinchActive = true;
+                            leftPinchStartMid = { ...L.mid };           // shallow copy
+                        }
+                        // delta in normalised screen space (‑1…1).  Flip Y so +Y = up.
+                        leftPinchDelta.x = (L.mid.x - leftPinchStartMid.x);
+                        leftPinchDelta.y = -(L.mid.y - leftPinchStartMid.y);
+
+                        // write to HUD
+                        dDrop.textContent =
+                            `Δx: ${leftPinchDelta.x.toFixed(3)}   Δy: ${leftPinchDelta.y.toFixed(3)}`;
+                    } else {                                      // pinch released
+                        if (leftPinchActive) {
+                            leftPinchActive = false;
+                            leftPinchStartMid = null;
+                            leftPinchDelta.x = leftPinchDelta.y = 0;
+                            dDrop.textContent = '(pinch released)';
+                        }
+                    }
+
+                    /* ── two‑hand pinch zoom (unchanged) ---------------------------------- */
+                    const R = hands.Right;
+                    if (L && R && L.dist < PINCH_THRESHOLD && R.dist < PINCH_THRESHOLD) {
+                        const dx = L.mid.x - R.mid.x, dy = L.mid.y - R.mid.y;
+                        const midDist = Math.hypot(dx, dy);
+                        if (prevHandsMidDist !== null) {
+                            const dd = midDist - prevHandsMidDist;
+                            const zoom = dd * ZOOM_SENSITIVITY;
+                            const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+                            camera.position.addScaledVector(dir, zoom); orbitControls.update();
+                        }
+                        prevHandsMidDist = midDist;
+                    } else prevHandsMidDist = null;
+
+                    /* ── glow line on any pinched hand (unchanged) ------------------------ */
+                    ['Left', 'Right'].forEach(name => {
+                        const h = hands[name];
+                        if (!h || h.dist > PINCH_THRESHOLD) return;
+                        const t4 = h.lm[4], t8 = h.lm[8];
+                        const x4 = (1 - t4.x) * 2 - 1, y4 = -(t4.y * 2 - 1);
+                        const x8 = (1 - t8.x) * 2 - 1, y8 = -(t8.y * 2 - 1);
+                        raycaster.setFromCamera({ x: x4, y: y4 }, camera);
+                        const A = new THREE.Vector3();
+                        const hitA = raycaster.ray.intersectPlane(projPlane, A);
+                        raycaster.setFromCamera({ x: x8, y: y8 }, camera);
+                        const B = new THREE.Vector3();
+                        const hitB = raycaster.ray.intersectPlane(projPlane, B);
+                        if (hitA && hitB) {
+                            const glowMat = new THREE.LineBasicMaterial({ color: 0xffaa00, linewidth: 4 });
+                            const glowGeo = new THREE.BufferGeometry().setFromPoints([A, B]);
+                            fingerGroup.add(new THREE.Line(glowGeo, glowMat));
+                        }
+                    });
+                }
+            }
+
+            // ─── 2) smooth scroll + drift in Tree‑Mode only ───────────────────────
             if (!brainMode) {
-                // wheel‑scroll velocity
                 if (Math.abs(scrollVelocity) > 1e-4) {
                     yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
                     scrollVelocity *= SCROLL_FRICTION;
                 } else {
                     scrollVelocity = 0;
                 }
-                // automatic drift
                 const nowMs = Date.now();
                 const dt = nowMs - lastDriftT;
                 yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / MS_PER_UNIT;
                 lastDriftT = nowMs;
                 graphGroup.position.y = yScrollOffset;
             } else {
-                // Brain‑Mode: lock at Y=0
                 graphGroup.position.y = 0;
             }
 
-            // ——— update header clocks ———————————————————————————————
+            // ─── 3) header clocks & decay ──────────────────────────────────────
             const nowDate = new Date();
             const elapsedMs = -yScrollOffset * MS_PER_UNIT;
             const viewDate = new Date(nowDate - elapsedMs);
@@ -2890,7 +3190,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
             scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
 
-            // ——— 2) camera fly‑to tween —————————————————————————————
+            // ─── 4) camera fly‑to tween ────────────────────────────────────────
             if (cameraTween) {
                 const tCam = Math.min((now - cameraTween.start) / cameraTween.duration, 1);
                 camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, tCam);
@@ -2898,45 +3198,38 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                 if (tCam >= 1) cameraTween = null;
             }
 
-            // ——— 3) node‑position tween + scale‑tween + edge update ——————
+            // ─── 5) node‑position & scale tweens ───────────────────────────────
             if (!brainMode) {
                 const nowT = performance.now();
                 let moved = false;
-
-                // a) position tweens
                 nodeMap.forEach(entry => {
-                    if (!entry.tweenStart) return;
-                    const t = Math.min((nowT - entry.tweenStart) / entry.tweenDuration, 1);
-                    const ip = entry.prevPos.clone().lerp(entry.pos, t);
-                    const mat = new THREE.Matrix4().compose(ip, new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
-                    instMesh.setMatrixAt(entry._instanceIndex, mat);
-                    moved = true;
-                    if (t === 1) {
-                        delete entry.tweenStart;
-                        entry.prevPos.copy(entry.pos);
+                    if (entry.tweenStart) {
+                        const t = Math.min((nowT - entry.tweenStart) / entry.tweenDuration, 1);
+                        const ip = entry.prevPos.clone().lerp(entry.pos, t);
+                        const mat = new THREE.Matrix4().compose(ip, new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
+                        instMesh.setMatrixAt(entry._instanceIndex, mat);
+                        moved = true;
+                        if (t === 1) {
+                            delete entry.tweenStart;
+                            entry.prevPos.copy(entry.pos);
+                        }
+                    }
+                    if (entry.scaleTweenStart) {
+                        const t2 = Math.min((nowT - entry.scaleTweenStart) / entry.scaleTweenDuration, 1);
+                        const scale = entry.scalePrev.clone().lerp(entry.scaleTarget, t2);
+                        const mat2 = new THREE.Matrix4().compose(entry.pos, new THREE.Quaternion(), scale);
+                        instMesh.setMatrixAt(entry._instanceIndex, mat2);
+                        moved = true;
+                        if (t2 === 1) delete entry.scaleTweenStart;
                     }
                 });
-
-                // b) scale tweens
-                nodeMap.forEach(entry => {
-                    if (!entry.scaleTweenStart) return;
-                    const t2 = Math.min((nowT - entry.scaleTweenStart) / entry.scaleTweenDuration, 1);
-                    const scale = entry.scalePrev.clone().lerp(entry.scaleTarget, t2);
-                    const mat = new THREE.Matrix4().compose(entry.pos, new THREE.Quaternion(), scale);
-                    instMesh.setMatrixAt(entry._instanceIndex, mat);
-                    moved = true;
-                    if (t2 === 1) {
-                        delete entry.scaleTweenStart;
-                    }
-                });
-
                 if (moved) {
                     instMesh.instanceMatrix.needsUpdate = true;
                     updateEdgeMeshes();
                 }
             }
 
-            // ——— 4) hover & click feedback —————————————————————————————
+            // ─── 6) hover & click feedback ─────────────────────────────────────
             if (instMesh) {
                 scene.updateMatrixWorld();
                 raycaster.setFromCamera(pointer, camera);
@@ -2952,10 +3245,9 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                             selPane.textContent = JSON.stringify(node.data, null, 2);
                             populateDetail(ctxId);
                             flashNeighbours(ctxId);
+                            document.querySelectorAll('.sidebar-item-highlight').forEach(e => e.classList.remove('sidebar-item-highlight'));
                             const el = document.querySelector(`[id^="sidebar-item-container-${ctxId}-"]`);
                             if (el) {
-                                document.querySelectorAll('.sidebar-item-highlight')
-                                    .forEach(e => e.classList.remove('sidebar-item-highlight'));
                                 el.classList.add('sidebar-item-highlight');
                                 el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                             }
@@ -2963,8 +3255,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                     }
                 } else {
                     hoveredIdx = hovered = null;
-                    document.querySelectorAll('.sidebar-item-highlight')
-                        .forEach(e => e.classList.remove('sidebar-item-highlight'));
+                    document.querySelectorAll('.sidebar-item-highlight').forEach(e => e.classList.remove('sidebar-item-highlight'));
                 }
             }
             if (hovered !== previousHoveredId) {
@@ -2972,11 +3263,9 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                 if (instMesh) instMesh.material.emissiveIntensity = 0;
             }
 
-            // ——— 5) final render —————————————————————————————
+            // ─── 7) final render ──────────────────────────────────────────────
             renderer.render(scene, camera);
         }
-
-
 
         // start it up
         animate();
