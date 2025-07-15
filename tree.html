@@ -223,7 +223,8 @@
   {
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.178.0/build/three.module.js",
-      "three/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.js"
+      "three/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.js",
+      "three/FlyControls": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/FlyControls.js"
     }
   }
   </script>
@@ -250,7 +251,9 @@
 
             <div class="row">
                 <select id="fileSelector">\
-                </select> <button id="timeToggle">Time Mode</button>
+                </select>
+                <button id="timeToggle">Time Mode</button>
+                <button id="modeswitch">Tree Mode</button>
 
             </div>
 
@@ -297,6 +300,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
     <script type="module">
         import * as THREE from 'three';
         import { OrbitControls } from 'three/OrbitControls';
+        import { FlyControls } from 'three/FlyControls';
 
         //////////////////////////////////////////////////////////////////////
         // CONFIG
@@ -322,6 +326,22 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             chainDelay: 200,
             maxChainDepth: 50,
             fadeOutDuration: 1000
+        };
+        // ─── COLOR CONFIG ─────────────────────────────────────────────────
+        const COLOR_CONFIG = {
+            // which field on each object to color by:
+            colorBy: 'component',
+            // HSL constants:
+            saturation: 0.7,
+            lightness: 0.5
+        };
+        // ─── BRAIN MODE CONFIG ────────────────────────────────────────────────
+        const BRAIN_CONFIG = {
+            // how much vertical spacing per BFS‐depth level
+            depthSpacing: 250,
+            initialSpread: 1000,
+            // scale factor for node diameter (tweak so they look reasonable)
+            scaleFactor: 0.01
         };
 
         //////////////////////////////////////////////////////////////////////
@@ -349,6 +369,11 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let pickableMeshes = [];
         let visibleMeshes = [];
         let initialLoadDone = false;
+
+        // ─── BRAIN vs TREE MODE ─────────────────────────────────────────────
+        const modeSwitch = document.getElementById('modeswitch');
+        let brainMode = false;
+        let timeMode = false;   // ← add this
 
         let freeNodeIx = 0;
         let freeEdgeIx = 0;
@@ -383,7 +408,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let leftover = "";    // carry over any partial line
         const OVERLAP = 1024;   // bytes to rewind so you don't cut a JSON in half
         const STORAGE_KEY = 'selectedContextFile';
-
+        let nodes = [];
         let nodeMap = new Map();
         let edges = [];
 
@@ -406,22 +431,45 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         const comps = [...new Set([...nodeMap.values()].map(n => n.data.component))];
         const hueMap = Object.fromEntries(comps.map((c, i) => [c, i / comps.length]));
         const MS_PER_UNIT = LAYOUT_CONFIG.msPerUnit;  // ms per world‐unit, e.g. 10 000
-let autoScrollEnabled = true;
-const sidebar = document.getElementById('sidebarList');
-sidebar.addEventListener('scroll', () => {
-  const nearBottom =
-    sidebar.scrollTop + sidebar.clientHeight >=
-    sidebar.scrollHeight - 5;
-  autoScrollEnabled = nearBottom;
-});
+        let autoScrollEnabled = true;
+        const sidebar = document.getElementById('sidebarList');
+        sidebar.addEventListener('scroll', () => {
+            const nearBottom =
+                sidebar.scrollTop + sidebar.clientHeight >=
+                sidebar.scrollHeight - 5;
+            autoScrollEnabled = nearBottom;
+        });
         function getContextFileUrl(cacheBust = false) {
-            const host = window.location.hostname || 'localhost';
-            // trust whatever the user chose
+            // Use the same scheme, host and port that loaded the page:
+            const origin = window.location.origin;
+            // Which file to load (defaults to context.jsonl):
             const fn = fileSelector.value || 'context.jsonl';
-            console.log('getContextFileUrl() →', `http://${host}:8000/${fn}`);
-            return `http://${host}:8000/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
+            // Build a cache‑busted URL if requested:
+            const url = `${origin}/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
+            console.log('[getContextFileUrl] →', url);
+            return url;
         }
+        // helper to recompute each instance's matrix in 3D
+        function updateBrainMatrices() {
+            const tmpQuat = new THREE.Quaternion();
+            nodeMap.forEach((entry, id) => {
+                // 1) diameter ∝ sqrt(byteSize)
+                const size = JSON.stringify(entry.data).length;
+                const dia = Math.sqrt(size) * BRAIN_CONFIG.scaleFactor;
 
+                // 2) build scale vector
+                const scale = new THREE.Vector3(dia, dia, dia);
+
+                // 3) position is already set in entry.pos (x,y,z)
+                const mat = new THREE.Matrix4().compose(
+                    entry.pos,
+                    tmpQuat,
+                    scale
+                );
+                instMesh.setMatrixAt(entry._instanceIndex, mat);
+            });
+            instMesh.instanceMatrix.needsUpdate = true;
+        }
         async function populateFileSelector() {
             try {
                 const res = await fetch(window.location.origin + '/', { cache: 'no-store' });
@@ -685,6 +733,154 @@ sidebar.addEventListener('scroll', () => {
             }
         }
 
+        // Build a BFS “depth” map from the highest‑degree node:
+        function computeDepths(nodes, links) {
+            const deg = Object.fromEntries(nodes.map(n => [n.id, 0]));
+            links.forEach(l => { deg[l.source]++; deg[l.target]++; });
+            const root = nodes.reduce((a, b) => deg[a.id] > deg[b.id] ? a : b);
+            const depth = { [root.id]: 0 };
+            const q = [root.id];
+            while (q.length) {
+                const u = q.shift();
+                links.forEach(l => {
+                    const v = l.source === u ? l.target
+                        : l.target === u ? l.source
+                            : null;
+                    if (v != null && depth[v] === undefined) {
+                        depth[v] = depth[u] + 1;
+                        q.push(v);
+                    }
+                });
+            }
+            return depth;
+        }
+        function runBrainLayout() {
+            // 1) gather sim nodes with BFS‐depth & size
+            const simNodes = [];
+            const depths = {};
+            // first compute BFS depths on the fly
+            const allNodes = [...nodeMap.keys()].map(id => ({ id }));
+            const allLinks = edges.map(e => ({ source: e.source, target: e.target }));
+            // build degree map & root
+            const deg = Object.fromEntries(allNodes.map(n => [n.id, 0]));
+            allLinks.forEach(l => { deg[l.source]++; deg[l.target]++; });
+            const root = allNodes.reduce((a, b) => deg[a.id] > deg[b.id] ? a : b);
+            // BFS
+            const q = [root.id]; depths[root.id] = 0;
+            while (q.length) {
+                const u = q.shift();
+                allLinks.forEach(l => {
+                    const v = l.source === u ? l.target : l.target === u ? l.source : null;
+                    if (v != null && depths[v] === undefined) {
+                        depths[v] = depths[u] + 1; q.push(v);
+                    }
+                });
+            }
+            const maxDepth = Math.max(...Object.values(depths), 1);
+
+            // now assemble simNodes with initial random 3D pos
+            nodeMap.forEach((entry, id) => {
+                const size = JSON.stringify(entry.data).length;
+                simNodes.push({
+                    id,
+                    size,
+                    depth: depths[id] || 0,
+                    x: (Math.random() - 0.5) * BRAIN_CONFIG.initialSpread,
+                    y: (Math.random() - 0.5) * BRAIN_CONFIG.initialSpread,
+                    z: (Math.random() - 0.5) * BRAIN_CONFIG.initialSpread
+                });
+            });
+
+            // 2) assemble simLinks with weight
+            const simLinks = edges.map(e => ({
+                source: e.source,
+                target: e.target,
+                weight: nodeMap.get(e.source).data.association_strengths?.[e.target] || 1
+            }));
+
+            // 3) custom 3D force simulation via 3 separate 1D forces + XY
+            const sim = d3.forceSimulation(simNodes)
+                // 2D link on X/Y plane
+                .force('link', d3.forceLink(simLinks)
+                    .id(d => d.id)
+                    .distance(d => 100 / d.weight)
+                    .strength(d => Math.min(d.weight * 0.1, 0.5)))
+                // 2D repulsion on X/Y
+                .force('charge', d3.forceManyBody().strength(d => -Math.sqrt(d.size) * 0.1))
+                // pull XY toward center
+                .force('center', d3.forceCenter(0, 0))
+                // collision in XY
+                .force('collision', d3.forceCollide().radius(d => Math.sqrt(d.size) * 0.2));
+
+            // we manually integrate Z as a radial pull toward its depth‐shell
+            sim.on('tick', () => {
+                simNodes.forEach(d => {
+                    // radial Z: each depth level sits at z = depth * depthSpacing
+                    d.z += ((d.depth * BRAIN_CONFIG.depthSpacing) - d.z) * 0.1;
+                });
+            });
+
+            // 4) run to (approx) convergence
+            for (let i = 0; i < 300; i++) sim.tick();
+            sim.stop();
+
+            // 5) write 3D positions back into your nodeMap
+            simNodes.forEach(d => {
+                const entry = nodeMap.get(d.id);
+                entry.pos.set(d.x, d.y, d.z);
+            });
+        }
+        modeSwitch.addEventListener('click', () => {
+            // toggle mode
+            brainMode = !brainMode;
+            modeSwitch.textContent = brainMode ? 'Brain Mode' : 'Tree Mode';
+
+            if (brainMode) {
+                // ─── Brain Mode ───────────────────────────────────────────────────
+                runBrainLayout();
+                nodeMap.forEach(entry => delete entry.tweenStart);
+                updateBrainMatrices();
+
+                // rebuild all edges so they follow your new 3D positions
+                updateEdgeMeshes();
+            } else {
+                // ─── Tree Mode ────────────────────────────────────────────────────
+                runForceLayout();
+
+                // in Tree mode edges still follow the force layout
+                updateEdgeMeshes();
+            }
+
+            // ─── Always OrbitControls ───────────────────────────────────────────
+            orbitControls.enabled = true;
+            orbitControls.enableZoom = brainMode;      // wheel = zoom in Brain Mode
+            orbitControls.enableRotate = !timeMode;      // respect your Time Mode toggle
+
+            // ─── Snap camera onto the selected node, if any ───────────────────
+            if (selectedId) {
+                const entry = nodeMap.get(selectedId);
+                if (entry) {
+                    const worldPos = entry.pos.clone();
+                    graphGroup.updateMatrixWorld();
+                    graphGroup.localToWorld(worldPos);
+
+                    // point the OrbitControls target directly at it
+                    orbitControls.target.copy(worldPos);
+
+                    // gently pull the camera toward a frame just above & behind
+                    camera.position.lerp(
+                        worldPos.clone().add(new THREE.Vector3(0, 100, 100)),
+                        0.2
+                    );
+
+                    orbitControls.update();
+                }
+            }
+
+            // ─── Sidebar sync ──────────────────────────────────────────────────
+            buildSidebarList(allData);
+        });
+
 
         let isBuilding = false;
         //////////////////////////////////////////////////////////////////////////
@@ -722,10 +918,21 @@ sidebar.addEventListener('scroll', () => {
             }
 
             // 2️⃣ Update palette & connectivity ceiling
-            const comps = new Set([...nodeMap.values()].map(n => n.data.component));
-            fresh.forEach(o => comps.add(o.component));
+            // gather all unique keys from the field we want:
+            const keys = [...new Set(
+                [...nodeMap.values()].map(n => n.data[COLOR_CONFIG.colorBy])
+            )];
+
+            // if you’re in an “append” function, also merge in the incoming batch:
+            fresh.forEach(o => {
+                cascadeChain(o.context_id);
+                const k = o[COLOR_CONFIG.colorBy];
+                if (!keys.includes(k)) keys.push(k);
+            });
+
+            // now spread them evenly around [0..1)
             hueMapCurrent = Object.fromEntries(
-                [...comps].map((c, i) => [c, i / comps.size])
+                keys.map((k, i) => [k, i / keys.length])
             );
             maxConnCurrent = Math.max(
                 maxConnCurrent,
@@ -1054,10 +1261,20 @@ sidebar.addEventListener('scroll', () => {
             /* ───────────────────────────────────
              * 3️⃣  Re-compute palette helpers
              * ─────────────────────────────────── */
-            const comps = new Set([...nodeMap.values()].map(n => n.data.component));
-            fresh.forEach(o => comps.add(o.component));
+            // gather all unique keys from the field we want:
+            const keys = [...new Set(
+                [...nodeMap.values()].map(n => n.data[COLOR_CONFIG.colorBy])
+            )];
+
+            // if you’re in an “append” function, also merge in the incoming batch:
+            fresh.forEach(o => {
+                const k = o[COLOR_CONFIG.colorBy];
+                if (!keys.includes(k)) keys.push(k);
+            });
+
+            // now spread them evenly around [0..1)
             hueMapCurrent = Object.fromEntries(
-                [...comps].map((c, i) => [c, i / comps.size])
+                keys.map((k, i) => [k, i / keys.length])
             );
 
             /* update connectivity ceiling */
@@ -1328,6 +1545,23 @@ sidebar.addEventListener('scroll', () => {
 
             allData = [...nodeMap.values()].map(n => n.data);
 
+            // after loading allData for the first time:
+            const NODE_CAP = allData.length * 1.2;  // a bit of headroom
+            const nodeGeom = new THREE.SphereGeometry(1, 8, 8);
+            const nodeMat = new THREE.MeshStandardMaterial({ vertexColors: true });
+            const nodesInst = new THREE.InstancedMesh(nodeGeom, nodeMat, NODE_CAP);
+
+            // per‑instance data attributes:
+            const posAttr = new THREE.InstancedBufferAttribute(new Float32Array(NODE_CAP * 3), 3);
+            const scaleAttr = new THREE.InstancedBufferAttribute(new Float32Array(NODE_CAP), 1);
+            const colAttr = new THREE.InstancedBufferAttribute(new Float32Array(NODE_CAP * 3), 3);
+
+            nodesInst.geometry.setAttribute('instancePosition', posAttr);
+            nodesInst.geometry.setAttribute('instanceScale', scaleAttr);
+            nodesInst.geometry.setAttribute('instanceColor', colAttr);
+
+            scene.add(nodesInst);
+
             // initial population
             populateDomainFilter(allData);
             populateComponentFilter(allData, '');
@@ -1347,16 +1581,16 @@ sidebar.addEventListener('scroll', () => {
         loadGraph = async function (...args) {
             await oldLoadGraph(...args);
 
-            // 1) re‐layout nodes via D3
-            runForceLayout();
+            if (brainMode) {
+                runBrainLayout();
+                updateBrainMatrices();
+            } else {
+                runForceLayout();
+            }
 
-            // 2) rebuild ALL edges to match new node positions
             updateEdgeMeshes();
-
-            // 3) rebuild sidebar
             buildSidebarList(allData);
         };
-
 
 
         async function grabTailChunk(url,
@@ -1516,131 +1750,131 @@ sidebar.addEventListener('scroll', () => {
             }
         }
 
-       async function pollForNew() {
-  const url = getContextFileUrl(true);
-  console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
+        async function pollForNew() {
+            const url = getContextFileUrl(true);
+            console.groupCollapsed(`[poll] ${new Date().toISOString()}`);
 
-  // ① HEAD → check length / etag
-  let head;
-  try {
-    head = await fetch(url, { method: "HEAD", cache: "no-store" });
-  } catch (e) {
-    console.warn("HEAD failed", e);
-    console.groupEnd();
-    return;
-  }
-  const size = Number(head.headers.get("Content-Length") || 0);
-  const etag = head.headers.get("ETag") || "";
-
-  // no change?
-  if (size === lastSize && etag === lastETag) {
-    console.debug("no change – skipping GET");
-    console.groupEnd();
-    return;
-  }
-  // file was rotated (shrunk)?
-  if (size < lastSize) lastContextId = null;
-
-  // ② GET the tail
-  const rangeStart = Math.max(0, size - LAST_KB * 1024);
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: { Range: `bytes=${rangeStart}-` },
-      cache: "no-store"
-    });
-  } catch (e) {
-    console.warn("GET failed", e);
-    console.groupEnd();
-    return;
-  }
-
-  const rangeHonoured = res.status === 206;
-  console.debug(`GET ${res.status} (Range honoured? ${rangeHonoured})`);
-
-  let chunk = "";
-  if (rangeHonoured) {
-    chunk = await res.text();
-  } else if (res.body && res.body.getReader) {
-    // fallback streaming until enough lines
-    const rdr = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "", lines = [], seen = lastContextId === null;
-    try {
-      while (true) {
-        const { value, done } = await rdr.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const parts = buf.split(/\r?\n/);
-        buf = parts.pop();
-        for (const ln of parts) {
-          if (!ln) continue;
-          if (!seen) {
-            if (lastContextId === null || ln.includes(lastContextId)) {
-              seen = true;
+            // ① HEAD → check length / etag
+            let head;
+            try {
+                head = await fetch(url, { method: "HEAD", cache: "no-store" });
+            } catch (e) {
+                console.warn("HEAD failed", e);
+                console.groupEnd();
+                return;
             }
-            continue;
-          }
-          lines.push(ln);
-          if (lines.length >= WANT_LINES) {
-            await rdr.cancel();
-            break;
-          }
+            const size = Number(head.headers.get("Content-Length") || 0);
+            const etag = head.headers.get("ETag") || "";
+
+            // no change?
+            if (size === lastSize && etag === lastETag) {
+                console.debug("no change – skipping GET");
+                console.groupEnd();
+                return;
+            }
+            // file was rotated (shrunk)?
+            if (size < lastSize) lastContextId = null;
+
+            // ② GET the tail
+            const rangeStart = Math.max(0, size - LAST_KB * 1024);
+            let res;
+            try {
+                res = await fetch(url, {
+                    headers: { Range: `bytes=${rangeStart}-` },
+                    cache: "no-store"
+                });
+            } catch (e) {
+                console.warn("GET failed", e);
+                console.groupEnd();
+                return;
+            }
+
+            const rangeHonoured = res.status === 206;
+            console.debug(`GET ${res.status} (Range honoured? ${rangeHonoured})`);
+
+            let chunk = "";
+            if (rangeHonoured) {
+                chunk = await res.text();
+            } else if (res.body && res.body.getReader) {
+                // fallback streaming until enough lines
+                const rdr = res.body.getReader();
+                const dec = new TextDecoder();
+                let buf = "", lines = [], seen = lastContextId === null;
+                try {
+                    while (true) {
+                        const { value, done } = await rdr.read();
+                        if (done) break;
+                        buf += dec.decode(value, { stream: true });
+                        const parts = buf.split(/\r?\n/);
+                        buf = parts.pop();
+                        for (const ln of parts) {
+                            if (!ln) continue;
+                            if (!seen) {
+                                if (lastContextId === null || ln.includes(lastContextId)) {
+                                    seen = true;
+                                }
+                                continue;
+                            }
+                            lines.push(ln);
+                            if (lines.length >= WANT_LINES) {
+                                await rdr.cancel();
+                                break;
+                            }
+                        }
+                        if (lines.length >= WANT_LINES) break;
+                    }
+                    if (buf && seen) lines.push(buf);
+                    chunk = lines.join("\n");
+                } catch (err) {
+                    console.warn("stream error", err);
+                    try { await rdr.cancel(); } catch { }
+                }
+            } else {
+                console.warn("Stream API not available → bailing");
+                console.groupEnd();
+                return;
+            }
+
+            // ③ parse & dedupe
+            const fresh = [];
+            chunk.split(/\r?\n/).forEach(ln => {
+                if (!ln.trim()) return;
+                try {
+                    const o = JSON.parse(ln);
+                    if (o.context_id && !seenIds.has(o.context_id)) {
+                        seenIds.add(o.context_id);
+                        fresh.push(o);
+                    }
+                } catch { }
+            });
+
+            console.debug("fresh objects:", fresh.length);
+            if (fresh.length) {
+                // update 3D graph
+                appendNodesFast(fresh, true);
+                appendEdgesFast(fresh);
+
+                // bump sentinel
+                lastContextId = fresh[fresh.length - 1].context_id;
+
+                // merge & rebuild sidebar
+                allData.push(...fresh);
+                buildSidebarList(allData);
+
+                // auto-scroll if allowed
+                if (autoScrollEnabled) {
+                    sidebar.scrollTop = sidebar.scrollHeight;
+                }
+
+                // re-apply filters so new nodes get correct coloring
+                applyFilters();
+            }
+
+            // ④ remember state
+            lastSize = size;
+            lastETag = etag;
+            console.groupEnd();
         }
-        if (lines.length >= WANT_LINES) break;
-      }
-      if (buf && seen) lines.push(buf);
-      chunk = lines.join("\n");
-    } catch (err) {
-      console.warn("stream error", err);
-      try { await rdr.cancel(); } catch {}
-    }
-  } else {
-    console.warn("Stream API not available → bailing");
-    console.groupEnd();
-    return;
-  }
-
-  // ③ parse & dedupe
-  const fresh = [];
-  chunk.split(/\r?\n/).forEach(ln => {
-    if (!ln.trim()) return;
-    try {
-      const o = JSON.parse(ln);
-      if (o.context_id && !seenIds.has(o.context_id)) {
-        seenIds.add(o.context_id);
-        fresh.push(o);
-      }
-    } catch {}
-  });
-
-  console.debug("fresh objects:", fresh.length);
-  if (fresh.length) {
-    // update 3D graph
-    appendNodesFast(fresh, true);
-    appendEdgesFast(fresh);
-
-    // bump sentinel
-    lastContextId = fresh[fresh.length - 1].context_id;
-
-    // merge & rebuild sidebar
-    allData.push(...fresh);
-    buildSidebarList(allData);
-
-    // auto-scroll if allowed
-    if (autoScrollEnabled) {
-      sidebar.scrollTop = sidebar.scrollHeight;
-    }
-
-    // re-apply filters so new nodes get correct coloring
-    applyFilters();
-  }
-
-  // ④ remember state
-  lastSize = size;
-  lastETag = etag;
-  console.groupEnd();
-}
 
 
         // ─── BUILD SCENE ──────────────────────────────────────────────────
@@ -1763,7 +1997,7 @@ sidebar.addEventListener('scroll', () => {
         timeToggle.addEventListener('click', () => {
             timeMode = !timeMode;
             timeToggle.textContent = timeMode ? 'Dolly ON' : 'Time Mode';
-            controls.enableRotate = !timeMode;
+            orbitControls.enableRotate = !timeMode;
         });
 
         //////////////////////////////////////////////////////////////////////////
@@ -1779,7 +2013,7 @@ sidebar.addEventListener('scroll', () => {
             0.1,
             2e6
         );
-        camera.position.set(0, -100, 0);
+        camera.position.set(0, -400, 0);
         camera.lookAt(0, 0, 0);    // baseline = looking along +Y (180° polar)
 
         // ─── RENDERER ────────────────────────────────────────────────────────
@@ -1787,41 +2021,94 @@ sidebar.addEventListener('scroll', () => {
         renderer.setSize(window.innerWidth, window.innerHeight);
         document.body.appendChild(renderer.domElement);
 
+        let prevTime = performance.now();
+        // maximum turn rate (rad/s) and damping
+        const KEY_MAX_SPEED = Math.PI;
+        const KEY_DAMPING = 5;    // higher = snappier, lower = floatier
+
+        // actual & target angular velocities
+        let yawVelocity = 0,
+            pitchVelocity = 0,
+            yawTarget = 0,
+            pitchTarget = 0;
+
+
         // ─── CONTROLS ────────────────────────────────────────────────────────
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
+        const orbitControls = new OrbitControls(camera, renderer.domElement);
+        orbitControls.enableDamping = true;
+        orbitControls.enableZoom = false;
+        orbitControls.enablePan = false;
+        orbitControls.rotateSpeed = -orbitControls.rotateSpeed;
+        orbitControls.minPolarAngle = 0;
+        orbitControls.maxPolarAngle = Math.PI;
+
+        const flyControls = new FlyControls(camera, renderer.domElement);
+        flyControls.movementSpeed = 100;      // world units per second
+        flyControls.rollSpeed = Math.PI;  // radians per second
+        flyControls.dragToLook = true;     // click+drag to control pitch/yaw
+        flyControls.autoForward = false;    // only move when you press keys
+        flyControls.enabled = false;    // start disabled
+        orbitControls.enableDamping = true;
 
         // lock out zoom & pan
-        controls.enableZoom = false;
-        controls.enablePan = false;
+        orbitControls.enableZoom = false;
+        orbitControls.enablePan = false;
 
         // (optional) flip horizontal drag direction
-        controls.rotateSpeed = -controls.rotateSpeed;
+        orbitControls.rotateSpeed = -orbitControls.rotateSpeed;
 
         // full pitch range so you can sweep “up” and “down” around the Y-axis baseline
-        controls.minPolarAngle = 0;       // look all the way “through” to –Y
-        controls.maxPolarAngle = Math.PI; // back down to +Y
+        //orbitControls.minPolarAngle = 0;       // look all the way “through” to –Y
+        //orbitControls.maxPolarAngle = Math.PI; // back down to +Y
 
         // full 360° yaw
-        controls.minAzimuthAngle = -Infinity;
-        controls.maxAzimuthAngle = Infinity;
+        orbitControls.minAzimuthAngle = -Infinity;
+        orbitControls.maxAzimuthAngle = Infinity;
 
         // one-time sync
-        controls.update();
+        orbitControls.update();
 
 
-
+        window.addEventListener('keydown', e => {
+            switch (e.code) {
+                case 'ArrowLeft': yawTarget = KEY_MAX_SPEED; break;
+                case 'ArrowRight': yawTarget = -KEY_MAX_SPEED; break;
+                case 'ArrowUp': pitchTarget = KEY_MAX_SPEED; break;
+                case 'ArrowDown': pitchTarget = -KEY_MAX_SPEED; break;
+            }
+        });
+        window.addEventListener('keyup', e => {
+            switch (e.code) {
+                case 'ArrowLeft':
+                case 'ArrowRight': yawTarget = 0; break;
+                case 'ArrowUp':
+                case 'ArrowDown': pitchTarget = 0; break;
+            }
+        });
 
         renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
         function onWheel(e) {
             e.preventDefault();
 
-            // compute a positive baseDelta when wheel-down
+            if (brainMode) {
+                // in Brain‑Mode: “dolly” by scaling the camera‑to‑target vector
+                const zoomFactor = 1 + e.deltaY * 0.001;  // tweak sensitivity here
+                if (zoomFactor > 0) {
+                    // vector from target → camera
+                    const dir = camera.position.clone().sub(orbitControls.target);
+                    // scale it and re‑position camera
+                    dir.multiplyScalar(zoomFactor);
+                    camera.position.copy(orbitControls.target.clone().add(dir));
+                    orbitControls.update();
+                }
+                return;
+            }
+
+            // ─── Time-mode scroll fallback ──────────────────────────────────
             const baseDelta = e.deltaY * SCROLL_ACCEL;
             const dir = Math.sign(baseDelta);
             const now = Date.now();
 
-            // build up boost if you’re flicking same direction quickly
             if (dir === lastWheelDir && (now - lastWheelTime) < 200) {
                 scrollBoost = Math.min(BOOST_MAX, scrollBoost + BOOST_INCREMENT);
             } else {
@@ -1830,9 +2117,9 @@ sidebar.addEventListener('scroll', () => {
             lastWheelDir = dir;
             lastWheelTime = now;
 
-            // non-linear flick + boost
-            scrollVelocity += dir * Math.abs(baseDelta) ** 1.2 * scrollBoost;
+            scrollVelocity += dir * Math.pow(Math.abs(baseDelta), 1.2) * scrollBoost;
         }
+
 
 
 
@@ -2186,7 +2473,7 @@ sidebar.addEventListener('scroll', () => {
 
             /* 2️⃣  define camera path */
             const fromPos = camera.position.clone();
-            const fromTarget = controls.target.clone();
+            const fromTarget = orbitControls.target.clone();
 
             /* back the camera off slightly so the sphere isn't inside the near-plane */
             const toTarget = worldPos;
@@ -2514,10 +2801,9 @@ sidebar.addEventListener('scroll', () => {
             detailPanel.appendChild(tbl);
 
             // visual feedback on graph
-            highlightPathFrom(ctxId);
-            triggerChain(ctxId, 0);
-            tweenToNode(ctxId);
             cascadeChain(ctxId);
+            // and still animate camera
+            tweenToNode(ctxId);
 
             // scroll & highlight in sidebar
             document.querySelectorAll('.sidebar-item-highlight')
@@ -2551,7 +2837,7 @@ sidebar.addEventListener('scroll', () => {
         timeToggle.addEventListener('click', () => {
             timeMode = !timeMode;
             timeToggle.textContent = timeMode ? 'Dolly ON' : 'Time Mode';
-            controls.enableRotate = !timeMode;
+            orbitControls.enableRotate = !timeMode;
         });
 
         fileSelector.addEventListener('change', () => loadGraph());
@@ -2568,22 +2854,35 @@ sidebar.addEventListener('scroll', () => {
          *******************************************************************/
         function animate() {
             requestAnimationFrame(animate);
-            controls.update();
 
-            // ——— 1) smooth scroll/drift —————————————————————————————
-            if (Math.abs(scrollVelocity) > 1e-4) {
-                yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
-                scrollVelocity *= SCROLL_FRICTION;
+            // ——— drive active control with delta ——————————————————————
+            const now = performance.now();
+            const delta = (now - prevTime) / 1000;  // seconds since last frame
+            prevTime = now;
+
+            orbitControls.update();
+
+            // ——— 1) smooth scroll/drift in Tree‑Mode only ——————————————————
+            if (!brainMode) {
+                // wheel‑scroll velocity
+                if (Math.abs(scrollVelocity) > 1e-4) {
+                    yScrollOffset = Math.min(0, yScrollOffset + scrollVelocity);
+                    scrollVelocity *= SCROLL_FRICTION;
+                } else {
+                    scrollVelocity = 0;
+                }
+                // automatic drift
+                const nowMs = Date.now();
+                const dt = nowMs - lastDriftT;
+                yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / MS_PER_UNIT;
+                lastDriftT = nowMs;
+                graphGroup.position.y = yScrollOffset;
             } else {
-                scrollVelocity = 0;
+                // Brain‑Mode: lock at Y=0
+                graphGroup.position.y = 0;
             }
-            const nowMs = Date.now();
-            const dt = nowMs - lastDriftT;
-            yScrollOffset += (dt * LAYOUT_CONFIG.driftFactor) / MS_PER_UNIT;
-            lastDriftT = nowMs;
-            graphGroup.position.y = yScrollOffset;
 
-            // update header clocks
+            // ——— update header clocks ———————————————————————————————
             const nowDate = new Date();
             const elapsedMs = -yScrollOffset * MS_PER_UNIT;
             const viewDate = new Date(nowDate - elapsedMs);
@@ -2591,48 +2890,50 @@ sidebar.addEventListener('scroll', () => {
             viewLbl.textContent = 'View: ' + viewDate.toLocaleString();
             scrollBoost = Math.max(1, scrollBoost * BOOST_DECAY);
 
-            // ——— 2) camera fly-to tween —————————————————————————————
+            // ——— 2) camera fly‑to tween —————————————————————————————
             if (cameraTween) {
-                const tCam = Math.min((performance.now() - cameraTween.start) / cameraTween.duration, 1);
+                const tCam = Math.min((now - cameraTween.start) / cameraTween.duration, 1);
                 camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, tCam);
-                controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, tCam);
+                orbitControls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, tCam);
                 if (tCam >= 1) cameraTween = null;
             }
 
-            // ——— 3) node-position tween + scale-tween + edge update —————————————————
-            const nowT = performance.now();
-            let moved = false;
+            // ——— 3) node‑position tween + scale‑tween + edge update ——————
+            if (!brainMode) {
+                const nowT = performance.now();
+                let moved = false;
 
-            // a) any D3/tween position updates?
-            nodeMap.forEach(entry => {
-                if (!entry.tweenStart) return;
-                const t = Math.min((nowT - entry.tweenStart) / entry.tweenDuration, 1);
-                const ip = entry.prevPos.clone().lerp(entry.pos, t);
-                const mat = new THREE.Matrix4().compose(ip, new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
-                instMesh.setMatrixAt(entry._instanceIndex, mat);
-                moved = true;
-                if (t === 1) {
-                    delete entry.tweenStart;
-                    entry.prevPos.copy(entry.pos);
+                // a) position tweens
+                nodeMap.forEach(entry => {
+                    if (!entry.tweenStart) return;
+                    const t = Math.min((nowT - entry.tweenStart) / entry.tweenDuration, 1);
+                    const ip = entry.prevPos.clone().lerp(entry.pos, t);
+                    const mat = new THREE.Matrix4().compose(ip, new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
+                    instMesh.setMatrixAt(entry._instanceIndex, mat);
+                    moved = true;
+                    if (t === 1) {
+                        delete entry.tweenStart;
+                        entry.prevPos.copy(entry.pos);
+                    }
+                });
+
+                // b) scale tweens
+                nodeMap.forEach(entry => {
+                    if (!entry.scaleTweenStart) return;
+                    const t2 = Math.min((nowT - entry.scaleTweenStart) / entry.scaleTweenDuration, 1);
+                    const scale = entry.scalePrev.clone().lerp(entry.scaleTarget, t2);
+                    const mat = new THREE.Matrix4().compose(entry.pos, new THREE.Quaternion(), scale);
+                    instMesh.setMatrixAt(entry._instanceIndex, mat);
+                    moved = true;
+                    if (t2 === 1) {
+                        delete entry.scaleTweenStart;
+                    }
+                });
+
+                if (moved) {
+                    instMesh.instanceMatrix.needsUpdate = true;
+                    updateEdgeMeshes();
                 }
-            });
-
-            // b) scale-tween for new nodes
-            nodeMap.forEach(entry => {
-                if (!entry.scaleTweenStart) return;
-                const t2 = Math.min((nowT - entry.scaleTweenStart) / entry.scaleTweenDuration, 1);
-                const scale = entry.scalePrev.clone().lerp(entry.scaleTarget, t2);
-                const mat = new THREE.Matrix4().compose(entry.pos, new THREE.Quaternion(), scale);
-                instMesh.setMatrixAt(entry._instanceIndex, mat);
-                moved = true;
-                if (t2 === 1) {
-                    delete entry.scaleTweenStart;
-                }
-            });
-
-            if (moved) {
-                instMesh.instanceMatrix.needsUpdate = true;
-                updateEdgeMeshes();
             }
 
             // ——— 4) hover & click feedback —————————————————————————————
