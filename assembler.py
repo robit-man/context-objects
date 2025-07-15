@@ -1381,14 +1381,14 @@ class Assembler:
         # ── tweakables ────────────────────────────────────────────────
         TOKEN_WINDOW             = 1200
         TOKEN_REPEAT_LIMIT       = 45
-        LINE_REPEAT_LIMIT        = 10
+        LINE_REPEAT_LIMIT        = 4
         PATTERN_MAX_LEN          = 50
-        PATTERN_REPEAT_THRESHOLD = 10
+        PATTERN_REPEAT_THRESHOLD = 6
         SEQ_MIN                  = 2
-        SEQ_MAX                  = 10
-        SEQ_REPEAT_LIMIT         = 10
+        SEQ_MAX                  = 25
+        SEQ_REPEAT_LIMIT         = 6
         MAX_ATTEMPTS             = 10
-        SESSION_TIMEOUT_SEC      = 10 * 60   # ← NEW: 10‑minute session timeout
+        SESSION_TIMEOUT_SEC      = 5 * 60   # ← NEW: 10‑minute session timeout
         # ──────────────────────────────────────────────────────────────
 
         # compile arbitrary‐pattern guard
