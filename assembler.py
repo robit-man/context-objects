@@ -1388,7 +1388,7 @@ class Assembler:
         SEQ_MAX                  = 25
         SEQ_REPEAT_LIMIT         = 6
         MAX_ATTEMPTS             = 10
-        SESSION_TIMEOUT_SEC      = 5 * 60   # ← NEW: 10‑minute session timeout
+        SESSION_TIMEOUT_SEC      = 5 * 60   # ← NEW: 10-minute session timeout
         # ──────────────────────────────────────────────────────────────
 
         # compile arbitrary‐pattern guard
