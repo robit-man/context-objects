@@ -2148,7 +2148,10 @@ class Tools:
         chrome_bin = (
             os.getenv("CHROME_BIN")
             or shutil.which("google-chrome")
+            or shutil.which("chromium-browser")
             or shutil.which("chromium")
+            or "/snap/bin/chromium"
+            or "/usr/bin/chromium-browser"
             or "/usr/bin/chromium"
         )
 
