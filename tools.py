@@ -2107,9 +2107,6 @@ class Tools:
                 return False
         return _cond
 
-    # This static method opens a Chrome/Chromium browser using Selenium WebDriver. It tries multiple methods to find a suitable chromedriver, including Selenium-Manager, system-wide chromedriver, and webdriver-manager. It handles different CPU architectures and returns a message indicating success or failure.
-
-    # This static method opens a Chrome/Chromium browser using Selenium WebDriver. It tries multiple methods to find a suitable chromedriver, including Selenium-Manager, system-wide chromedriver, and webdriver-manager. It handles different CPU architectures and returns a message indicating success or failure.
     @staticmethod
     def open_browser(headless: bool = False, force_new: bool = False) -> str:
         """
@@ -2120,6 +2117,7 @@ class Tools:
           3) System chromedriver (PATH)
           4) Auto-download & install ARM64 chromedriver if on ARM64
           5) webdriver-manager (x86_64 only)
+          6) **Auto‑snap install chromium (last‑resort)**
         """
         import os
         import random
@@ -2202,9 +2200,8 @@ class Tools:
         arch = platform.machine().lower()
         if arch in ("aarch64", "arm64", "armv8l", "armv7l"):
             try:
-                # determine exact Chromium version
                 raw = subprocess.check_output([chrome_bin, "--version"]).decode().strip()
-                ver = raw.split()[1]  # e.g. "138.0.7204.92"
+                ver = raw.split()[1]
                 url = (
                     f"https://edgedl.me.gvt1.com/edgedl/"
                     f"chrome/chrome-for-testing/{ver}/linux-arm64/"
@@ -2251,10 +2248,22 @@ class Tools:
                     "webdriver-manager failed on x86_64; install matching chromedriver or set CHROME_BIN/PATH."
                 ) from e
 
+        # 8️⃣ **Last‑resort: try to install the Chromium snap**
+        try:
+            log_message("[open_browser] Attempting `sudo snap install chromium`…", "DEBUG")
+            subprocess.check_call(["sudo", "snap", "install", "chromium"])
+            # once installed, retry the snap-driver path immediately
+            Tools._driver = webdriver.Chrome(service=Service(snap_drv), options=opts)
+            log_message("[open_browser] Launched via newly‑installed snap chromium.", "SUCCESS")
+            return "Browser launched (snap install fallback)"
+        except Exception as e:
+            log_message(f"[open_browser] Auto‑snap install failed or Chrome still not found: {e}", "ERROR")
+
         # ❌ If we reach here, no driver worked
         raise RuntimeError(
-            "No usable chromedriver found. On ARM64, ensure download/install succeeded; "
-            "on x86_64, install a matching chromedriver or set CHROME_BIN/PATH."
+            "No usable chromedriver found.  "
+            "Please install Chrome/Chromium (e.g. `sudo snap install chromium`) "
+            "or place a matching chromedriver on your PATH."
         )
 
 
