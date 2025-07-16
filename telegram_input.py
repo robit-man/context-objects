@@ -1068,24 +1068,28 @@ def telegram_input(asm):
                                 images_b64.append(base64.b64encode(data).decode("ascii"))
                             except Exception:
                                 continue
-
                         try:
-                            # create a fresh “live‐stream” sink for this run
-                            #live_sink = chat_asm.tts.token_sink()
-                            if chat_asm.tts and hasattr(chat_asm.tts, "enqueue"):
-                                live_sink = lambda token: chat_asm.tts.enqueue(token)
-                            else:
-                                live_sink = None
+                            # switch into “file” (or “live”) mode as you already do
+                            chat_asm.tts.set_mode("file")
 
+                            # 1) grab a fresh buffered sink from TTSManager
+                            sink = chat_asm.tts.token_sink()
+
+                            # 2) run_with_meta_context, feeding tokens into our buffered sink
                             final = await asyncio.to_thread(
                                 chat_asm.run_with_meta_context,
                                 request_text,
                                 status_cb,
                                 images=images_b64,
-                                on_token=live_sink,                # ← wire in token_stream
+                                on_token=sink,                # ← buffered sink now
                             )
-                            # make sure any last buffered tokens get flushed to TTS
+
+                            # 3) force‑flush any remaining partial sentence
+                            sink(None)
+
+                            # 4) wait for all the file‑mode chunks to be generated
                             await asyncio.to_thread(chat_asm.tts._file_q.join)
+
                         except Exception:
                             logger.exception("run_with_meta_context failed")
                             final = ""
