@@ -1017,11 +1017,12 @@ def telegram_input(asm):
                 )
                 await queue.put((user_text, trigger_id))
                 return
+            
             # ── Runner that stages “processing…” then delivers text+voice ─────────
             async def start_runner(request_text: str, reply_to_id: int):
                 # Load debug flag
                 try:
-                    with open("config.json","r") as _f:
+                    with open("config.json", "r") as _f:
                         _cfg = json.load(_f)
                 except FileNotFoundError:
                     _cfg = {}
@@ -1030,6 +1031,7 @@ def telegram_input(asm):
                 placeholder_id = None
                 typing_task    = None
 
+                # 1) Set up UI‐status editing (if debug) or a no‐op
                 if debug_enabled:
                     placeholder = await bot.send_message(
                         chat_id=chat_id,
@@ -1037,18 +1039,55 @@ def telegram_input(asm):
                         reply_to_message_id=reply_to_id
                     )
                     placeholder_id = placeholder.message_id
-                    status_cb, stop_status = _make_status_cb(loop, bot, chat_id, placeholder_id)
+                    orig_status, stop_status = _make_status_cb(
+                        loop, bot, chat_id, placeholder_id
+                    )
                 else:
-                    status_cb   = lambda *a, **k: None
+                    # no UI edits in non-debug mode
+                    orig_status = lambda stage, info=None: None
                     stop_status = lambda: None
+
+                    # still show “typing…” every few seconds
                     async def _typing_loop():
                         try:
                             while True:
-                                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                                await bot.send_chat_action(
+                                    chat_id=chat_id,
+                                    action=ChatAction.TYPING
+                                )
                                 await asyncio.sleep(4)
                         except asyncio.CancelledError:
                             return
+
                     typing_task = loop.create_task(_typing_loop())
+
+                # 2) Wrap status_cb to also drain/send stage OGGs immediately
+                def status_cb(stage: str, info: Any = None):
+                    # a) update UI or no-op
+                    orig_status(stage, info)
+
+                    # b) drain any new .ogg files and send them right away
+                    while True:
+                        try:
+                            ogg_path = chat_asm.tts._ogg_q.get_nowait()
+                        except _queue.Empty:
+                            break
+                        else:
+                            # schedule the voice send on the event loop
+                            def _send(ogg=ogg_path):
+                                try:
+                                    vf = open(ogg, "rb")
+                                    asyncio.create_task(
+                                        bot.send_voice(
+                                            chat_id,
+                                            vf,
+                                            reply_to_message_id=reply_to_id
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                            loop.call_soon_threadsafe(_send)
+
 
                 async def runner():
                     nonlocal placeholder_id, typing_task
@@ -1081,7 +1120,7 @@ def telegram_input(asm):
                                 request_text,
                                 status_cb,
                                 images=images_b64,
-                                on_token=sink,                # ← buffered sink now
+                                on_token=sink,
                             )
 
                             # 3) force‑flush any remaining partial sentence
@@ -1154,35 +1193,6 @@ def telegram_input(asm):
                                 asyncio.create_task(_delayed_unpin(bot, chat_id, sent.message_id))
                             except: pass
 
-                        # deliver voice
-                        chat_asm.tts.enqueue(final)
-                        await asyncio.to_thread(chat_asm.tts._file_q.join)
-                        oggs = []
-                        while True:
-                            try:
-                                p = chat_asm.tts._ogg_q.get_nowait()
-                                if os.path.getsize(p) > 0:
-                                    oggs.append(p)
-                            except _queue.Empty:
-                                break
-
-                        if oggs:
-                            if len(oggs) == 1:
-                                with open(oggs[0], "rb") as vf:
-                                    await bot.send_voice(chat_id, vf, reply_to_message_id=reply_to_id)
-                            else:
-                                combined = os.path.join(tempfile.gettempdir(), f"combined_{uuid.uuid4().hex}.ogg")
-                                ins = sum([["-i", p] for p in oggs], [])
-                                streams = "".join(f"[{i}:a]" for i in range(len(oggs)))
-                                filt = f"{streams}concat=n={len(oggs)}:v=0:a=1,aresample=48000"
-                                subprocess.run(
-                                    ["ffmpeg", "-y", "-loglevel", "error", *ins,
-                                    "-filter_complex", filt,
-                                    "-c:a", "libopus", "-b:a", "48k", combined],
-                                    check=True
-                                )
-                                with open(combined, "rb") as vf:
-                                    await bot.send_voice(chat_id, vf, reply_to_message_id=reply_to_id)
 
                     except asyncio.CancelledError:
                         if placeholder_id:
