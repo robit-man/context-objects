@@ -627,6 +627,17 @@ class Assembler:
         self._seed_tool_schemas()
         self._seed_static_prompts()
 
+        self.tts_live_stages = set(
+            self.cfg.get("tts_live_stages", [
+                "announcement",
+                "record_input",
+                "intent_clarification",
+                "planning_summary",
+                "assemble_and_infer",
+                "final_inference",
+            ])
+        )
+
         # — text-to-speech manager —
         self.tts = tts_manager
         self._chat_contexts: set[int] = set()
@@ -2196,24 +2207,48 @@ class Assembler:
         images: list[str] | None = None,
         on_token: Callable[[str], None] | None = None,
     ) -> str:
+        # ─── Normalize a no-op status_cb ─────────────────────────────────────
         if status_cb is None:
-            def status_cb(*args, **kwargs):
+            def status_cb(stage: str, info: Any = None):
                 return None
 
-        import logging, time, numpy as np
+        # ─── Wrap status_cb so it also speaks in live mode ────────────────────
+        real_status = status_cb
+        def speakable_status(stage: str, info: Any = None):
+            # 1) Forward to the original callback (UI / Telegram / logs)
+            real_status(stage, info)
+
+            # 2) If TTS exists, is in live mode, and this stage is configured to speak → enqueue
+            if (
+                self.tts
+                and getattr(self.tts, "_mode", "") == "live"
+                and stage in getattr(self, "tts_live_stages", set())
+            ):
+                # turn the payload into a concise utterance
+                utter = str(info).strip() or stage.replace("_", " ")
+                self.tts.enqueue(utter)
+
+        status_cb = speakable_status
+
+        # ─── Library imports & bootstrap ─────────────────────────────────────
+        import logging, time, traceback
+        import numpy as np
         from datetime import datetime
         from context import ContextObject, sanitize_jsonl
-        import logging
-        # quiet down httpx embed calls
+
+        # quiet down httpx/urllib3 noise
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("urllib3").setLevel(logging.WARNING)
-        # ─── Bootstrap & sanitize ─────────────────────────────────────────
+
+        # ─── Sanitize context store on disk ──────────────────────────────────
         sanitize_jsonl(self.context_path)
+
+        # ─── Early exit on blank input ───────────────────────────────────────
         if not user_text or not user_text.strip():
             status_cb("output", "")
             return ""
 
-        # ─── Initialize state ─────────────────────────────────────────────
+        # ─── Initialize conversation state ───────────────────────────────────
         state: Dict[str, Any] = {
             "user_text":   user_text,
             "errors":      [],
@@ -2222,14 +2257,15 @@ class Assembler:
             "images":      images or [],
         }
         self._last_state = state
+
         import uuid
-        state["conversation_id"] = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
+        state["conversation_id"] = getattr(self, "_active_conversation_id",
+                                          uuid.uuid4().hex)
         self._active_conversation_id = state["conversation_id"]
         state["user_id"] = getattr(self, "current_user_id", "anon")
 
-        # ─── Stage 0: decision_to_respond ─────────────────────────────────
+        # ─── Stage 0: decision_to_respond ────────────────────────────────────
         if user_text.strip():
-            # non‐empty text → use your normal filter
             try:
                 should, _ = self.filter_callback(user_text)
                 state["should_respond"] = should
@@ -2238,7 +2274,6 @@ class Assembler:
                 state["should_respond"] = True
                 status_cb("decision_to_respond_error", str(e))
         else:
-            # empty text → if we have images, still respond; otherwise skip
             if state["images"]:
                 state["should_respond"] = True
                 status_cb("decision_to_respond", True)
@@ -2250,22 +2285,20 @@ class Assembler:
             status_cb("output", "…")
             return ""
 
-
-
-        # ─── Stage 0.5: decide_tool_usage ─────────────────────────────────
+        # ─── Stage 0.5: decide_tool_usage ───────────────────────────────────
         try:
-            use_tools, _ = self.tools_callback(user_text) 
+            use_tools, _ = self.tools_callback(user_text)
             state["use_tools"] = use_tools
             status_cb("decide_tool_usage", use_tools)
         except Exception as e:
             state["use_tools"] = True
             status_cb("decide_tool_usage_error", str(e))
 
-        # ─── Fast-path: no tools ───────────────────────────────────────────
+        # ─── Fast‐path when tools are disabled ───────────────────────────────
         if not state["use_tools"]:
             status_cb("no_tools_start", "Skipping tool pipeline, going direct to assembly")
 
-            # Stage 1: record_input
+            # Stage 1
             try:
                 ctx1 = self._stage1_record_input(user_text, state)
                 state["user_ctx"] = ctx1
@@ -2274,7 +2307,7 @@ class Assembler:
                 status_cb("record_input_error", str(e))
                 state["errors"].append(("record_input", str(e)))
 
-            # Stage 2: load_system_prompts
+            # Stage 2
             try:
                 ctx2 = self._stage2_load_system_prompts()
                 state["sys_ctx"] = ctx2
@@ -2282,12 +2315,13 @@ class Assembler:
             except Exception as e:
                 status_cb("load_system_prompts_error", str(e))
                 state["errors"].append(("load_system_prompts", str(e)))
-        # Stage 3: retrieve_and_merge_context
+
+        # ─── Stage 3: retrieve_and_merge_context ─────────────────────────────
         try:
             extra = self._get_history()
             state["recent_ids"] = [c.context_id for c in extra]
 
-            # ----- RETRIEVER -----
+            # 3a) retrieval
             try:
                 out3 = self._stage3_retrieve_and_merge_context(
                     user_text,
@@ -2306,94 +2340,82 @@ class Assembler:
                 }
             state.update(out3)
 
-            # ----- INTEGRATOR -----
+            # 3b) integrator
             try:
-                # ingest everything we retrieved
                 self.integrator.ingest(state["merged"])
-
-                # build list of core IDs to keep
                 keep_core: List[str] = []
                 user_ctx = state.get("user_ctx")
-                if user_ctx is not None:
+                if user_ctx:
                     keep_core.append(user_ctx.context_id)
 
-                # sys_ctx may be a single ContextObject or a list
                 sys_val = state.get("sys_ctx") or []
-                if not isinstance(sys_val, list):
-                    sys_list = [sys_val]
-                else:
-                    sys_list = sys_val
-
+                sys_list = sys_val if isinstance(sys_val, list) else [sys_val]
                 for sc in sys_list:
                     keep_core.append(sc.context_id)
 
-                # ingest user+system contexts so they won't be pruned
                 core_ctxs: List[ContextObject] = []
-                if user_ctx is not None:
+                if user_ctx:
                     core_ctxs.append(user_ctx)
                 core_ctxs.extend(sys_list)
                 if core_ctxs:
                     self.integrator.ingest(core_ctxs)
 
-                # contract down to fit max_nodes, preserving keep_core
                 contracted = self.integrator.contract(keep_ids=keep_core)
-
-                # update state with contracted window
                 state["merged"]     = contracted
                 state["merged_ids"] = [c.context_id for c in contracted]
                 state["wm_ids"]     = [c.context_id for c in contracted[-20:]]
-                hist = [
-                    c
-                    for c in contracted
-                    if c.semantic_label in ("user_input", "assistant")
-                ]
+                hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
                 hist.sort(key=lambda c: c.timestamp)
                 state["history"] = hist[-8:]
             except Exception:
                 status_cb("integrator_error", traceback.format_exc(limit=5))
 
-            status_cb("retrieve_and_merge_context", f"{len(state.get('merged', []))} ctxs")
+            status_cb(
+                "retrieve_and_merge_context",
+                f"{len(state.get('merged', []))} ctxs"
+            )
         except Exception:
             status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
             state["errors"].append(("retrieve_and_merge_context", "fatal"))
 
+        # ─── Stage 4: intent_clarification ──────────────────────────────────
+        try:
+            ctx4 = self._stage4_intent_clarification(
+                user_text, state, on_token=on_token
+            )
+            state["clar_ctx"] = ctx4
+            status_cb("intent_clarification", ctx4.summary)
+        except Exception as e:
+            status_cb("intent_clarification_error", str(e))
+            state["errors"].append(("intent_clarification", str(e)))
+            dummy = ContextObject.make_stage(
+                "intent_clarification_failed",
+                [state["user_ctx"].context_id],
+                {"summary": ""}
+            )
+            dummy.touch(); self.repo.save(dummy)
+            state["clar_ctx"] = dummy
 
-            # Stage 4: intent_clarification
-            try:
-                ctx4 = self._stage4_intent_clarification(user_text, state, on_token=on_token)
-                state["clar_ctx"] = ctx4
-                status_cb("intent_clarification", ctx4.summary)
-            except Exception as e:
-                status_cb("intent_clarification_error", str(e))
-                state["errors"].append(("intent_clarification", str(e)))
-                dummy = ContextObject.make_stage(
-                    "intent_clarification_failed",
-                    [state["user_ctx"].context_id],
-                    {"summary": ""}
+        # ─── Stage 5: external_knowledge_retrieval ──────────────────────────
+        try:
+            know_ctx = self._stage5_external_knowledge(state["clar_ctx"], state)
+            if isinstance(know_ctx, dict):
+                know_ctx = ContextObject.make_stage(
+                    "external_knowledge_retrieval",
+                    state["clar_ctx"].references,
+                    know_ctx
                 )
-                dummy.touch(); self.repo.save(dummy)
-                state["clar_ctx"] = dummy
+                know_ctx.stage_id = "external_knowledge_retrieval"
+                know_ctx.summary  = "(snippets)"
+                know_ctx.touch(); self.repo.save(know_ctx)
+            state["know_ctx"] = know_ctx
+            status_cb("external_knowledge", "(snippets)")
+        except Exception as e:
+            status_cb("external_knowledge_error", str(e))
+            state["errors"].append(("external_knowledge", str(e)))
 
-            # Stage 5: external_knowledge_retrieval
-            try:
-                know_ctx = self._stage5_external_knowledge(state["clar_ctx"], state)
-                if isinstance(know_ctx, dict):
-                    know_ctx = ContextObject.make_stage(
-                        "external_knowledge_retrieval",
-                        state["clar_ctx"].references,
-                        know_ctx
-                    )
-                    know_ctx.stage_id = "external_knowledge_retrieval"
-                    know_ctx.summary  = "(snippets)"
-                    know_ctx.touch()
-                    self.repo.save(know_ctx)
-                state["know_ctx"] = know_ctx
-                status_cb("external_knowledge", "(snippets)")
-            except Exception as e:
-                status_cb("external_knowledge_error", str(e))
-                state["errors"].append(("external_knowledge", str(e)))
-
-            # Ensure no tool contexts
+        # ─── If no tools, assemble & exit ───────────────────────────────────
+        if not state["use_tools"]:
             state["tool_ctxs"] = []
 
             # Stage 10: assemble + infer
@@ -2420,14 +2442,11 @@ class Assembler:
                 status_cb("memory_writeback_error", str(e))
                 state["errors"].append(("memory_writeback", str(e)))
 
-            # Final output
             out = final.strip()
             status_cb("output", out)
             return out
 
-        # ─── With-tools branch ────────────────────────────────────────────
-
-        # Announcement
+        # ─── With-tools branch ──────────────────────────────────────────────
         prepared = self._stage6_prepare_tools()
         tools_list = [t["name"] for t in prepared]
         announce = (
@@ -2437,7 +2456,7 @@ class Assembler:
         )
         status_cb("announcement", announce)
 
-        # Stage 1: record_input
+        # Stage 1
         try:
             ctx1 = self._stage1_record_input(user_text, state)
             state["user_ctx"] = ctx1
@@ -2446,7 +2465,7 @@ class Assembler:
             status_cb("record_input_error", str(e))
             state["errors"].append(("record_input", str(e)))
 
-        # Stage 2: load_system_prompts
+        # Stage 2
         try:
             ctx2 = self._stage2_load_system_prompts()
             state["sys_ctx"] = ctx2
@@ -2454,12 +2473,12 @@ class Assembler:
         except Exception as e:
             status_cb("load_system_prompts_error", str(e))
             state["errors"].append(("load_system_prompts", str(e)))
-        # Stage 3: retrieve_and_merge_context
+
+        # Stage 3 (retriever+integrator again)
         try:
             extra = self._get_history()
             state["recent_ids"] = [c.context_id for c in extra]
 
-            # ----- RETRIEVER -----
             try:
                 out3 = self._stage3_retrieve_and_merge_context(
                     user_text,
@@ -2478,57 +2497,44 @@ class Assembler:
                 }
             state.update(out3)
 
-            # ----- INTEGRATOR -----
             try:
-                # ingest everything we retrieved
                 self.integrator.ingest(state["merged"])
-
-                # build list of core IDs to keep
                 keep_core: List[str] = []
                 user_ctx = state.get("user_ctx")
-                if user_ctx is not None:
+                if user_ctx:
                     keep_core.append(user_ctx.context_id)
 
-                # sys_ctx may be a single ContextObject or a list
                 sys_val = state.get("sys_ctx") or []
-                if not isinstance(sys_val, list):
-                    sys_list = [sys_val]
-                else:
-                    sys_list = sys_val
-
+                sys_list = sys_val if isinstance(sys_val, list) else [sys_val]
                 for sc in sys_list:
                     keep_core.append(sc.context_id)
 
-                # ingest user+system contexts so they won't be pruned
                 core_ctxs: List[ContextObject] = []
-                if user_ctx is not None:
+                if user_ctx:
                     core_ctxs.append(user_ctx)
                 core_ctxs.extend(sys_list)
                 if core_ctxs:
                     self.integrator.ingest(core_ctxs)
 
-                # contract down to fit max_nodes, preserving keep_core
                 contracted = self.integrator.contract(keep_ids=keep_core)
-
-                # update state with contracted window
                 state["merged"]     = contracted
                 state["merged_ids"] = [c.context_id for c in contracted]
                 state["wm_ids"]     = [c.context_id for c in contracted[-20:]]
-                hist = [
-                    c
-                    for c in contracted
-                    if c.semantic_label in ("user_input", "assistant")
-                ]
+                hist = [c for c in contracted if c.semantic_label in ("user_input","assistant")]
                 hist.sort(key=lambda c: c.timestamp)
                 state["history"] = hist[-8:]
             except Exception:
                 status_cb("integrator_error", traceback.format_exc(limit=5))
 
-            status_cb("retrieve_and_merge_context", f"{len(state.get('merged', []))} ctxs")
+            status_cb(
+                "retrieve_and_merge_context",
+                f"{len(state.get('merged', []))} ctxs"
+            )
         except Exception:
             status_cb("retrieve_and_merge_context_error", traceback.format_exc(limit=5))
             state["errors"].append(("retrieve_and_merge_context", "fatal"))
-        # Stage 4: intent_clarification
+
+        # Stage 4… through Stage 11 (tools branch), unchanged except status_cb calls:
         try:
             ctx4 = self._stage4_intent_clarification(user_text, state, on_token=on_token)
             state["clar_ctx"] = ctx4
@@ -2544,7 +2550,6 @@ class Assembler:
             dummy.touch(); self.repo.save(dummy)
             state["clar_ctx"] = dummy
 
-        # Stage 5: external_knowledge_retrieval
         try:
             know_ctx = self._stage5_external_knowledge(state["clar_ctx"], state)
             if isinstance(know_ctx, dict):
@@ -2555,24 +2560,21 @@ class Assembler:
                 )
                 know_ctx.stage_id = "external_knowledge_retrieval"
                 know_ctx.summary  = "(snippets)"
-                know_ctx.touch()
-                self.repo.save(know_ctx)
+                know_ctx.touch(); self.repo.save(know_ctx)
             state["know_ctx"] = know_ctx
             status_cb("external_knowledge", "(snippets)")
         except Exception as e:
             status_cb("external_knowledge_error", str(e))
             state["errors"].append(("external_knowledge", str(e)))
 
-        # Stage 6: prepare_tools
         try:
             tools = prepared
             state["tools_list"] = tools
             status_cb("prepare_tools", f"{len(tools)} tools")
         except Exception as e:
-            status_cb("prepare_tools_error", str(e)) 
+            status_cb("prepare_tools_error", str(e))
             state["errors"].append(("prepare_tools", str(e)))
 
-        # Stage 7: planning_summary
         try:
             ctx7, plan_out = self._stage7_planning_summary(
                 state["clar_ctx"],
@@ -2588,7 +2590,6 @@ class Assembler:
             status_cb("planning_summary_error", str(e))
             state["errors"].append(("planning_summary", str(e)))
 
-        # Stage 7b: plan_validation
         try:
             _, _, fixed = self._stage7b_plan_validation(
                 state["plan_ctx"],
@@ -2602,7 +2603,6 @@ class Assembler:
             status_cb("plan_validation_error", str(e))
             state["errors"].append(("plan_validation", str(e)))
 
-        # Stage 8: tool_chaining
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
@@ -2619,7 +2619,6 @@ class Assembler:
             status_cb("tool_chaining_error", str(e))
             state["errors"].append(("tool_chaining", str(e)))
 
-        # Stage 8.5: user_confirmation
         try:
             confirmed = self._stage8_5_user_confirmation(state["raw_calls"], user_text)
             state["confirmed_calls"] = confirmed
@@ -2628,7 +2627,6 @@ class Assembler:
             status_cb("user_confirmation_error", str(e))
             state["errors"].append(("user_confirmation", str(e)))
 
-        # Stage 9: invoke_with_retries
         try:
             tcs = self._stage9_invoke_with_retries(
                 state["confirmed_calls"],
@@ -2645,7 +2643,6 @@ class Assembler:
             status_cb("invoke_with_retries_error", str(e))
             state["errors"].append(("invoke_with_retries", str(e)))
 
-        # Stage 9b: reflection_and_replan
         try:
             rp = self._stage9b_reflection_and_replan(
                 state["tool_ctxs"],
@@ -2660,7 +2657,7 @@ class Assembler:
             status_cb("reflection_and_replan_error", str(e))
             state["errors"].append(("reflection_and_replan", str(e)))
 
-        # Stage 10: assemble + infer (draft)
+        # Stage 10 (draft)
         try:
             draft = self._stage10_assemble_and_infer(
                 user_text,
@@ -2676,7 +2673,7 @@ class Assembler:
             draft = ""
             state["draft"] = draft
 
-        # Stage 10b: response_critique (if errors)
+        # Stage 10b: critique if errors
         if state["errors"]:
             try:
                 patched = self._stage10b_response_critique_and_safety(
@@ -2691,7 +2688,7 @@ class Assembler:
                 status_cb("response_critique_error", str(e))
                 state["errors"].append(("response_critique", str(e)))
 
-        # Stage 10b: final_inference
+        # Stage 10b: final inference
         try:
             final = self._stage10_assemble_and_infer(
                 user_text,
@@ -2705,7 +2702,7 @@ class Assembler:
             status_cb("final_inference_error", str(e))
             state["final"] = state.get("draft", "")
 
-        # Stage 11: memory_writeback
+        # Stage 11: memory writeback
         try:
             self._stage11_memory_writeback(state["final"], state["tool_ctxs"])
             status_cb("memory_writeback", "(queued)")
@@ -2713,7 +2710,7 @@ class Assembler:
             status_cb("memory_writeback_error", str(e))
             state["errors"].append(("memory_writeback", str(e)))
 
-        # Final output
+        # ─── Final output ────────────────────────────────────────────────────
         out = state["final"].strip()
         status_cb("output", out)
         return out
