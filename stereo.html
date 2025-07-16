@@ -28,8 +28,8 @@
 
         #settingsBtn {
             position: absolute;
-            top: calc(env(safe-area-inset-top, 0)+10px);
-            right: calc(env(safe-area-inset-right, 0)+10px);
+            top: 8px;
+            left: 8px;
             width: 32px;
             height: 32px;
             background: #444;
@@ -42,6 +42,22 @@
             display: flex;
             align-items: center;
             justify-content: center;
+        }
+
+        #torchBtn {
+
+            position: absolute;
+            top: 8px;
+            left: 42px;
+            width: 32px;
+            height: 32px;
+            background: #444;
+            color: #eee;
+            border: none;
+            border-radius: 20px;
+            font-size: 18px;
+            cursor: pointer;
+            z-index: 2;
         }
 
         .modal {
@@ -113,6 +129,7 @@
 </head>
 
 <body>
+    <button id="torchBtn">🔦</button>
     <button id="settingsBtn">⚙️</button>
     <div id="settingsModal" class="modal">
         <div class="modal-content">
@@ -219,6 +236,7 @@
         const terrainMat = new THREE.MeshStandardMaterial({
             color: 0x556B2F,
             flatShading: true,
+            wireframe: true,
             metalness: 0.1,
             roughness: 0.8
         });
@@ -292,51 +310,76 @@
         // 1) geometry
         const hpGeo = new THREE.PlaneGeometry(PANEL_WIDTH, PANEL_HEIGHT);
 
-        // 2) video texture
         const videoTex = new THREE.VideoTexture(video);
         videoTex.minFilter = THREE.LinearFilter;
         videoTex.magFilter = THREE.LinearFilter;
         videoTex.format = THREE.RGBAFormat;
         videoTex.flipY = false;
+
         const hpMat = new THREE.ShaderMaterial({
             uniforms: {
-                map: { value: videoTex }
+                map: { value: videoTex },
+                resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                maxBoost: { value: 2.5 } // ⬅️ maximum contrast boost factor in darkest regions
             },
             vertexShader: /* glsl */`
     varying vec2 vUv;
     void main() {
       vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
     }
   `,
             fragmentShader: /* glsl */`
     uniform sampler2D map;
+    uniform vec2 resolution;
+    uniform float maxBoost;
     varying vec2 vUv;
 
     void main() {
-      // flip vertically:
+      // flip video
       vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
+      vec4 src = texture2D(map, uv);
+      vec3 color = src.rgb;
 
-      vec4 color = texture2D(map, uv);
+      // --- edge boost (Sobel) ---
+      vec2 off = 1.0 / resolution;
+      float gx = texture2D(map, uv + vec2(off.x,0)).r
+               - texture2D(map, uv - vec2(off.x,0)).r;
+      float gy = texture2D(map, uv + vec2(0,off.y)).r
+               - texture2D(map, uv - vec2(0,off.y)).r;
+      float edge = length(vec2(gx,gy));
+      color += edge * 4.0; // slightly less aggressive
 
-      // distance from center (0.5,0.5)
+      // --- local contrast boost in dark areas ---
+      // blur
+      vec3 blur = (
+        texture2D(map, uv + vec2(off.x, off.y)).rgb +
+        texture2D(map, uv + vec2(-off.x, off.y)).rgb +
+        texture2D(map, uv + vec2(off.x, -off.y)).rgb +
+        texture2D(map, uv + vec2(-off.x, -off.y)).rgb
+      ) * 0.25;
+
+      // high‑freq detail
+      vec3 high = color - blur;
+
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      // boost strongest at lum=0, none at lum>=0.5
+      float t = smoothstep(0.5, 0.0, lum);
+      float cf = mix(1.0, maxBoost, t);
+
+      color = blur + high * cf;
+
+      // --- radial fade ---
       float d = distance(vUv, vec2(0.5));
+      float fade = 1.0 - smoothstep(0.3, 0.5, d);
 
-      // outer fade: fully opaque inside r=0.3 → fully transparent at r=0.5
-      float outer = 1.0 - smoothstep(0.3, 0.5, d);
-
-      // inner fade: start at 0.9 @ center → 1.0 @ r=0.3
-      float inner = mix(0.9, 1.0, smoothstep(0.0, 0.3, d));
-
-      float alpha = outer * inner;
-
-      gl_FragColor = vec4(color.rgb, color.a * alpha);
+      gl_FragColor = vec4(color, src.a * fade);
     }
   `,
             transparent: true,
-            opacity: 0.6,
             side: THREE.DoubleSide
         });
+
 
 
 
@@ -402,26 +445,47 @@
             runningMode: 'VIDEO',
             numHands: 4
         });
+        // 2) In your camera startup block, capture the video track:
+        let videoTrack;  // make this visible in the outer scope
 
-        // Start rear camera & zoom
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { facingMode: { ideal: 'environment' } }
             });
             video.srcObject = stream;
             await video.play();
-            const [track] = stream.getVideoTracks();
-            const caps = track.getCapabilities();
-            if (caps.zoom) {
-                await track.applyConstraints({ advanced: [{ zoom: Math.min(caps.max, 0.5) }] });
-            }
-            if (/iPhone/i.test(navigator.userAgent)) {
-                [camera, leftCam, rightCam].forEach(cam => {
-                    cam.zoom = 0.5; cam.updateProjectionMatrix();
-                });
-            }
-        } catch (err) { console.error('Camera error:', err); }
 
+            // grab the track for torch control
+            [videoTrack] = stream.getVideoTracks();
+
+            // try to set initial zoom as you already have...
+            const caps = videoTrack.getCapabilities();
+            if (caps.zoom) {
+                const z = Math.min(caps.max, Math.max(caps.min, 0.5));
+                await videoTrack.applyConstraints({ advanced: [{ zoom: z }] });
+            }
+        } catch (err) {
+            console.error('Camera error:', err);
+        }
+        // 3) Now wire up the torch button:
+        const torchBtn = document.getElementById('torchBtn');
+        let torchOn = false;
+
+        torchBtn.addEventListener('click', async () => {
+            if (!videoTrack) return;
+            const caps = videoTrack.getCapabilities();
+            if (!caps.torch) {
+                alert('Torch not supported on this device/browser');
+                return;
+            }
+            try {
+                torchOn = !torchOn;
+                await videoTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
+                torchBtn.style.background = torchOn ? '#ffa' : '#444';
+            } catch (err) {
+                console.warn('Torch toggle failed:', err);
+            }
+        });
         // Device orientation
         let haveOrient = false;
         const zee = new THREE.Vector3(0, 0, 1),
