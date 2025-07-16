@@ -357,7 +357,9 @@ def _stage4_intent_clarification(
     self,
     user_text: str,
     state: Dict[str, Any],
-) -> "ContextObject":
+    *,
+    on_token: Callable[[str],None] | None = None,
+    ) -> "ContextObject":
     """
     Ask the Clarifier model to restate / expand the user's intent.
 
@@ -501,6 +503,7 @@ def _stage4_intent_clarification(
         msgs,
         tag="[Clarifier]",
         images=state.get("images"),
+        on_token=on_token,
     ).strip()
 
     # ------------------------------------------------------------------ #
@@ -1315,8 +1318,9 @@ def _stage8_tool_chaining(
     plan_ctx: ContextObject,
     plan_output: str,
     tools_list: List[Dict[str, Any]],
-    state: Dict[str, Any]
-) -> Tuple[ContextObject, List[str], List[ContextObject]]:
+    state: Dict[str, Any],
+    *,
+    on_token: Callable[[str],None] | None = None,) -> Tuple[ContextObject, List[str], List[ContextObject]]:
     import json, re, inspect
     from tools import Tools
 
@@ -1404,6 +1408,10 @@ def _stage8_tool_chaining(
         except Exception as e:
             output, exception = None, str(e)
 
+        # stream it live:
+        if on_token:
+            on_token(f"[Tool:{name}] → {repr(output) if exception is None else 'ERROR'}")
+            
         # verbose logging
         print(f"[ToolInvocation] {name} called with {invoke_kwargs!r} → "
               f"output={output!r}, exception={exception!r}")
@@ -1916,7 +1924,8 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         self.primary_model,
         msgs,
         tag="[Assistant]",
-        images=state.get("images")
+        images=state.get("images"),
+        on_token=on_token,
     ).strip()
 
     # ─── 9) Persist assistant reply ─────────────────────────────────

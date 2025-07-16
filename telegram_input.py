@@ -473,9 +473,19 @@ async def _start_runner_for_pin(
     loop = asyncio.get_event_loop()
     status_cb, stop_status = _make_status_cb(loop, bot, chat_id, None)
     try:
+        #live_sink = chat_asm.tts.token_sink()
+        if chat_asm.tts and hasattr(chat_asm.tts, "enqueue"):
+            live_sink = lambda token: chat_asm.tts.enqueue(token)
+        else:
+            live_sink = None
+            
         final = await asyncio.to_thread(
-            chat_asm.run_with_meta_context, request_text, status_cb
+            chat_asm.run_with_meta_context,
+            request_text,
+            status_cb,
+            on_token=live_sink,   # ← same hookup here
         )
+        await asyncio.to_thread(chat_asm.tts._file_q.join)
     except Exception:
         final = ""
     stop_status()
@@ -1060,12 +1070,22 @@ def telegram_input(asm):
                                 continue
 
                         try:
+                            # create a fresh “live‐stream” sink for this run
+                            #live_sink = chat_asm.tts.token_sink()
+                            if chat_asm.tts and hasattr(chat_asm.tts, "enqueue"):
+                                live_sink = lambda token: chat_asm.tts.enqueue(token)
+                            else:
+                                live_sink = None
+
                             final = await asyncio.to_thread(
                                 chat_asm.run_with_meta_context,
                                 request_text,
                                 status_cb,
-                                images=images_b64
+                                images=images_b64,
+                                on_token=live_sink,                # ← wire in token_stream
                             )
+                            # make sure any last buffered tokens get flushed to TTS
+                            await asyncio.to_thread(chat_asm.tts._file_q.join)
                         except Exception:
                             logger.exception("run_with_meta_context failed")
                             final = ""

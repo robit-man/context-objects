@@ -1360,18 +1360,16 @@ class Assembler:
         tag: str = "",
         max_image_bytes: int = 8 * 1024 * 1024,
         images: list[bytes] | None = None,
+        on_token: Callable[[str], None] | None = None    # ← NEW
     ) -> str:
         """
         Stream a response from Ollama with:
          • automatic image‐inlining
-         • *four* runaway‐repetition guards:
-             1) TOKEN guard:       ≥ TOKEN_REPEAT_LIMIT identical tokens
-             2) LINE guard:        ≥ LINE_REPEAT_LIMIT identical lines
-             3) PATTERN guard:     ≥ PATTERN_REPEAT_THRESHOLD repeats of
-                                   ANY substring of length 1–50 chars
-             4) MULTI-TOKEN guard: any sequence of 2–10 tokens repeating
-                                   SEQ_REPEAT_LIMIT times
-           Any guard trips → abort & restart the chat from scratch, up to MAX_ATTEMPTS.
+         • token‐level callback for TTS or UI updates
+         • early abort if self._abort_inference is set
+         • four runaway‐repetition guards (token, line, pattern, multi‐token)
+         • retry up to MAX_ATTEMPTS on guard trips
+         • session timeout guard
         """
         import re, time, requests
         from pathlib import Path
@@ -1388,7 +1386,7 @@ class Assembler:
         SEQ_MAX                  = 25
         SEQ_REPEAT_LIMIT         = 8
         MAX_ATTEMPTS             = 10
-        SESSION_TIMEOUT_SEC      = 5 * 60   # ← NEW: 10-minute session timeout
+        SESSION_TIMEOUT_SEC      = 10 * 60  # ten minutes
         # ──────────────────────────────────────────────────────────────
 
         # compile arbitrary‐pattern guard
@@ -1445,10 +1443,9 @@ class Assembler:
                     return True
             return False
 
-        # record session start for timeout
         session_start = time.time()
 
-        # ── one streaming pass ────────────────────────────────────────
+        # ── perform one streaming pass ─────────────────────────────────
         def one_pass() -> tuple[str, bool]:
             buf_tokens = deque(maxlen=TOKEN_WINDOW)
             buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
@@ -1456,15 +1453,28 @@ class Assembler:
 
             print(f"{tag} ", end="", flush=True)
             for part in chat(model=model, messages=messages, stream=True):
-                # ← NEW: abort this pass if we've been running over 10 minutes
+                # user‑interrupt / abort check
+                if getattr(self, "_abort_inference", False):
+                    print("\n[Interrupted] aborting generation.")
+                    return "".join(chunks), False
+
+                # session timeout guard
                 if time.time() - session_start > SESSION_TIMEOUT_SEC:
-                    print("\n[Timeout guard] 10 min elapsed → aborting pass.")
+                    print("\n[Timeout guard] session expired → aborting pass.")
                     return "".join(chunks), True
 
                 chunk = part["message"]["content"]
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
 
+                # send each token out
+                if on_token:
+                    try:
+                        on_token(chunk)
+                    except Exception as e:
+                        print(f"[on_token] {e}")
+
+                # update guards
                 for tok in chunk.split():
                     buf_tokens.append(tok)
                 for ln in chunk.splitlines():
@@ -1473,33 +1483,33 @@ class Assembler:
                         buf_lines.append(s)
 
                 if token_guard(buf_tokens):
-                    print("\n[Run-away guard] token repetition → aborting pass.")
+                    print("\n[Run‑away guard] token repetition → aborting pass.")
                     return "".join(chunks), True
                 if line_guard(buf_lines):
-                    print("\n[Run-away guard] line repetition → aborting pass.")
+                    print("\n[Run‑away guard] line repetition → aborting pass.")
                     return "".join(chunks), True
                 if multi_token_guard(buf_tokens):
-                    print("\n[Run-away guard] multi-token repetition → aborting pass.")
+                    print("\n[Run‑away guard] multi‑token repetition → aborting pass.")
                     return "".join(chunks), True
 
                 full = "".join(chunks)
                 if pat_regex.search(full):
-                    print("\n[Run-away guard] pattern repetition → aborting pass.")
+                    print("\n[Run‑away guard] pattern repetition → aborting pass.")
                     return full, True
 
             print()
             return "".join(chunks), False
 
-        # ── retry loop with MAX_ATTEMPTS ──────────────────────────────
-        for attempt in range(1, MAX_ATTEMPTS+1):
+        # ── retry loop with restarts ──────────────────────────────────
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             text, hit = one_pass()
             if not hit:
                 return text
-            print(f"[Run-away guard] restarting inference (attempt {attempt}/{MAX_ATTEMPTS}) …")
+            print(f"[Run‑away guard] restart ({attempt}/{MAX_ATTEMPTS}) …")
             time.sleep(0.1)
 
-        # 10 attempts failed – hard abort
-        print(f"[Run-away guard] aborting after {MAX_ATTEMPTS} attempts → returning empty string.")
+        # hard abort after retries
+        print(f"[Run‑away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
 
 
@@ -2181,9 +2191,15 @@ class Assembler:
     def run_with_meta_context(
         self,
         user_text: str,
-        status_cb: Callable[[str, Any], None] = lambda *a: None,
-        images: list[bytes] | None = None
+        status_cb: Callable[...,Any] = None,
+        *,
+        images: list[str] | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
+        if status_cb is None:
+            def status_cb(*args, **kwargs):
+                return None
+
         import logging, time, numpy as np
         from datetime import datetime
         from context import ContextObject, sanitize_jsonl
@@ -2344,7 +2360,7 @@ class Assembler:
 
             # Stage 4: intent_clarification
             try:
-                ctx4 = self._stage4_intent_clarification(user_text, state)
+                ctx4 = self._stage4_intent_clarification(user_text, state, on_token=on_token)
                 state["clar_ctx"] = ctx4
                 status_cb("intent_clarification", ctx4.summary)
             except Exception as e:
@@ -2385,7 +2401,8 @@ class Assembler:
                 final = self._stage10_assemble_and_infer(
                     user_text,
                     state,
-                    images=state.get("images", [])
+                    images=state.get("images", []),
+                    on_token=on_token,
                 )
                 state["final"] = final
                 status_cb("assemble_and_infer", final)
@@ -2513,7 +2530,7 @@ class Assembler:
             state["errors"].append(("retrieve_and_merge_context", "fatal"))
         # Stage 4: intent_clarification
         try:
-            ctx4 = self._stage4_intent_clarification(user_text, state)
+            ctx4 = self._stage4_intent_clarification(user_text, state, on_token=on_token)
             state["clar_ctx"] = ctx4
             status_cb("intent_clarification", ctx4.summary)
         except Exception as e:
@@ -2591,7 +2608,8 @@ class Assembler:
                 state["plan_ctx"],
                 "\n".join(state["fixed_calls"]),
                 state["tools_list"],
-                state
+                state,
+                on_token=on_token,
             )
             state["tc_ctx"]    = tc_ctx
             state["raw_calls"] = raw_calls
@@ -2647,7 +2665,8 @@ class Assembler:
             draft = self._stage10_assemble_and_infer(
                 user_text,
                 state,
-                images=state.get("images", [])
+                images=state.get("images", []),
+                on_token=on_token,
             )
             state["draft"] = draft
             status_cb("assemble_and_infer", draft)
@@ -2677,7 +2696,8 @@ class Assembler:
             final = self._stage10_assemble_and_infer(
                 user_text,
                 state,
-                images=state.get("images", [])
+                images=state.get("images", []),
+                on_token=on_token,
             )
             state["final"] = final
             status_cb("final_inference", final)

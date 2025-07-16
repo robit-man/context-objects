@@ -358,8 +358,8 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         const DISPLAY_CONFIG = {
             sphereRadius: 2,
             sphereSegments: 8,
-            lineBaseOpacity: 0.8,
-            hoverHighlightOpacity: 0.3,
+            lineBaseOpacity: 0.3,
+            hoverHighlightOpacity: 0.5,
             chainDelay: 200,
             maxChainDepth: 50,
             fadeOutDuration: 1000
@@ -369,14 +369,14 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             // which field on each object to color by:
             colorBy: 'component',
             // HSL constants:
-            saturation: 0.7,
+            saturation: 0.5,
             lightness: 0.2
         };
         // ─── BRAIN MODE CONFIG ────────────────────────────────────────────────
         const BRAIN_CONFIG = {
             // how much vertical spacing per BFS‐depth level
-            depthSpacing: 250,
-            initialSpread: 1000,
+            depthSpacing: 350,
+            initialSpread: 1200,
             // scale factor for node diameter (tweak so they look reasonable)
             scaleFactor: 0.01
         };
@@ -409,7 +409,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
 
         // ─── BRAIN vs TREE MODE ─────────────────────────────────────────────
         const modeSwitch = document.getElementById('modeswitch');
-        let brainMode = false;
+        let brainMode = true;
         let timeMode = false;   // ← add this
 
         let freeNodeIx = 0;
@@ -476,8 +476,12 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
 
         let hueMapCurrent = {};
         let maxConnCurrent = 1;
-
+        // ─── right‑hand pinch → orbit ──────────────────────────────
+        let rightPinchActive   = false;
+        let rightPinchStartMid = null;          // {x,y} of pinch‑mid at activation
+        const RIGHT_ROTATE_SENSITIVITY = 4.0;   // tweak to taste
         let cameraTween = null;
+        let rightPinchStartVec = null;
         let selectedId = null;
         let previousHoveredId = null;
         // ←── Add this so instMesh is visible everywhere ──→
@@ -2060,76 +2064,80 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             timeMode = !timeMode;
             timeToggle.textContent = timeMode ? 'Dolly ON' : 'Time Mode';
             orbitControls.enableRotate = !timeMode;
-        });
+        });//////////////////////////////////////////////////////////////////////////
+// THREE.JS SETUP
+//////////////////////////////////////////////////////////////////////////
+const scene = new THREE.Scene();
+scene.background = null;                          // let CSS paint the black
 
-        //////////////////////////////////////////////////////////////////////////
-        // THREE.JS SETUP
-        //////////////////////////////////////////////////////////////////////////
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x000000);
+// ─── CAMERA ──────────────────────────────────────────────────────────
+const camera = new THREE.PerspectiveCamera(
+    85,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    2e6
+);
+camera.position.set(0, -400, 0);
+camera.lookAt(0, 0, 0);
 
-        // ─── CAMERA ──────────────────────────────────────────────────────────
-        const camera = new THREE.PerspectiveCamera(
-            85,
-            window.innerWidth / window.innerHeight,
-            0.1,
-            2e6
-        );
-        camera.position.set(0, -400, 0);
-        camera.lookAt(0, 0, 0);    // baseline = looking along +Y (180° polar)
+// ─── RENDERER ────────────────────────────────────────────────────────
+const DPR = Math.min(window.devicePixelRatio, 1.25);   // clamp high‑DPI
+const renderer = new THREE.WebGLRenderer({
+    antialias       : true,                     // drop MSAA → big win
 
-        // ─── RENDERER ────────────────────────────────────────────────────────
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        document.body.appendChild(renderer.domElement);
+    powerPreference : 'high-performance'
+});
+renderer.setPixelRatio(DPR);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.sortObjects = false;                    // skip depth‑sort
+document.body.appendChild(renderer.domElement);
 
-        let prevTime = performance.now();
+let prevTime = performance.now();
 
-        // maximum turn rate (rad/s) and damping
-        const KEY_MAX_SPEED = Math.PI;
-        const KEY_DAMPING = 5;    // higher = snappier, lower = floatier
+// maximum turn rate (rad/s) and damping
+const KEY_MAX_SPEED = Math.PI;
+const KEY_DAMPING   = 5;   // higher = snappier, lower = floatier
 
-        // actual & target angular velocities
-        let yawVelocity = 0,
-            pitchVelocity = 0,
-            yawTarget = 0,
-            pitchTarget = 0;
+// actual & target angular velocities
+let yawVelocity = 0,
+    pitchVelocity = 0,
+    yawTarget = 0,
+    pitchTarget = 0;
 
+// — for head‑pose tracking —
+let video, faceLandmarker, handLandmarker;
+const poseTransform = new THREE.Object3D();
+const prevEuler     = new THREE.Euler();
 
-        // — for head‑pose tracking —
-        let video, faceLandmarker, handLandmarker;
-        const poseTransform = new THREE.Object3D();
-        const prevEuler = new THREE.Euler();
+// — for hand‑landmark spheres/lines —
+const fingerGroup = new THREE.Group();
+scene.add(fingerGroup);
 
-        // — for hand‑landmark spheres/lines —
-        const fingerGroup = new THREE.Group();
-        scene.add(fingerGroup);
+// — orbitCamera helper (yaw, pitch, roll deltas) —
+function orbitCamera(dY, dP, dR) {
+    const T = orbitControls.target;
+    const O = camera.position.clone().sub(T);
 
-        // — orbitCamera helper (yaw, pitch, roll deltas) —
-        function orbitCamera(dY, dP, dR) {
-            const T = orbitControls.target;
-            const O = camera.position.clone().sub(T);
+    // yaw around world‑up
+    O.applyQuaternion(
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY)
+    );
 
-            // yaw around world‑up
-            O.applyQuaternion(
-                new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY)
-            );
+    // pitch around camera‑right
+    const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
+    O.applyQuaternion(
+        new THREE.Quaternion().setFromAxisAngle(R, dP)
+    );
 
-            // pitch around camera‑right
-            const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
-            O.applyQuaternion(
-                new THREE.Quaternion().setFromAxisAngle(R, dP)
-            );
+    // roll around view direction
+    const F = O.clone().normalize();
+    camera.up.applyQuaternion(
+        new THREE.Quaternion().setFromAxisAngle(F, dR)
+    );
 
-            // roll around view direction
-            const F = O.clone().normalize();
-            camera.up.applyQuaternion(
-                new THREE.Quaternion().setFromAxisAngle(F, dR)
-            );
-
-            camera.position.copy(T).add(O);
-            camera.lookAt(T);
-        }
+    camera.position.copy(T).add(O);
+    camera.lookAt(T);
+}
 
         // — initialize webcam + MediaPipe models —
         async function initVision() {
@@ -3129,6 +3137,8 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                         }
                     }
 
+                    
+                   
                     /* ── two‑hand pinch zoom (unchanged) ---------------------------------- */
                     const R = hands.Right;
                     if (L && R && L.dist < PINCH_THRESHOLD && R.dist < PINCH_THRESHOLD) {
@@ -3142,7 +3152,33 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
                         }
                         prevHandsMidDist = midDist;
                     } else prevHandsMidDist = null;
+ /* ── RIGHT‑hand single‑pinch → camera orbit ───────────────────────── */
+                    if ( R && R.dist < PINCH_THRESHOLD && !( L && L.dist < PINCH_THRESHOLD ) ) {
 
+                    // ① pinch just started
+                    if ( !rightPinchActive ) {
+                        rightPinchActive   = true;
+                        rightPinchStartMid = { ...R.mid };          // remember initial mid‑point
+                    }
+
+                    // ② delta since last frame (screen‑space −1…+1, Y flipped so +Y = up)
+                    const dX =  ( R.mid.x - rightPinchStartMid.x );
+                    const dY = -( R.mid.y - rightPinchStartMid.y );
+
+                    // ③ apply orbit (scale by sensitivity)
+                    orbitCamera( -dX * RIGHT_ROTATE_SENSITIVITY,
+                                -dY * RIGHT_ROTATE_SENSITIVITY,
+                                    0 );
+
+                    orbitControls.update();               // keep damping in sync
+
+                    // ④ reset start point so movement is incremental
+                    rightPinchStartMid = { ...R.mid };
+
+                    } else {
+                    rightPinchActive   = false;
+                    rightPinchStartMid = null;
+                    }
                     /* ── glow line on any pinched hand (unchanged) ------------------------ */
                     ['Left', 'Right'].forEach(name => {
                         const h = hands[name];
