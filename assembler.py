@@ -590,18 +590,40 @@ class Assembler:
             self.context_path = self.repo.json_repo.path
         else:
             from pathlib import Path
+            import shutil
             from context import sanitize_jsonl
 
             # ensure our storage directory exists
             base = Path("context_repos")
             base.mkdir(parents=True, exist_ok=True)
 
-            # build per-chat filenames under that dir
-            filename     = Path(context_path).name
-            jsonl_file   = base / filename
-            sqlite_file  = base / filename.replace(".jsonl", ".db")
+            # derive per-chat filenames under that dir
+            filename    = Path(context_path).name            # e.g. "12345.jsonl"
+            jsonl_file  = base / filename                    # context_repos/12345.jsonl
+            sqlite_file = base / filename.replace(".jsonl", ".db")             # context_repos/12345.db
+            corrupt_file = base / f"{filename}.corrupt"       # context_repos/12345.jsonl.corrupt
 
-            # initialize empty JSONL if needed
+            # look for any existing files in the CWD and move them in
+            cwd_jsonl   = Path.cwd() / filename
+            cwd_db      = Path.cwd() / filename.replace(".jsonl", ".db")
+            cwd_corrupt = Path.cwd() / f"{filename}.corrupt"
+
+            if cwd_jsonl.exists():
+                if jsonl_file.exists():
+                    jsonl_file.unlink()
+                shutil.move(str(cwd_jsonl), str(jsonl_file))
+
+            if cwd_db.exists():
+                if sqlite_file.exists():
+                    sqlite_file.unlink()
+                shutil.move(str(cwd_db), str(sqlite_file))
+
+            if cwd_corrupt.exists():
+                if corrupt_file.exists():
+                    corrupt_file.unlink()
+                shutil.move(str(cwd_corrupt), str(corrupt_file))
+
+            # initialize empty JSONL if it still doesn't exist
             sanitize_jsonl(str(jsonl_file))
 
             # create the Hybrid repo
@@ -613,6 +635,7 @@ class Assembler:
 
             # remember the actual on‑disk JSONL path for later pruning
             self.context_path = str(jsonl_file)
+
 
         import tools
         tools.repo = self.repo            # for module-level tools

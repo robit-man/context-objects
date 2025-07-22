@@ -152,17 +152,48 @@ async def _send_long_text_async(
             logger.warning(f"pin scheduling failed for msg {msg.message_id}: {e}")
 
 def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridContextRepository:
-    # ensure our subfolder exists
+    from pathlib import Path
+    import shutil
+    from context import sanitize_jsonl
+
+    # 1) Ensure our storage directory exists
     base = Path("context_repos")
-    base.mkdir(exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
 
-    # build filenames under that folder
-    jsonl_path  = base / f"context_{chat_id}.jsonl"
-    sqlite_path = base / f"context_{chat_id}.db"
+    # 2) Filenames for this chat
+    filename_jsonl    = f"context_{chat_id}.jsonl"
+    filename_db       = f"context_{chat_id}.db"
+    filename_corrupt  = f"{filename_jsonl}.corrupt"
 
-    # if no JSONL exists yet, create an empty one
+    # 3) Paths in context_repos/
+    jsonl_path   = base / filename_jsonl
+    sqlite_path  = base / filename_db
+    corrupt_path = base / filename_corrupt
+
+    # 4) Look in CWD for any existing files and move them in
+    cwd_jsonl    = Path.cwd() / filename_jsonl
+    cwd_db       = Path.cwd() / filename_db
+    cwd_corrupt  = Path.cwd() / filename_corrupt
+
+    if cwd_jsonl.exists():
+        if jsonl_path.exists():
+            jsonl_path.unlink()
+        shutil.move(str(cwd_jsonl), str(jsonl_path))
+
+    if cwd_db.exists():
+        if sqlite_path.exists():
+            sqlite_path.unlink()
+        shutil.move(str(cwd_db), str(sqlite_path))
+
+    if cwd_corrupt.exists():
+        if corrupt_path.exists():
+            corrupt_path.unlink()
+        shutil.move(str(cwd_corrupt), str(corrupt_path))
+
+    # 5) Initialize an empty JSONL if needed
     sanitize_jsonl(str(jsonl_path))
 
+    # 6) Create and return the repository
     return HybridContextRepository(
         jsonl_path=str(jsonl_path),
         sqlite_path=str(sqlite_path),
