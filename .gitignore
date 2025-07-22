@@ -11,6 +11,8 @@
 *.pem
 venv
 agent_stack.json
+tts_output
+context_repos
 captures
 config.json
 tts_ogg

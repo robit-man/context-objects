@@ -3,15 +3,15 @@
 import os
 import uuid
 import json
-import math
 import logging
 import sqlite3
 import threading
 import contextlib
 import numpy as np
+from pathlib import Path
+import json, collections
 from threading import Lock
 from json import JSONDecodeError
-import math, time, json, collections
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional
@@ -692,10 +692,22 @@ class HybridContextRepository:
         sqlite_path: str = "context.db",
         archive_max_mb: float = 10.0,   # max JSONL size in megabytes
     ):
-        self.json_repo = JSONLContextRepository(jsonl_path)
-        self.sql_repo  = SQLiteContextRepository(sqlite_path)
+        # ─── ensure our subfolder exists ───────────────────────────────
+        base_dir = Path("context_repos")
+        base_dir.mkdir(exist_ok=True)
+
+        # ─── force both paths into that folder ─────────────────────────
+        jsonl_filename   = Path(jsonl_path).name
+        sqlite_filename  = Path(sqlite_path).name
+        jsonl_full_path  = str(base_dir / jsonl_filename)
+        sqlite_full_path = str(base_dir / sqlite_filename)
+
+        # ─── wire up underlying repositories ────────────────────────────
+        self.json_repo  = JSONLContextRepository(jsonl_full_path)
+        self.sql_repo   = SQLiteContextRepository(sqlite_full_path)
         self._max_bytes = int(archive_max_mb * 1024 * 1024)
-        HybridContextRepository._singleton = self                 # register singleton
+
+        HybridContextRepository._singleton = self  # register singleton
 
     def save(self, ctx: ContextObject) -> None:
         # always append the new object
@@ -747,15 +759,10 @@ class HybridContextRepository:
             except Exception:
                 continue
 
-            # <<< NEW: skip tool-code artifacts entirely >>>
-            if obj.domain == "artifact" and obj.component == "prompt":
+            # <<< skip prompt & schema artifacts >>>
+            if obj.domain == "artifact" and obj.component in ("prompt", "schema"):
                 continue
 
-            # never archive schema artifacts either
-            if obj.domain == "artifact" and obj.component == "schema":
-                continue
-
-            # track (index, timestamp, object)
             ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
             entries.append((idx, ts, obj))
 
@@ -763,7 +770,6 @@ class HybridContextRepository:
         entries.sort(key=lambda x: x[1])
 
         to_remove = set()
-        # remove oldest until under size limit
         for idx, ts, obj in entries:
             # archive into SQLite
             self.sql_repo.save(obj)
@@ -784,7 +790,6 @@ class HybridContextRepository:
                 if i not in to_remove:
                     f.write(l)
 
-
     @classmethod
     def instance(cls) -> "ContextRepository":
         """
@@ -793,8 +798,8 @@ class HybridContextRepository:
         """
         if cls._singleton is None:
             raise RuntimeError("ContextRepository has not been initialised yet")
-        
         return cls._singleton
+
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║            H O L O G R A P H I C   M E M O R Y               ║

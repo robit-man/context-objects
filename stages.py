@@ -503,7 +503,6 @@ def _stage4_intent_clarification(
         msgs,
         tag="[Clarifier]",
         images=state.get("images"),
-        on_token=on_token,
     ).strip()
 
     # ------------------------------------------------------------------ #
@@ -523,23 +522,7 @@ def _stage4_intent_clarification(
         return None
 
     clar = _as_json(out)
-    if clar is None:
-        # one retry with minimal system reminder
-        retry_sys = (
-            "⚠️ Output MUST be valid JSON with keys "
-            '"keywords" (array) and "notes" (string). '
-            'Optionally "debug_notes" (array).'
-        )
-        out_retry = self._stream_and_capture(
-            self.primary_model,
-            [
-                {"role": "system", "content": retry_sys},
-                {"role": "user",   "content": out},
-            ],
-            tag="[ClarifierRetry]",
-            images=state.get("images"),
-        ).strip()
-        clar = _as_json(out_retry)
+
 
     # Final fallback: wrap raw text
     if clar is None:
@@ -580,7 +563,7 @@ def _stage4_intent_clarification(
     clar_ctx.touch()
     self.repo.save(clar_ctx)
     # embed for later retrieval
-    self.memman.register_relationships(clar_ctx, self.embed_text)
+    #self.memman.register_relationships(clar_ctx, self.embed_text)
 
     return clar_ctx
 
@@ -692,7 +675,7 @@ def _stage5_external_knowledge(
     ext_ctx.touch()
     self.repo.save(ext_ctx)
     # 🔑  **register embedding so future similarity queries can find it**
-    self.memman.register_relationships(ext_ctx, self.embed_text)
+    #self.memman.register_relationships(ext_ctx, self.embed_text)
 
     # ------------------------------------------------------------------ #
     # 5) Optional debug print                                            #
@@ -1925,7 +1908,6 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         msgs,
         tag="[Assistant]",
         images=state.get("images"),
-        on_token=on_token,
     ).strip()
 
     # ─── 9) Persist assistant reply ─────────────────────────────────

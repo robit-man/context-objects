@@ -587,13 +587,32 @@ class Assembler:
         # — init context store & memory manager —
         if repo is not None:
             self.repo = repo
+            self.context_path = self.repo.json_repo.path
         else:
-            sqlite_path = context_path.replace(".jsonl", ".db")
+            from pathlib import Path
+            from context import sanitize_jsonl
+
+            # ensure our storage directory exists
+            base = Path("context_repos")
+            base.mkdir(parents=True, exist_ok=True)
+
+            # build per-chat filenames under that dir
+            filename     = Path(context_path).name
+            jsonl_file   = base / filename
+            sqlite_file  = base / filename.replace(".jsonl", ".db")
+
+            # initialize empty JSONL if needed
+            sanitize_jsonl(str(jsonl_file))
+
+            # create the Hybrid repo
             self.repo = HybridContextRepository(
-                jsonl_path=context_path,
-                sqlite_path=sqlite_path,
+                jsonl_path=str(jsonl_file),
+                sqlite_path=str(sqlite_file),
                 archive_max_mb=self.cfg.get("archive_max_mb", 10.0),
             )
+
+            # remember the actual on‑disk JSONL path for later pruning
+            self.context_path = str(jsonl_file)
 
         import tools
         tools.repo = self.repo            # for module-level tools
@@ -623,7 +642,7 @@ class Assembler:
         )
         
         from context import sanitize_jsonl
-        sanitize_jsonl(self.context_path)
+        sanitize_jsonl(self.repo.json_repo.path)
         self._seed_tool_schemas()
         self._seed_static_prompts()
 
@@ -778,7 +797,7 @@ class Assembler:
         """
         import os, sys, json, tempfile
 
-        path         = self.context_path
+        path         = self.repo.json_repo.path
         corrupt_path = path + ".corrupt"
         seen: dict[str, dict] = {}
         total, bad = 0, 0
@@ -842,8 +861,8 @@ class Assembler:
         • UPDATE        – if the stored JSON differs from canonical.
         • DEDUPE in-repo– keep only the newest, delete extras.
         • PURGE/ARCHIVE – if a schema exists for a tool name
-                          that's been removed from TOOL_SCHEMAS.
-        • DISK-CLEANUP  – rewrite context.jsonl to remove duplicate lines.
+                        that's been removed from TOOL_SCHEMAS.
+        • DISK-CLEANUP  – rewrite the on‐disk JSONL to remove duplicate lines.
         """
         import json
         from context import sanitize_jsonl
@@ -852,7 +871,6 @@ class Assembler:
         from tools import Tools, TOOL_SCHEMAS
         TOOL_SCHEMAS.clear()
         Tools.generate_all_tool_schemas()
-        # cache for introspection or later use
         self.tool_schemas = {name: schema for name, schema in TOOL_SCHEMAS.items()}
 
         # ── 1) bucket existing ContextObjects by tool name ────────────────
@@ -903,31 +921,29 @@ class Assembler:
             if name not in TOOL_SCHEMAS:
                 rows.sort(key=lambda c: c.timestamp, reverse=True)
                 keep, *extras = rows
-                # delete extras
                 for e in extras:
                     self.repo.delete(e.context_id)
-                # mark the keeper as legacy
                 if "legacy_tool_schema" not in keep.tags:
                     keep.tags.append("legacy_tool_schema")
-                # remove the old tag
                 keep.tags = [t for t in keep.tags if t != "tool_schema"]
                 keep.touch()
                 self.repo.save(keep)
 
-        # ── 4) cleanup the on-disk JSONL ───────────────────────────────────
-        sanitize_jsonl(self.context_path)
+        # ── 4) cleanup the on‐disk JSONL ───────────────────────────────────
+        jsonl_path = self.repo.json_repo.path
+        sanitize_jsonl(jsonl_path)
         self._prune_jsonl_duplicates()
+
 
 
     def _seed_static_prompts(self) -> None:
         """
         Guarantee exactly one ContextObject for each static system prompt:
-         - INSERT if missing
-         - UPDATE if text differs
-         - DEDUPE extras
+        - INSERT if missing
+        - UPDATE if text differs
+        - DEDUPE extras
 
-        Afterwards, rewrite context.jsonl so that every JSON line is minified
-        (no spaces between keys and values).
+        Afterwards, rewrite JSONL so that every JSON line is minified.
         """
         # ── 1) Build our table of desired prompts ───────────────────────
         self.system_prompts = {
@@ -942,10 +958,10 @@ class Assembler:
             "critic_prompt":           self.critic_prompt,
             "narrative_mull_prompt":   self.narrative_mull_prompt,
         }
-        static = dict(self.system_prompts)  # alias
+        static = dict(self.system_prompts)
 
         # ── 2) Bucket existing ContextObjects by semantic_label ─────────
-        buckets: Dict[str, List[ContextObject]] = {}
+        buckets: dict[str, list[ContextObject]] = {}
         for ctx in self.repo.query(lambda c: c.component == "prompt"):
             buckets.setdefault(ctx.semantic_label, []).append(ctx)
 
@@ -982,27 +998,27 @@ class Assembler:
                 keeper.touch()
                 self.repo.save(keeper)
 
-        # ── 4) Sanitize + prune duplicates (this will already minify new entries) ─
+        # ── 4) Sanitize + prune duplicates ───────────────────────────────
         from context import sanitize_jsonl
-        sanitize_jsonl(self.context_path)
+        jsonl_path = self.repo.json_repo.path
+        sanitize_jsonl(jsonl_path)
         self._prune_jsonl_duplicates()
 
-        # ── 5) Finally, rewrite *every* line as compact JSON ────────────────
+        # ── 5) Finally, rewrite *every* line as compact JSON ─────────────
         import json
         minified = []
-        with open(self.context_path, "r", encoding="utf-8") as infile:
+        with open(jsonl_path, "r", encoding="utf-8") as infile:
             for line in infile:
                 try:
                     obj = json.loads(line)
                     minified.append(obj)
                 except json.JSONDecodeError:
-                    # skip malformed / corrupt lines
                     continue
 
-        with open(self.context_path, "w", encoding="utf-8") as outfile:
+        with open(jsonl_path, "w", encoding="utf-8") as outfile:
             for obj in minified:
-                # NO spaces between keys & values
                 outfile.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
 
 
 
@@ -2237,7 +2253,7 @@ class Assembler:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
 
         # ─── Sanitize context store on disk ──────────────────────────────────
-        sanitize_jsonl(self.context_path)
+        sanitize_jsonl(self.repo.json_repo.path)
 
         # ─── Early exit on blank input ───────────────────────────────────────
         if not user_text or not user_text.strip():

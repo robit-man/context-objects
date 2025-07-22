@@ -152,12 +152,20 @@ async def _send_long_text_async(
             logger.warning(f"pin scheduling failed for msg {msg.message_id}: {e}")
 
 def make_per_chat_repo(chat_id: int, archive_max_mb: float = 10.0) -> HybridContextRepository:
-    jsonl_path  = f"context_{chat_id}.jsonl"
-    sqlite_path = f"context_{chat_id}.db"
-    sanitize_jsonl(jsonl_path)
+    # ensure our subfolder exists
+    base = Path("context_repos")
+    base.mkdir(exist_ok=True)
+
+    # build filenames under that folder
+    jsonl_path  = base / f"context_{chat_id}.jsonl"
+    sqlite_path = base / f"context_{chat_id}.db"
+
+    # if no JSONL exists yet, create an empty one
+    sanitize_jsonl(str(jsonl_path))
+
     return HybridContextRepository(
-        jsonl_path=jsonl_path,
-        sqlite_path=sqlite_path,
+        jsonl_path=str(jsonl_path),
+        sqlite_path=str(sqlite_path),
         archive_max_mb=archive_max_mb,
     )
 
@@ -406,6 +414,7 @@ def _make_status_cb(
     max_lines: int = 30,
     min_interval: float = 5,
 ):
+    # No‐ops on Windows
     if os.name == "nt":
         def _noop_status(stage: str, output: Any):
             return
@@ -414,6 +423,7 @@ def _make_status_cb(
         return _noop_status, _noop_stop
 
     from typing import List, Any
+    global assemblers  # map of chat_id → Assembler instance
     history: List[str] = []
     last_edit_at: float = 0.0
     pending_handle = None
@@ -424,12 +434,14 @@ def _make_status_cb(
         if disabled or msg_id is None:
             return
         header = f"`context_{chat_id}.jsonl` updating...\n"
-        body = "\n".join(history[-max_lines:])
-        text = header + body
+        body   = "\n".join(history[-max_lines:])
+        text   = header + body
         try:
             await bot.edit_message_text(
-                chat_id=chat_id, message_id=msg_id,
-                text=text, parse_mode="Markdown"
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="Markdown"
             )
         except:
             pass
@@ -445,18 +457,48 @@ def _make_status_cb(
             asyncio.run_coroutine_threadsafe(_do_edit(), loop)
         else:
             pending_handle = loop.call_later(
-                delay, lambda: asyncio.run_coroutine_threadsafe(_do_edit(), loop)
+                delay,
+                lambda: asyncio.run_coroutine_threadsafe(_do_edit(), loop)
             )
 
     def status_cb(stage: str, output: Any):
         nonlocal history
         if disabled:
             return
+
+        # 1) update the pinned‐message UI
         snippet = str(output).replace("\n", " ")
         if len(snippet) > 1000:
             snippet = snippet[:997] + "…"
         history.append(f"• *{stage}*: {snippet}")
         _schedule_edit()
+
+        # 2) only send voice when this stage is in tts_live_stages
+        chat_asm = assemblers.get(chat_id)
+        live_stages = getattr(chat_asm, "tts_live_stages", set()) if chat_asm else set()
+        if stage not in live_stages:
+            return
+
+        # 3) drain any queued .ogg files and send them immediately
+        while True:
+            try:
+                ogg_path = chat_asm.tts._ogg_q.get_nowait()
+            except _queue.Empty:
+                break
+            else:
+                def _send(ogg=ogg_path):
+                    try:
+                        with open(ogg, "rb") as vf:
+                            asyncio.create_task(
+                                bot.send_voice(
+                                    chat_id=chat_id,
+                                    voice=vf,
+                                    reply_to_message_id=msg_id
+                                )
+                            )
+                    except Exception:
+                        pass
+                loop.call_soon_threadsafe(_send)
 
     def stop_cb():
         nonlocal disabled, pending_handle
@@ -465,6 +507,7 @@ def _make_status_cb(
             pending_handle.cancel()
 
     return status_cb, stop_cb
+
 
 async def _start_runner_for_pin(
     chat_asm, bot, chat_id: int,
@@ -1066,27 +1109,33 @@ def telegram_input(asm):
                     # a) update UI or no-op
                     orig_status(stage, info)
 
-                    # b) drain any new .ogg files and send them right away
+                    # b) only send voice for configured live stages
+                    if stage not in chat_asm.tts_live_stages:
+                        return
+
+                    # c) drain any new .ogg files and send them right away
                     while True:
                         try:
                             ogg_path = chat_asm.tts._ogg_q.get_nowait()
                         except _queue.Empty:
                             break
                         else:
-                            # schedule the voice send on the event loop
+                            # schedule the voice send on the event loop,
+                            # pass the file path so telegram uploads directly
                             def _send(ogg=ogg_path):
                                 try:
-                                    vf = open(ogg, "rb")
                                     asyncio.create_task(
                                         bot.send_voice(
-                                            chat_id,
-                                            vf,
+                                            chat_id=chat_id,
+                                            voice=str(ogg),
                                             reply_to_message_id=reply_to_id
                                         )
                                     )
                                 except Exception:
                                     pass
                             loop.call_soon_threadsafe(_send)
+
+
 
 
                 async def runner():
