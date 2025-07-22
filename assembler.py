@@ -630,10 +630,6 @@ class Assembler:
         self.tts_live_stages = set(
             self.cfg.get("tts_live_stages", [
                 "announcement",
-                "record_input",
-                "intent_clarification",
-                "planning_summary",
-                "assemble_and_infer",
                 "final_inference",
             ])
         )
@@ -2172,7 +2168,7 @@ class Assembler:
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
-            history_size=1,
+            history_size=3,
             var_names=["arg1", "arg2"],
             record=False
         )
@@ -2192,7 +2188,7 @@ class Assembler:
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
-            history_size=1,
+            history_size=3,
             var_names=["arg1", "arg2"],
             record=False
         )
@@ -2448,13 +2444,6 @@ class Assembler:
 
         # ─── With-tools branch ──────────────────────────────────────────────
         prepared = self._stage6_prepare_tools()
-        tools_list = [t["name"] for t in prepared]
-        announce = (
-            "Got it! This may take a moment—I’ll be using: "
-            + ", ".join(tools_list[:3])
-            + " …"
-        )
-        status_cb("announcement", announce)
 
         # Stage 1
         try:
@@ -2602,6 +2591,33 @@ class Assembler:
         except Exception as e:
             status_cb("plan_validation_error", str(e))
             state["errors"].append(("plan_validation", str(e)))
+        
+        # ─── Dynamic announcement via LLM ────────────────────────────────
+        selected = [call.split("(",1)[0] for call in state.get("fixed_calls", [])]
+        if selected:
+            # summarize tool names (up to 3)
+            if len(selected) > 3:
+                preview = ", ".join(selected[:3]) + f", and {len(selected)-3} more"
+            else:
+                preview = ", ".join(selected)
+
+            system_prompt = (
+                "You are a helpful assistant preparing to run a set of tools for the user. "
+                "Given the list of tool names, generate a single, friendly sentence announcing "
+                "which tools you will use next."
+            )
+            user_prompt = f"Tools to be used: {preview}."
+
+            announcement = self._stream_and_capture(
+                self.primary_model,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                tag="[Announcement]"
+            ).strip()
+
+            status_cb("announcement", announcement)
 
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
