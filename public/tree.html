@@ -75,6 +75,7 @@
             box-shadow: inset 0px -50px 20px #c8fff7aa, 0px 0px 100px #00ff04, 0px 0px 300px #2600ffbd, 0px 0px 500px #aeffd780, 0px 0px 700px #ff835aa3;
             background: rgb(255, 255, 255);
         }
+
         #light1 {
 
             position: fixed;
@@ -406,7 +407,11 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let pickableMeshes = [];
         let visibleMeshes = [];
         let initialLoadDone = false;
+        let headSmoothQuat = new THREE.Quaternion();
 
+        // at top of your module, next to headSmoothQuat:
+        let prevHeadSmoothQuat = new THREE.Quaternion(); // identity
+        const headEulerTemp = new THREE.Euler(0, 0, 0, 'YXZ');
         // ─── BRAIN vs TREE MODE ─────────────────────────────────────────────
         const modeSwitch = document.getElementById('modeswitch');
         let brainMode = true;
@@ -451,7 +456,8 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let lastLeftPinchMid = null;
         let lastTwoHandPinchDist = null;
         const ROT_SENSITIVITY = 2.0;
-        const PAN_SENSITIVITY = 50.0;
+        const PAN_SENSITIVITY = 100.0;
+        const PAN_BOOST = 50.0;    // overall multiplier—crank this up for more oomph
         const BOOST_INCREMENT = 50;    // how much boost you gain per rapid event
         const BOOST_DECAY = 0.75;   // how quickly boost winds down
         const BOOST_MAX = 1000;      // cap on boost multiplier
@@ -477,7 +483,7 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         let hueMapCurrent = {};
         let maxConnCurrent = 1;
         // ─── right‑hand pinch → orbit ──────────────────────────────
-        let rightPinchActive   = false;
+        let rightPinchActive = false;
         let rightPinchStartMid = null;          // {x,y} of pinch‑mid at activation
         const RIGHT_ROTATE_SENSITIVITY = 4.0;   // tweak to taste
         let cameraTween = null;
@@ -510,8 +516,10 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             const origin = window.location.origin;
             // Which file to load (defaults to context.jsonl):
             const fn = fileSelector.value || 'context.jsonl';
-            // Build a cache‑busted URL if requested:
-            const url = `${origin}/${fn}` + (cacheBust ? `?_=${Date.now()}` : '');
+            // Build the URL pointing at context_repos/:
+            const urlPath = `context_repos/${fn}`;
+            // Append a cache‑busting query if requested:
+            const url = `${origin}/${urlPath}${cacheBust ? `?_=${Date.now()}` : ''}`;
             console.log('[getContextFileUrl] →', url);
             return url;
         }
@@ -538,43 +546,49 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
         }
         async function populateFileSelector() {
             try {
-                const res = await fetch(window.location.origin + '/', { cache: 'no-store' });
+                const origin = window.location.origin;
+                // 1) hit our context_repos directory
+                const res = await fetch(`${origin}/context_repos/`, { cache: 'no-store' });
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const txt = await res.text();
                 let files = [];
 
-                // 1) try JSON
+                // 2) JSON‐array listing?
                 try {
                     const arr = JSON.parse(txt);
                     if (Array.isArray(arr)) {
-                        files = arr;
+                        files = arr.map(p => p.replace(/^context_repos\//, ''));
                     } else {
                         throw new Error('JSON is not an array');
                     }
                 } catch (jsonErr) {
-                    console.warn('Could not parse / as JSON, falling back to HTML scrape:', jsonErr);
-                    // 2) fallback — pull href="context_....jsonl"
-                    const regex = /href="(context(?:_-?\d+)?\.jsonl)"/g;
+                    console.warn('Could not parse /context_repos/ as JSON, falling back to HTML scrape:', jsonErr);
+                    // 3) HTML listing → grab any .jsonl link
+                    const regex = /href="([^"]+\.jsonl)"/g;
                     let m;
                     while ((m = regex.exec(txt))) {
-                        files.push(m[1]);
+                        // strip off any leading path
+                        const name = m[1].replace(/^.*\//, '');
+                        if (/^context(?:_-?\d+)?\.jsonl$/.test(name)) {
+                            files.push(name);
+                        }
                     }
                 }
 
-                // 3) dedupe & filter & sort
-                const unique = Array.from(new Set(files))
-                    .filter(f => /^context(?:_-?\d+)?\.jsonl$/.test(f))
-                    .sort();
+                // 4) dedupe and sort
+                const unique = Array.from(new Set(files)).sort();
 
-                // 4) rebuild the <select>
+                // 5) rebuild the <select>
                 fileSelector.innerHTML = unique
                     .map(f => `<option value="${f}">${f}</option>`)
                     .join('');
 
-                // 5) restore last selection if present
+                // 6) restore last selection or pick the first one
                 const saved = localStorage.getItem(STORAGE_KEY);
                 if (saved && unique.includes(saved)) {
                     fileSelector.value = saved;
+                } else if (unique.length) {
+                    fileSelector.value = unique[0];
                 }
 
             } catch (err) {
@@ -2065,79 +2079,79 @@ border:1px solid #555; line-height:1.75!important;padding: 0.25rem; color:#fff; 
             timeToggle.textContent = timeMode ? 'Dolly ON' : 'Time Mode';
             orbitControls.enableRotate = !timeMode;
         });//////////////////////////////////////////////////////////////////////////
-// THREE.JS SETUP
-//////////////////////////////////////////////////////////////////////////
-const scene = new THREE.Scene();
-scene.background = null;                          // let CSS paint the black
+        // THREE.JS SETUP
+        //////////////////////////////////////////////////////////////////////////
+        const scene = new THREE.Scene();
+        scene.background = null;                          // let CSS paint the black
 
-// ─── CAMERA ──────────────────────────────────────────────────────────
-const camera = new THREE.PerspectiveCamera(
-    85,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    2e6
-);
-camera.position.set(0, -400, 0);
-camera.lookAt(0, 0, 0);
+        // ─── CAMERA ──────────────────────────────────────────────────────────
+        const camera = new THREE.PerspectiveCamera(
+            85,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            2e6
+        );
+        camera.position.set(0, -400, 0);
+        camera.lookAt(0, 0, 0);
 
-// ─── RENDERER ────────────────────────────────────────────────────────
-const DPR = Math.min(window.devicePixelRatio, 1.25);   // clamp high‑DPI
-const renderer = new THREE.WebGLRenderer({
-    antialias       : true,                     // drop MSAA → big win
+        // ─── RENDERER ────────────────────────────────────────────────────────
+        const DPR = Math.min(window.devicePixelRatio, 1.25);   // clamp high‑DPI
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,                     // drop MSAA → big win
 
-    powerPreference : 'high-performance'
-});
-renderer.setPixelRatio(DPR);
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.sortObjects = false;                    // skip depth‑sort
-document.body.appendChild(renderer.domElement);
+            powerPreference: 'high-performance'
+        });
+        renderer.setPixelRatio(DPR);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.sortObjects = false;                    // skip depth‑sort
+        document.body.appendChild(renderer.domElement);
 
-let prevTime = performance.now();
+        let prevTime = performance.now();
 
-// maximum turn rate (rad/s) and damping
-const KEY_MAX_SPEED = Math.PI;
-const KEY_DAMPING   = 5;   // higher = snappier, lower = floatier
+        // maximum turn rate (rad/s) and damping
+        const KEY_MAX_SPEED = Math.PI;
+        const KEY_DAMPING = 5;   // higher = snappier, lower = floatier
 
-// actual & target angular velocities
-let yawVelocity = 0,
-    pitchVelocity = 0,
-    yawTarget = 0,
-    pitchTarget = 0;
+        // actual & target angular velocities
+        let yawVelocity = 0,
+            pitchVelocity = 0,
+            yawTarget = 0,
+            pitchTarget = 0;
 
-// — for head‑pose tracking —
-let video, faceLandmarker, handLandmarker;
-const poseTransform = new THREE.Object3D();
-const prevEuler     = new THREE.Euler();
+        // — for head‑pose tracking —
+        let video, faceLandmarker, handLandmarker;
+        const poseTransform = new THREE.Object3D();
+        const prevEuler = new THREE.Euler();
 
-// — for hand‑landmark spheres/lines —
-const fingerGroup = new THREE.Group();
-scene.add(fingerGroup);
+        // — for hand‑landmark spheres/lines —
+        const fingerGroup = new THREE.Group();
+        scene.add(fingerGroup);
 
-// — orbitCamera helper (yaw, pitch, roll deltas) —
-function orbitCamera(dY, dP, dR) {
-    const T = orbitControls.target;
-    const O = camera.position.clone().sub(T);
+        // — orbitCamera helper (yaw, pitch, roll deltas) —
+        function orbitCamera(dY, dP, dR) {
+            const T = orbitControls.target;
+            const O = camera.position.clone().sub(T);
 
-    // yaw around world‑up
-    O.applyQuaternion(
-        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY)
-    );
+            // yaw around world‑up
+            O.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dY)
+            );
 
-    // pitch around camera‑right
-    const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
-    O.applyQuaternion(
-        new THREE.Quaternion().setFromAxisAngle(R, dP)
-    );
+            // pitch around camera‑right
+            const R = new THREE.Vector3().crossVectors(camera.up, O).normalize();
+            O.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(R, dP)
+            );
 
-    // roll around view direction
-    const F = O.clone().normalize();
-    camera.up.applyQuaternion(
-        new THREE.Quaternion().setFromAxisAngle(F, dR)
-    );
+            // roll around view direction
+            const F = O.clone().normalize();
+            camera.up.applyQuaternion(
+                new THREE.Quaternion().setFromAxisAngle(F, dR)
+            );
 
-    camera.position.copy(T).add(O);
-    camera.lookAt(T);
-}
+            camera.position.copy(T).add(O);
+            camera.lookAt(T);
+        }
 
         // — initialize webcam + MediaPipe models —
         async function initVision() {
@@ -3026,22 +3040,51 @@ function orbitCamera(dY, dP, dR) {
                 const fRes = faceLandmarker.detectForVideo(video, now);
                 const hRes = handLandmarker.detectForVideo(video, now);
 
-                /* 1a) head pose → camera (unchanged) ------------------------------------ */
-                if (fRes.facialTransformationMatrixes?.length) {
-                    const m = fRes.facialTransformationMatrixes[0].data;
-                    poseTransform.matrix.fromArray(m);
-                    poseTransform.matrix.decompose(
-                        poseTransform.position,
-                        poseTransform.quaternion,
-                        poseTransform.scale
-                    );
-                    const e = new THREE.Euler().setFromQuaternion(poseTransform.quaternion, 'YXZ');
-                    headSmooth.y = THREE.MathUtils.lerp(headSmooth.y, e.y - prevEuler.y, HEAD_SMOOTH_FACTOR);
-                    headSmooth.p = THREE.MathUtils.lerp(headSmooth.p, e.x - prevEuler.x, HEAD_SMOOTH_FACTOR);
-                    headSmooth.r = THREE.MathUtils.lerp(headSmooth.r, e.z - prevEuler.z, HEAD_SMOOTH_FACTOR);
-                    orbitCamera(-headSmooth.y, headSmooth.p, -headSmooth.r);
-                    prevEuler.copy(e);
-                }
+
+/* 1a) head pose → camera (fixed swap yaw/roll) */
+if (fRes.facialTransformationMatrixes?.length) {
+  // ① extract raw head quaternion
+  const m = fRes.facialTransformationMatrixes[0].data;
+  poseTransform.matrix.fromArray(m);
+  poseTransform.matrix.decompose(
+    poseTransform.position,
+    poseTransform.quaternion,
+    poseTransform.scale
+  );
+
+  // ② smooth
+  headSmoothQuat.slerp(poseTransform.quaternion, HEAD_SMOOTH_FACTOR);
+
+  // ③ delta = new ⊗ inverse(old)
+  const deltaQuat = headSmoothQuat
+    .clone()
+    .multiply(prevHeadSmoothQuat.clone().invert());
+
+  // ─── **swap yaw<->roll** ───────────────────────────────────────────
+  const fixedDelta = new THREE.Quaternion(
+    deltaQuat.x,  // pitch stays X
+    deltaQuat.z,  // swap: roll→Y
+    deltaQuat.y,  // swap: yaw → Z
+    deltaQuat.w   // scalar
+  );
+
+  // ④ apply around your orbitControls.target
+  const T = orbitControls.target;
+  camera.position
+    .sub(T)                 // to origin
+    .applyQuaternion(fixedDelta)
+    .add(T);                // back to world
+  camera.up.applyQuaternion(fixedDelta);
+
+  // ⑤ re‑aim and update
+  camera.lookAt(T);
+  orbitControls.update();
+
+  // ⑥ stash for next frame
+  prevHeadSmoothQuat.copy(headSmoothQuat);
+}
+
+
 
                 /* 1b) HANDS -------------------------------------------------------------- */
                 if (hRes.landmarks?.length) {
@@ -3115,69 +3158,95 @@ function orbitCamera(dY, dP, dR) {
                         document.body.appendChild(div); return div;
                     })();
 
+                    /* ── LEFT‑hand single‑pinch ➜ PAN (dolly slide) ----------------------- */
                     const L = hands.Left;
-                    if (L && L.dist < PINCH_THRESHOLD) {          // pinch is **ON**
-                        if (!leftPinchActive) {                     // …just started
-                            leftPinchActive = true;
-                            leftPinchStartMid = { ...L.mid };           // shallow copy
-                        }
-                        // delta in normalised screen space (‑1…1).  Flip Y so +Y = up.
-                        leftPinchDelta.x = (L.mid.x - leftPinchStartMid.x);
-                        leftPinchDelta.y = -(L.mid.y - leftPinchStartMid.y);
+                    const R = hands.Right;
 
-                        // write to HUD
-                        dDrop.textContent =
-                            `Δx: ${leftPinchDelta.x.toFixed(3)}   Δy: ${leftPinchDelta.y.toFixed(3)}`;
-                    } else {                                      // pinch released
+                    if (L && L.dist < PINCH_THRESHOLD && !(R && R.dist < PINCH_THRESHOLD)) {
+                        if (!leftPinchActive) {
+                            leftPinchActive = true;
+                            leftPinchStartMid = { ...L.mid };
+                        }
+
+                        const rawDx = L.mid.x - leftPinchStartMid.x;
+                        const rawDy = -(L.mid.y - leftPinchStartMid.y);
+                        const accelX = Math.sign(rawDx) * Math.pow(Math.abs(rawDx), 1.2);
+                        const accelY = Math.sign(rawDy) * Math.pow(Math.abs(rawDy), 1.2);
+
+                        // camera‑relative right
+                        const rightVec = new THREE.Vector3();
+                        camera.getWorldDirection(rightVec);
+                        rightVec.cross(camera.up).normalize();
+
+                        // camera‑relative up
+                        const upVec = new THREE.Vector3(0, 1, 0)
+                            .applyQuaternion(camera.quaternion)
+                            .normalize();
+
+                        // pan amounts
+                        const panX = accelX * PAN_SENSITIVITY * PAN_BOOST;
+                        const panY = accelY * PAN_SENSITIVITY * PAN_BOOST * -1;
+
+                        // apply pans
+                        camera.position.addScaledVector(rightVec, panX);
+                        orbitControls.target.addScaledVector(rightVec, panX);
+
+                        camera.position.addScaledVector(upVec, panY);
+                        orbitControls.target.addScaledVector(upVec, panY);
+
+                        orbitControls.update();
+                        leftPinchStartMid = { ...L.mid };
+                    }
+                    else {
                         if (leftPinchActive) {
                             leftPinchActive = false;
                             leftPinchStartMid = null;
-                            leftPinchDelta.x = leftPinchDelta.y = 0;
-                            dDrop.textContent = '(pinch released)';
                         }
                     }
 
-                    
-                   
-                    /* ── two‑hand pinch zoom (unchanged) ---------------------------------- */
-                    const R = hands.Right;
+                    // ── TWO‑finger pinch → dolly in/out along camera’s local Z ──
                     if (L && R && L.dist < PINCH_THRESHOLD && R.dist < PINCH_THRESHOLD) {
-                        const dx = L.mid.x - R.mid.x, dy = L.mid.y - R.mid.y;
+                        const dx = L.mid.x - R.mid.x;
+                        const dy = L.mid.y - R.mid.y;
                         const midDist = Math.hypot(dx, dy);
+
                         if (prevHandsMidDist !== null) {
                             const dd = midDist - prevHandsMidDist;
-                            const zoom = dd * ZOOM_SENSITIVITY;
-                            const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
-                            camera.position.addScaledVector(dir, zoom); orbitControls.update();
+                            // translateZ positive moves camera *forward*, so invert sign
+                            camera.translateZ(-dd * ZOOM_SENSITIVITY);
+                            orbitControls.update();
                         }
+
                         prevHandsMidDist = midDist;
-                    } else prevHandsMidDist = null;
- /* ── RIGHT‑hand single‑pinch → camera orbit ───────────────────────── */
-                    if ( R && R.dist < PINCH_THRESHOLD && !( L && L.dist < PINCH_THRESHOLD ) ) {
-
-                    // ① pinch just started
-                    if ( !rightPinchActive ) {
-                        rightPinchActive   = true;
-                        rightPinchStartMid = { ...R.mid };          // remember initial mid‑point
+                    } else {
+                        prevHandsMidDist = null;
                     }
+                    /* ── RIGHT‑hand single‑pinch → camera orbit ───────────────────────── */
+                    if (R && R.dist < PINCH_THRESHOLD && !(L && L.dist < PINCH_THRESHOLD)) {
 
-                    // ② delta since last frame (screen‑space −1…+1, Y flipped so +Y = up)
-                    const dX =  ( R.mid.x - rightPinchStartMid.x );
-                    const dY = -( R.mid.y - rightPinchStartMid.y );
+                        // ① pinch just started
+                        if (!rightPinchActive) {
+                            rightPinchActive = true;
+                            rightPinchStartMid = { ...R.mid };          // remember initial mid‑point
+                        }
 
-                    // ③ apply orbit (scale by sensitivity)
-                    orbitCamera( -dX * RIGHT_ROTATE_SENSITIVITY,
-                                -dY * RIGHT_ROTATE_SENSITIVITY,
-                                    0 );
+                        // ② delta since last frame (screen‑space −1…+1, Y flipped so +Y = up)
+                        const dX = (R.mid.x - rightPinchStartMid.x);
+                        const dY = -(R.mid.y - rightPinchStartMid.y);
 
-                    orbitControls.update();               // keep damping in sync
+                        // ③ apply orbit (scale by sensitivity)
+                        orbitCamera(-dX * RIGHT_ROTATE_SENSITIVITY,
+                            -dY * RIGHT_ROTATE_SENSITIVITY,
+                            0);
 
-                    // ④ reset start point so movement is incremental
-                    rightPinchStartMid = { ...R.mid };
+                        orbitControls.update();               // keep damping in sync
+
+                        // ④ reset start point so movement is incremental
+                        rightPinchStartMid = { ...R.mid };
 
                     } else {
-                    rightPinchActive   = false;
-                    rightPinchStartMid = null;
+                        rightPinchActive = false;
+                        rightPinchStartMid = null;
                     }
                     /* ── glow line on any pinched hand (unchanged) ------------------------ */
                     ['Left', 'Right'].forEach(name => {
