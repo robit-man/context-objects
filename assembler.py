@@ -2336,6 +2336,7 @@ class Assembler:
 
         # ─── Fast‐path when tools are disabled ───────────────────────────────
         if not state["use_tools"]:
+            state["raw_calls"] = []
             status_cb("no_tools_start", "Skipping tool pipeline, going direct to assembly")
 
             # Stage 1

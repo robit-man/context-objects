@@ -585,7 +585,7 @@ def _make_status_cb(
 
         # 2) only send voice when this stage is in tts_live_stages
         chat_asm = assemblers.get(chat_id)
-        live_stages = getattr(chat_asm, "tts_live_stages", set()) if chat_asm else set()
+        live_stages = getattr(chat_asm, "tts_telegram_stages", set()) if chat_asm else set()
         if stage not in live_stages:
             return
 
@@ -981,6 +981,15 @@ def telegram_input(asm):
                 )
                 assemblers[chat_id] = chat_asm
 
+                chat_asm.tts_telegram_stages = {
+                    "record_input",
+                    "intent_clarification",
+                    "external_knowledge",   # reads snippets
+                    "announcement",         # “I’m about to run tools…”
+                    "assemble_and_infer",   # draft
+                    "final_inference",      # final answer
+                }
+
             chat_asm._chat_contexts.add(chat_id)
 
             # ── User & group registries ───────────────────────────────────────
@@ -1268,7 +1277,30 @@ def telegram_input(asm):
                         except Exception:
                             continue
 
-                    # 2) Run inference in file-mode, streaming audio into .ogg queue
+                async def runner():
+                    nonlocal placeholder_id, typing_task
+                    pre_oggs = []
+                    post_oggs = []
+
+                    # 0) Drain any stale audio queues so we only send fresh clips
+                    for q in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
+                        while True:
+                            try:
+                                q.get_nowait()
+                            except _queue.Empty:
+                                break
+
+                    # 1) Prepare any image payloads as base64 strings
+                    image_paths = metadata.get("image_paths", [])
+                    images_b64 = []
+                    for p in image_paths:
+                        try:
+                            data = Path(p).read_bytes()
+                            images_b64.append(base64.b64encode(data).decode("ascii"))
+                        except Exception:
+                            continue
+
+                    # 2) Run inference in file‐mode, streaming live tokens into .ogg queue
                     chat_asm.tts.set_mode("file")
                     try:
                         sink = chat_asm.tts.token_sink()
@@ -1279,17 +1311,18 @@ def telegram_input(asm):
                             images=images_b64 or None,
                             on_token=sink,
                         )
-                        sink(None)  # flush tokens
+                        sink(None)  # flush any remaining tokens
                         await asyncio.to_thread(chat_asm.tts._file_q.join)
                     except Exception:
                         logger.exception("run_with_meta_context failed")
                         final = ""
                     finally:
+                        # stop the live‐status callback and typing indicator
                         stop_status()
                         if typing_task:
                             typing_task.cancel()
 
-                    # 3) Collect pre-text .ogg clips
+                    # 3) Collect any OGG clips generated *before* the text reply
                     while True:
                         try:
                             ogg = chat_asm.tts._ogg_q.get_nowait()
@@ -1298,33 +1331,49 @@ def telegram_input(asm):
                         else:
                             pre_oggs.append(ogg)
 
-                    # 4) If no text, cleanup placeholder and exit
+                    # 4) If there's no text at all, clean up and exit
                     if not final.strip():
                         if placeholder_id:
                             try:
                                 await bot.delete_message(chat_id, placeholder_id)
-                            except: pass
+                            except:
+                                pass
                         running.pop((chat_id, bot.id), None)
                         return
 
-                    # 5) Send or edit text reply
+                    # 5) Send or edit the assistant's text reply
                     if debug_enabled:
+                        # edit the placeholder in debug mode
                         if len(final) < 4000:
                             sent = await bot.edit_message_text(
-                                chat_id=chat_id, message_id=placeholder_id, text=final
+                                chat_id=chat_id,
+                                message_id=placeholder_id,
+                                text=final
                             )
+                            target_id = sent.message_id
                         else:
+                            # delete placeholder & chunk long text
                             await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                            await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+                            await _send_long_text_async(
+                                bot, chat_id, final, reply_to=reply_to_id
+                            )
+                            target_id = reply_to_id
                     else:
+                        # normal send
                         if len(final) < 4000:
                             sent = await bot.send_message(
-                                chat_id=chat_id, text=final, reply_to_message_id=reply_to_id
+                                chat_id=chat_id,
+                                text=final,
+                                reply_to_message_id=reply_to_id
                             )
+                            target_id = sent.message_id
                         else:
-                            await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+                            await _send_long_text_async(
+                                bot, chat_id, final, reply_to=reply_to_id
+                            )
+                            target_id = reply_to_id
 
-                    # 6) Collect post-text .ogg clips
+                    # 6) Collect any OGG clips generated *after* the text reply
                     while True:
                         try:
                             ogg = chat_asm.tts._ogg_q.get_nowait()
@@ -1333,47 +1382,83 @@ def telegram_input(asm):
                         else:
                             post_oggs.append(ogg)
 
-                    # 7) Send all audio clips in order
-                    for ogg in pre_oggs + post_oggs:
-                        try:
-                            with open(ogg, "rb") as vf:
+                    # 7) Send all OGG clips in chronological order
+                    all_oggs = pre_oggs + post_oggs
+                    if all_oggs:
+                        # if exactly one clip, send it directly
+                        if len(all_oggs) == 1:
+                            path = all_oggs[0]
+                            if os.path.getsize(path) > 0:
+                                with open(path, "rb") as vf:
+                                    await bot.send_voice(
+                                        chat_id=chat_id,
+                                        voice=vf,
+                                        reply_to_message_id=target_id
+                                    )
+                        else:
+                            # concatenate into one OGG and send
+                            combined = os.path.join(
+                                tempfile.gettempdir(),
+                                f"combined_{uuid.uuid4().hex}.ogg"
+                            )
+                            inputs  = sum([["-i", p] for p in all_oggs], [])
+                            streams = "".join(f"[{i}:a]" for i in range(len(all_oggs)))
+                            filt    = f"{streams}concat=n={len(all_oggs)}:v=0:a=1,aresample=48000"
+                            subprocess.run(
+                                [
+                                    "ffmpeg", "-y", "-loglevel", "error",
+                                    *inputs,
+                                    "-filter_complex", filt,
+                                    "-c:a", "libopus",
+                                    "-b:a", "48k",
+                                    combined
+                                ],
+                                check=True
+                            )
+                            with open(combined, "rb") as vf:
                                 await bot.send_voice(
                                     chat_id=chat_id,
                                     voice=vf,
-                                    reply_to_message_id=(sent.message_id if "sent" in locals() else reply_to_id)
+                                    reply_to_message_id=target_id
                                 )
-                        except Exception:
-                            continue
 
-                    # 8) Send any search_images results
+                    # 8) (unchanged) Photo results from search_images tool calls
                     last = getattr(chat_asm, "_last_state", {}) or {}
                     for tc in last.get("tool_ctxs", []):
-                        name = tc.metadata.get("tool_call", "").split("(",1)[0]
+                        name = tc.metadata.get("tool_call", "").split("(", 1)[0]
                         if name == "search_images" and isinstance(tc.metadata.get("output"), list):
                             for img in tc.metadata["output"]:
                                 try:
-                                    # local file?
+                                    # local file first
                                     with open(img, "rb") as fimg:
-                                        await bot.send_photo(chat_id, photo=fimg, reply_to_message_id=reply_to_id)
+                                        await bot.send_photo(
+                                            chat_id, photo=fimg, reply_to_message_id=reply_to_id
+                                        )
                                 except:
-                                    await bot.send_photo(chat_id, photo=img, reply_to_message_id=reply_to_id)
+                                    await bot.send_photo(
+                                        chat_id, photo=img, reply_to_message_id=reply_to_id
+                                    )
 
-                    # 9) Pin/unpin final text
+                    # 9) Pin / unpin the final text (debug mode only)
                     if "sent" in locals():
                         try:
                             await bot.pin_chat_message(
-                                chat_id=chat_id, message_id=sent.message_id, disable_notification=True
+                                chat_id=chat_id,
+                                message_id=sent.message_id,
+                                disable_notification=True
                             )
                             asyncio.create_task(_delayed_unpin(bot, chat_id, sent.message_id))
-                        except: pass
+                        except:
+                            pass
 
-                    # 10) Cleanup & process next
+                    # 10) Cleanup & possibly start next queued request
                     running.pop((chat_id, bot.id), None)
                     try:
                         nxt, nxt_id = _pending[(chat_id, bot.id)].get_nowait()
                     except:
                         return
                     await start_runner(nxt, nxt_id)
+
 
                 running[(chat_id, bot.id)] = loop.create_task(runner())
 
