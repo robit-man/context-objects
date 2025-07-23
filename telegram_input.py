@@ -1247,133 +1247,133 @@ def telegram_input(asm):
                             loop.call_soon_threadsafe(_send)
 
 
-
-
                 async def runner():
                     nonlocal placeholder_id, typing_task
-                    try:
-                        # clear any queued audio
-                        for qobj in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
-                            while True:
-                                try: qobj.get_nowait()
-                                except _queue.Empty: break
+                    pre_oggs = []
+                    post_oggs = []
 
-                        chat_asm.tts.set_mode("file")
-                        image_paths = metadata.get("image_paths", [])
-                        images_b64 = []
-                        for p in image_paths:
-                            try:
-                                data = Path(p).read_bytes()
-                                images_b64.append(base64.b64encode(data).decode("ascii"))
-                            except Exception:
-                                continue
+                    # 0) Drain any stale audio queues
+                    for q in (chat_asm.tts._file_q, chat_asm.tts._ogg_q):
+                        while True:
+                            try: q.get_nowait()
+                            except _queue.Empty: break
+
+                    # 1) Prepare image payloads
+                    image_paths = metadata.get("image_paths", [])
+                    images_b64 = []
+                    for p in image_paths:
                         try:
-                            # switch into “file” (or “live”) mode as you already do
-                            chat_asm.tts.set_mode("file")
-
-                            # 1) grab a fresh buffered sink from TTSManager
-                            sink = chat_asm.tts.token_sink()
-
-                            # 2) run_with_meta_context, feeding tokens into our buffered sink
-                            final = await asyncio.to_thread(
-                                chat_asm.run_with_meta_context,
-                                request_text,
-                                status_cb,
-                                images=images_b64,
-                                on_token=sink,
-                            )
-
-                            # 3) force‑flush any remaining partial sentence
-                            sink(None)
-
-                            # 4) wait for all the file‑mode chunks to be generated
-                            await asyncio.to_thread(chat_asm.tts._file_q.join)
-
+                            data = Path(p).read_bytes()
+                            images_b64.append(base64.b64encode(data).decode("ascii"))
                         except Exception:
-                            logger.exception("run_with_meta_context failed")
-                            final = ""
-                        finally:
-                            stop_status()
-                            if typing_task:
-                                typing_task.cancel()
+                            continue
 
-                        if not final.strip():
-                            if placeholder_id:
-                                try:
-                                    await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                                except: pass
-                            return
+                    # 2) Run inference in file-mode, streaming audio into .ogg queue
+                    chat_asm.tts.set_mode("file")
+                    try:
+                        sink = chat_asm.tts.token_sink()
+                        final = await asyncio.to_thread(
+                            chat_asm.run_with_meta_context,
+                            request_text,
+                            status_cb,
+                            images=images_b64 or None,
+                            on_token=sink,
+                        )
+                        sink(None)  # flush tokens
+                        await asyncio.to_thread(chat_asm.tts._file_q.join)
+                    except Exception:
+                        logger.exception("run_with_meta_context failed")
+                        final = ""
+                    finally:
+                        stop_status()
+                        if typing_task:
+                            typing_task.cancel()
 
-                        # deliver text
-                        if debug_enabled:
-                            if len(final) < 4000:
-                                sent = await bot.edit_message_text(
-                                    chat_id=chat_id, message_id=placeholder_id, text=final
-                                )
-                            else:
-                                await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
-                                await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+                    # 3) Collect pre-text .ogg clips
+                    while True:
+                        try:
+                            ogg = chat_asm.tts._ogg_q.get_nowait()
+                        except _queue.Empty:
+                            break
                         else:
-                            if len(final) < 4000:
-                                sent = await bot.send_message(
-                                    chat_id=chat_id, text=final, reply_to_message_id=reply_to_id
-                                )
-                            else:
-                                await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
-                        # suppose tcs is the list of tool results, and one of them is our image search:
-                        last_state = getattr(chat_asm, "_last_state", {}) or {}
-                        for tool_ctx in last_state.get("tool_ctxs", []):
-                            # your ContextObject tool contexts store the tool name and the result
-                            tool_name = tool_ctx.metadata.get("tool") or getattr(tool_ctx, "name", None)
-                            results   = tool_ctx.metadata.get("result") or getattr(tool_ctx, "result", None)
-                            if tool_name == "search_images" and isinstance(results, list):
-                                for img_path in results:
-                                    try:
-                                        # try sending as a local file
-                                        with open(img_path, "rb") as img_file:
-                                            await bot.send_photo(
-                                                chat_id=chat_id,
-                                                photo=img_file,
-                                                reply_to_message_id=reply_to_id
-                                            )
-                                    except (FileNotFoundError, IsADirectoryError):
-                                        # fallback: send by URL or whatever string remains
-                                        await bot.send_photo(
-                                            chat_id=chat_id,
-                                            photo=img_path,
-                                            reply_to_message_id=reply_to_id
-                                        )
+                            pre_oggs.append(ogg)
 
-                        # pin/unpin
-                        if 'sent' in locals():
-                            try:
-                                await bot.pin_chat_message(
-                                    chat_id=chat_id, message_id=sent.message_id, disable_notification=True
-                                )
-                                asyncio.create_task(_delayed_unpin(bot, chat_id, sent.message_id))
-                            except: pass
-
-
-                    except asyncio.CancelledError:
+                    # 4) If no text, cleanup placeholder and exit
+                    if not final.strip():
                         if placeholder_id:
                             try:
-                                await bot.edit_message_text(
-                                    chat_id=chat_id, message_id=placeholder_id,
-                                    text="⚠️ Previous request cancelled."
-                                )
+                                await bot.delete_message(chat_id, placeholder_id)
                             except: pass
-
-                    except Exception:
-                        logger.exception("Unexpected error in Telegram runner")
-
-                    finally:
                         running.pop((chat_id, bot.id), None)
-                        # drain queue
+                        return
+
+                    # 5) Send or edit text reply
+                    if debug_enabled:
+                        if len(final) < 4000:
+                            sent = await bot.edit_message_text(
+                                chat_id=chat_id, message_id=placeholder_id, text=final
+                            )
+                        else:
+                            await bot.delete_message(chat_id=chat_id, message_id=placeholder_id)
+                            await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+                    else:
+                        if len(final) < 4000:
+                            sent = await bot.send_message(
+                                chat_id=chat_id, text=final, reply_to_message_id=reply_to_id
+                            )
+                        else:
+                            await _send_long_text_async(bot, chat_id, final, reply_to=reply_to_id)
+
+                    # 6) Collect post-text .ogg clips
+                    while True:
                         try:
-                            nxt, nxt_id = _pending[(chat_id, bot.id)].get_nowait()
-                        except:
-                            return
-                        await start_runner(nxt, nxt_id)
+                            ogg = chat_asm.tts._ogg_q.get_nowait()
+                        except _queue.Empty:
+                            break
+                        else:
+                            post_oggs.append(ogg)
+
+                    # 7) Send all audio clips in order
+                    for ogg in pre_oggs + post_oggs:
+                        try:
+                            with open(ogg, "rb") as vf:
+                                await bot.send_voice(
+                                    chat_id=chat_id,
+                                    voice=vf,
+                                    reply_to_message_id=(sent.message_id if "sent" in locals() else reply_to_id)
+                                )
+                        except Exception:
+                            continue
+
+                    # 8) Send any search_images results
+                    last = getattr(chat_asm, "_last_state", {}) or {}
+                    for tc in last.get("tool_ctxs", []):
+                        name = tc.metadata.get("tool_call", "").split("(",1)[0]
+                        if name == "search_images" and isinstance(tc.metadata.get("output"), list):
+                            for img in tc.metadata["output"]:
+                                try:
+                                    # local file?
+                                    with open(img, "rb") as fimg:
+                                        await bot.send_photo(chat_id, photo=fimg, reply_to_message_id=reply_to_id)
+                                except:
+                                    await bot.send_photo(chat_id, photo=img, reply_to_message_id=reply_to_id)
+
+                    # 9) Pin/unpin final text
+                    if "sent" in locals():
+                        try:
+                            await bot.pin_chat_message(
+                                chat_id=chat_id, message_id=sent.message_id, disable_notification=True
+                            )
+                            asyncio.create_task(_delayed_unpin(bot, chat_id, sent.message_id))
+                        except: pass
+
+                    # 10) Cleanup & process next
+                    running.pop((chat_id, bot.id), None)
+                    try:
+                        nxt, nxt_id = _pending[(chat_id, bot.id)].get_nowait()
+                    except:
+                        return
+                    await start_runner(nxt, nxt_id)
 
                 running[(chat_id, bot.id)] = loop.create_task(runner())
 

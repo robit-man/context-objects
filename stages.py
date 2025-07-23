@@ -1114,6 +1114,7 @@ def _stage7_planning_summary(
 
     state["plan_calls"] = call_strings 
 
+
     # 7) persist artefacts ---------------------------------------------
     plan_json = json.dumps(plan_obj, ensure_ascii=False)
     plan_sig = hashlib.md5(plan_json.encode()).hexdigest()[:8]
@@ -1545,7 +1546,6 @@ def _stage9_invoke_with_retries(
 ) -> List[ContextObject]:
     import json, re, hashlib, datetime, logging
     from tools import Tools
-
     # --- utilities -------------------------------------------------
     def _smart_truncate(text: str, max_len: int = 4000) -> str:
         if len(text) <= max_len:

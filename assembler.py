@@ -2454,11 +2454,11 @@ class Assembler:
             status_cb("external_knowledge_error", str(e))
             state["errors"].append(("external_knowledge", str(e)))
 
-        # ─── If no tools, assemble & exit ───────────────────────────────────
-        if not state["use_tools"]:
+        # ─── Fast‐path assemble & exit (no-tools) ───────────────────────────
+        if not state.get("use_tools", False):
             state["tool_ctxs"] = []
 
-            # Stage 10: assemble + infer
+            # ─── Stage 10: assemble + infer ────────────────────────────────
             try:
                 final = self._stage10_assemble_and_infer(
                     user_text,
@@ -2469,22 +2469,68 @@ class Assembler:
                 state["final"] = final
                 status_cb("assemble_and_infer", final)
             except Exception as e:
-                status_cb("assemble_and_infer_error", str(e))
                 state["errors"].append(("assemble_and_infer", str(e)))
+                status_cb("assemble_and_infer_error", str(e))
                 final = ""
                 state["final"] = final
 
-            # Stage 11: memory_writeback
+            # ─── Stage 11: memory writeback ─────────────────────────────────
             try:
-                self._stage11_memory_writeback(final, state["tool_ctxs"])
+                self._stage11_memory_writeback(final, [])
                 status_cb("memory_writeback", "(queued)")
             except Exception as e:
-                status_cb("memory_writeback_error", str(e))
                 state["errors"].append(("memory_writeback", str(e)))
+                status_cb("memory_writeback_error", str(e))
 
-            out = final.strip()
+            # ─── Stage 10b: critique if errors ──────────────────────────────
+            # Only runs if any errors collected so far
+            if state["errors"]:
+                try:
+                    patched = self._stage10b_response_critique_and_safety(
+                        state.get("final", ""),
+                        user_text,
+                        [],  # no tool_ctxs
+                        state,
+                    )
+                    # patched may be None → fall back to final
+                    state["draft"] = patched or state.get("final", "")
+                    status_cb("response_critique", state["draft"])
+                except Exception as e:
+                    state["errors"].append(("response_critique", str(e)))
+                    status_cb("response_critique_error", str(e))
+            else:
+                # if no errors, draft == final
+                state["draft"] = state.get("final", "")
+
+            # ─── Stage 10b (final inference) ────────────────────────────────
+            try:
+                final2 = self._stage10_assemble_and_infer(
+                    user_text,
+                    state,
+                    images=state.get("images", []),
+                    on_token=on_token,
+                )
+                state["final"] = final2
+                status_cb("final_inference", final2)
+            except Exception as e:
+                state["errors"].append(("final_inference", str(e)))
+                status_cb("final_inference_error", str(e))
+                # fallback to whatever draft we have
+                state["final"] = state.get("draft", "")
+
+            # ─── Stage 11 again: memory writeback of final ───────────────────
+            try:
+                self._stage11_memory_writeback(state["final"], [])
+                status_cb("memory_writeback", "(queued)")
+            except Exception as e:
+                state["errors"].append(("memory_writeback", str(e)))
+                status_cb("memory_writeback_error", str(e))
+
+            # ─── Final output ───────────────────────────────────────────────
+            out = state["final"].strip()
             status_cb("output", out)
             return out
+
 
         # ─── With-tools branch ──────────────────────────────────────────────
         prepared = self._stage6_prepare_tools()
