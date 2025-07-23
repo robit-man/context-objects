@@ -311,14 +311,12 @@ if not os.path.exists(SETUP_MARKER):
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-
-# ──────────── LOAD / GENERATE config.json ────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CFG = {
     # core LLM models
     "primary_model":   "gemma3:4b",
     "secondary_model": "gemma3:4b",
-    "decision_model": "gemma3:1b",
+    "decision_model":  "gemma3:1b",
 
     # audio thresholds
     "sample_rate":         16000,
@@ -329,8 +327,7 @@ DEFAULT_CFG = {
 
     # Piper release base URL & local executable name
     "piper_base_url":    "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/",
-    "piper_executable":  "piper",  # name of the binary inside piper/
-    # platform-specific Piper archives
+    "piper_executable":  "piper",
     "piper_release_linux_x86_64": "piper_linux_x86_64.tar.gz",
     "piper_release_linux_arm64":  "piper_linux_aarch64.tar.gz",
     "piper_release_linux_armv7l": "piper_linux_armv7l.tar.gz",
@@ -338,53 +335,55 @@ DEFAULT_CFG = {
     "piper_release_macos_arm64":  "piper_macos_aarch64.tar.gz",
     "piper_release_windows":      "piper_windows_amd64.zip",
 
-    # ONNX assets: point at your *local* filenames here
+    # ONNX assets
     "onnx_json_filename":  "glados_piper_medium.onnx.json",
     "onnx_model_filename": "glados_piper_medium.onnx",
-    # …but also keep the URLs so we can download if missing…
     "onnx_json_url":  "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json",
     "onnx_model_url": "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx",
 }
 
-# load or init
+# 1) Load existing config.json (or start empty)
 if os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE) as f:
+    with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
 else:
     config = {}
 
-# ──────────── CHECK / CREATE .env ─────────────────────────────
+# 2) Strip any stray bot_token from config
+config.pop("bot_token", None)
+
+# ──────────── ENSURE .env and BOT_TOKEN ────────────────────────────────────
 ENV_FILE = ".env"
 if not os.path.exists(ENV_FILE):
-    # 1) create .env with placeholder
+    # create and prompt for BOT_TOKEN
     with open(ENV_FILE, "w") as f:
         f.write("BOT_TOKEN=\n")
-    # 2) prompt user to obtain & enter token
     print("Please obtain a Telegram bot token from BotFather:")
     print("https://telegram.me/BotFather")
     token = input("Paste your BOT_TOKEN here: ").strip()
-    # 3) write the real token back into .env
     with open(ENV_FILE, "w") as f:
         f.write(f"BOT_TOKEN={token}\n")
-else:
-    # load existing token if present
-    with open(ENV_FILE) as f:
-        for line in f:
-            if line.startswith("BOT_TOKEN="):
-                config["bot_token"] = line.strip().split("=", 1)[1]
-                break
 
-# fill in any missing defaults
+# load BOT_TOKEN from .env (do NOT write back into config.json)
+from dotenv import load_dotenv
+load_dotenv(ENV_FILE)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+# 3) Merge in any missing defaults (only DEFAULT_CFG keys)
 updated = False
-for k, v in DEFAULT_CFG.items():
-    if k not in config:
-        config[k] = v
+for key, val in DEFAULT_CFG.items():
+    if key not in config:
+        config[key] = val
         updated = True
 
+# 4) Persist config.json if we added defaults
 if updated:
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
+
+# 5) Make BOT_TOKEN available at runtime—but never persist it on disk in config.json
+config["bot_token"] = BOT_TOKEN
 
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 import ollama
