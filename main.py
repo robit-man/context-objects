@@ -389,7 +389,6 @@ if updated:
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 import ollama
 
-
 # 1) List locally-available specs
 try:
     listing = ollama.list()
