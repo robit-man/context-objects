@@ -14,6 +14,7 @@ import tempfile
 import traceback
 import threading
 import re
+from tools import _thread_local
 
 import stages
 from pathlib import Path
@@ -1430,13 +1431,16 @@ class Assembler:
          • four runaway‐repetition guards (token, line, pattern, multi‐token)
          • retry up to MAX_ATTEMPTS on guard trips
          • session timeout guard
+
+        This version also strips accidental nested ```json…``` fences
+        so that stray debug wrappers cannot accumulate in the output.
         """
-        import re, time, requests
+        import re, time, requests, types
         from pathlib import Path
         from collections import deque
         from ollama import chat
 
-        # ── tweakables ────────────────────────────────────────────────
+        # ── tweakables ───────────────────────────────────────────────
         TOKEN_WINDOW             = 2000
         TOKEN_REPEAT_LIMIT       = 200
         LINE_REPEAT_LIMIT        = 20
@@ -1499,7 +1503,7 @@ class Assembler:
                 if n < needed:
                     continue
                 seq = arr[-L:]
-                if all(arr[-r*L : -(r-1)*L] == seq for r in range(2, SEQ_REPEAT_LIMIT+1)):
+                if all(arr[-r * L : -(r-1) * L] == seq for r in range(2, SEQ_REPEAT_LIMIT+1)):
                     return True
             return False
 
@@ -1510,10 +1514,11 @@ class Assembler:
             buf_tokens = deque(maxlen=TOKEN_WINDOW)
             buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
             chunks     = []
+            inside_json = False
 
             print(f"{tag} ", end="", flush=True)
             for part in chat(model=model, messages=messages, stream=True):
-                # user‑interrupt / abort check
+                # user-interrupt / abort check
                 if getattr(self, "_abort_inference", False):
                     print("\n[Interrupted] aborting generation.")
                     return "".join(chunks), False
@@ -1524,6 +1529,20 @@ class Assembler:
                     return "".join(chunks), True
 
                 chunk = part["message"]["content"]
+
+                # ── 0) strip accidental nested JSON fences ───────────────
+                stripped = chunk.strip()
+                if stripped.startswith("```json"):
+                    inside_json = True
+                    continue
+                if stripped.startswith("```") and inside_json:
+                    inside_json = False
+                    continue
+                if inside_json:
+                    # drop contents until closing fence
+                    continue
+
+                # ── 1) accept cleaned chunk ─────────────────────────────
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
 
@@ -1534,7 +1553,7 @@ class Assembler:
                     except Exception as e:
                         print(f"[on_token] {e}")
 
-                # update guards
+                # update repetition guards
                 for tok in chunk.split():
                     buf_tokens.append(tok)
                 for ln in chunk.splitlines():
@@ -1542,19 +1561,21 @@ class Assembler:
                     if s:
                         buf_lines.append(s)
 
+                # ── 2) guard checks ──────────────────────────────────
                 if token_guard(buf_tokens):
-                    print("\n[Run‑away guard] token repetition → aborting pass.")
+                    print("\n[Run-away guard] token repetition → aborting pass.")
                     return "".join(chunks), True
                 if line_guard(buf_lines):
-                    print("\n[Run‑away guard] line repetition → aborting pass.")
+                    print("\n[Run-away guard] line repetition → aborting pass.")
                     return "".join(chunks), True
                 if multi_token_guard(buf_tokens):
-                    print("\n[Run‑away guard] multi‑token repetition → aborting pass.")
+                    print("\n[Run-away guard] multi-token repetition → aborting pass.")
                     return "".join(chunks), True
 
                 full = "".join(chunks)
-                if pat_regex.search(full):
-                    print("\n[Run‑away guard] pattern repetition → aborting pass.")
+                # tighten pattern guard to catch nested ```json fences
+                if pat_regex.search(full) or full.count("```json") > 1:
+                    print("\n[Run-away guard] pattern repetition → aborting pass.")
                     return full, True
 
             print()
@@ -1565,13 +1586,12 @@ class Assembler:
             text, hit = one_pass()
             if not hit:
                 return text
-            print(f"[Run‑away guard] restart ({attempt}/{MAX_ATTEMPTS}) …")
+            print(f"[Run-away guard] restart ({attempt}/{MAX_ATTEMPTS}) …")
             time.sleep(0.1)
 
         # hard abort after retries
-        print(f"[Run‑away guard] giving up after {MAX_ATTEMPTS} attempts.")
+        print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
-
 
 
     def _parse_task_tree(
@@ -2256,6 +2276,9 @@ class Assembler:
         images: list[str] | None = None,
         on_token: Callable[[str], None] | None = None,
     ) -> str:
+        
+        _thread_local.assembler = self
+
         # ─── Normalize a no-op status_cb ─────────────────────────────────────
         if status_cb is None:
             def status_cb(stage: str, info: Any = None):
@@ -2718,45 +2741,57 @@ class Assembler:
             ).strip()
 
             status_cb("announcement", announcement)
-        # ensure raw_calls exists even if chaining fails
-        state["raw_calls"] = []
+        # ─── Initialize last_tool_outputs ─────────────────────────────────
+        # This will be populated in Stage 9 (invocation), then read by Stage 8
+        state["last_tool_outputs"] = {}
 
+        # ─── Stage 8 → tool_chaining (with placeholder substitution) ──────
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
-                "\n".join(state.get("fixed_calls", [])),
+                state.get("plan_output", ""),
                 state.get("tools_list", []),
                 state,
                 on_token=on_token,
             )
-            state["tc_ctx"]    = tc_ctx
-            state["raw_calls"] = raw_calls
-            state["schemas"]   = schemas
+            state["tc_ctx"]        = tc_ctx
+            state["raw_calls"]     = raw_calls
+            state["schemas"]       = schemas
             status_cb("tool_chaining", f"{len(raw_calls)} calls")
         except Exception as e:
-            # chaining failed → record error but leave raw_calls as [] (safe default)
             status_cb("tool_chaining_error", str(e))
             state["errors"].append(("tool_chaining", str(e)))
+            # Optionally bail out if chaining is fatal:
+            # status_cb("output", "…")
+            # return ""
+            raw_calls, schemas = [], []
 
-        # Now we can safely read raw_calls without KeyError
-        confirmed = state["raw_calls"]
+        # ─── Stage 8.5 → user_confirmation as before ───────────────────────
+        confirmed = raw_calls
         state["confirmed_calls"] = confirmed
         status_cb("user_confirmation", confirmed)
 
+        # ─── Stage 9 → invocation, capture each tool's real output ────────
         try:
-            tcs = self._stage9_invoke_with_retries(
-                state["confirmed_calls"],
-                state["plan_output"],
-                state["schemas"],
+            tool_ctxs = self._stage9_invoke_with_retries(
+                confirmed,
+                state.get("plan_output", ""),
+                schemas,
                 user_text,
                 state["clar_ctx"].metadata,
                 state
             )
-            if tcs:
-                state["tool_ctxs"] = tcs
-                self.integrator.ingest(tcs)
-                state["merged"].extend(tcs)
-            status_cb("invoke_with_retries", f"{len(tcs)} runs")
+            # ingest & extend
+            if tool_ctxs:
+                state["tool_ctxs"] = tool_ctxs
+                self.integrator.ingest(tool_ctxs)
+                state["merged"].extend(tool_ctxs)
+            # record last_tool_outputs for Stage 10 or any re-chaining
+            for t in tool_ctxs:
+                nm   = t.metadata.get("tool_name") or t.stage_id.split("_",1)[1]
+                outv = t.metadata.get("output", t.metadata.get("output_full"))
+                state["last_tool_outputs"][nm] = outv
+            status_cb("invoke_with_retries", f"{len(tool_ctxs)} runs")
         except Exception as e:
             status_cb("invoke_with_retries_error", str(e))
             state["errors"].append(("invoke_with_retries", str(e)))

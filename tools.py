@@ -6,7 +6,9 @@ import re
 from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
-from context import ContextRepository, ContextObject, default_clock
+from context import ContextRepository, HybridContextRepository, ContextObject, default_clock
+from numpy import dot
+from numpy.linalg import norm
 
 import os, json, re, difflib
 from datetime import datetime, timedelta
@@ -50,6 +52,7 @@ import networkx as nx
 import sqlite3
 import pandas as pd
 
+_thread_local = threading.local()
 
 # ----- COLOR CODES FOR LOGGING -----
 COLOR_RESET = "\033[0m"
@@ -2732,9 +2735,10 @@ class Tools:
             for i, e in enumerate(entries, 1)
         )
         
+
     @staticmethod
     def get_chat_history(
-        assembler,                    # required: Assembler instance (must have `.repo`)
+        assembler=None,                    # optional: if omitted, uses the singleton repo
         limit:    int | None = None,
         n:        int | None = None,
         count:    int | None = None,
@@ -2749,44 +2753,9 @@ class Tools:
         query:    str | None = None,
     ) -> dict[str, list[dict[str, str]]]:
         """
-        Retrieve a slice of past chat/context entries from the in-memory repository.
-        (TESTING SEEDING)
-        Parameters
-        ----------
-    
-        limit, n, count : int, optional
-            Alias for the maximum number of entries to return.
-        direction : str, optional
-            "fwd" or "forward" to sort oldest→newest, anything else (or None)
-            for newest→oldest.
-        time, time_range, time_ago : str, optional
-            Textual time window. Any one may be used; priority is
-            time_ago → time_range → time.
-            Supported formats:
-              - `"today"` / `"yesterday"`
-              - `"last N days"`, `"last N hours"`, `"last hour"`
-              - `"<N> minutes ago"`, `"<N> hours ago"`, etc.
-            If omitted or unrecognized, skips window filtering.
-        domain, component, semantic_label : str or list, optional
-            Filter entries by ContextObject.domain, .component, or .semantic_label.
-        keyword, query : str, optional
-            If provided, rank candidates by simple substring match +
-            embedding-similarity to this text.
-
-            (Ignore assembler arg, it is automatically passed in.)
-        
-        Returns
-        -------
-        dict
-            A plain dict with key `"results"` mapping to a list of entries:
-            `[{"timestamp":…, "role":…, "content":…}, …]`.  On error,
-            returns `{"results": [], "error": "<message>"}`.
-
-        Notes
-        -----
-        - `limit`, `n`, and `count` are interchangeable.
-        - `time_ago` is sugar for things like `"10 minutes ago"`.
-        - Embedding-based relevance only looks at the last 100 candidates for speed.
+        Retrieve a slice of past chat/context entries.
+        If `assembler` is provided, uses assembler.repo; otherwise falls
+        back to HybridContextRepository.instance().
         """
         import re, traceback, json
         from datetime import datetime, timedelta
@@ -2800,13 +2769,22 @@ class Tools:
               f"keyword={keyword!r}, query={query!r}\n")
 
         try:
+            # 0) pick our repository
+            if assembler is not None and hasattr(assembler, "repo"):
+                repo = assembler.repo
+                print("→ using provided assembler.repo")
+            else:
+                from context import HybridContextRepository
+                repo = HybridContextRepository.instance()
+                print("→ using HybridContextRepository.instance()")
+
             # 1) alias limit/count/n
             if count is not None:
-                print(f"Aliasing count={count} → n")
                 n = count
+                print(f"Aliasing count={count} → n")
             if limit is not None:
-                print(f"Aliasing limit={limit} → n")
                 n = limit
+                print(f"Aliasing limit={limit} → n")
 
             # 2) choose textual window argument
             window = time_ago or time_range or time
@@ -2815,7 +2793,7 @@ class Tools:
 
             # 3) fetch all entries
             entries = []
-            for c in assembler.repo.query(lambda c: True):
+            for c in repo.query(lambda c: True):
                 entries.append({
                     "timestamp":      c.timestamp,
                     "role":           c.metadata.get("role", ""),
@@ -2855,7 +2833,6 @@ class Tools:
                 now = datetime.utcnow()
                 start = end = None
 
-                # today / yesterday
                 if period == "today":
                     d0 = datetime.combine(now.date(), datetime.min.time())
                     start, end = d0, d0 + timedelta(days=1)
@@ -2863,10 +2840,8 @@ class Tools:
                     d0 = datetime.combine(now.date()-timedelta(days=1), datetime.min.time())
                     start, end = d0, d0 + timedelta(days=1)
                 else:
-                    # last N days/hours
                     m_d = re.match(r"last\s+(\d+)\s+days?", period)
                     m_h = re.match(r"last\s+(\d+)\s+hours?", period)
-                    # N minutes ago / N hours ago
                     m_ago = re.match(r"(\d+)\s*(minutes?|hours?|days?)\s+ago", period)
                     if m_d:
                         days = int(m_d.group(1)); start, end = now - timedelta(days=days), now
@@ -2900,13 +2875,21 @@ class Tools:
             if keyword or query:
                 txt = query or keyword or ""
                 print(f"Relevance ranking to '{txt}'")
-                qv = assembler.engine.embedder(txt)
+                # embedder must exist on assembler; if missing, skip
+                try:
+                    qv = repo  # dummy to silence linters
+                    qv = assembler.engine.embedder(txt) if assembler and hasattr(assembler, "engine") else None
+                except:
+                    qv = None
                 scored = []
                 cand = results[-100:]
                 for e in cand:
                     txt_score = float(txt.lower() in e["content"].lower())
-                    vv = assembler.engine.embedder(e["content"])
-                    emb_score = dot(qv, vv)/(norm(qv)*norm(vv)) if norm(qv) and norm(vv) else 0.0
+                    if qv is not None:
+                        vv = assembler.engine.embedder(e["content"])
+                        emb_score = dot(qv, vv)/(norm(qv)*norm(vv)) if norm(qv) and norm(vv) else 0.0
+                    else:
+                        emb_score = 0.0
                     scored.append((txt_score + emb_score, e))
                 scored.sort(key=lambda x: x[0], reverse=True)
                 results = [e for _, e in scored[:top_n]]
@@ -2922,7 +2905,7 @@ class Tools:
             results.sort(key=lambda e: _parse(e["timestamp"]), reverse=rev)
             print(f"Final direction: {order}\n")
 
-            # 9) return raw list
+            # 9) return
             print("Returning results:")
             print(json.dumps(results, indent=2, ensure_ascii=False))
             return {"results": results}
@@ -2936,20 +2919,6 @@ class Tools:
             print("=== get_chat_history finished ===\n")
 
 
-
-    # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
-    @staticmethod
-    def get_current_time():
-        """
-        Return the current time and date in a human readable format.
-        """
-        from datetime import datetime
-        # Grab current local time
-        now = datetime.now()
-        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
-        # Log the exact timestamp we’re returning
-        log_message(f"Current time retrieved: {current_time}", "DEBUG")
-        return current_time
     
     # This static method captures the primary monitor's screen using mss, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the screenshot.
     @staticmethod
