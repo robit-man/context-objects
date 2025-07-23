@@ -1308,8 +1308,6 @@ def _stage7b_plan_validation(
     return fixed_calls, [], fixed_calls
 
 
-
-
 def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
@@ -1319,71 +1317,95 @@ def _stage8_tool_chaining(
     *,
     on_token: Callable[[str], None] | None = None,
 ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
-    import json
-    import re
+    import json, re
+    from context import ContextObject
     from tools import Tools
 
-    # Ensure Tools can always reach the current repo
+    # Ensure Tools.repo is always set
     Tools.repo = self.repo
 
-    # 0) load schemas from the repo (so we can reference them in the chaining context)
-    all_schemas = {
-        json.loads(s.metadata["schema"])["name"]: s
-        for s in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in c.tags)
-    }
+    # Load all known schemas once
+    try:
+        all_schemas = {
+            json.loads(c.metadata["schema"])["name"]: c
+            for c in self.repo.query(
+                lambda c: c.component == "schema" and "tool_schema" in c.tags
+            )
+        }
+    except Exception:
+        all_schemas = {}
 
-    # A) extract flat list of calls from the JSON plan (or fallback via regex)
+    # Extract flat list of call-strings
     calls: List[str] = []
     try:
         plan = json.loads(plan_output)
-        def flatten(tasks):
+        def _flatten(tasks):
             out = []
-            for t in tasks:
+            for t in tasks or []:
                 out.append(t)
-                out.extend(flatten(t.get("subtasks", [])))
+                out.extend(_flatten(t.get("subtasks", [])))
             return out
 
-        for t in flatten(plan.get("tasks", [])):
-            name   = t["call"].split("(", 1)[0]
+        for t in _flatten(plan.get("tasks", [])):
+            name   = t.get("call", "").split("(", 1)[0]
             params = t.get("tool_input", {}) or {}
-            if params:
-                arg_s = ",".join(
-                    f"{k}={json.dumps(v, ensure_ascii=False)}"
-                    for k, v in params.items()
-                )
-                calls.append(f"{name}({arg_s})")
-            else:
-                calls.append(f"{name}()")
+            if name:
+                if params:
+                    arg_s = ",".join(
+                        f"{k}={json.dumps(v, ensure_ascii=False)}"
+                        for k, v in params.items()
+                    )
+                    calls.append(f"{name}({arg_s})")
+                else:
+                    calls.append(f"{name}()")
     except Exception:
+        # fallback: regex scrape any foo(...) in the raw plan_output string
         salvage = set()
-        for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\(([^)]*)\)', plan_output):
-            nm, raw = m.group(1), m.group(2).strip()
-            salvage.add(f"{nm}({raw})" if raw else f"{nm}()")
-        calls.extend(sorted(salvage))
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(([^)]*)\)", plan_output or ""):
+            fn, raw = m.group(1), m.group(2).strip()
+            salvage.add(f"{fn}({raw})" if raw else f"{fn}()")
+        calls = sorted(salvage)
 
-    # B) pick matching schema ContextObjects
+    # Deduplicate
+    calls = list(dict.fromkeys(calls))
+
+    # Pick matching schema ContextObjects
+    selected_schemas: List[ContextObject] = []
     wanted = {c.split("(", 1)[0] for c in calls}
-    selected_schemas = [
-        all_schemas[name]
-        for name in wanted
-        if name in all_schemas
-    ]
+    for name in wanted:
+        schema_ctx = all_schemas.get(name)
+        if schema_ctx:
+            selected_schemas.append(schema_ctx)
 
-    # C) **Do NOT invoke** any tools here.  Defer actual execution to Stage 9.
-    #    We simply record the plan as a "tool_chaining" context.
+    # Build and save the chaining context
+    try:
+        tc_ctx = ContextObject.make_stage(
+            "tool_chaining",
+            plan_ctx.references + [s.context_id for s in selected_schemas],
+            {"tool_calls": calls},
+        )
+        tc_ctx.stage_id = "tool_chaining"
+        tc_ctx.summary  = json.dumps(calls, ensure_ascii=False)
+        tc_ctx.touch()
+        self.repo.save(tc_ctx)
+    except Exception:
+        # If we cannot persist, create a minimal placeholder
+        tc_ctx = ContextObject.make_stage(
+            "tool_chaining",
+            [],
+            {"tool_calls": calls},
+        )
+        tc_ctx.stage_id = "tool_chaining"
+        tc_ctx.summary  = json.dumps(calls, ensure_ascii=False)
+        tc_ctx.touch()
+        # best effort save
+        try:
+            self.repo.save(tc_ctx)
+        except:
+            pass
 
-    tc_ctx = ContextObject.make_stage(
-        "tool_chaining",
-        plan_ctx.references + [s.context_id for s in selected_schemas],
-        {"tool_calls": calls}
-    )
-    tc_ctx.stage_id = "tool_chaining"
-    tc_ctx.summary  = json.dumps(calls, ensure_ascii=False)
-    tc_ctx.touch()
-    self.repo.save(tc_ctx)
-
-    # downstream stages will actually invoke the calls
     return tc_ctx, calls, selected_schemas
+
 
 def _stage8_5_user_confirmation(
     self,

@@ -176,40 +176,48 @@ class TaskExecutor:
       6) Mark node completed
     Accumulates all resulting ContextObject IDs into each node's context_ids.
     """
+
     def __init__(self, asm: "Assembler", user_text: str, clar_metadata: Dict[str,Any]):
-        self.asm = asm
-        self.user_text = user_text
-        self.clar_metadata = clar_metadata
+        self.asm            = asm
+        self.user_text      = user_text
+        self.clar_metadata  = clar_metadata
+
+        # ---- NEW LINES ----
+        # Pull out the assembler’s tools_list and memory manager for easy access
+        self.tools_list = getattr(asm, "tools_list", [])
+        self.memman     = asm.memman
 
     def execute(self, node: TaskNode) -> None:
         import json
+        from context import ContextObject
 
         # 1) Static validation / fix — always pull the real plan_ctx from the node itself
-        plan_ctx_id = node.context_ids[0]
+        plan_ctx_id  = node.context_ids[0]
         plan_ctx_obj = self.asm.repo.get(plan_ctx_id)
 
-        # reuse the planning-validation with a single-call plan
+        # reuse the planning-validation to repair/fix the one-call plan
         _, errors, fixed = self.asm._stage7b_plan_validation(
             plan_ctx_obj,
             node.call,
-            self.asm.tools_list
+            self.tools_list
         )
         if errors:
             node.errors = [err for (_, err) in errors]
+
         calls = fixed or [node.call]
 
-        # 2) Tool chaining
+        # 2) Tool chaining (stage 8)
         tc_ctx, raw_calls, schemas = self.asm._stage8_tool_chaining(
             plan_ctx_obj,
             "\n".join(calls),
-            self.asm.tools_list
+            self.tools_list
         )
         node.context_ids.append(tc_ctx.context_id)
 
-        # 3) User confirmation
+        # 3) User confirmation (stage 8.5)
         confirmed = self.asm._stage8_5_user_confirmation(raw_calls, self.user_text)
 
-        # 4) Invoke with retries
+        # 4) Invoke with retries (stage 9)
         tool_ctxs = self.asm._stage9_invoke_with_retries(
             confirmed,
             "\n".join(calls),
@@ -220,7 +228,7 @@ class TaskExecutor:
         for t in tool_ctxs:
             node.context_ids.append(t.context_id)
 
-            # ——— record per-tool success/failure —————————————
+            # record per-tool success/failure and reinforce memory
             if t.metadata.get("exception") is None:
                 succ = ContextObject.make_success(
                     f"Tool `{t.metadata.get('tool_name', t.semantic_label)}` succeeded",
@@ -228,8 +236,9 @@ class TaskExecutor:
                 )
                 succ.touch()
                 self.asm.repo.save(succ)
-                self.memman.register_relationships(succ, embed_text)
-                self.asm.memman.reinforce(succ.context_id, [t.context_id])
+                # now reinforce memory
+                self.memman.register_relationships(succ, self.asm.embed_text)
+                self.memman.reinforce(succ.context_id, [t.context_id])
             else:
                 fail = ContextObject.make_failure(
                     f"Tool `{t.metadata.get('tool_name', t.semantic_label)}` failed: {t.metadata.get('exception')}",
@@ -237,17 +246,19 @@ class TaskExecutor:
                 )
                 fail.touch()
                 self.asm.repo.save(fail)
-                self.asm.memman.reinforce(fail.context_id, [t.context_id])
+                self.memman.reinforce(fail.context_id, [t.context_id])
 
-        # 5) Reflection & replan
+        # 5) Reflection & replan (stage 9b)
+        # pass in all ContextObjects collected so far
+        all_ctx_objs = [self.asm.repo.get(cid) for cid in node.context_ids]
         replan = self.asm._stage9b_reflection_and_replan(
-            [self.asm.repo.get(cid) for cid in node.context_ids],
+            all_ctx_objs,
             "\n".join(calls),
             self.user_text,
             self.clar_metadata
         )
 
-        # ——— record reflection outcome —————————————
+        # record reflection outcome and reinforce memory
         if replan is None:
             succ = ContextObject.make_success(
                 "Reflection validated original plan (OK)",
@@ -255,7 +266,7 @@ class TaskExecutor:
             )
             succ.touch()
             self.asm.repo.save(succ)
-            self.asm.memman.reinforce(succ.context_id, node.context_ids)
+            self.memman.reinforce(succ.context_id, node.context_ids)
         else:
             fail = ContextObject.make_failure(
                 "Reflection triggered plan adjustment",
@@ -263,9 +274,9 @@ class TaskExecutor:
             )
             fail.touch()
             self.asm.repo.save(fail)
-            self.asm.memman.reinforce(fail.context_id, node.context_ids)
+            self.memman.reinforce(fail.context_id, node.context_ids)
 
-            # if there's a new plan, expand into subtasks
+            # if there's a new plan JSON, turn it into subtasks
             try:
                 tree = json.loads(replan)
                 node.children = self.asm._parse_task_tree(tree, parent=node)
@@ -276,23 +287,21 @@ class TaskExecutor:
         for child in node.children:
             self.execute(child)
 
-        # ——— at end of this node, log overall task success/failure ————
+        # 7) Mark node overall success/failure
         if not node.errors and replan is None:
             overall = ContextObject.make_success(
                 f"Task `{node.call}` completed successfully",
                 refs=node.context_ids
             )
-            overall.touch()
-            self.asm.repo.save(overall)
-            self.asm.memman.reinforce(overall.context_id, node.context_ids)
         else:
             overall = ContextObject.make_failure(
                 f"Task `{node.call}` failed or was replanned",
                 refs=node.context_ids
             )
-            overall.touch()
-            self.asm.repo.save(overall)
-            self.asm.memman.reinforce(overall.context_id, node.context_ids)
+
+        overall.touch()
+        self.asm.repo.save(overall)
+        self.memman.reinforce(overall.context_id, node.context_ids)
 
         node.completed = True
 
@@ -2336,7 +2345,6 @@ class Assembler:
 
         # ─── Fast‐path when tools are disabled ───────────────────────────────
         if not state["use_tools"]:
-            state["raw_calls"] = []
             status_cb("no_tools_start", "Skipping tool pipeline, going direct to assembly")
 
             # Stage 1
@@ -2457,6 +2465,7 @@ class Assembler:
 
         # ─── Fast‐path assemble & exit (no-tools) ───────────────────────────
         if not state.get("use_tools", False):
+            state["raw_calls"] = []
             state["tool_ctxs"] = []
 
             # ─── Stage 10: assemble + infer ────────────────────────────────
@@ -2709,12 +2718,14 @@ class Assembler:
             ).strip()
 
             status_cb("announcement", announcement)
+        # ensure raw_calls exists even if chaining fails
+        state["raw_calls"] = []
 
         try:
             tc_ctx, raw_calls, schemas = self._stage8_tool_chaining(
                 state["plan_ctx"],
-                "\n".join(state["fixed_calls"]),
-                state["tools_list"],
+                "\n".join(state.get("fixed_calls", [])),
+                state.get("tools_list", []),
                 state,
                 on_token=on_token,
             )
@@ -2723,9 +2734,11 @@ class Assembler:
             state["schemas"]   = schemas
             status_cb("tool_chaining", f"{len(raw_calls)} calls")
         except Exception as e:
+            # chaining failed → record error but leave raw_calls as [] (safe default)
             status_cb("tool_chaining_error", str(e))
             state["errors"].append(("tool_chaining", str(e)))
 
+        # Now we can safely read raw_calls without KeyError
         confirmed = state["raw_calls"]
         state["confirmed_calls"] = confirmed
         status_cb("user_confirmation", confirmed)
