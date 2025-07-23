@@ -1955,11 +1955,8 @@ def _stage10b_response_critique_and_safety(
         outputs.append(f"[{c.stage_id}]\n{blob}")
 
     # 2️⃣  Relevance Extractor
-    extractor_sys = (
-        "You are a relevance extractor.\n"
-        "Return ONLY the information that directly helps answer the user.\n"
-        "Strict format: at most 8 lines, each starting with the bullet '• '."
-    )
+    extractor_sys = self._get_prompt("extractor_sys_prompt")
+
     extractor_user = "\n\n".join((
         f"USER QUESTION:\n{user_text}",
         f"PLAN EXECUTED:\n{plan_text}",

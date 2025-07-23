@@ -2315,7 +2315,7 @@ class Tools:
     @staticmethod
     def input(selector: str, text: str, timeout: int = 8) -> str:
         """
-        This static method inputs text into a specified element in the currently open browser using a CSS selector. Do not use for replying
+        Do not use for replying as a standalone tool! This static method inputs text into a specified element in the currently open browser using a CSS selector.
         """
         if not Tools._driver:
             return "Error: browser not open"
