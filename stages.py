@@ -1878,7 +1878,6 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     return reply
 
 
-
 def _stage10b_response_critique_and_safety(
     self,
     draft: str,
@@ -1889,31 +1888,34 @@ def _stage10b_response_critique_and_safety(
     import json, difflib
     from context import ContextObject
 
-    # Gather the last plan
+    # Pull in full merged context (including prior user/assistant turns)
+    merged_ctxs = state.get("merged", [])
+    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs)
+
+    # Retrieve the last executed plan
     plan_text = getattr(self, "_last_plan_output", "(no plan)")
 
-    # 1) Unpack all tool outputs fully
+    # 1) Serialize every tool output clearly
     outputs = []
     for c in tool_ctxs:
         raw = c.metadata.get("output")
         if isinstance(raw, dict) and "results" in raw:
-            blob = "\n".join(
-                f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
-                for r in raw["results"]
-            )
+            fragment = "\n".join(f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
+                                  for r in raw["results"])
         else:
-            blob = json.dumps(raw, indent=2, ensure_ascii=False)
-        outputs.append(f"[{c.stage_id}]\n{blob}")
+            fragment = json.dumps(raw, indent=2, ensure_ascii=False)
+        outputs.append(f"[{c.stage_id}]\n{fragment}")
 
-    # 2️⃣  Relevance Extractor
+    # 2️⃣  Relevance Extraction
     extractor_sys = self._get_prompt("extractor_sys_prompt")
-
-    extractor_user = "\n\n".join((
+    extractor_user = "\n\n".join([
         f"USER QUESTION:\n{user_text}",
         f"PLAN EXECUTED:\n{plan_text}",
-        "RAW DRAFT:\n" + draft,
-        "RAW TOOL OUTPUTS:\n" + "\n\n".join(outputs),
-    ))
+        "MERGED CONTEXT SNIPPETS:\n" + (merged_texts or "(none)"),
+        "RAW TOOL OUTPUTS:\n" + ("\n\n".join(outputs) or "(none)"),
+        "DRAFT RESPONSE:\n" + draft,
+        "Your goal: identify exactly the facts, data points, or insights that should shape the revised response."
+    ])
     bullets = self._stream_and_capture(
         self.secondary_model,
         [
@@ -1924,23 +1926,20 @@ def _stage10b_response_critique_and_safety(
         images=state.get("images"),
     ).strip()
 
+    # Persist relevance summary
     sum_ctx = ContextObject.make_stage("relevance_summary", [], {"summary": bullets})
     sum_ctx.stage_id = "relevance_summary"
     sum_ctx.summary  = bullets
-    #sum_ctx.touch(); self.repo.save(sum_ctx)
     self._persist_and_index([sum_ctx])
 
-    # 3️⃣  Polisher / Critic
-    editor_sys = (
-        "You are an expert editor.\n"
-        "Use ONLY the bullet list to fix or extend the draft so it answers the "
-        "user fully and directly. Do NOT invent extra content or apologies."
-    )
-    editor_user = "\n\n".join((
+    # 3️⃣  Polishing / Safety Critique
+
+    editor_sys = self._get_prompt("editor_sys_prompt")
+    editor_user = "\n\n".join([
         f"USER QUESTION:\n{user_text}",
-        "RELEVANT BULLETS:\n" + bullets,
-        "CURRENT DRAFT:\n" + draft,
-    ))
+        "RELEVANCE BULLETS:\n" + bullets,
+        "CURRENT DRAFT:\n" + draft
+    ])
     polished = self._stream_and_capture(
         self.secondary_model,
         [
@@ -1951,30 +1950,30 @@ def _stage10b_response_critique_and_safety(
         images=state.get("images"),
     ).strip()
 
+    # If nothing changed, return original draft
     if polished == draft.strip():
         return polished
 
-    # 4️⃣  Diff & dynamic-prompt patch
+    # 4️⃣  Compute diff & update dynamic patch
     diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
-    diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(minor re-formatting)"
+    diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
 
     patch_rows = self.repo.query(
         lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
     )
     patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
-    patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
-        "dynamic_prompt_patch", "", tags=["dynamic_prompt"]
+    dynamic_patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
+        "dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"]
     )
-    if patch.summary != diff_summary:
-        patch.summary = diff_summary
-        patch.metadata["policy"] = diff_summary
-        patch.touch(); self.repo.save(patch)
+    if dynamic_patch.summary != diff_summary:
+        dynamic_patch.summary = diff_summary
+        dynamic_patch.metadata["policy"] = diff_summary
+        dynamic_patch.touch(); self.repo.save(dynamic_patch)
 
-    # 5️⃣  Persist polished reply & critique
+    # 5️⃣  Persist polished reply and critique contexts
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
     resp_ctx.stage_id = "response_critique"
     resp_ctx.summary  = polished
-    #resp_ctx.touch(); self.repo.save(resp_ctx)
     self._persist_and_index([resp_ctx])
 
     critique_ctx = ContextObject.make_stage(
@@ -1984,10 +1983,10 @@ def _stage10b_response_critique_and_safety(
     )
     critique_ctx.component      = "analysis"
     critique_ctx.semantic_label = "plan_critique"
-    #critique_ctx.touch(); self.repo.save(critique_ctx)
     self._persist_and_index([critique_ctx])
 
     return polished
+
 
 
 def _stage11_memory_writeback(

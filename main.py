@@ -387,79 +387,62 @@ if updated:
     log_message(f"Added missing defaults into {CONFIG_FILE}", "INFO")
 
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
-import subprocess
+import ollama
 
-for model in (config.get("primary_model"),
-              config.get("secondary_model"),
-              config.get("decision_model")):
 
-    if not model:                      # config might return None / ""
+# 1) List locally-available specs
+try:
+    listing = ollama.list()
+    raw_entries = listing.models
+except Exception as e:
+    log_message(f"Failed to fetch Ollama model list: {e}", "ERROR")
+    raw_entries = []
+
+# Extract just the model spec strings
+available = [m.model for m in raw_entries]
+available_set = set(available)
+
+# Print a clean list
+print("[Ollama] locally available models:")
+for name in sorted(available):
+    print(f"  • {name}")
+
+# 2) Helper to render a single-line bar
+def render_bar(completed: int, total: int, width: int = 40) -> str:
+    pct = completed / total if total else 0.0
+    filled = int(pct * width)
+    bar = "█" * filled + "-" * (width - filled)
+    return f"[{bar}] {pct*100:6.2f}%"
+
+# 3) Pull any missing specs
+for model_spec in (
+    config.get("primary_model"),
+    config.get("secondary_model"),
+    config.get("decision_model"),
+):
+    if not model_spec:
         continue
 
-    base_name = model.split(":", 1)[0]  # “llama3” from “llama3:8b”
+    if model_spec in available_set:
+        log_message(f"Ollama model '{model_spec}' already present.", "INFO")
+        continue
 
-    # try at most twice: original pull, then (if needed) pull after upgrade
-    for attempt in range(2):
-        try:
-            # Current inventory
-            existing_raw = subprocess.check_output(
-                ["ollama", "list"],
-                stderr=subprocess.STDOUT,
-                text=True
-            )
+    log_message(f"Model '{model_spec}' not found locally — pulling with Ollama…", "PROCESS")
+    try:
+        # stream=True yields successive status dicts
+        for status in ollama.pull(model_spec, stream=True):
+            comp = status.get("completed", 0)
+            tot  = status.get("total",    0)
+            bar_line = render_bar(comp, tot)
+            sys.stdout.write(f"\r[Ollama:pull {model_spec}] {bar_line}")
+            sys.stdout.flush()
+        print()  # newline after finished
+        log_message(f"Successfully pulled Ollama model '{model_spec}'.", "SUCCESS")
+        available_set.add(model_spec)
 
-            # Build a set of base-names already present
-            present = {
-                ln.split()[0].split(":", 1)[0]          # first token, strip tag
-                for ln in existing_raw.splitlines() if ln.strip()
-            }
-
-            if base_name in present:
-                log_message(f"Ollama model '{model}' already present.", "INFO")
-                break
-
-            log_message(f"Model '{model}' not found locally — pulling with Ollama…",
-                        "PROCESS")
-
-            # Pull the model
-            result = subprocess.run(
-                ["ollama", "pull", model],
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode == 0:
-                log_message(f"Successfully pulled Ollama model '{model}'.",
-                            "SUCCESS")
-                break  # done with this model
-
-            # ── Pull failed ──────────────────────────────────────────────
-            combined = (result.stdout or "") + (result.stderr or "")
-            needs_upgrade = (
-                "requires a newer version of Ollama" in combined
-                or "manifest: 412" in combined
-            )
-
-            if needs_upgrade and attempt == 0:
-                log_message("Ollama is out of date; upgrading Ollama…", "PROCESS")
-                try:
-                    subprocess.check_call(
-                        ["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"]
-                    )
-                except subprocess.CalledProcessError as up_err:
-                    log_message(f"Failed to upgrade Ollama: {up_err}", "ERROR")
-                    break                     # give up on this model
-                else:
-                    log_message("Upgrade complete — retrying pull…", "INFO")
-                    continue                  # retry after upgrade
-            else:
-                log_message(f"Error pulling model '{model}': {combined.strip()}",
-                            "WARNING")
-                break                         # unrecoverable; stop retrying
-
-        except subprocess.CalledProcessError as e:
-            log_message(f"Subprocess error with model '{model}': {e}", "WARNING")
-            break
+    except Exception as pull_err:
+        print()  # clear the bar line
+        log_message(f"Error pulling Ollama model '{model_spec}': {pull_err}", "WARNING")
 
 
 

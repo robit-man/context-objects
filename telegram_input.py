@@ -380,6 +380,85 @@ async def blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✔️ Blacklisted @{target_username} (ID: {target_id}).")
 
 
+async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /config get *            → show entire config.json
+    /config get <key>        → show one entry
+    /config set <key> <json> → set one entry
+    Only the configured admin_chat_id in config.json may run these.
+    """
+    user_id = update.effective_user.id
+
+    # Load existing config (or empty dict)
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+
+    admin_id = cfg.get("admin_chat_id")
+    if user_id != admin_id:
+        await update.message.reply_text("❌ You are not authorized to use /config.")
+        return
+
+    args = context.args or []
+    if not args or args[0] not in ("get", "set"):
+        await update.message.reply_text(
+            "Usage:\n"
+            "/config get *\n"
+            "/config get <key>\n"
+            "/config set <key> <json-literal>"
+        )
+        return
+
+    action = args[0]
+
+    # ── GET ───────────────────────────────────────────────────────────────
+    if action == "get":
+        # no further args or wildcard → full config
+        if len(args) == 1 or (len(args) == 2 and args[1] in ("*", "all")):
+            pretty = json.dumps(cfg, indent=2)
+            # wrap in triple-backticks so Telegram preserves formatting
+            await update.message.reply_text(f"```\n{pretty}\n```", parse_mode="Markdown")
+            return
+
+        # single key
+        if len(args) == 2:
+            key = args[1]
+            val = cfg.get(key, None)
+            await update.message.reply_text(
+                f"```json\n{json.dumps({key: val}, indent=2)}\n```",
+                parse_mode="Markdown"
+            )
+            return
+
+        # too many args
+        await update.message.reply_text("Usage: /config get *  OR  /config get <key>")
+        return
+
+    # ── SET ───────────────────────────────────────────────────────────────
+    # args[0] == "set"
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /config set <key> <json-literal>")
+        return
+
+    key = args[1]
+    raw = " ".join(args[2:])
+    try:
+        new_val = json.loads(raw)
+    except json.JSONDecodeError:
+        new_val = raw  # treat as string
+
+    cfg[key] = new_val
+    with open("config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    await update.message.reply_text(
+        f"✅ Set `{key}` =\n```json\n{json.dumps(new_val, indent=2)}\n```",
+        parse_mode="Markdown"
+    )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, tg_error.Conflict):
@@ -747,6 +826,7 @@ def telegram_input(asm):
         group=0
     )    
     app.add_handler(CommandHandler("setadmin", set_admin), group=0)
+    app.add_handler(CommandHandler("config", config_handler), group=0)
     app.add_handler(CommandHandler("blacklist", blacklist), group=0)
     app.add_handler(CommandHandler("dm", set_dm), group=0)
     app.add_handler(CommandHandler("debug", set_debug), group=0)    
