@@ -446,7 +446,7 @@ class Assembler:
             "Additionally:\n"
             "- Under a key called 'debug_notes', include the last 3 turns of raw "
             "conversation (both user and assistant) even if they seem redundant, "
-            "so we can diagnose mis‐clarifications.\n"
+            "so we can diagnose mis‐clarifications. DO NOT HALLUCINATE AND REPEAT INDEFINATELY, TAKE NOTE OF LENGTH AND ENSURE YOU DO NOT CONTINUE AT GREAT LENGTH!\n"
             "- Notes should produce NO value judgments or claims, and should only "
             "expand what the user actually said.\n"
             "- Ignore irrelevant errors or tool outputs that do not bear on the "
@@ -2676,6 +2676,8 @@ class Assembler:
             )
             if tcs:
                 state["tool_ctxs"] = tcs
+                self.integrator.ingest(tcs)
+                state["merged"].extend(tcs)
             status_cb("invoke_with_retries", f"{len(tcs)} runs")
         except Exception as e:
             status_cb("invoke_with_retries_error", str(e))

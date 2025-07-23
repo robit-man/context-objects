@@ -898,12 +898,25 @@ def _stage7_planning_summary(
         cleaned = _clean_json_block(raw)
         try:
             cand = json.loads(cleaned)
-            assert isinstance(cand, dict) and "tasks" in cand
-            plan_obj = cand
+            # ─── NEW: if the LLM returned "tool_calls" instead of "tasks", wrap it ───
+            if isinstance(cand, dict) and "tool_calls" in cand and "tasks" not in cand:
+                plan_obj = {
+                    "tasks": [
+                        {"call": call, "tool_input": {}, "subtasks": []}
+                        for call in cand["tool_calls"]
+                    ]
+                }
+            else:
+                assert isinstance(cand, dict) and "tasks" in cand
+                plan_obj = cand
         except Exception:
+            # fallback: regex‐extract any foo(...) calls
             calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw)
             plan_obj = {
-                "tasks": [{"call": c, "tool_input": {}, "subtasks": []} for c in calls]
+                "tasks": [
+                    {"call": c, "tool_input": {}, "subtasks": []}
+                    for c in calls
+                ]
             }
 
         valid = {t["name"] for t in tools_list}
@@ -1303,17 +1316,19 @@ def _stage8_tool_chaining(
     tools_list: List[Dict[str, Any]],
     state: Dict[str, Any],
     *,
-    on_token: Callable[[str],None] | None = None,) -> Tuple[ContextObject, List[str], List[ContextObject]]:
-    import json, re, inspect
+    on_token: Callable[[str], None] | None = None,
+) -> Tuple[ContextObject, List[str], List[ContextObject]]:
+    import json
+    import re
     from tools import Tools
 
     # Ensure Tools can always reach the current repo
     Tools.repo = self.repo
 
-    # 0) load schemas from the repo
-    schema_map = {
-        json.loads(s.metadata["schema"])["name"]: json.loads(s.metadata["schema"])
-        for s in self.repo.query(lambda c: c.component=="schema" and "tool_schema" in c.tags)
+    # 0) load schemas from the repo (so we can reference them in the chaining context)
+    all_schemas = {
+        json.loads(s.metadata["schema"])["name"]: s
+        for s in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in c.tags)
     }
 
     # A) extract flat list of calls from the JSON plan (or fallback via regex)
@@ -1346,94 +1361,28 @@ def _stage8_tool_chaining(
         calls.extend(sorted(salvage))
 
     # B) pick matching schema ContextObjects
-    wanted = {c.split("(",1)[0] for c in calls}
+    wanted = {c.split("(", 1)[0] for c in calls}
     selected_schemas = [
-        s for s in self.repo.query(lambda c: c.component=="schema" and "tool_schema" in c.tags)
-        if json.loads(s.metadata["schema"])["name"] in wanted
+        all_schemas[name]
+        for name in wanted
+        if name in all_schemas
     ]
 
-    # C) actually invoke each tool, injecting assembler only when needed
-    tool_ctxs: List[ContextObject] = []
-    confirmed: List[str]  = []
-    for call_str in calls:
-        name, arg_blob = call_str.split("(",1)
-        arg_blob = arg_blob.rstrip(")")
+    # C) **Do NOT invoke** any tools here.  Defer actual execution to Stage 9.
+    #    We simply record the plan as a "tool_chaining" context.
 
-        # parse kwargs from the call string
-        try:
-            kwargs = json.loads("{" + arg_blob + "}")
-        except Exception:
-            kwargs = {}
-            for part in arg_blob.split(","):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    try:
-                        kwargs[k] = json.loads(v)
-                    except Exception:
-                        kwargs[k] = v.strip('"\'')
-
-        if hasattr(Tools, name):
-            func = getattr(Tools, name)
-        else:
-            import tools as _pkg
-            func = getattr(_pkg, name)
-        sig = inspect.signature(func)
-
-        # only inject assembler if the tool actually declares it
-        if "assembler" in sig.parameters:
-            invoke_kwargs = {"assembler": self, **kwargs}
-        else:
-            invoke_kwargs = kwargs
-
-        try:
-            output = func(**invoke_kwargs)
-            exception = None
-        except Exception as e:
-            output, exception = None, str(e)
-
-        # stream it live:
-        if on_token:
-            on_token(f"[Tool:{name}] → {repr(output) if exception is None else 'ERROR'}")
-            
-        # verbose logging
-        print(f"[ToolInvocation] {name} called with {invoke_kwargs!r} → "
-              f"output={output!r}, exception={exception!r}")
-
-        # persist the tool_output context
-        sch_ctx = next(
-            (s for s in selected_schemas
-             if json.loads(s.metadata["schema"])["name"] == name),
-            None
-        )
-        refs = [sch_ctx.context_id] if sch_ctx else []
-        ctx = ContextObject.make_stage(
-            "tool_output",
-            refs,
-            {"tool_call": call_str, "output": output, "exception": exception}
-        )
-        ctx.stage_id = f"tool_output_{name}"
-        ctx.summary  = repr(output) if exception is None else f"ERROR: {exception}"
-        ctx.touch()
-        self.repo.save(ctx)
-
-        tool_ctxs.append(ctx)
-        confirmed.append(call_str)
-
-    # D) record the chaining itself
     tc_ctx = ContextObject.make_stage(
         "tool_chaining",
         plan_ctx.references + [s.context_id for s in selected_schemas],
-        {"tool_calls": confirmed}
+        {"tool_calls": calls}
     )
     tc_ctx.stage_id = "tool_chaining"
-    tc_ctx.summary  = json.dumps(confirmed, ensure_ascii=False)
+    tc_ctx.summary  = json.dumps(calls, ensure_ascii=False)
     tc_ctx.touch()
     self.repo.save(tc_ctx)
 
-    # make tool_ctxs available downstream
-    state["tool_ctxs"] = tool_ctxs
-
-    return tc_ctx, confirmed, tool_ctxs
+    # downstream stages will actually invoke the calls
+    return tc_ctx, calls, selected_schemas
 
 def _stage8_5_user_confirmation(
     self,
@@ -1814,6 +1763,8 @@ def _stage9_invoke_with_retries(
     tracker.touch(); self.repo.save(tracker)
 
     state["tool_ctxs"] = tool_ctxs
+    self.integrator.ingest(tool_ctxs)
+    state["merged"].extend(tool_ctxs)
     return tool_ctxs
 
 
