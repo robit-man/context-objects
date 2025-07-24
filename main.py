@@ -435,36 +435,35 @@ print("[Ollama] locally available models:")
 for name in sorted(available):
     print(f"  • {name}")
 
-# 2) Helper to render a single-line bar
+# ─── Helper to render a single-line progress bar ────────────────────────────
 def render_bar(completed: int, total: int, width: int = 40) -> str:
-    pct = completed / total if total else 0.0
+    # coerce None→0, avoid division by zero
+    comp = completed or 0
+    tot  = total or 0
+    pct  = (comp / tot) if tot else 0.0
     filled = int(pct * width)
     bar = "█" * filled + "-" * (width - filled)
     return f"[{bar}] {pct*100:6.2f}%"
 
-# 3) Pull any missing specs
+# ─── Pull any missing specs ─────────────────────────────────────────────────
 for model_spec in (
     config.get("primary_model"),
     config.get("secondary_model"),
     config.get("decision_model"),
 ):
-    if not model_spec:
-        continue
-
-    if model_spec in available_set:
-        log_message(f"Ollama model '{model_spec}' already present.", "INFO")
+    if not model_spec or model_spec in available_set:
         continue
 
     log_message(f"Model '{model_spec}' not found locally — pulling with Ollama…", "PROCESS")
     try:
-        # stream=True yields successive status dicts
         for status in ollama.pull(model_spec, stream=True):
-            comp = status.get("completed", 0)
-            tot  = status.get("total",    0)
+            # status dict may have None for completed/total until it really starts
+            comp = status.get("completed")  # might be None
+            tot  = status.get("total")      # might be None
             bar_line = render_bar(comp, tot)
             sys.stdout.write(f"\r[Ollama:pull {model_spec}] {bar_line}")
             sys.stdout.flush()
-        print()  # newline after finished
+        print()  # newline once done
         log_message(f"Successfully pulled Ollama model '{model_spec}'.", "SUCCESS")
         available_set.add(model_spec)
 
