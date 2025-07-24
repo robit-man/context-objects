@@ -62,6 +62,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
     level=logging.INFO
 )
+
+# Silence all the HTTP “Request: POST … getUpdates” lines
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# (Optionally also silence any lower‑level PTB logs)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # chat_id → dedicated Assembler instance
