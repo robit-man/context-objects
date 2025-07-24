@@ -32,6 +32,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 import json
+from telegram import InputFile
 from telegram import Update, Bot, error as tg_error
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 from telegram.request import HTTPXRequest
@@ -602,7 +603,7 @@ def _make_status_cb(
                             asyncio.create_task(
                                 bot.send_voice(
                                     chat_id=chat_id,
-                                    voice=vf,
+                                    voice=ogg_path,            # pass the path, not an open handle
                                     reply_to_message_id=msg_id
                                 )
                             )
@@ -626,23 +627,19 @@ async def _start_runner_for_pin(
     loop = asyncio.get_event_loop()
     status_cb, stop_status = _make_status_cb(loop, bot, chat_id, None)
     try:
-        #live_sink = chat_asm.tts.token_sink()
-        if chat_asm.tts and hasattr(chat_asm.tts, "enqueue"):
-            live_sink = lambda token: chat_asm.tts.enqueue(token)
-        else:
-            live_sink = None
-            
-        final = await asyncio.to_thread(
-            chat_asm.run_with_meta_context,
+        live_sink = (lambda token: chat_asm.tts.enqueue(token)) \
+                    if chat_asm.tts and hasattr(chat_asm.tts, "enqueue") else None
+
+        final = await chat_asm.run_with_meta_context(
             request_text,
             status_cb,
-            on_token=live_sink,   # ← same hookup here
+            on_token=live_sink,
         )
         await asyncio.to_thread(chat_asm.tts._file_q.join)
     except Exception:
         final = ""
     stop_status()
-    if not final.strip():
+    if not (final or "").strip():
         return
 
     await bot.send_message(chat_id=chat_id, text=final, reply_to_message_id=reply_to_id)
@@ -981,14 +978,8 @@ def telegram_input(asm):
                 )
                 assemblers[chat_id] = chat_asm
 
-                chat_asm.tts_telegram_stages = {
-                    "record_input",
-                    "intent_clarification",
-                    "external_knowledge",   # reads snippets
-                    "announcement",         # “I’m about to run tools…”
-                    "assemble_and_infer",   # draft
-                    "final_inference",      # final answer
-                }
+                chat_asm.tts_telegram_stages = set(chat_asm.tts_live_stages)
+
 
             chat_asm._chat_contexts.add(chat_id)
 
@@ -1000,7 +991,6 @@ def telegram_input(asm):
                 title = update.effective_chat.title or f"chat_{chat_id}"
                 _GREG.add(title, chat_id)
 
-            # ── Build tags & *define metadata up-front* ───────────────────────
             # ── Build tags & define metadata up-front ───────────────────────
             metadata = {
                 "chat_id":       chat_id,
@@ -1225,36 +1215,31 @@ def telegram_input(asm):
                     typing_task = loop.create_task(_typing_loop())
 
                 # 2) Wrap status_cb to also drain/send stage OGGs immediately
-                def status_cb(stage: str, info: Any = None):
-                    # a) update UI or no-op
+                def status_cb(stage: str, info: Any | None = None):
+                    # 1) original UI/edit callback
                     orig_status(stage, info)
 
-                    # b) only send voice for configured live stages
-                    if stage not in chat_asm.tts_live_stages:
+                    # 2) only stream OGGs for the stages we’ve opted in
+                    if stage not in chat_asm.tts_telegram_stages:
                         return
 
-                    # c) drain any new .ogg files and send them right away
+                    # 3) drain all new .ogg files and send each immediately
                     while True:
                         try:
                             ogg_path = chat_asm.tts._ogg_q.get_nowait()
                         except _queue.Empty:
                             break
                         else:
-                            # schedule the voice send on the event loop,
-                            # pass the file path so telegram uploads directly
-                            def _send(ogg=ogg_path):
-                                try:
-                                    asyncio.create_task(
-                                        bot.send_voice(
-                                            chat_id=chat_id,
-                                            voice=str(ogg),
-                                            reply_to_message_id=reply_to_id
-                                        )
+                            # schedule a send_voice using the current reply_to_id
+                            loop.call_soon_threadsafe(
+                                lambda path=ogg_path, reply_to=reply_to_id: asyncio.create_task(
+                                    bot.send_voice(
+                                        chat_id=chat_id,
+                                        voice=InputFile(path),
+                                        reply_to_message_id=reply_to
                                     )
-                                except Exception:
-                                    pass
-                            loop.call_soon_threadsafe(_send)
-
+                                )
+                            )
 
                 async def runner():
                     nonlocal placeholder_id, typing_task
@@ -1304,20 +1289,18 @@ def telegram_input(asm):
                     chat_asm.tts.set_mode("file")
                     try:
                         sink = chat_asm.tts.token_sink()
-                        final = await asyncio.to_thread(
-                            chat_asm.run_with_meta_context,
+                        final = await chat_asm.run_with_meta_context(
                             request_text,
                             status_cb,
                             images=images_b64 or None,
                             on_token=sink,
                         )
-                        sink(None)  # flush any remaining tokens
-                        await asyncio.to_thread(chat_asm.tts._file_q.join)
+                        sink(None)                              # flush synth buffer
+                        await asyncio.to_thread(chat_asm.tts._file_q.join)  # wait for OGG encode
                     except Exception:
                         logger.exception("run_with_meta_context failed")
                         final = ""
                     finally:
-                        # stop the live‐status callback and typing indicator
                         stop_status()
                         if typing_task:
                             typing_task.cancel()
@@ -1330,16 +1313,6 @@ def telegram_input(asm):
                             break
                         else:
                             pre_oggs.append(ogg)
-
-                    # 4) If there's no text at all, clean up and exit
-                    if not final.strip():
-                        if placeholder_id:
-                            try:
-                                await bot.delete_message(chat_id, placeholder_id)
-                            except:
-                                pass
-                        running.pop((chat_id, bot.id), None)
-                        return
 
                     # 5) Send or edit the assistant's text reply
                     if debug_enabled:
@@ -1389,12 +1362,12 @@ def telegram_input(asm):
                         if len(all_oggs) == 1:
                             path = all_oggs[0]
                             if os.path.getsize(path) > 0:
-                                with open(path, "rb") as vf:
-                                    await bot.send_voice(
-                                        chat_id=chat_id,
-                                        voice=vf,
-                                        reply_to_message_id=target_id
-                                    )
+                                # Let Telegram open the path itself
+                                await bot.send_voice(
+                                    chat_id=chat_id,
+                                    voice=InputFile(path),
+                                    reply_to_message_id=target_id
+                                )
                         else:
                             # concatenate into one OGG and send
                             combined = os.path.join(

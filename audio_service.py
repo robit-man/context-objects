@@ -14,6 +14,7 @@ class AudioService:
     """
     Handles microphone capture, optional audio enhancement,
     and dual-model Whisper consensus transcription.
+    Always preempts any in-flight assembler processing when new speech arrives, if an assembler is provided.
     """
     def __init__(
         self,
@@ -25,6 +26,7 @@ class AudioService:
         on_transcription: callable,
         logger: callable,
         cfg: dict,
+        assembler=None,            # ← now optional
         denoise_fn: callable = None,
     ):
         self.sample_rate       = sample_rate
@@ -32,10 +34,16 @@ class AudioService:
         self.silence_duration  = silence_duration
         self.consensus_thresh  = consensus_threshold
         self.enable_denoise    = enable_denoise
-        self.on_transcription  = on_transcription
         self.log               = logger
         self.config            = cfg
         self._denoise_fn       = denoise_fn
+
+        # assembler may be None
+        self.assembler = assembler
+
+        # wrap user callback to handle assembler abortion only if assembler is present
+        self._user_cb = on_transcription
+        self.on_transcription = self._wrap_transcription
 
         self.log("AudioService: loading Whisper models…", "INFO")
         self.model_base   = whisper.load_model("base")
@@ -47,6 +55,33 @@ class AudioService:
         self._stream    = None
         self._worker    = threading.Thread(target=self._listen_loop, daemon=True)
         self._suspended = False
+
+    def _wrap_transcription(self, text: str):
+        """
+        If an assembler is provided, cancel its in-flight run, then restart with this new text.
+        Otherwise, just call the user callback.
+        """
+        if self.assembler:
+            # signal any running inference to abort
+            try:
+                setattr(self.assembler, "_abort_inference", True)
+            except Exception:
+                pass
+
+            # brief pause so the stream loop sees the flag
+            time.sleep(0.05)
+
+            # clear flag for next run
+            try:
+                setattr(self.assembler, "_abort_inference", False)
+            except Exception:
+                pass
+
+        # propagate upward
+        try:
+            self._user_cb(text)
+        except Exception as ex:
+            self.log(f"AudioService callback error: {ex}", "ERROR")
 
     def start(self):
         """Begin capturing audio and running transcription loop."""
@@ -116,10 +151,8 @@ class AudioService:
             text = self._transcribe_consensus(audio_block)
             if text:
                 self.log(f"AudioService: recognized: {text!r}", "INFO")
-                try:
-                    self.on_transcription(text)
-                except Exception as ex:
-                    self.log(f"AudioService callback error: {ex}", "ERROR")
+                # this will preempt any ongoing assembler work if assembler is set
+                self.on_transcription(text)
 
         self.log("AudioService: listen loop exiting.", "DEBUG")
 
@@ -128,12 +161,14 @@ class AudioService:
         if rms < self.rms_threshold:
             return ""
         tb = tm = ""
+
         def run_b():
             nonlocal tb
             try:
                 tb = self.model_base.transcribe(audio, language="en")["text"].strip()
             except Exception as e:
                 self.log(f"Base transcription error: {e}", "ERROR")
+
         def run_m():
             nonlocal tm
             try:

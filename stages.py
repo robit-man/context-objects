@@ -5,6 +5,7 @@ import re
 import os
 import ast
 import inspect
+import asyncio
 import importlib
 import random
 import math
@@ -161,6 +162,7 @@ def _stage2_load_system_prompts(self) -> List[ContextObject]:
     self._persist_and_index(prompts)
 
     return prompts
+
 def _stage3_retrieve_and_merge_context(
     self,
     user_text: str,
@@ -567,126 +569,168 @@ def _stage4_intent_clarification(
 
     return clar_ctx
 
-
+# ──────────────────────────────────────────────────────────────────
+# _stage5_external_knowledge   (upgraded)
+# ──────────────────────────────────────────────────────────────────
 def _stage5_external_knowledge(
     self,
     clar_ctx: "ContextObject",
     state: Dict[str, Any] | None = None,
 ) -> "ContextObject":
     """
-    Build a compact “external knowledge” context for the planner from:
-      • recent dialogue/history
-      • recent tool outputs
-      • semantic recalls
-      • associative recalls
-      • fresh engine.query hits based on clarifier keywords
+    Build a ranked “external knowledge” ContextObject for the planner.
+
+    Signal sources (in trust order):
+
+      • Recent dialogue turns            (last 6)
+      • Recent tool outputs              (last 6)
+      • Semantic recalls                 (saved in state["semantic"])
+      • Associative holographic recall   (MemoryManager.holographic_recall)
+      • Fresh similarity hits            (engine.query, recency‑boosted)
+
+    Score  =  0.55 · similarity   +   0.25 · recency_boost   +   0.20 · assoc
+    (dialogue / tool snippets keep max score)
+
+    Top `MAX_SNIPPETS` unique snippets are kept and persisted.
     """
-    import json, textwrap
-    from datetime import datetime
+    import json, math, time
+    from datetime import datetime, timezone
     from context import ContextObject
+
+    # ─── tunables ───────────────────────────────────────────────────
+    MAX_SNIPPETS        = 12
+    MAX_PER_CATEGORY    = 6
+    SIM_TOP_K           = max(3, getattr(self, "top_k", 3))
+    HALF_LIFE_DAYS      = 3.0
+    NOW_TS              = time.time()
 
     state = state or {}
 
-    # ------------------------------------------------------------------ #
-    # 1) Clarifier keywords → fallback to summary if empty               #
-    # ------------------------------------------------------------------ #
+    # ---------- helpers --------------------------------------------
+    def _recency_boost(ctx) -> float:
+        ts = ctx.timestamp
+        try:
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+        age_days = max((NOW_TS - ts) / 86400.0, 0.0)
+        return 0.5 ** (age_days / HALF_LIFE_DAYS)
+
+    def _label_trim(text: str, lbl: str, limit: int = 220) -> str:
+        text = text.replace("\n", " ").strip()
+        if len(text) > limit:
+            text = text[:limit].rsplit(" ", 1)[0] + " …"
+        return f"({lbl}) {text}"
+
+    scored: list[tuple[float, str, ContextObject]] = []
+    seen_texts: dict[str, float] = {}   # text → best_score
+
+    # ---------- 1) recent dialogue ---------------------------------
+    for c in reversed(state.get("history", [])[-MAX_PER_CATEGORY:]):
+        txt = c.summary or c.metadata.get("text", "")
+        s   = _label_trim(txt, "USER" if c.semantic_label == "user_input" else "ASSIST")
+        score = 1.0
+        scored.append((score, s, c))
+        seen_texts[s] = score
+
+    # ---------- 2) recent tool outputs -----------------------------
+    for c in reversed(state.get("tools", [])[-MAX_PER_CATEGORY:]):
+        payload = c.metadata.get("output") or c.metadata.get("exception") or ""
+        if not isinstance(payload, str):
+            try:    payload = json.dumps(payload, ensure_ascii=False)[:300]
+            except: payload = repr(payload)[:300]
+        s = _label_trim(payload, f"TOOL:{c.stage_id}")
+        score = 1.0
+        scored.append((score, s, c))
+        seen_texts[s] = score
+
+    # ---------- 3) semantic & assoc recalls from previous stages ---
+    for lbl, key in (("SEM", "semantic"), ("ASSOC", "assoc")):
+        for c in state.get(key, [])[:MAX_PER_CATEGORY]:
+            txt = c.summary or ""
+            s   = _label_trim(txt, lbl)
+            if s in seen_texts:
+                continue
+            sim = c.retrieval_score or 0.7
+            scored.append((sim, s, c))
+            seen_texts[s] = sim
+
+    # ---------- 4) holographic associative recall ------------------
+    seed_ids = [clar_ctx.context_id] + [c.context_id for c in state.get("history", [])[-2:]]
+    assoc_hits = self.memman.holographic_recall(
+        cue_ids=seed_ids,
+        cue_text=clar_ctx.summary or "",
+        hops=2,
+        top_n=MAX_PER_CATEGORY,
+        embed_fn=self.embed_text
+    )
+    for h in assoc_hits:
+        txt = h.summary or h.metadata.get("content", "")
+        s   = _label_trim(txt, "HMM")
+        if s in seen_texts:
+            continue
+        assoc = h.retrieval_score or 0.5
+        rec   = _recency_boost(h)
+        score = 0.20 * assoc + 0.25 * rec + 0.55 * assoc  # assoc doubles as similarity proxy
+        scored.append((score, s, h))
+        seen_texts[s] = score
+
+    # ---------- 5) fresh similarity hits (recency‑boosted) ---------
     kws = clar_ctx.metadata.get("keywords") or []
     if not kws and clar_ctx.summary:
         kws = [clar_ctx.summary]
 
-    # ------------------------------------------------------------------ #
-    # 2) Fresh similarity hits                                           #
-    # ------------------------------------------------------------------ #
-    TOP_K = max(3, self.top_k)
-    fresh_hits: list[tuple["ContextObject", str]] = []
-    seen_ids: set[str] = set()
-
     for kw in kws:
-        hits = self.engine.query(
-            similarity_to=kw,
-            stage_id="external_knowledge_query",
-            top_k=TOP_K,
-        )
-        for h in hits:
-            if h.context_id in seen_ids:
-                continue
-            seen_ids.add(h.context_id)
+        for h in self.engine.query(similarity_to=kw,
+                                   stage_id="external_knowledge_query",
+                                   top_k=SIM_TOP_K):
             txt = (h.summary or h.metadata.get("content", "")).strip()
-            fresh_hits.append((h, txt))
-            if len(fresh_hits) >= TOP_K:
-                break
-        if len(fresh_hits) >= TOP_K:
+            s   = _label_trim(txt, "FRESH")
+            if s in seen_texts:
+                continue
+            sim  = h.retrieval_score or 0.0
+            rec  = _recency_boost(h)
+            score = 0.55 * sim + 0.25 * rec + 0.20 * 0.0   # no assoc for engine hits
+            scored.append((score, s, h))
+            seen_texts[s] = score
+
+    # ---------- 6) final ranking & de‑dup --------------------------
+    scored.sort(key=lambda t: t[0], reverse=True)
+    uniq_lines = []
+    added = set()
+    for _, txt, _ in scored:
+        if txt not in added:
+            uniq_lines.append(txt)
+            added.add(txt)
+        if len(uniq_lines) >= MAX_SNIPPETS:
             break
 
-    # ------------------------------------------------------------------ #
-    # 3) Helper to label + truncate                                      #
-    # ------------------------------------------------------------------ #
-    def _label_and_trim(text: str, lbl: str, limit: int = 200) -> str:
-        text = text.replace("\n", " ").strip()
-        if len(text) > limit:
-            text = text[: limit].rsplit(" ", 1)[0] + " …"
-        return f"({lbl}) {text}"
-
-    lines: list[str] = []
-
-    # a) dialogue / history
-    for c in state.get("history", []):
-        role = "USER" if c.semantic_label == "user_input" else "ASSIST"
-        lines.append(_label_and_trim(c.summary or c.metadata.get("text", ""), role))
-
-    # b) recent tool outputs
-    for c in state.get("tools", []):
-        payload = c.metadata.get("output") or c.metadata.get("exception") or ""
-        if not isinstance(payload, str):
-            try:
-                payload = json.dumps(payload, ensure_ascii=False)
-            except Exception:
-                payload = repr(payload)
-        lines.append(_label_and_trim(payload, f"TOOL:{c.stage_id}"))
-
-    # c) semantic recalls
-    for c in state.get("semantic", []):
-        lines.append(_label_and_trim(c.summary or "", "SEM"))
-
-    # d) associative recalls
-    for c in state.get("assoc", []):
-        lines.append(_label_and_trim(c.summary or "", "ASSOC"))
-
-    # e) fresh similarity hits
-    for ctx, txt in fresh_hits:
-        lines.append(_label_and_trim(txt, "FRESH"))
-
-    # Hard cap: keep the most recent ~4·TOP_K snippets
-    lines = lines[: TOP_K * 4]
-
-    # ------------------------------------------------------------------ #
-    # 4) Persist ContextObject                                           #
-    # ------------------------------------------------------------------ #
+    # ---------- 7) persist ContextObject ---------------------------
     ext_ctx = ContextObject.make_stage(
         "external_knowledge_retrieval",
         input_refs=[clar_ctx.context_id],
-        output={"snippets": lines},
+        output={"snippets": uniq_lines},
     )
     ext_ctx.stage_id       = "external_knowledge_retrieval"
     ext_ctx.semantic_label = "external_knowledge"
     ext_ctx.tags.append("external")
-    ext_ctx.summary = "\n".join(lines)[:1024]  # store a concise summary
-
+    ext_ctx.summary = "\n".join(uniq_lines)[:1024]
     ext_ctx.touch()
     self.repo.save(ext_ctx)
-    # 🔑  **register embedding so future similarity queries can find it**
-    #self.memman.register_relationships(ext_ctx, self.embed_text)
+    self.memman.register_relationships(ext_ctx, self.embed_text)
 
-    # ------------------------------------------------------------------ #
-    # 5) Optional debug print                                            #
-    # ------------------------------------------------------------------ #
+    # ---------- 8) debug print -------------------------------------
     self._print_stage_context(
         "external_knowledge_retrieval",
-        {"snippets": lines, "total": len(lines)},
+        {"chosen_snippets": uniq_lines, "total_candidates": len(scored)},
     )
 
-    return ext_ctx
+    # expose snippets to downstream stages
+    if state is not None:
+        state["knowledge_snippets"] = uniq_lines
 
+    return ext_ctx
 
 
 
@@ -876,27 +920,36 @@ def _stage7_planning_summary(
         except Exception:
             cand = None
 
-        # ─ Normalization: ALWAYS end up with {"tasks":[…]} ───────────────
         if isinstance(cand, dict) and "tasks" in cand and isinstance(cand["tasks"], list):
+            # Already the new schema
             plan_obj = cand
 
         elif isinstance(cand, dict) and "tool_calls" in cand:
-            # wrap old shape into new tasks schema
+            # Wrap old `tool_calls` shape into `tasks`
             tasks = []
             for tc in cand["tool_calls"]:
                 if isinstance(tc, str):
                     tasks.append({"call": tc, "tool_input": {}, "subtasks": []})
                 else:
-                    name    = tc.get("call") or tc.get("tool_call")
-                    inp     = tc.get("tool_input", {}) or {}
-                    subs    = tc.get("subtasks", []) or []
+                    name = tc.get("call") or tc.get("tool_call")
+                    inp  = tc.get("tool_input", {}) or {}
+                    subs = tc.get("subtasks", []) or []
                     tasks.append({"call": name, "tool_input": inp, "subtasks": subs})
             plan_obj = {"tasks": tasks}
 
+        elif isinstance(cand, dict):
+            # Any other dict → wrap the entire payload as one task
+            plan_obj = {"tasks": [cand]}
+
         else:
-            # fallback: regex‐extract foo(...) calls into minimal tasks
+            # Fallback: regex‐extract foo(...) calls into minimal tasks
             calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw_json or raw)
-            plan_obj = {"tasks": [{"call": c, "tool_input": {}, "subtasks": []} for c in calls]}
+            plan_obj = {
+                "tasks": [
+                    {"call": c, "tool_input": {}, "subtasks": []}
+                    for c in calls
+                ]
+            }
 
         # ensure structure
         if not isinstance(plan_obj, dict) or "tasks" not in plan_obj or not isinstance(plan_obj["tasks"], list):
@@ -1707,16 +1760,23 @@ def _stage9_invoke_with_retries(
     state["merged"].extend(tool_ctxs)
     return tool_ctxs
 
+def _await_if_needed(obj):
+    """Return result synchronously whether obj is a coroutine or not.
+       Safe to call from a worker thread (no running loop there)."""
+    if inspect.isawaitable(obj):
+        return asyncio.run(obj)   # we're inside a to_thread worker, so no active loop
+    return obj
 
-def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> str:
-    import json
+
+def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> str:
+    import json, pprint
     from collections import OrderedDict
     from context import ContextObject
 
     # ─── 1) Conversation snippets ────────────────────────────────────
     MAX_CTX_OBJS = 32
-    merged = state.get("merged", [])
-    recent = merged[-MAX_CTX_OBJS:]
+    merged  = state.get("merged", [])
+    recent  = merged[-MAX_CTX_OBJS:]
     convo_lines = [c.summary or "" for c in recent]
     conversation_block = (
         "[Conversation so far]\n" + "\n".join(convo_lines)
@@ -1724,20 +1784,17 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     )
 
     # ─── 2) Tool outputs ─────────────────────────────────────────────
-    tool_ctxs = state.get("tool_ctxs", []) or []
+    tool_ctxs   = state.get("tool_ctxs", []) or []
     tool_blocks = []
     for tc in tool_ctxs:
-        meta = tc.metadata.copy()
-        if "tool_call" in meta:
-            meta["tool_call"] = meta["tool_call"]
+        meta = dict(getattr(tc, "metadata", {}))
         try:
             payload = json.dumps(meta, ensure_ascii=False, indent=2)
         except Exception:
-            payload = repr(meta)
+            payload = pprint.pformat(meta, compact=True)
         call_name = meta.get("tool_call", tc.stage_id)
-        ts = getattr(tc, "timestamp", "")
-        header = f"--- {tc.stage_id} ({call_name}) @ {ts} ---"
-        tool_blocks.append(header)
+        ts        = getattr(tc, "timestamp", "")
+        tool_blocks.append(f"--- {tc.stage_id} ({call_name}) @ {ts} ---")
         tool_blocks.append(payload)
 
     tools_block = (
@@ -1745,11 +1802,11 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         if tool_blocks else ""
     )
 
-    # ─── 3) Narrative ────────────────────────────────────────────────
+    # ─── 3) Narrative block ──────────────────────────────────────────
     narr_ctx = self._load_narrative_context()
-    narrative_block = "[Narrative]\n" + (narr_ctx.summary or "")
+    narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
 
-    # ─── 4) Recent history bullets ──────────────────────────────────
+    # ─── 4) Recent‑history bullets ───────────────────────────────────
     recent_hist = merged[-5:]
     bullets = [f"- {c.semantic_label}: {c.summary}" for c in recent_hist]
     recent_hist_block = (
@@ -1757,12 +1814,18 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
         if bullets else ""
     )
 
-    # ─── 5) Plan & user question ────────────────────────────────────
-    plan_txt = state.get("plan_output", "(no plan)")
-    plan_block = "[Plan]\n" + plan_txt
+    # ─── 5) Plan & user question (now plan‑safe) ─────────────────────
+    raw_plan = state.get("plan_output", "(no plan)")
+    if not isinstance(raw_plan, str):
+        try:
+            raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
+        except Exception:
+            raw_plan = pprint.pformat(raw_plan, compact=True)
+
+    plan_block = "[Plan]\n" + raw_plan
     user_block = "[User question]\n" + user_text
 
-    # ─── 6) Compose the exact messages for the LLM ──────────────────
+    # ─── 6) Compose LLM messages ─────────────────────────────────────
     final_sys = self._get_prompt("final_inference_prompt")
     msgs = [
         {"role": "system", "content": final_sys},
@@ -1779,7 +1842,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
 
-    # ─── 7) DEBUG PRINT: show all blocks *and* the assembled msgs ────
+    # ─── 7) DEBUG payload (pretty printed) ───────────────────────────
     debug_payload = OrderedDict([
         ("conversation_block", conversation_block),
         ("tools_block",        tools_block),
@@ -1794,12 +1857,15 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     self._print_stage_context("assemble_and_infer", debug_payload)
 
     # ─── 8) Call the model ───────────────────────────────────────────
-    reply = self._stream_and_capture(
-        self.primary_model,
-        msgs,
-        tag="[Assistant]",
-        images=state.get("images"),
-    ).strip()
+    raw_reply = _await_if_needed(
+        self._stream_and_capture(
+            self.primary_model,
+            msgs,
+            tag="[Assistant]",
+            images=state.get("images")
+        )
+    )
+    reply = (raw_reply or "").strip()
 
     # ─── 9) Persist assistant reply ─────────────────────────────────
     refs = debug_payload["merged_ids"] + debug_payload["tool_ctx_ids"]
@@ -1811,11 +1877,16 @@ def _stage10_assemble_and_infer(self, user_text: str, state: Dict[str, Any]) -> 
     seg = ContextObject.make_segment("assistant",
                                      [resp_ctx.context_id],
                                      tags=["assistant"])
-    seg.summary   = reply
-    seg.stage_id  = "assistant"
-    seg.touch(); self.repo.save(seg)
+    seg.summary = reply
+    seg.stage_id = "assistant"
+    seg.touch()
+    self.repo.save(seg)
 
+    # store on state for downstream
+    state["draft"]         = reply
+    state["assistant_ctx"] = resp_ctx
     return reply
+
 
 
 def _stage10b_response_critique_and_safety(
@@ -1828,12 +1899,19 @@ def _stage10b_response_critique_and_safety(
     import json, difflib
     from context import ContextObject
 
+    # ─── Guard: if there's no draft, skip polishing ───────────────
+    if not draft:
+        return draft
+
+    # Ensure we have tool_ctxs
+    tool_ctxs = tool_ctxs or state.get("tool_ctxs", [])
+
     # Pull in full merged context (including prior user/assistant turns)
     merged_ctxs = state.get("merged", [])
     merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs)
 
     # Retrieve the last executed plan
-    plan_text = getattr(self, "_last_plan_output", "(no plan)")
+    plan_text = state.get("plan_output", "(no plan)")
 
     # 1) Serialize every tool output clearly
     outputs = []
@@ -1841,7 +1919,7 @@ def _stage10b_response_critique_and_safety(
         raw = c.metadata.get("output")
         if isinstance(raw, dict) and "results" in raw:
             fragment = "\n".join(f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
-                                  for r in raw["results"])
+                                    for r in raw["results"])
         else:
             fragment = json.dumps(raw, indent=2, ensure_ascii=False)
         outputs.append(f"[{c.stage_id}]\n{fragment}")
@@ -1873,7 +1951,6 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([sum_ctx])
 
     # 3️⃣  Polishing / Safety Critique
-
     editor_sys = self._get_prompt("editor_sys_prompt")
     editor_user = "\n\n".join([
         f"USER QUESTION:\n{user_text}",

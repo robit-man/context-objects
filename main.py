@@ -519,10 +519,6 @@ def setup_piper_and_onnx():
 # finally, run it
 setup_piper_and_onnx()
 
-# globals for pipelines
-audio_svc = None
-tts_audio = None
-asm_audio = None
 # ─────────── globals for pipelines ─────────────────────────────────────────
 audio_svc = None
 tts_audio = None
@@ -536,60 +532,83 @@ asm_tele  = None
 from audio_service import AudioService
 from tts_service import TTSManager
 from telegram_input import notify_admin, telegram_input
+import threading, subprocess, os, sys, time, traceback
 
-import traceback
+import asyncio, threading, traceback
+from assembler import Assembler
 
-CTX_PATH = "context.jsonl"
+CTX_PATH    = "context.jsonl"
+CONFIG_FILE = "config.json"  # adjust as needed
 
-# ─── 1) AUDIO PIPELINE ────────────────────────────────────────────────────
+
+# ─── Create one persistent event loop for the audio thread ───────────────
+_audio_loop = asyncio.new_event_loop()
+
 def start_audio_pipeline():
-    global audio_svc, tts_audio, asm_audio
-    try:
-        from assembler import Assembler
+    # 1) Bind that loop to this thread
+    asyncio.set_event_loop(_audio_loop)
 
-        audio_svc = AudioService(
-            sample_rate         = config["sample_rate"],
-            rms_threshold       = config["rms_threshold"],
-            silence_duration    = config["silence_duration"],
-            consensus_threshold = config["consensus_threshold"],
-            enable_denoise      = config["enable_noise_reduction"],
-            on_transcription    = None,
-            logger              = log_message,
-            cfg                 = config,
-        )
-        tts_audio = TTSManager(
-            logger=log_message,
-            cfg=config,
-            audio_service=audio_svc
-        )
-        tts_audio.set_mode("live")
+    # 2) Instantiate audio → TTS → assembler exactly as before:
+    audio_svc = AudioService(
+        sample_rate         = config["sample_rate"],
+        rms_threshold       = config["rms_threshold"],
+        silence_duration    = config["silence_duration"],
+        consensus_threshold = config["consensus_threshold"],
+        enable_denoise      = config["enable_noise_reduction"],
+        on_transcription    = lambda text: None,   # overridden below
+        logger              = log_message,
+        cfg                 = config,
+        denoise_fn          = None,
+    )
+    tts_audio = TTSManager(
+        logger=log_message,
+        cfg=config,
+        audio_service=audio_svc
+    )
+    tts_audio.set_mode("live")
 
-        asm_audio = Assembler(
-            context_path     = CTX_PATH,
-            config_path      = CONFIG_FILE,
-            lookback_minutes = 60,
-            top_k            = 5,
-            tts_manager      = tts_audio,
-        )
+    asm_audio = Assembler(
+        context_path     = CTX_PATH,
+        config_path      = CONFIG_FILE,
+        lookback_minutes = 60,
+        top_k            = 5,
+        tts_manager      = tts_audio,
+    )
 
-        def _audio_input_cb(text: str):
-            try:
-                answer = asm_audio.run_with_meta_context(text)
-                if answer and answer.strip():
-                    tts_audio.enqueue(answer)
-            except Exception:
-                tb = traceback.format_exc()
-                log_message(f"Audio callback error:\n{tb}", "ERROR")
-                notify_admin(f"⚠️ *Audio callback error*:\n```{tb[:1500]}```")
+    # 3) Monkey‑patch the transcription callback to schedule on _audio_loop
+    def _audio_input_cb(text: str):
+        try:
+            # schedule the async run (it will cancel/restart previous in-flight turn)
+            future = asyncio.run_coroutine_threadsafe(
+                asm_audio.run_with_meta_context(text),
+                _audio_loop
+            )
+            # optionally handle the result (enqueue TTS) when it completes:
+            def _on_done(fut):
+                try:
+                    answer = fut.result()
+                    if answer and answer.strip():
+                        tts_audio.enqueue(answer)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    log_message(f"Audio callback error:\n{tb}", "ERROR")
+                    notify_admin(f"⚠️ *Audio callback error*:\n```{tb[:1500]}```")
+            future.add_done_callback(_on_done)
 
-        audio_svc.on_transcription = _audio_input_cb
-        audio_svc.start()
+        except Exception:
+            tb = traceback.format_exc()
+            log_message(f"Audio callback scheduling failed:\n{tb}", "ERROR")
+            notify_admin(f"⚠️ *Audio scheduling error*:\n```{tb[:1500]}```")
 
-    except Exception:
-        tb = traceback.format_exc()
-        log_message(f"Audio pipeline startup failed:\n{tb}", "ERROR")
-        notify_admin(f"⚠️ *Audio pipeline startup failed*:\n```{tb[:1500]}```")
+    audio_svc.on_transcription = _audio_input_cb
 
+    # 4) Start the microphone/transcription loop
+    audio_svc.start()
+
+    # 5) Run the loop forever so cancellations & restarts work reliably
+    _audio_loop.run_forever()
+
+# ─── Kick off the audio thread once ─────────────────────────────────────────
 threading.Thread(
     target=start_audio_pipeline,
     daemon=True,
@@ -598,10 +617,20 @@ threading.Thread(
 
 # ─── 2) CLI PIPELINE ──────────────────────────────────────────────────────
 def start_cli_pipeline():
-    global tts_cli, asm_cli
-    try:
-        from assembler import Assembler
+    """
+    Async-safe CLI loop:
+    - awaits asm.run_with_meta_context()
+    - streams tokens to TTS in live mode
+    - prints stage updates
+    """
+    import asyncio, inspect, traceback, threading
+    from tts_service import TTSManager
+    from assembler import Assembler
 
+    async def _cli_main():
+        global tts_cli, asm_cli   # <-- use globals, not nonlocal
+
+        # ----- init TTS + Assembler -----
         tts_cli = TTSManager(
             logger=log_message,
             cfg=config,
@@ -617,31 +646,71 @@ def start_cli_pipeline():
             tts_manager      = tts_cli,
         )
 
+        # status callback for console
+        def cli_status(stage: str, info=None):
+            snippet = (str(info) if info is not None else "").replace("\n", " ")
+            if len(snippet) > 120:
+                snippet = snippet[:117] + "…"
+            print(f"[{stage}] {snippet}")
+
         print("Ready (CLI): type your message, Ctrl-C to exit.")
         while True:
             try:
-                line = input(">> ").strip()
+                line = await asyncio.to_thread(input, ">> ")
             except (EOFError, KeyboardInterrupt):
                 break
-            if not line:
+            if not line.strip():
                 continue
 
-            answer = asm_cli.run_with_meta_context(line)
+            # token sink (if available) for ultra-low-latency TTS
+            sink = getattr(tts_cli, "token_sink", None)
+            sink = sink() if callable(sink) else None
+
+            try:
+                answer = await asm_cli.run_with_meta_context(
+                    line.strip(),
+                    status_cb=cli_status,
+                    images=None,
+                    on_token=sink
+                )
+                # just in case something upstream returned a coroutine
+                if inspect.iscoroutine(answer):
+                    answer = await answer
+            except Exception:
+                tb = traceback.format_exc()
+                log_message(f"Run failed:\n{tb}", "ERROR")
+                notify_admin(f"⚠️ *CLI turn failed*:\n```{tb[:1500]}```")
+                answer = ""
+
+            # flush pending audio chunks
+            if sink:
+                try: sink(None)
+                except Exception: pass
+
             if answer and answer.strip():
-                tts_cli.enqueue(answer)
+                print(answer)
+                try:
+                    tts_cli.enqueue(answer)
+                except Exception:
+                    pass
 
         print("CLI loop exiting…")
 
+    try:
+        asyncio.run(_cli_main())
     except Exception:
         tb = traceback.format_exc()
         log_message(f"CLI pipeline startup failed:\n{tb}", "ERROR")
         notify_admin(f"⚠️ *CLI pipeline startup failed*:\n```{tb[:1500]}```")
 
+
+# kick it off in a background thread (unchanged)
 threading.Thread(
     target=start_cli_pipeline,
     daemon=True,
     name="CLIThread"
 ).start()
+
 
 # ─── 3) TELEGRAM PIPELINE ─────────────────────────────────────────────────
 def start_telegram_pipeline():
@@ -739,6 +808,10 @@ threading.Thread(
 
 # ─── CLEANUP & WAIT ───────────────────────────────────────────────────────
 import atexit
+import signal
+import os
+import sys
+
 def _cleanup():
     log_message("Shutting down services…", "INFO")
     try: audio_svc.stop()
@@ -747,5 +820,21 @@ def _cleanup():
     except: pass
     log_message("Goodbye.", "INFO")
 
+# 1) Always run cleanup on normal exit
 atexit.register(_cleanup)
-threading.Event().wait()
+
+# 2) On SIGINT/SIGTERM, cleanup then _immediately_ kill the process
+def _signal_handler(signum, frame):
+    log_message(f"Received signal {signum}, exiting…", "INFO")
+    _cleanup()
+    os._exit(0)   # bypass Python shutdown hooks & thread.join()
+
+signal.signal(signal.SIGINT,  _signal_handler)   # Ctrl‑C
+signal.signal(signal.SIGTERM, _signal_handler)   # kill, docker stop
+
+# 3) Ignore Ctrl‑Z (SIGTSTP) so you can't background it
+if hasattr(signal, "SIGTSTP"):
+    signal.signal(signal.SIGTSTP, lambda s, f: None)
+
+# 4) Block here until a signal arrives
+signal.pause()
