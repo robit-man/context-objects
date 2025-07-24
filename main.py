@@ -264,7 +264,7 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["sudo", "apt-get", "update"])
         subprocess.check_call([
             "sudo", "apt-get", "install", "-y",
-            "libsqlite3-dev", "ffmpeg", "wget", "unzip",  "portaudio19-dev", "libportaudio2"
+            "libsqlite3-dev", "ffmpeg", "wget", "unzip",  "portaudio19-dev", "libportaudio2", "curl"
         ])
 
     # System packages on macOS
@@ -273,7 +273,7 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["brew", "update"])
         subprocess.check_call([
             "brew", "install",
-            "sqlite3", "ffmpeg", "wget", "unzip", "portaudio"
+            "sqlite3", "ffmpeg", "wget", "unzip", "portaudio", "curl"
         ])
 
     # System packages on Windows
@@ -282,7 +282,7 @@ if not os.path.exists(SETUP_MARKER):
         if shutil.which("choco"):
             subprocess.check_call([
                 "choco", "install", "-y",
-                "sqlite", "ffmpeg", "wget", "unzip", "portaudio"
+                "sqlite", "ffmpeg", "wget", "unzip", "portaudio", "curl"
             ])
         else:
             log_message("Chocolatey not found; skipping system package installation on Windows", "WARNING")
@@ -385,6 +385,36 @@ if updated:
 # 5) Make BOT_TOKEN available at runtime—but never persist it on disk in config.json
 config["bot_token"] = BOT_TOKEN
 
+import shutil
+import subprocess
+import sys
+
+# ─── Ensure ollama CLI is installed on every run ───────────────────────────
+if shutil.which("ollama") is None:
+    log_message("ollama CLI not found; installing via official script…", "PROCESS")
+
+    # pick a downloader
+    if shutil.which("curl"):
+        dl_cmd = "curl -fsSL"
+    elif shutil.which("wget"):
+        dl_cmd = "wget -qO-"
+    else:
+        # install curl if we can
+        if sys.platform.startswith("linux") and shutil.which("apt-get"):
+            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call(["sudo", "apt-get", "install", "-y", "curl"])
+            dl_cmd = "curl -fsSL"
+        elif sys.platform == "darwin" and shutil.which("brew"):
+            subprocess.check_call(["brew", "install", "curl"])
+            dl_cmd = "curl -fsSL"
+        else:
+            raise RuntimeError("Neither curl nor wget available to install ollama CLI")
+
+    # run the official installer
+    subprocess.check_call([
+        "sh", "-c",
+        f"{dl_cmd} https://ollama.com/install.sh | sh"
+    ])
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 import ollama
 
