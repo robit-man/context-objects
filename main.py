@@ -264,7 +264,7 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["sudo", "apt-get", "update"])
         subprocess.check_call([
             "sudo", "apt-get", "install", "-y",
-            "libsqlite3-dev", "ffmpeg", "wget", "unzip"
+            "libsqlite3-dev", "ffmpeg", "wget", "unzip",  "portaudio19-dev", "libportaudio2"
         ])
 
     # System packages on macOS
@@ -273,7 +273,7 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["brew", "update"])
         subprocess.check_call([
             "brew", "install",
-            "sqlite3", "ffmpeg", "wget", "unzip"
+            "sqlite3", "ffmpeg", "wget", "unzip", "portaudio"
         ])
 
     # System packages on Windows
