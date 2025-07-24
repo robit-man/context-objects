@@ -282,7 +282,7 @@ if not os.path.exists(SETUP_MARKER):
         if shutil.which("choco"):
             subprocess.check_call([
                 "choco", "install", "-y",
-                "sqlite", "ffmpeg", "wget", "unzip"
+                "sqlite", "ffmpeg", "wget", "unzip", "portaudio"
             ])
         else:
             log_message("Chocolatey not found; skipping system package installation on Windows", "WARNING")
