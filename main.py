@@ -264,7 +264,15 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["sudo", "apt-get", "update"])
         subprocess.check_call([
             "sudo", "apt-get", "install", "-y",
-            "libsqlite3-dev", "ffmpeg", "wget", "unzip",  "portaudio19-dev", "libportaudio2", "curl"
+            "libsqlite3-dev",
+            "ffmpeg",
+            "wget",
+            "unzip",
+            "chromium",
+            "pulseaudio-utils",
+            "portaudio19-dev",
+            "libportaudio2",
+            "curl"
         ])
 
     # System packages on macOS
@@ -273,7 +281,13 @@ if not os.path.exists(SETUP_MARKER):
         subprocess.check_call(["brew", "update"])
         subprocess.check_call([
             "brew", "install",
-            "sqlite3", "ffmpeg", "wget", "unzip", "portaudio", "curl"
+            "sqlite3",
+            "ffmpeg",
+            "wget",
+            "unzip",
+            "portaudio",
+            "chromium",
+            "curl"
         ])
 
     # System packages on Windows
@@ -282,13 +296,20 @@ if not os.path.exists(SETUP_MARKER):
         if shutil.which("choco"):
             subprocess.check_call([
                 "choco", "install", "-y",
-                "sqlite", "ffmpeg", "wget", "unzip", "portaudio", "curl"
+                "sqlite",
+                "ffmpeg",
+                "wget",
+                "unzip",
+                "portaudio",
+                "chromium",
+                "curl"
             ])
         else:
             log_message("Chocolatey not found; skipping system package installation on Windows", "WARNING")
 
     else:
         log_message("No recognized system package manager; skipping system package installation", "WARNING")
+
 
     # Python packages
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])

@@ -734,6 +734,9 @@ def _stage5_external_knowledge(
 
 
 
+# ──────────────────────────────────────────────────────────────────
+# Stage 6 – collect & deduplicate tool schemas
+# ──────────────────────────────────────────────────────────────────
 def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
     """
     Return a de-duplicated, lexicographically sorted list of:
@@ -758,6 +761,7 @@ def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
             name = blob["name"]
         except Exception:
             continue
+        # pick the most recent
         if name not in buckets or ctx.timestamp > buckets[name].timestamp:
             buckets[name] = ctx
 
@@ -773,7 +777,12 @@ def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
             "schema":      blob,
         })
 
+    # Debug: show exactly what we're returning
+    self._print_stage_context("prepare_tools_full_list", {
+        "all_tool_names": [t["name"] for t in tool_defs]
+    })
     return tool_defs
+
 
 
 def _stage7_planning_summary(
@@ -789,7 +798,7 @@ def _stage7_planning_summary(
     2) Inject a “Conversation so far” block from merged context
     3) Inject truncated tool list (name + first sentence of description)
     4) Run up to 3 JSON-only planning passes, halving snippets each retry
-    5) For each selected tool, refine the call against its schema
+    5) For each selected tool, refine the call against its schema (printing only those schemas)
     6) Persist artefacts & plan tracker; return (ctx, raw-JSON)
     """
 
@@ -800,20 +809,23 @@ def _stage7_planning_summary(
     # 0️⃣  Diagnostic print                                             #
     # ------------------------------------------------------------------ #
     incoming = {
-        "user_text":       user_text,
-        "clarifier_notes": clar_ctx.summary,
-        "knowledge_snips": len((know_ctx.summary or "").splitlines()),
-        "merged_len":      len(state.get("merged", [])),
-        "history_len":     len(state.get("history",   [])),
-        "tools_len":       len(state.get("tools",     [])),
-        "semantic_len":    len(state.get("semantic",  [])),
-        "assoc_len":       len(state.get("assoc",     [])),
+        "user_text":         user_text,
+        "clarifier_notes":   clar_ctx.summary,
+        "knowledge_snips":   len((know_ctx.summary or "").splitlines()),
+        "merged_len":        len(state.get("merged", [])),
+        "history_len":       len(state.get("history",   [])),
+        "available_tools":   len(tools_list),                # ← now counts your tool schemas
+        "semantic_len":      len(state.get("semantic",  [])),
+        "assoc_len":         len(state.get("assoc",     [])),
     }
     banner = "=" * 20 + " PLANNER INPUT " + "=" * 20
     print("\n" + banner)
     for k, v in incoming.items():
         print(f"{k:>15}: {v}")
     print("=" * len(banner) + "\n")
+    self._print_stage_context("planning_summary_tools", {
+        "tool_names": [t["name"] for t in tools_list]
+    })
     self._print_stage_context("planning_summary_incoming", incoming)
 
     # ------------------------------------------------------------------ #
@@ -855,12 +867,13 @@ def _stage7_planning_summary(
     raw_prompt = prompt_rows[0].summary if prompt_rows else self._get_prompt("planning_prompt")
     first_two  = ".".join(raw_prompt.split(".", 2)[:2]) + "."
 
+    # Show only one‐line per tool here
     tool_lines = "\n".join(
         f"- **{t['name']}**: {_first_sentence(t['description'])}"
         for t in tools_list
     ) or "(none)"
 
-    base_system   = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
+    base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
     replan_system = (
         "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.\n\n"
         f"Available tools:\n{tool_lines}"
@@ -870,7 +883,6 @@ def _stage7_planning_summary(
     # 3️⃣  Build USER message                                           #
     # ------------------------------------------------------------------ #
     original_snips = (know_ctx.summary or "").splitlines()
-
     def build_user(snips):
         blocks = [
             convo_block,
@@ -920,12 +932,10 @@ def _stage7_planning_summary(
         except Exception:
             cand = None
 
+        # normalize into {"tasks":[...]}
         if isinstance(cand, dict) and "tasks" in cand and isinstance(cand["tasks"], list):
-            # Already the new schema
             plan_obj = cand
-
         elif isinstance(cand, dict) and "tool_calls" in cand:
-            # Wrap old `tool_calls` shape into `tasks`
             tasks = []
             for tc in cand["tool_calls"]:
                 if isinstance(tc, str):
@@ -936,26 +946,17 @@ def _stage7_planning_summary(
                     subs = tc.get("subtasks", []) or []
                     tasks.append({"call": name, "tool_input": inp, "subtasks": subs})
             plan_obj = {"tasks": tasks}
-
         elif isinstance(cand, dict):
-            # Any other dict → wrap the entire payload as one task
             plan_obj = {"tasks": [cand]}
-
         else:
-            # Fallback: regex‐extract foo(...) calls into minimal tasks
             calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw_json or raw)
-            plan_obj = {
-                "tasks": [
-                    {"call": c, "tool_input": {}, "subtasks": []}
-                    for c in calls
-                ]
-            }
+            plan_obj = {"tasks":[{"call": c,"tool_input":{},"subtasks":[]} for c in calls]}
 
-        # ensure structure
+        # ensure well‐formed
         if not isinstance(plan_obj, dict) or "tasks" not in plan_obj or not isinstance(plan_obj["tasks"], list):
             plan_obj = {"tasks": []}
 
-        # validate tool names
+        # validate names
         valid = {t["name"] for t in tools_list}
         if any(t.get("call") not in valid for t in plan_obj["tasks"]):
             continue
@@ -966,7 +967,7 @@ def _stage7_planning_summary(
         last_calls = calls_now
         break
 
-    # ─── 5) Refine each tool call ────────────────────────────────────
+    # ─── 5) Refine each chosen tool with its schema ────────────────────
     schema_map = {t["name"]: t["schema"] for t in tools_list}
 
     def refine_single_tool(task: dict) -> dict:
@@ -976,8 +977,15 @@ def _stage7_planning_summary(
         props    = schema["parameters"].get("properties", {})
         schema_json = json.dumps(schema, indent=2)
 
+        # **PRINT only the schema for this selected tool**
+        print(f"\n--- Selected schema for tool `{name}` ---\n{schema_json}\n")
+
         def make_base():
-            return {"call": name, "tool_input": task.get("tool_input", {}) or {}, "subtasks": task.get("subtasks", []) or []}
+            return {
+                "call":      name,
+                "tool_input": task.get("tool_input", {}) or {},
+                "subtasks":  task.get("subtasks", []) or []
+            }
 
         refined = make_base()
         critic  = ""
@@ -994,13 +1002,17 @@ def _stage7_planning_summary(
             if errors:
                 parts.append("=== ERRORS ===\n" + "\n".join(errors))
             parts.extend([
-                "=== CURRENT CALL ===\n```json\n" + json.dumps({"tasks":[refined]}, indent=2) + "\n```",
+                "=== CURRENT CALL ===\n```json\n"
+                + json.dumps({"tasks":[refined]}, indent=2)
+                + "\n```",
                 "Output **only** a JSON object `{ \"tasks\": [...] }` matching the schema exactly.",
-                "Required parameters:\n" + "\n".join(f"- `{p}`: {props[p]['type']}" for p in required),
+                "Required parameters:\n"
+                + "\n".join(f"- `{p}`: {props[p]['type']}" for p in required),
                 "=== SCHEMA ===\n```json\n" + schema_json + "\n```",
             ])
             sys_msg  = "\n\n".join(parts)
             user_msg = json.dumps({"tasks":[refined]})
+
             out = self._stream_and_capture(
                 self.secondary_model,
                 [{"role":"system","content":sys_msg},{"role":"user","content":user_msg}],
@@ -1013,8 +1025,7 @@ def _stage7_planning_summary(
             except:
                 pass
 
-            missing = [p for p in required if p not in refined["tool_input"]]
-            if not missing:
+            if not [p for p in required if p not in refined["tool_input"]]:
                 return refined
 
             critic = self._stream_and_capture(
@@ -1033,25 +1044,12 @@ def _stage7_planning_summary(
     with ThreadPoolExecutor(max_workers=len(tasks_in) or 1) as pool:
         futures = [pool.submit(refine_single_tool, t) for t in tasks_in]
         refined = [f.result() for f in as_completed(futures)]
+
+    # preserve order
     order_map = {t["call"]: t for t in refined}
     plan_obj["tasks"] = [order_map.get(t["call"], t) for t in tasks_in]
 
-    # record validation
-    invalid = []
-    for t in plan_obj["tasks"]:
-        call = t["call"]
-        if call not in schema_map:
-            invalid.append(f"unknown tool '{call}'")
-            continue
-        miss = [p for p in schema_map[call]["parameters"].get("required", []) if p not in (t["tool_input"] or {})]
-        if miss:
-            invalid.append(f"tool '{call}' missing {miss}")
-    if invalid:
-        state.setdefault("errors", []).append(("plan_validation","; ".join(invalid)))
-        state["plan_errors"]      = invalid
-        state["plan_output_prev"] = json.dumps(plan_obj)
-
-    # ─── 6) Flatten → call_strings ──────────────────────────────────
+    # ─── 6) Flatten → call_strings & record any validation errors ──────
     def _flatten(t):
         out = [t]
         for s in t.get("subtasks", []):
@@ -1073,7 +1071,7 @@ def _stage7_planning_summary(
     state["valid_calls"] = calls
     state["fixed_calls"] = calls
 
-    # ─── 7) Persist artefacts & tracker ────────────────────────────
+    # ─── 7) Persist artefacts & plan_tracker ──────────────────────────
     plan_json = json.dumps(plan_obj)
     plan_sig  = hashlib.md5(plan_json.encode()).hexdigest()[:8]
 
@@ -1113,12 +1111,13 @@ def _stage7_planning_summary(
     tracker.touch()
     self.repo.save(tracker)
 
-    state["plan_ctx"]      = ctx
-    state["plan_output"]   = plan_json
-    state["tools_list"]    = tools_list
-    state["tc_ctx"]        = None
+    state["plan_ctx"]    = ctx
+    state["plan_output"] = plan_json
+    state["tools_list"]  = tools_list
+    state["tc_ctx"]      = None
 
     return ctx, plan_json
+
 
 
 def _stage7b_plan_validation(

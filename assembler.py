@@ -2645,7 +2645,7 @@ class Assembler:
         *,
         images: List[str] | None = None,
         on_token: Callable[[str], None] | None = None,
-        skip_quick_phases: bool = False,   # ← new flag
+        skip_quick_phases: bool = True,   # ← new flag
     ) -> str:
         """
         Two‑phase orchestrator:
@@ -3323,19 +3323,23 @@ class Assembler:
 
         import json
         planner_payload = {
-            "user_question":       state["user_text"],
-            "clarifier_notes":     clar_ctx.metadata.get("notes", ""),
-            "clarifier_keywords":  clar_ctx.metadata.get("keywords", []),
-            "rag_snippets":        state.get("know_snippets", []),
-            "recent_history":      [c.summary for c in state.get("merged", [])[-5:]],
+            "user_question":      state["user_text"],
+            "clarifier_notes":    clar_ctx.metadata.get("notes", ""),
+            "clarifier_keywords": clar_ctx.metadata.get("keywords", []),
+            "rag_snippets":       state.get("know_snippets", []),
+            "recent_history":     [c.summary for c in state.get("merged", [])[-5:]],
+
+            # 🔻 NEW: give the planner the **full schema & description** for each tool
             "available_tools": [
                 {
-                    "name": t["name"],
-                    "parameters": list(t["schema"]["parameters"]["properties"].keys())
+                    "name":        t["name"],
+                    "description": t["description"],
+                    "schema":      t["schema"],          # ← full JSON‑RPC schema
                 }
                 for t in state["tools_list"]
             ],
-            "early_phases":        state["early_phases"],
+
+            "early_phases": state["early_phases"],
         }
 
         try:
@@ -3344,9 +3348,10 @@ class Assembler:
                 clar_ctx,
                 know_ctx,
                 state["tools_list"],
-                json.dumps(planner_payload, ensure_ascii=False),
+                state["user_text"],      # just the user's latest message
                 state,
             )
+
 
             if not isinstance(plan_output_raw, str):
                 plan_output_raw = json.dumps(plan_output_raw, ensure_ascii=False)
@@ -3483,8 +3488,8 @@ class Assembler:
         try:
             system_prompt = self.assembler_prompt
             msgs = [
-                {"role":"system","content":system_prompt},
-                {"role":"user",  "content":user_text},
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_text},
             ]
             async def _tok_cb(tok: str) -> None:
                 status_cb("assemble_and_infer", tok)
@@ -3498,34 +3503,60 @@ class Assembler:
         except Exception as e:
             state["errors"].append(("assemble_and_infer", str(e)))
             status_cb("assemble_and_infer_error", str(e))
+            # preserve previous draft if any
             draft = state.get("draft", "")
 
         # ---------------------------------------------------------------------
         # Stage 10b — Critique & safety patch if errors
         # ---------------------------------------------------------------------
-        if state["errors"]:
+        if state.get("errors"):
             _check_cancel()
             try:
-                patched = await _to_thread_safe(
+                patched = await asyncio.to_thread(
                     self._stage10b_response_critique_and_safety,
                     draft,
                     user_text,
-                    state["tool_ctxs"],
+                    state.get("tool_ctxs", []),
                     state,
                 )
-                state["draft"] = patched or draft
+                # only replace draft if patch returned non‐empty
+                if patched:
+                    state["draft"] = patched
                 status_cb("response_critique", state["draft"])
             except Exception as e:
                 state["errors"].append(("response_critique", str(e)))
                 status_cb("response_critique_error", str(e))
 
         # ---------------------------------------------------------------------
-        # Stage 11 — Final inference pass
+        # Stage 11 — Final inference pass (include all tool outputs)
         # ---------------------------------------------------------------------
         _check_cancel()
-        final = await self._assemble_and_infer(user_text, state, status_cb)
+        # ensure we have the list of tool ContextObjects
+        tool_ctxs = state.get("tool_ctxs", [])
+        # build a “Tool outputs” block for assembler
+        tool_block = []
+        for ctx in tool_ctxs:
+            name = ctx.metadata.get("tool_name") or ctx.stage_id.split("_", 1)[1]
+            output = ctx.metadata.get("output", ctx.metadata.get("output_full", ""))
+            tool_block.append(f"**{name}** → {output!s}")
+
+        # final system+user messages, weaving in draft + tool outputs
+        final_system = self.assembler_prompt
+        final_user_parts = [user_text]
+        if state.get("draft"):
+            final_user_parts.append(state["draft"])
+        if tool_block:
+            final_user_parts.append("Tool outputs:\n" + "\n".join(tool_block))
+        final_user = "\n\n".join(final_user_parts)
+
+        final = await self._assemble_and_infer(
+            final_user,
+            state,
+            status_cb,
+        )
         state["final"] = final
         status_cb("final_inference", final)
+
 
         # ---------------------------------------------------------------------
         # Stage 11.5 — Memory write‑back

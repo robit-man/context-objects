@@ -197,6 +197,9 @@ class TTSManager:
     # ───────────────────────────────────────────────────────────────────────
     # live‐mode worker
     # ───────────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
+    # live‐mode worker
+    # ───────────────────────────────────────────────────────────────────────
     def _live_worker(self):
         self.log("TTS live‐worker started.", "DEBUG")
         while self._running:
@@ -211,15 +214,22 @@ class TTSManager:
                 self._live_q.task_done()
         self.log("TTS live‐worker exiting.", "DEBUG")
 
-    def _do_live(self, text: str):
-        if self.audio_service:
-            self.audio_service.suspend()
-        try:
-            script_dir = os.path.dirname(__file__)
-            piper_exe  = os.path.join(script_dir, "piper", self.config.get("piper_executable", "piper"))
-            onnx_json  = os.path.join(script_dir, self.config.get("onnx_json_filename", "overwatch.onnx.json"))
-            onnx_model = os.path.join(script_dir, self.config.get("onnx_model_filename",  "overwatch.onnx"))
 
+    def _do_live(self, text: str):
+        """
+        Speak `text` via Piper→aplay (or ffplay), but also feed
+        the exact PCM into AudioService for cancellation.
+        """
+        import subprocess, json, time, shutil, os
+
+        script_dir = os.path.dirname(__file__)
+        piper_exe  = os.path.join(script_dir, "piper", self.config.get("piper_executable", "piper"))
+        onnx_json  = os.path.join(script_dir, self.config.get("onnx_json_filename", "overwatch.onnx.json"))
+        onnx_model = os.path.join(script_dir, self.config.get("onnx_model_filename", "overwatch.onnx"))
+
+        # Helper that runs Piper and plays back via aplay/ffplay,
+        # while capturing every PCM block for cancellation.
+        def _speak_phrase(phrase: str):
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
                 cmd_piper.insert(3, "--debug")
@@ -229,42 +239,87 @@ class TTSManager:
             elif shutil.which("ffplay"):
                 cmd_play = ["ffplay", "-autoexit", "-nodisp", "-f", "s16le", "-ar", "22050", "-i", "pipe:0"]
             else:
-                raise RuntimeError("No suitable audio playback command found; install 'aplay' or 'ffplay'.")
+                raise RuntimeError("Install 'aplay' or 'ffplay' for playback")
 
-            payload = json.dumps({"text": text, "config": onnx_json, "model": onnx_model}).encode("utf-8")
-            self.log(f"[TTS live] Speaking: {text!r}", "INFO")
+            payload = json.dumps({"text": phrase, "config": onnx_json, "model": onnx_model}).encode("utf-8")
 
             with tts_lock:
                 p1 = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=(subprocess.PIPE if self.debug else subprocess.DEVNULL))
                 p2 = subprocess.Popen(cmd_play, stdin=subprocess.PIPE)
 
+            # send text → Piper
             p1.stdin.write(payload)
             p1.stdin.close()
 
             def _stream_audio():
+                # Read raw 16‑bit PCM from Piper, cancel + play
                 while True:
-                    chunk = p1.stdout.read(4096)
-                    if not chunk:
+                    raw = p1.stdout.read(4096)
+                    if not raw:
                         break
+
+                    # 1) Decode → float32 in [-1.0,1.0]
+                    arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                    frames = arr / 32768.0
+
+                    # 2) Apply your volume
                     if self.volume != 1.0:
-                        arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) * self.volume
-                        chunk = np.clip(arr, -32768,32767).astype(np.int16).tobytes()
-                    p2.stdin.write(chunk)
+                        frames = frames * self.volume
+
+                    # 3) Push *inverted* frames into AudioService for cancellation
+                    svc = getattr(self, "audio_service", None)
+                    if svc is not None:
+                        try:
+                            # invert here
+                            svc.push_cancellation((-frames).copy())
+                        except Exception:
+                            pass
+
+                    # 4) Re‑quantize → int16
+                    out_arr = np.clip(frames * 32767.0, -32768, 32767).astype(np.int16)
+                    out_bytes = out_arr.tobytes()
+
+                    # 5) Write & flush so the player actually emits immediately
+                    p2.stdin.write(out_bytes)
+                    p2.stdin.flush()
+
                 p2.stdin.close()
+
 
             streamer = threading.Thread(target=_stream_audio, daemon=True)
             streamer.start()
-            p1.wait(); streamer.join(); p2.wait()
+            p1.wait()
+            streamer.join()
+            p2.wait()
 
             if self.debug and p1.stderr:
                 err = p1.stderr.read().decode(errors="ignore").strip()
                 if err:
                     self.log(f"[Piper STDERR] {err}", "ERROR")
 
-        finally:
-            if self.audio_service:
-                self.audio_service.resume()
+
+        # (Optional) Calibration on first call, unchanged from before:
+        svc = getattr(self, "audio_service", None)
+        if svc and not hasattr(svc, "_echo_profile"):
+            self.log("[TTS live] Calibrating echo cancellation…", "INFO")
+            cal_phrase = "calibration one two three"
+            _speak_phrase(cal_phrase)
+            wait_time = len(cal_phrase.split()) * 0.3 + 0.5
+            time.sleep(wait_time)
+            # old‐style profile capture if you still need it:
+            with svc._buffer_lock:
+                buf = svc._buffer.copy()
+            clip_len = int(0.5 * svc.sample_rate)
+            svc._echo_profile = buf[:clip_len] if len(buf) >= clip_len else buf
+            self.log(f"[TTS live] Captured echo profile: {len(svc._echo_profile)} samples", "INFO")
+
+        # Now speak the real text
+        self.log(f"[TTS live] Speaking: {text!r}", "INFO")
+        _speak_phrase(text)
+
+
+
 
     # ───────────────────────────────────────────────────────────────────────
     # file‐mode worker
