@@ -2645,7 +2645,7 @@ class Assembler:
         *,
         images: List[str] | None = None,
         on_token: Callable[[str], None] | None = None,
-        skip_quick_phases: bool = True,   # ← new flag
+        skip_quick_phases: bool = False,   # ← new flag
     ) -> str:
         """
         Two‑phase orchestrator:
