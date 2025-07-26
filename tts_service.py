@@ -10,6 +10,8 @@ import shutil
 import time
 import numpy as np
 import re
+import math
+from scipy.signal import resample_poly
 
 # lock to prevent Piper/process races
 tts_lock = threading.Lock()
@@ -17,9 +19,10 @@ tts_lock = threading.Lock()
 class TTSManager:
     """
     Piper → live‐playback or file‐output TTS manager.
-    Automatically splits long text into manageable chunks,
-    and provides a token_sink() for buffering streaming tokens
-    into full sentences (or timeout‐flushed fragments) before speaking.
+    Splits text into chunks, mutes the mic during live TTS so
+    AudioService never hears its own speech, pushes resampled
+    PCM for optional adaptive LMS cancellation, and supports
+    interrupting in‑flight speech.
     """
 
     def __init__(self, logger: callable, cfg: dict, audio_service=None):
@@ -29,26 +32,37 @@ class TTSManager:
         self.volume         = cfg.get("tts_volume", 0.2)
         self.debug          = cfg.get("tts_debug", False)
 
-        # chunk size in characters (adjust as needed)
+        # chunk size in characters
         self.max_chunk_size = cfg.get("tts_max_chunk_size", 500)
 
         # Queues for live vs file modes
         self._live_q = queue.Queue()
         self._file_q = queue.Queue()
-        self._ogg_q  = queue.Queue()  # holds paths to generated .ogg
+        self._ogg_q  = queue.Queue()
 
         self._mode    = "live"
         self._running = True
 
-        # Token‐buffer state
+        # token-buffer state
         self._token_buffer  = ""
         self._token_lock    = threading.Lock()
         self._flush_timer   = None
         self._flush_timeout = cfg.get("tts_token_flush_timeout", 1)
 
-        # Start workers
+        # calibration flag
+        self._calibrated = False
+
+        # interrupt control
+        self._interrupt_event = threading.Event()
+        self._current_procs   = []
+
+        # start worker threads
         threading.Thread(target=self._live_worker, daemon=True).start()
         threading.Thread(target=self._file_worker, daemon=True).start()
+
+        # inform audio service of ourselves if provided
+        if self.audio_service and hasattr(self.audio_service, 'set_tts_manager'):
+            self.audio_service.set_tts_manager(self)
 
     def set_mode(self, mode: str):
         if mode not in ("live", "file"):
@@ -61,8 +75,17 @@ class TTSManager:
             try: q.get_nowait()
             except queue.Empty: break
 
+    def interrupt(self):
+        """
+        Immediately cut off any in‑flight Piper/aplay processes.
+        """
+        self.log("TTSManager: interrupt requested", "INFO")
+        self._interrupt_event.set()
+        for p in self._current_procs:
+            try: p.terminate()
+            except: pass
+
     def _flush_buffer(self):
-        """Internal: emit whatever is left in the token buffer as one chunk."""
         with self._token_lock:
             text = self._token_buffer.strip()
             if text:
@@ -73,89 +96,63 @@ class TTSManager:
                 self._flush_timer = None
 
     def flush(self):
-        """
-        Public: immediately flush any buffered tokens (e.g. at end of stream)
-        into a final sentence/fragment.
-        """
+        """Flush any buffered tokens immediately."""
         self._flush_buffer()
 
     def token_sink(self):
         """
-        Returns a callback(token:str) that will buffer tokens into full
-        sentences (splitting on . ? !), call enqueue() for each sentence,
-        and then at the end you call sink(None) to flush leftovers.
+        Returns a callback(token:str) that buffers tokens into sentences,
+        enqueues them, and flushes on None.
         """
         sentence_end = re.compile(r'([\.!?])')
-
         buf = []
-
         def sink(token):
-            # final flush
             if token is None:
                 text = ''.join(buf).strip()
                 if text:
                     self.enqueue(text)
                 buf.clear()
                 return
-
             buf.append(token)
             joined = ''.join(buf)
-            # if we see punctuation, split there
             m = sentence_end.search(joined)
             if m:
                 end = m.end()
                 sentence = joined[:end].strip()
                 self.enqueue(sentence)
-                # carry over the rest (if any) back into buf
-                remainder = joined[end:]
                 buf.clear()
-                if remainder:
-                    buf.append(remainder)
-
+                rem = joined[end:]
+                if rem:
+                    buf.append(rem)
         return sink
 
     def _split_text(self, text: str) -> list[str]:
-        """
-        1) Split on blank lines (paragraphs)
-        2) Within each paragraph, split on sentence boundaries or newlines
-        3) Pack sentences into chunks ≤ max_chunk_size
-        4) Hard‑slice any leftover over‑long bits
-        """
         paras = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
         chunks: list[str] = []
         for para in paras:
-            parts = re.split(r'(?<=[\.\?\!])\s+|\n+|(?<=\u2022)\s*', para)
+            parts = re.split(r'(?<=[\.!?])\s+|\n+', para)
             buf = ""
             for part in parts:
                 part = part.strip()
-                if not part:
-                    continue
-                # would overflow?
-                if buf and len(buf) + 1 + len(part) > self.max_chunk_size:
-                    chunks.append(buf)
-                    buf = ""
-                # fits?
+                if not part: continue
+                if buf and len(buf)+1+len(part) > self.max_chunk_size:
+                    chunks.append(buf); buf = ""
                 if len(part) <= self.max_chunk_size:
-                    buf = (buf + " " + part).strip() if buf else part
+                    buf = (buf+" "+part).strip() if buf else part
                 else:
-                    # break it up
                     if buf:
-                        chunks.append(buf)
-                        buf = ""
+                        chunks.append(buf); buf = ""
                     for i in range(0, len(part), self.max_chunk_size):
                         slice_ = part[i:i+self.max_chunk_size].strip()
-                        if slice_:
-                            chunks.append(slice_)
+                        if slice_: chunks.append(slice_)
             if buf:
                 chunks.append(buf)
         return chunks
 
     def enqueue(self, text: str):
         """
-        Queue up a piece of text (sentence or chunk) for TTS.
-        In 'live' mode → _live_q; in 'file' mode → _file_q.
+        Queue a sentence or chunk for TTS (live vs file).
         """
-        # strip emojis & markdown artifacts
         emoji_pattern = re.compile(
             "[" 
             "\U0001F600-\U0001F64F"
@@ -164,15 +161,14 @@ class TTSManager:
             "\U0001F1E0-\U0001F1FF"
             "]+", flags=re.UNICODE
         )
-        clean = emoji_pattern.sub('', text).strip().replace("*", "")
+        clean = emoji_pattern.sub('', text).strip().replace("*","")
         if not clean:
             return
-
         parts = self._split_text(clean)
         total = len(parts)
         for idx, chunk in enumerate(parts, start=1):
             tag = f"{idx}/{total}"
-            if self._mode == "live":
+            if self._mode=="live":
                 self.log(f"Enqueue live TTS chunk {tag}: {chunk!r}", "DEBUG")
                 self._live_q.put(chunk)
             else:
@@ -180,28 +176,22 @@ class TTSManager:
                 self._file_q.put(chunk)
 
     def wait_for_latest_ogg(self, timeout: float):
-        """Block up to `timeout` seconds for the next .ogg file path."""
+        """Block up to `timeout` seconds for the next .ogg filepath."""
         return self._ogg_q.get(timeout=timeout)
 
     def stop(self):
-        """Shut everything down, cancel timers, unblock queues."""
+        """Shut down workers and timers."""
         self._running = False
-        # unblock workers
         self._live_q.put(None)
         self._file_q.put(None)
-        # cancel any pending flush
         if self._flush_timer:
             self._flush_timer.cancel()
             self._flush_timer = None
 
-    # ───────────────────────────────────────────────────────────────────────
-    # live‐mode worker
-    # ───────────────────────────────────────────────────────────────────────
-    # ───────────────────────────────────────────────────────────────────────
-    # live‐mode worker
-    # ───────────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────
+    # Live‐mode worker
     def _live_worker(self):
-        self.log("TTS live‐worker started.", "DEBUG")
+        self.log("TTS live‑worker started.", "DEBUG")
         while self._running:
             text = self._live_q.get()
             if text is None:
@@ -212,80 +202,65 @@ class TTSManager:
                 self.log(f"TTS live error: {e}", "ERROR")
             finally:
                 self._live_q.task_done()
-        self.log("TTS live‐worker exiting.", "DEBUG")
-
+        self.log("TTS live‑worker exiting.", "DEBUG")
 
     def _do_live(self, text: str):
-        """
-        Speak `text` via Piper→aplay (or ffplay), but also feed
-        the exact PCM into AudioService for cancellation.
-        """
         import subprocess, json, time, shutil, os
-
         script_dir = os.path.dirname(__file__)
-        piper_exe  = os.path.join(script_dir, "piper", self.config.get("piper_executable", "piper"))
-        onnx_json  = os.path.join(script_dir, self.config.get("onnx_json_filename", "overwatch.onnx.json"))
-        onnx_model = os.path.join(script_dir, self.config.get("onnx_model_filename", "overwatch.onnx"))
+        piper_exe  = os.path.join(script_dir, "piper", self.config.get("piper_executable","piper"))
+        onnx_json  = os.path.join(script_dir, self.config.get("onnx_json_filename","overwatch.onnx.json"))
+        onnx_model = os.path.join(script_dir, self.config.get("onnx_model_filename","overwatch.onnx"))
 
-        # Helper that runs Piper and plays back via aplay/ffplay,
-        # while capturing every PCM block for cancellation.
         def _speak_phrase(phrase: str):
+            # clear any prior interrupt
+            self._interrupt_event.clear()
+            # launch Piper → output_raw
             cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
             if self.debug:
                 cmd_piper.insert(3, "--debug")
-
             if shutil.which("aplay"):
-                cmd_play = ["aplay", "-r", "22050", "-f", "S16_LE"]
+                cmd_play = ["aplay","-r","22050","-f","S16_LE"]
             elif shutil.which("ffplay"):
-                cmd_play = ["ffplay", "-autoexit", "-nodisp", "-f", "s16le", "-ar", "22050", "-i", "pipe:0"]
+                cmd_play = ["ffplay","-autoexit","-nodisp","-f","s16le","-ar","22050","-i","pipe:0"]
             else:
-                raise RuntimeError("Install 'aplay' or 'ffplay' for playback")
-
-            payload = json.dumps({"text": phrase, "config": onnx_json, "model": onnx_model}).encode("utf-8")
+                raise RuntimeError("Install 'aplay' or 'ffplay'.")
+            payload = json.dumps({"text": phrase,"config":onnx_json,"model":onnx_model}).encode("utf-8")
 
             with tts_lock:
                 p1 = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=(subprocess.PIPE if self.debug else subprocess.DEVNULL))
                 p2 = subprocess.Popen(cmd_play, stdin=subprocess.PIPE)
+                self._current_procs = [p1, p2]
 
-            # send text → Piper
-            p1.stdin.write(payload)
-            p1.stdin.close()
+            p1.stdin.write(payload); p1.stdin.close()
 
             def _stream_audio():
-                # Read raw 16‑bit PCM from Piper, cancel + play
                 while True:
+                    if self._interrupt_event.is_set():
+                        break
                     raw = p1.stdout.read(4096)
                     if not raw:
                         break
-
-                    # 1) Decode → float32 in [-1.0,1.0]
                     arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-                    frames = arr / 32768.0
+                    frames = arr/32768.0 * self.volume
 
-                    # 2) Apply your volume
-                    if self.volume != 1.0:
-                        frames = frames * self.volume
-
-                    # 3) Push *inverted* frames into AudioService for cancellation
                     svc = getattr(self, "audio_service", None)
-                    if svc is not None:
+                    if svc and self._calibrated:
                         try:
-                            # invert here
-                            svc.push_cancellation((-frames).copy())
-                        except Exception:
+                            src_sr, tgt_sr = 22050, svc.sample_rate
+                            g = math.gcd(src_sr, tgt_sr)
+                            up, down = tgt_sr//g, src_sr//g
+                            frames_rs = resample_poly(frames, up, down)
+                            svc.push_cancellation(frames_rs.astype(np.float32))
+                        except:
                             pass
 
-                    # 4) Re‑quantize → int16
-                    out_arr = np.clip(frames * 32767.0, -32768, 32767).astype(np.int16)
-                    out_bytes = out_arr.tobytes()
+                    out = np.clip(frames*32767.0, -32768, 32767).astype(np.int16)
+                    p2.stdin.write(out.tobytes()); p2.stdin.flush()
 
-                    # 5) Write & flush so the player actually emits immediately
-                    p2.stdin.write(out_bytes)
-                    p2.stdin.flush()
-
-                p2.stdin.close()
-
+                # cleanup
+                try: p2.stdin.close()
+                except: pass
 
             streamer = threading.Thread(target=_stream_audio, daemon=True)
             streamer.start()
@@ -293,39 +268,26 @@ class TTSManager:
             streamer.join()
             p2.wait()
 
-            if self.debug and p1.stderr:
+            # if interrupted, skip reading stderr
+            if self.debug and p1.stderr and not self._interrupt_event.is_set():
                 err = p1.stderr.read().decode(errors="ignore").strip()
                 if err:
                     self.log(f"[Piper STDERR] {err}", "ERROR")
 
-
-        # (Optional) Calibration on first call, unchanged from before:
         svc = getattr(self, "audio_service", None)
-        if svc and not hasattr(svc, "_echo_profile"):
-            self.log("[TTS live] Calibrating echo cancellation…", "INFO")
-            cal_phrase = "calibration one two three"
-            _speak_phrase(cal_phrase)
-            wait_time = len(cal_phrase.split()) * 0.3 + 0.5
-            time.sleep(wait_time)
-            # old‐style profile capture if you still need it:
-            with svc._buffer_lock:
-                buf = svc._buffer.copy()
-            clip_len = int(0.5 * svc.sample_rate)
-            svc._echo_profile = buf[:clip_len] if len(buf) >= clip_len else buf
-            self.log(f"[TTS live] Captured echo profile: {len(svc._echo_profile)} samples", "INFO")
 
-        # Now speak the real text
-        self.log(f"[TTS live] Speaking: {text!r}", "INFO")
+        # actual TTS
+        if svc:
+            svc.mute_tts()
+        self.log(f"[TTS] Speaking: {text!r}", "INFO")
         _speak_phrase(text)
+        if svc:
+            svc.unmute_tts()
 
-
-
-
-    # ───────────────────────────────────────────────────────────────────────
-    # file‐mode worker
-    # ───────────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────
+    # File‐mode worker
     def _file_worker(self):
-        self.log("TTS file‐worker started.", "DEBUG")
+        self.log("TTS file‑worker started.", "DEBUG")
         while self._running:
             text = self._file_q.get()
             if text is None:
@@ -389,4 +351,4 @@ class TTSManager:
             finally:
                 self._file_q.task_done()
 
-        self.log("TTS file‐worker exiting.", "DEBUG")
+        self.log("TTS file‑worker exiting.", "DEBUG")
