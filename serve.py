@@ -208,9 +208,22 @@ http.createServer = (opts, listener) => {
         except KeyboardInterrupt:
             proc.terminate()
     else:
-        # Python HTTPS fallback on 0.0.0.0:443
-        httpd = HTTPServer(("0.0.0.0", HTTPS_PORT), SimpleHTTPRequestHandler)
+        # Python HTTPS fallback: try primary port, else pick a free port
+        import errno
+        port = HTTPS_PORT
+        for p in range(HTTPS_PORT, HTTPS_PORT + 10):
+            try:
+                httpd = HTTPServer(("0.0.0.0", p), SimpleHTTPRequestHandler)
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE:
+                    continue
+                raise
+            else:
+                port = p
+                break
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        if port != HTTPS_PORT:
+            print(f"⚠ Port {HTTPS_PORT} in use; serving on port {port}")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
