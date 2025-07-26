@@ -15,11 +15,11 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 # ─── Constants ───────────────────────────────────────────────────────────────
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH  = os.path.join(SCRIPT_DIR, "config.json")
-VENV_FLAG    = "--in-venv"
-VENV_DIR     = os.path.join(SCRIPT_DIR, "venv")
-HTTPS_PORT   = 443
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+VENV_FLAG   = "--in-venv"
+VENV_DIR    = os.path.join(SCRIPT_DIR, "venv")
+HTTPS_PORT  = 443
 
 # ─── Spinner for long operations ──────────────────────────────────────────────
 class Spinner:
@@ -82,7 +82,10 @@ def get_public_ip():
 
 # ─── ASCII Banner ────────────────────────────────────────────────────────────
 def print_banner(lan, public):
-    lines = [f"  Local : https://{lan}", f"  Public: https://{public}" if public else "  Public: <none>"]
+    lines = [
+        f"  Local : https://{lan}",
+        f"  Public: https://{public}" if public else "  Public: <none>"
+    ]
     w = max(len(l) for l in lines) + 4
     print("\n╔" + "═"*w + "╗")
     for l in lines:
@@ -94,59 +97,32 @@ def generate_cert(cert_file, key_file):
     lan_ip    = get_lan_ip()
     public_ip = get_public_ip()
 
-    # Auto-install mkcert if missing
-    if not shutil.which("mkcert"):
-        if sys.platform.startswith("linux"):
-            with Spinner("Installing mkcert…"):
-                subprocess.check_call(["sudo","apt","update"])
-                subprocess.check_call(["sudo","apt","install","-y","libnss3-tools","wget"])
-                url = subprocess.check_output([
-                    "bash","-lc",
-                    "curl -s https://api.github.com/repos/FiloSottile/mkcert/releases/latest"
-                    " | grep browser_download_url | grep linux-amd64 | cut -d '\"' -f4"
-                ], shell=True, text=True).strip()
-                subprocess.check_call(["wget","-O","mkcert",url])
-                subprocess.check_call(["chmod","+x","mkcert"])
-                subprocess.check_call(["sudo","mv","mkcert","/usr/local/bin/"])
-        elif sys.platform=="darwin":
-            with Spinner("Installing mkcert via Homebrew…"):
-                subprocess.check_call(["brew","install","mkcert","nss"])
-        elif os.name=="nt":
-            with Spinner("Installing mkcert via Chocolatey…"):
-                subprocess.check_call(["choco","install","mkcert","-y"])
-
-    # Use mkcert if available
-    if shutil.which("mkcert"):
-        cmd = ["mkcert","-install", lan_ip, "localhost", "127.0.0.1"]
-        if public_ip:
-            cmd.append(public_ip)
-        with Spinner("Generating mkcert certificates…"):
-            subprocess.run(cmd, check=True)
-        import glob
-        pems = sorted(glob.glob(f"{lan_ip}+*.pem"))
-        keys = sorted(glob.glob(f"{lan_ip}+*-key.pem"))
-        if pems and keys:
-            shutil.copy(pems[-1], cert_file)
-            shutil.copy(keys[-1], key_file)
-            return
-
-    # Fallback self-signed via cryptography
+    # Always generate a self-signed certificate (no mkcert)
     from cryptography.hazmat.primitives import serialization, hashes
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509 import NameOID, SubjectAlternativeName, DNSName
+    from cryptography.x509 import NameOID, SubjectAlternativeName, DNSName, IPAddress
     import cryptography.x509 as x509
+    import ipaddress
 
+    # Generate private key
     keyobj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    # Build SAN list
     san_list = [
         DNSName(lan_ip),
         DNSName("localhost"),
-        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))
+        IPAddress(ipaddress.IPv4Address("127.0.0.1"))
     ]
     if public_ip:
-        san_list.append(x509.IPAddress(ipaddress.IPv4Address(public_ip)))
-    san  = SubjectAlternativeName(san_list)
+        try:
+            san_list.append(IPAddress(ipaddress.IPv4Address(public_ip)))
+        except ValueError:
+            pass
+
+    san = SubjectAlternativeName(san_list)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, lan_ip)])
 
+    # Build and sign certificate
     with Spinner("Generating self-signed certificate…"):
         cert = (
             x509.CertificateBuilder()
@@ -155,16 +131,19 @@ def generate_cert(cert_file, key_file):
                .public_key(keyobj.public_key())
                .serial_number(x509.random_serial_number())
                .not_valid_before(datetime.utcnow())
-               .not_valid_after(datetime.utcnow()+timedelta(days=365))
+               .not_valid_after(datetime.utcnow() + timedelta(days=365))
                .add_extension(san, critical=False)
                .sign(keyobj, hashes.SHA256())
         )
-    with open(key_file,"wb") as f:
+
+    # Write key and cert
+    with open(key_file, "wb") as f:
         f.write(keyobj.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption()))
-    with open(cert_file,"wb") as f:
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+    with open(cert_file, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
 # ─── Main Flow ────────────────────────────────────────────────────────────────
@@ -177,19 +156,13 @@ def main():
     # 2) Load config and ensure required fields exist
     cfg = load_config()
     updated = False
-
-    # If first run (no file), prompt for serve_path
     if not os.path.exists(CONFIG_PATH):
         cfg["serve_path"] = input(f"Serve path [{cfg['serve_path']}]: ") or cfg["serve_path"]
         updated = True
-
-    # Ensure any required fields are present
-    required = {"serve_path": os.getcwd()}
-    for key, default in required.items():
+    for key, default in {"serve_path": os.getcwd()}.items():
         if key not in cfg:
             cfg[key] = default
             updated = True
-
     if updated:
         save_config(cfg)
 
