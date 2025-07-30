@@ -2729,45 +2729,62 @@ class Assembler:
         except:
             tool_preview = ""
 
-        # ──────────────────────────────────────────────────────────────
-        # 1) Quick‑Take micro‑stage (immediate reply)
         async def _quick_take() -> str:
-            if state["skip_quick"] or "quick_take" in state["stages_run"]:
+            """
+            Quick‑Take micro‑stage (immediate reply).
+            Provides an immediate ack/placeholder response based on very limited context,
+            deferring any up‑to‑date factual information to downstream stages.
+            """
+            # Skip if already run or explicitly disabled
+            if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
                 return ""
-            # Gather recent context
-            seeds = [state["prev_final"]] if state["prev_final"] else []
+
+            # 1️⃣ Gather up to 3 recent context snippets
+            seeds = []
+            if state.get("prev_final"):
+                seeds.append(state["prev_final"])
             hist = await asyncio.to_thread(self._get_history)
             for c in reversed(hist):
-                if len(seeds) >= 3: break
+                if len(seeds) >= 3:
+                    break
                 if c.summary and c.summary not in seeds:
                     seeds.append(c.summary.strip())
-            snippet = " | ".join(seeds) or "(none)"
+            snippet = " | ".join(seeds) if seeds else "(none)"
 
-            # System prompt: never deny, expose tools, timestamp, narrative
+            # Prepare dynamic info
+            tool_preview    = state.get("tool_preview", "(none)")
+            narrative_text  = state.get("narrative_text", "(no narrative available)")
+            current_time    = now_ts()  # should return an ISO timestamp or human-readable time
+            cutoff_notice   = "Your internal training data is current only through 2023 and may be outdated. You do not need to mention this to the user, but acknowledge it internally."
+
+            # 2️⃣ Build system prompt with limitations & deferral
             sys_txt = (
                 "You are QuickResponder, a fast front‑line assistant. "
-                "You have a powerful tool‑calling pipeline behind you and "
-                "must never refuse or claim ignorance, but you must also never repy with anything that, given a request for updated information, only includes content from embedded internal training data."
-                "DO NOT REPLY WITH MEMORIES FROM 2023 IF ASKED FOR UPDATED INFO, THAT WILL BE TAKEN CARE OF IN DOWNSTREAM STAGES, JUST LET THE USER KNOW YOU WILL GET ON IT, INSTEAD OF TRYING TO REPLY WITH RELEVANT INFORMATION (WHICH IS NOT RELEVANT DUE TO EMBEDDED INFORMATION CUTOFF). "
-                "Also do not hallucinate responses, as yor internal memory is locked into a past date of 2023, whereas years have passed since your training data cutoff."
-                f"Tools available: {tool_preview or 'none'}. "
-                f"Time: {now_ts()}. "
+                f"{cutoff_notice} "
+                "For any request requiring current or real‑time information, acknowledge that you will "
+                "retrieve updated data in subsequent stages rather than attempt to answer now. "
+                "Do NOT hallucinate or invent facts. "
+                f"Tools available: {tool_preview}. "
+                f"Current time: {current_time}. "
                 f"Context: {narrative_text}."
             )
 
-            # Compose and stream
+            # 3️⃣ Invoke model and stream
             reply = await self._stream_and_capture_async(
                 self.primary_model,
                 [
-                    {"role":"system", "content": sys_txt},
-                    {"role":"user",   "content": f"{user_text}\nRecent: {snippet}"}
+                    {"role": "system",  "content": sys_txt},
+                    {"role": "user",    "content": f"{user_text}\nRecent: {snippet}"}
                 ],
                 tag="[Quick‑Take]",
                 on_token=_tok_to_sentence,
             )
             text = (reply or "").strip()
-            state["early_phases"]["quick_take"] = text
-            state["stages_run"].add("quick_take")
+
+            # Record and mark this micro‑stage as run
+            state.setdefault("early_phases", {})["quick_take"] = text
+            state.setdefault("stages_run", set()).add("quick_take")
+
             return text
 
         # ──────────────────────────────────────────────────────────────
@@ -3436,11 +3453,13 @@ class Assembler:
         status_cb("user_confirmation", state["confirmed_calls"])
 
         # ---------------------------------------------------------------------
-        # Stage 9 — Invoke tools (with retries)
+        # Stage 9 — Invoke tools (with retries)
         # ---------------------------------------------------------------------
         _check_cancel()
+        plan_ctx = state.get("plan_ctx")
         try:
-            tool_ctxs = await _to_thread_safe(
+            # this returns nothing; it writes ContextObjects into your repo
+            await _to_thread_safe(
                 self._stage9_invoke_with_retries,
                 state["confirmed_calls"],
                 state.get("plan_output_raw"),
@@ -3452,33 +3471,29 @@ class Assembler:
         except Exception as e:
             state.setdefault("errors", []).append(("invoke_with_retries", str(e)))
             status_cb("invoke_with_retries_error", str(e))
-            tool_ctxs = []
 
-        # store the real ctxs
+        # now pull every tool_output context object from the repo
+        tool_ctxs = self.repo.query(lambda c:
+            c.domain == "stage" and
+            c.component == "tool_output" and
+            c.semantic_label == "tool_output" and
+            (not plan_ctx or plan_ctx.context_id in getattr(c, "references", []))
+        )
         state["tool_ctxs"] = tool_ctxs
 
-        # build tool_summaries fallback
-        summaries = state.get("tool_summaries", [])
-        for tc in tool_ctxs:
-            call   = tc.metadata.get("tool_call") or tc.stage_id
-            output = tc.metadata.get("output", tc.metadata.get("output_full"))
-            summaries.append({"call": call, "result": output})
-        state["tool_summaries"] = summaries
-
         if tool_ctxs:
-            # ingest into your integrator and merged context
+            # ingest into your integrator and append to merged
             await _to_thread_safe(self.integrator.ingest, tool_ctxs)
             state["merged"].extend(tool_ctxs)
-            # last_tool_outputs for quick lookup
             state["last_tool_outputs"] = {
-                (tc.metadata.get("tool_name") or tc.stage_id.split("_",1)[1]):
-                    tc.metadata.get("output", tc.metadata.get("output_full"))
-                for tc in tool_ctxs
+                (t.metadata.get("tool_name") or t.stage_id):
+                    t.metadata.get("output", t.metadata.get("output_full"))
+                for t in tool_ctxs
             }
         status_cb("invoke_with_retries", f"{len(tool_ctxs)} runs")
 
         # ---------------------------------------------------------------------
-        # Stage 9b — reflection_and_replan
+        # Stage 9b — Reflection & Replan
         # ---------------------------------------------------------------------
         _check_cancel()
         try:
@@ -3497,30 +3512,27 @@ class Assembler:
             status_cb("reflection_and_replan_error", str(e))
 
         # ---------------------------------------------------------------------
-        # Stage 10 — Assemble draft answer
+        # Stage 10 — Assemble & Infer (includes tool outputs)
         # ---------------------------------------------------------------------
         _check_cancel()
         try:
-            draft = await _to_thread_safe(
-                self._stage10_assemble_and_infer,
-                user_text,
-                state
-            )
+            draft = await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state)
             state["draft"] = draft
             status_cb("assemble_and_infer", draft)
         except Exception as e:
             state.setdefault("errors", []).append(("assemble_and_infer", str(e)))
             status_cb("assemble_and_infer_error", str(e))
+            draft = state.get("draft", "")
 
         # ---------------------------------------------------------------------
-        # Stage 10b — Critique & safety patch if errors
+        # Stage 10b — Response Critique & Safety
         # ---------------------------------------------------------------------
         if state.get("errors"):
             _check_cancel()
             try:
                 patched = await _to_thread_safe(
                     self._stage10b_response_critique_and_safety,
-                    state.get("draft", ""),
+                    state["draft"],
                     user_text,
                     state.get("tool_ctxs", []),
                     state,
@@ -3531,6 +3543,7 @@ class Assembler:
             except Exception as e:
                 state.setdefault("errors", []).append(("response_critique", str(e)))
                 status_cb("response_critique_error", str(e))
+
 
 
         # ---------------------------------------------------------------------
