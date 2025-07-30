@@ -649,11 +649,11 @@ class Assembler:
         )
         self.assembler_prompt = self.cfg.get(
             "assembler_prompt",
-            "You are Assembler. Distill context into a concise summary, but do not omit implied content which is needed for effective evaluation."
+            "Distill context into a concise summary, but do not omit implied content which is needed for effective evaluation. Dont repeat this instruction in your response!"
         )
         self.inference_prompt = self.cfg.get(
             "inference_prompt",
-            "You are helpful and highly detailed in your context-aware assessment. Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention."
+            "Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention. Dont repeat this instruction in your response!"
         )
         self.planning_prompt = self.cfg.get(
             "planning_prompt",
@@ -705,7 +705,7 @@ class Assembler:
         )
         self.final_inference_prompt = self.cfg.get(
             "final_inference_prompt",
-            "You are the Assembler.  You will receive two blocks:  \n"
+            "You will receive two blocks:  \n"
             "1) A **User+Plan** section containing the user’s request and the JSON plan we executed.  \n"
             "2) A **Tool outputs** section listing each tool call and its JSON result (or error).  \n\n"
             "**Do NOT parrot back the user’s exact phrasing or dump the JSON.**  Instead, in your own words:  \n"
@@ -739,7 +739,8 @@ class Assembler:
             "  • Acknowledges and corrects any gaps identified\n"
             "  • Incorporates every valid piece of information from successful tools\n"
             "  • Delivers a clear, comprehensive response that exactly satisfies the user’s intent\n"
-            "Return nothing else—no JSON, no analysis, only the polished final answer."
+            "Return nothing else—no JSON, no analysis, only the polished final answer.\n"
+            "Dont repeat this instruction in your response, simply use it to guide your reply!"
             # ──────────────────────────────────────────────────────────────────
         )
 
@@ -2746,7 +2747,9 @@ class Assembler:
             sys_txt = (
                 "You are QuickResponder, a fast front‑line assistant. "
                 "You have a powerful tool‑calling pipeline behind you and "
-                "must never refuse or claim ignorance. "
+                "must never refuse or claim ignorance, but you must also never repy with anything that, given a request for updated information, only includes content from embedded internal training data."
+                "DO NOT REPLY WITH MEMORIES FROM 2023 IF ASKED FOR UPDATED INFO, THAT WILL BE TAKEN CARE OF IN DOWNSTREAM STAGES, JUST LET THE USER KNOW YOU WILL GET ON IT, INSTEAD OF TRYING TO REPLY WITH RELEVANT INFORMATION (WHICH IS NOT RELEVANT DUE TO EMBEDDED INFORMATION CUTOFF). "
+                "Also do not hallucinate responses, as yor internal memory is locked into a past date of 2023, whereas years have passed since your training data cutoff."
                 f"Tools available: {tool_preview or 'none'}. "
                 f"Time: {now_ts()}. "
                 f"Context: {narrative_text}."
@@ -3433,7 +3436,7 @@ class Assembler:
         status_cb("user_confirmation", state["confirmed_calls"])
 
         # ---------------------------------------------------------------------
-        # Stage 9 — Invoke tools (with retries)
+        # Stage 9 — Invoke tools (with retries)
         # ---------------------------------------------------------------------
         _check_cancel()
         try:
@@ -3447,23 +3450,35 @@ class Assembler:
                 state,
             )
         except Exception as e:
-            state["errors"].append(("invoke_with_retries", str(e)))
+            state.setdefault("errors", []).append(("invoke_with_retries", str(e)))
             status_cb("invoke_with_retries_error", str(e))
             tool_ctxs = []
 
+        # store the real ctxs
         state["tool_ctxs"] = tool_ctxs
+
+        # build tool_summaries fallback
+        summaries = state.get("tool_summaries", [])
+        for tc in tool_ctxs:
+            call   = tc.metadata.get("tool_call") or tc.stage_id
+            output = tc.metadata.get("output", tc.metadata.get("output_full"))
+            summaries.append({"call": call, "result": output})
+        state["tool_summaries"] = summaries
+
         if tool_ctxs:
+            # ingest into your integrator and merged context
             await _to_thread_safe(self.integrator.ingest, tool_ctxs)
             state["merged"].extend(tool_ctxs)
+            # last_tool_outputs for quick lookup
             state["last_tool_outputs"] = {
-                (t.metadata.get("tool_name") or t.stage_id.split("_",1)[1]):
-                    t.metadata.get("output", t.metadata.get("output_full"))
-                for t in tool_ctxs
+                (tc.metadata.get("tool_name") or tc.stage_id.split("_",1)[1]):
+                    tc.metadata.get("output", tc.metadata.get("output_full"))
+                for tc in tool_ctxs
             }
         status_cb("invoke_with_retries", f"{len(tool_ctxs)} runs")
 
         # ---------------------------------------------------------------------
-        # Stage 9b — reflection_and_replan
+        # Stage 9b — reflection_and_replan
         # ---------------------------------------------------------------------
         _check_cancel()
         try:
@@ -3478,54 +3493,45 @@ class Assembler:
             state["replan"] = rp
             status_cb("reflection_and_replan", rp)
         except Exception as e:
-            state["errors"].append(("reflection_and_replan", str(e)))
+            state.setdefault("errors", []).append(("reflection_and_replan", str(e)))
             status_cb("reflection_and_replan_error", str(e))
 
         # ---------------------------------------------------------------------
-        # Stage 10 — Assemble draft answer (stream tokens to TTS)
+        # Stage 10 — Assemble draft answer
         # ---------------------------------------------------------------------
         _check_cancel()
         try:
-            system_prompt = self.assembler_prompt
-            msgs = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_text},
-            ]
-            async def _tok_cb(tok: str) -> None:
-                status_cb("assemble_and_infer", tok)
-            draft = await self._stream_and_capture_async(
-                self.primary_model,
-                messages=msgs,
-                tag="[Assembly]",
-                on_token=_tok_cb,
+            draft = await _to_thread_safe(
+                self._stage10_assemble_and_infer,
+                user_text,
+                state
             )
             state["draft"] = draft
+            status_cb("assemble_and_infer", draft)
         except Exception as e:
-            state["errors"].append(("assemble_and_infer", str(e)))
+            state.setdefault("errors", []).append(("assemble_and_infer", str(e)))
             status_cb("assemble_and_infer_error", str(e))
-            # preserve previous draft if any
-            draft = state.get("draft", "")
 
         # ---------------------------------------------------------------------
-        # Stage 10b — Critique & safety patch if errors
+        # Stage 10b — Critique & safety patch if errors
         # ---------------------------------------------------------------------
         if state.get("errors"):
             _check_cancel()
             try:
-                patched = await asyncio.to_thread(
+                patched = await _to_thread_safe(
                     self._stage10b_response_critique_and_safety,
-                    draft,
+                    state.get("draft", ""),
                     user_text,
                     state.get("tool_ctxs", []),
                     state,
                 )
-                # only replace draft if patch returned non‐empty
                 if patched:
                     state["draft"] = patched
                 status_cb("response_critique", state["draft"])
             except Exception as e:
-                state["errors"].append(("response_critique", str(e)))
+                state.setdefault("errors", []).append(("response_critique", str(e)))
                 status_cb("response_critique_error", str(e))
+
 
         # ---------------------------------------------------------------------
         # Stage 11 — Final inference pass (include all tool outputs)

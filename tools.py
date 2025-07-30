@@ -829,7 +829,7 @@ class Tools:
         # Must be a function call
         call = expr.body
         if not isinstance(call, ast.Call):
-            return {"output": None, "exception": "Invalid call: not a function invocation"}
+            return #{"output": None, "exception": "Invalid call: not a function invocation"}
 
         # 2) Resolve function name
         #    Accept either foo(...) or Tools.foo(...)

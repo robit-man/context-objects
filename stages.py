@@ -798,25 +798,29 @@ def _stage7_planning_summary(
     2) Inject a “Conversation so far” block from merged context
     3) Inject truncated tool list (name + first sentence of description)
     4) Run up to 3 JSON-only planning passes, halving snippets each retry
-    5) For each selected tool, refine the call against its schema (printing only those schemas)
+    5) For each selected tool, refine the call against its schema
+       — in this second pass, seed with the original tool_input from
+         the first pass, drop any args not in the schema, include only
+         schema-defined keys, fill required params, and supply clarifier
+         notes + user question so it picks real values.
     6) Persist artefacts & plan tracker; return (ctx, raw-JSON)
     """
 
-    import json, re, hashlib, datetime, textwrap
+    import json, re, hashlib, datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # ------------------------------------------------------------------ #
     # 0️⃣  Diagnostic print                                             #
     # ------------------------------------------------------------------ #
     incoming = {
-        "user_text":         user_text,
-        "clarifier_notes":   clar_ctx.summary,
-        "knowledge_snips":   len((know_ctx.summary or "").splitlines()),
-        "merged_len":        len(state.get("merged", [])),
-        "history_len":       len(state.get("history",   [])),
-        "available_tools":   len(tools_list),                # ← now counts your tool schemas
-        "semantic_len":      len(state.get("semantic",  [])),
-        "assoc_len":         len(state.get("assoc",     [])),
+        "user_text":       user_text,
+        "clarifier_notes": clar_ctx.summary,
+        "knowledge_snips": len((know_ctx.summary or "").splitlines()),
+        "merged_len":      len(state.get("merged", [])),
+        "history_len":     len(state.get("history", [])),
+        "available_tools": len(tools_list),
+        "semantic_len":    len(state.get("semantic", [])),
+        "assoc_len":       len(state.get("assoc", [])),
     }
     banner = "=" * 20 + " PLANNER INPUT " + "=" * 20
     print("\n" + banner)
@@ -834,7 +838,9 @@ def _stage7_planning_summary(
     merged = state.get("merged", [])
     N = min(10, len(merged))
     convo_lines = [f"- {c.summary}" for c in merged[-N:]]
-    convo_block = "Conversation so far:\n" + "\n".join(convo_lines) if convo_lines else ""
+    convo_block = (
+        "Conversation so far:\n" + "\n".join(convo_lines)
+    ) if convo_lines else ""
 
     # ------------------------------------------------------------------ #
     # Helper utilities                                                  #
@@ -854,25 +860,32 @@ def _stage7_planning_summary(
     # 2️⃣  Fetch critique & prompt                                       #
     # ------------------------------------------------------------------ #
     critique_rows = sorted(
-        self.repo.query(lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"),
+        self.repo.query(lambda c:
+            c.component == "analysis" and c.semantic_label == "plan_critique"
+        ),
         key=lambda c: c.timestamp,
     )
     critique_ids = [c.context_id for c in critique_rows]
 
     prompt_rows = sorted(
-        self.repo.query(lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"),
+        self.repo.query(lambda c:
+            c.component == "artifact" and c.semantic_label == "planning_prompt"
+        ),
         key=lambda c: c.timestamp,
         reverse=True,
     )
-    raw_prompt = prompt_rows[0].summary if prompt_rows else self._get_prompt("planning_prompt")
-    first_two  = ".".join(raw_prompt.split(".", 2)[:2]) + "."
+    raw_prompt = (
+        prompt_rows[0].summary
+        if prompt_rows else
+        self._get_prompt("planning_prompt")
+    )
+    first_two = ".".join(raw_prompt.split(".", 2)[:2]) + "."
 
-    # Show only one‐line per tool here
+    # one-line description per tool
     tool_lines = "\n".join(
         f"- **{t['name']}**: {_first_sentence(t['description'])}"
         for t in tools_list
     ) or "(none)"
-
     base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
     replan_system = (
         "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.\n\n"
@@ -907,29 +920,35 @@ def _stage7_planning_summary(
 
     full_user = build_user(original_snips)
 
-    # ─── 4) High‐level planning loop ────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # 4️⃣  High‐level planning loop                                    #
+    # ------------------------------------------------------------------ #
     last_calls = None
     plan_obj   = None
-    raw_json   = None
 
     for attempt in range(1, 4):
         if attempt == 1:
             sys_p, user_p, tag = base_system, full_user, "[Planner]"
         else:
             keep = max(1, len(original_snips) // (2 ** (attempt - 1)))
-            sys_p, user_p, tag = replan_system, build_user(original_snips[:keep]), "[PlannerReplan]"
+            sys_p, user_p, tag = (
+                replan_system,
+                build_user(original_snips[:keep]),
+                "[PlannerReplan]"
+            )
 
         raw = self._stream_and_capture(
             self.secondary_model,
-            [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+            [{"role": "system", "content": sys_p},
+             {"role": "user",   "content": user_p}],
             tag=tag,
             images=state.get("images"),
         ).strip()
-        raw_json = _clean_json_block(raw)
+        cleaned = _clean_json_block(raw)
 
         try:
-            cand = json.loads(raw_json)
-        except Exception:
+            cand = json.loads(cleaned)
+        except:
             cand = None
 
         # normalize into {"tasks":[...]}
@@ -949,16 +968,18 @@ def _stage7_planning_summary(
         elif isinstance(cand, dict):
             plan_obj = {"tasks": [cand]}
         else:
-            calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", raw_json or raw)
-            plan_obj = {"tasks":[{"call": c,"tool_input":{},"subtasks":[]} for c in calls]}
+            calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", cleaned or raw)
+            plan_obj = {"tasks": [
+                {"call": c, "tool_input": {}, "subtasks": []}
+                for c in calls
+            ]}
 
         # ensure well‐formed
-        if not isinstance(plan_obj, dict) or "tasks" not in plan_obj or not isinstance(plan_obj["tasks"], list):
+        if not plan_obj or not isinstance(plan_obj.get("tasks"), list):
             plan_obj = {"tasks": []}
 
-        # validate names
-        valid = {t["name"] for t in tools_list}
-        if any(t.get("call") not in valid for t in plan_obj["tasks"]):
+        valid_names = {t["name"] for t in tools_list}
+        if any(t.get("call") not in valid_names for t in plan_obj["tasks"]):
             continue
 
         calls_now = [t.get("call") for t in plan_obj["tasks"]]
@@ -967,7 +988,9 @@ def _stage7_planning_summary(
         last_calls = calls_now
         break
 
-    # ─── 5) Refine each chosen tool with its schema ────────────────────
+    # ------------------------------------------------------------------ #
+    # 5️⃣  Refine each chosen tool with its schema                     #
+    # ------------------------------------------------------------------ #
     schema_map = {t["name"]: t["schema"] for t in tools_list}
 
     def refine_single_tool(task: dict) -> dict:
@@ -977,19 +1000,17 @@ def _stage7_planning_summary(
         props    = schema["parameters"].get("properties", {})
         schema_json = json.dumps(schema, indent=2)
 
-        # **PRINT only the schema for this selected tool**
-        print(f"\n--- Selected schema for tool `{name}` ---\n{schema_json}\n")
+        # display only this tool’s schema
+        print(f"\n--- Schema for `{name}` ---\n{schema_json}\n")
 
-        def make_base():
-            return {
-                "call":      name,
-                "tool_input": task.get("tool_input", {}) or {},
-                "subtasks":  task.get("subtasks", []) or []
-            }
-
-        refined = make_base()
-        critic  = ""
-        errors  = []
+        # start with the original tool_input from first pass
+        refined = {
+            "call":       name,
+            "tool_input": dict(task.get("tool_input", {})),
+            "subtasks":   list(task.get("subtasks", []))
+        }
+        critic = ""
+        errors = []
 
         for retry in range(3):
             missing = [p for p in required if p not in refined["tool_input"]]
@@ -997,31 +1018,38 @@ def _stage7_planning_summary(
                 errors.append(f"⚠️ Missing required parameters: {missing}")
 
             parts = []
+            # seed with original clarifier/user context
+            parts.append(f"Clarified intent: {clar_ctx.metadata.get('notes') or clar_ctx.summary}")
+            parts.append(f"User question: {user_text}")
             if critic:
                 parts.append(f"💡 Critic: {critic}")
             if errors:
                 parts.append("=== ERRORS ===\n" + "\n".join(errors))
             parts.extend([
-                "=== CURRENT CALL ===\n```json\n"
-                + json.dumps({"tasks":[refined]}, indent=2)
-                + "\n```",
-                "Output **only** a JSON object `{ \"tasks\": [...] }` matching the schema exactly.",
-                "Required parameters:\n"
-                + "\n".join(f"- `{p}`: {props[p]['type']}" for p in required),
+                "=== CURRENT CALL ===\n```json\n" + json.dumps({"tasks":[refined]}, indent=2) + "\n```",
+                "Output **only** a JSON matching the schema exactly.",
+                "• Drop any args not in schema.",
+                "• Include all required params; do not invent extra keys.",
+                "• Use only these parameters and types:\n"
+                + "\n".join(f"- `{k}`: {props[k]['type']}" for k in props),
                 "=== SCHEMA ===\n```json\n" + schema_json + "\n```",
             ])
-            sys_msg  = "\n\n".join(parts)
-            user_msg = json.dumps({"tasks":[refined]})
 
             out = self._stream_and_capture(
                 self.secondary_model,
-                [{"role":"system","content":sys_msg},{"role":"user","content":user_msg}],
+                [
+                    {"role": "system", "content": "\n\n".join(parts)},
+                    {"role": "user",   "content": json.dumps({"tasks":[refined]})},
+                ],
                 tag=f"[PlannerRefine_{name}]_retry{retry}",
                 images=state.get("images"),
             )
-            clean = _clean_json_block(out)
+            block = _clean_json_block(out)
             try:
-                refined = json.loads(clean)["tasks"][0]
+                cand = json.loads(block)["tasks"][0]
+                ti = cand.get("tool_input", {}) or {}
+                # prune to schema props only
+                refined["tool_input"] = {k: ti[k] for k in props if k in ti}
             except:
                 pass
 
@@ -1031,8 +1059,12 @@ def _stage7_planning_summary(
             critic = self._stream_and_capture(
                 self.secondary_model,
                 [
-                    {"role":"system","content":"In one sentence, tell the planner exactly what to fix to conform to the schema."},
-                    {"role":"user","content":"SCHEMA:\n"+schema_json+"\n\nCALL:\n"+json.dumps(refined)},
+                    {"role": "system", "content":
+                        "In one sentence, tell me how to fix this call to match the schema exactly."
+                    },
+                    {"role": "user",   "content":
+                        "SCHEMA:\n" + schema_json + "\n\nCALL:\n" + json.dumps(refined)
+                    },
                 ],
                 tag=f"[ToolCritic_{name}]",
                 images=state.get("images"),
@@ -1049,31 +1081,37 @@ def _stage7_planning_summary(
     order_map = {t["call"]: t for t in refined}
     plan_obj["tasks"] = [order_map.get(t["call"], t) for t in tasks_in]
 
-    # ─── 6) Flatten → call_strings & record any validation errors ──────
-    def _flatten(t):
+    # ------------------------------------------------------------------ #
+    # 6️⃣  Flatten → call_strings & record                              #
+    # ------------------------------------------------------------------ #
+    def _flatten(t): 
         out = [t]
         for s in t.get("subtasks", []):
             out.extend(_flatten(s))
         return out
 
-    flat, calls = [], []
+    flat = []
     for t in plan_obj["tasks"]:
         flat.extend(_flatten(t))
+
+    call_strings = []
     for t in flat:
-        inp = t.get("tool_input", {}) or {}
-        if inp:
-            arg_s = ",".join(f"{k}={json.dumps(v)}" for k,v in inp.items())
-            calls.append(f"{t['call']}({arg_s})")
+        ti = t.get("tool_input", {}) or {}
+        if ti:
+            arg_s = ",".join(f"{k}={json.dumps(v)}" for k,v in ti.items())
+            call_strings.append(f"{t['call']}({arg_s})")
         else:
-            calls.append(f"{t['call']}()")
+            call_strings.append(f"{t['call']}()")
 
-    state["plan_calls"]  = calls
-    state["valid_calls"] = calls
-    state["fixed_calls"] = calls
+    state["plan_calls"]  = call_strings
+    state["valid_calls"] = call_strings
+    state["fixed_calls"] = call_strings
 
-    # ─── 7) Persist artefacts & plan_tracker ──────────────────────────
-    plan_json = json.dumps(plan_obj)
-    plan_sig  = hashlib.md5(plan_json.encode()).hexdigest()[:8]
+    # ------------------------------------------------------------------ #
+    # 7️⃣  Persist artefacts & plan_tracker                            #
+    # ------------------------------------------------------------------ #
+    plan_json = json.dumps(plan_obj, ensure_ascii=False)
+    plan_sig = hashlib.md5(plan_json.encode()).hexdigest()[:8]
 
     ctx = ContextObject.make_stage(
         "planning_summary",
@@ -1085,8 +1123,11 @@ def _stage7_planning_summary(
     ctx.touch()
     self.repo.save(ctx)
 
-    succ_cls = ContextObject.make_success if calls else ContextObject.make_failure
-    succ_msg = f"Planner → {len(calls)} task(s)" if calls else "Planner → empty plan"
+    succ_cls  = ContextObject.make_success if call_strings else ContextObject.make_failure
+    succ_msg  = (
+        f"Planner → {len(call_strings)} task(s)"
+        if call_strings else "Planner → empty plan"
+    )
     succ = succ_cls(succ_msg, refs=[ctx.context_id])
     succ.stage_id = f"planning_summary_signal_{plan_sig}"
     succ.touch()
@@ -1097,8 +1138,8 @@ def _stage7_planning_summary(
         [ctx.context_id],
         {
             "plan_id":     plan_sig,
-            "plan_calls":  calls,
-            "total_calls": len(calls),
+            "plan_calls":  call_strings,
+            "total_calls": len(call_strings),
             "succeeded":   0,
             "attempts":    0,
             "status":      "in_progress",
@@ -1117,6 +1158,7 @@ def _stage7_planning_summary(
     state["tc_ctx"]      = None
 
     return ctx, plan_json
+
 
 
 
@@ -1771,6 +1813,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     import json, pprint
     from collections import OrderedDict
     from context import ContextObject
+    from types import SimpleNamespace
 
     # ─── 1) Conversation snippets ────────────────────────────────────
     MAX_CTX_OBJS = 32
@@ -1783,12 +1826,36 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     )
 
     # ─── 2) Tool outputs ─────────────────────────────────────────────
-    tool_ctxs   = state.get("tool_ctxs", []) or []
-    tool_blocks = []
+    # Prefer real ContextObjects if present, else rebuild from tool_summaries
+    tool_ctxs      = state.get("tool_ctxs", []) or []
+    tool_summaries = state.get("tool_summaries", []) or []
+    tool_blocks    = []
+
+    if not tool_ctxs and tool_summaries:
+        # turn your summaries into light‐weight objects
+        for summ in tool_summaries:
+            call_name = summ.get("call")
+            result    = summ.get("result")
+            ts         = ""
+            if isinstance(result, dict):
+                ts = result.get("timestamp", "")
+            # use SimpleNamespace so the rest of your code can treat it like a ContextObject
+            tc = SimpleNamespace(
+                metadata={"output": result},
+                summary=json.dumps(result, ensure_ascii=False, indent=2),
+                stage_id=call_name,
+                timestamp=ts
+            )
+            tool_ctxs.append(tc)
+
+    # now render whichever list you have
     for tc in tool_ctxs:
-        meta = dict(getattr(tc, "metadata", {}))
+        meta = getattr(tc, "metadata", {})
+        payload = None
         try:
-            payload = json.dumps(meta, ensure_ascii=False, indent=2)
+            # if metadata["output"] exists use that, else fallback to full metadata
+            data = meta.get("output", meta)
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
         except Exception:
             payload = pprint.pformat(meta, compact=True)
         call_name = meta.get("tool_call", tc.stage_id)
@@ -1820,7 +1887,6 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
             raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
         except Exception:
             raw_plan = pprint.pformat(raw_plan, compact=True)
-
     plan_block = "[Plan]\n" + raw_plan
     user_block = "[User question]\n" + user_text
 
@@ -1828,11 +1894,11 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     final_sys = self._get_prompt("final_inference_prompt")
     msgs = [
         {"role": "system", "content": final_sys},
-        {"role": "system", "content": narrative_block},
+        #{"role": "system", "content": narrative_block},
     ]
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
-    msgs.append({"role": "system", "content": self.inference_prompt})
+    #msgs.append({"role": "system", "content": self.inference_prompt})
     if recent_hist_block:
         msgs.append({"role": "system", "content": recent_hist_block})
     msgs.append({"role": "system", "content": plan_block})
@@ -1851,7 +1917,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
         ("user_block",         user_block),
         ("assembled_msgs",     json.dumps(msgs, ensure_ascii=False, indent=2)),
         ("merged_ids",         [c.context_id for c in recent]),
-        ("tool_ctx_ids",       [tc.context_id for tc in tool_ctxs]),
+        ("tool_ctx_ids",       [getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs]),
     ])
     self._print_stage_context("assemble_and_infer", debug_payload)
 
@@ -1881,11 +1947,9 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     seg.touch()
     self.repo.save(seg)
 
-    # store on state for downstream
     state["draft"]         = reply
     state["assistant_ctx"] = resp_ctx
     return reply
-
 
 
 def _stage10b_response_critique_and_safety(
@@ -1895,18 +1959,31 @@ def _stage10b_response_critique_and_safety(
     tool_ctxs: list["ContextObject"],
     state: dict[str, Any],
 ) -> str:
-    import json, difflib
+    import json, difflib, pprint
     from context import ContextObject
+    from types import SimpleNamespace
 
     # ─── Guard: if there's no draft, skip polishing ───────────────
     if not draft:
         return draft
 
-    # Ensure we have tool_ctxs
-    tool_ctxs = tool_ctxs or state.get("tool_ctxs", [])
+    # Normalize tool_ctxs exactly as above
+    tool_ctxs      = tool_ctxs or state.get("tool_ctxs", []) or []
+    tool_summaries = state.get("tool_summaries", []) or []
+    if not tool_ctxs and tool_summaries:
+        for summ in tool_summaries:
+            call_name = summ.get("call")
+            result    = summ.get("result")
+            tc = SimpleNamespace(
+                metadata={"output": result},
+                summary=json.dumps(result, ensure_ascii=False, indent=2),
+                stage_id=call_name,
+                timestamp=(result.get("timestamp","") if isinstance(result, dict) else "")
+            )
+            tool_ctxs.append(tc)
 
-    # Pull in full merged context (including prior user/assistant turns)
-    merged_ctxs = state.get("merged", [])
+    # Pull in full merged context
+    merged_ctxs  = state.get("merged", [])
     merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs)
 
     # Retrieve the last executed plan
@@ -1916,11 +1993,17 @@ def _stage10b_response_critique_and_safety(
     outputs = []
     for c in tool_ctxs:
         raw = c.metadata.get("output")
+        fragment = None
         if isinstance(raw, dict) and "results" in raw:
-            fragment = "\n".join(f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
-                                    for r in raw["results"])
+            fragment = "\n".join(
+                f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
+                for r in raw["results"]
+            )
         else:
-            fragment = json.dumps(raw, indent=2, ensure_ascii=False)
+            try:
+                fragment = json.dumps(raw, indent=2, ensure_ascii=False)
+            except:
+                fragment = pprint.pformat(raw, compact=True)
         outputs.append(f"[{c.stage_id}]\n{fragment}")
 
     # 2️⃣  Relevance Extraction
@@ -1971,8 +2054,13 @@ def _stage10b_response_critique_and_safety(
         return polished
 
     # 4️⃣  Compute diff & update dynamic patch
-    diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
-    diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
+    diff = difflib.unified_diff(
+        draft.splitlines(), polished.splitlines(),
+        lineterm="", n=1
+    )
+    diff_summary = "; ".join(
+        ln for ln in diff if ln.startswith(("+ ", "- "))
+    ) or "(format refined)"
 
     patch_rows = self.repo.query(
         lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
@@ -1982,9 +2070,10 @@ def _stage10b_response_critique_and_safety(
         "dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"]
     )
     if dynamic_patch.summary != diff_summary:
-        dynamic_patch.summary = diff_summary
+        dynamic_patch.summary          = diff_summary
         dynamic_patch.metadata["policy"] = diff_summary
-        dynamic_patch.touch(); self.repo.save(dynamic_patch)
+        dynamic_patch.touch()
+        self.repo.save(dynamic_patch)
 
     # 5️⃣  Persist polished reply and critique contexts
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
@@ -1994,7 +2083,7 @@ def _stage10b_response_critique_and_safety(
 
     critique_ctx = ContextObject.make_stage(
         "plan_critique",
-        [resp_ctx.context_id] + [c.context_id for c in tool_ctxs],
+        [resp_ctx.context_id] + [c.stage_id for c in tool_ctxs],
         {"critique": polished, "diff": diff_summary},
     )
     critique_ctx.component      = "analysis"

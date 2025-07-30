@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Context Dashboard</title>
+  <style>
+    body {
+      margin: 0;
+      display: flex;
+      height: 100vh;
+      font-family: sans-serif;
+      background: #1e1e1e;
+      color: #ddd;
+    }
+    #sidebar {
+      width: 300px;
+      border-right: 1px solid #444;
+      display: flex;
+      flex-direction: column;
+      background: #252526;
+    }
+    #fileSelector {
+      margin: 8px;
+      padding: 4px;
+      background: #1e1e1e;
+      color: #ddd;
+      border: 1px solid #333;
+    }
+    #nodes {
+      flex: 1;
+      overflow-y: auto;
+    }
+    #sidebar .node {
+      padding: 8px;
+      border-bottom: 1px solid #333;
+      cursor: pointer;
+    }
+    #sidebar .node:hover {
+      background: #3a3a3a;
+    }
+    #sidebar .node.selected {
+      background: #007acc;
+      color: #fff;
+    }
+    #detail {
+      flex: 1;
+      padding: 16px;
+      overflow-y: auto;
+      background: #1e1e1e;
+    }
+    #detail h2 {
+      margin-top: 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+    td {
+      padding: 4px 8px;
+      vertical-align: top;
+    }
+    td.key {
+      font-weight: bold;
+      color: #aaa;
+      width: 120px;
+    }
+    .refs a {
+      color: #4fc1ff;
+      text-decoration: none;
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <select id="fileSelector"></select>
+    <div id="nodes"></div>
+  </div>
+  <div id="detail">
+    <h2>Select a node</h2>
+    <div id="content">Click on a context node in the sidebar to see details here.</div>
+  </div>
+
+  <script>
+    const fileSelector = document.getElementById('fileSelector');
+    const sidebar      = document.getElementById('nodes');
+    const detail       = document.getElementById('content');
+    let allNodes = [];
+    let selectedContextId = null;
+
+    // Build full URL to /context_repos/<filename>
+    function contextFileUrl(filename, cacheBust = false) {
+      const origin = window.location.origin;
+      return `${origin}/context_repos/${filename}${cacheBust ? `?_=${Date.now()}` : ''}`;
+    }
+
+    // Populate the file-selector by fetching directory listing
+    async function populateFileSelector() {
+      try {
+        const origin = window.location.origin;
+        const res    = await fetch(`${origin}/context_repos/`, { cache: 'no-store' });
+        const txt    = await res.text();
+        let files    = [];
+
+        // Attempt JSON array listing
+        try {
+          const arr = JSON.parse(txt);
+          if (Array.isArray(arr)) {
+            files = arr.filter(f => f.endsWith('.jsonl'));
+          }
+        } catch {}
+
+        // Fallback: scrape HTML for .jsonl links
+        if (!files.length) {
+          const re = /href="([^"]+\.jsonl)"/g;
+          let m;
+          while ((m = re.exec(txt))) {
+            files.push(m[1].split('/').pop());
+          }
+        }
+
+        files = Array.from(new Set(files)).sort();
+        fileSelector.innerHTML = files
+          .map(f => `<option value="${f}">${f}</option>`)
+          .join('');
+
+        fileSelector.onchange = () => {
+          // clear any prior selection when user switches files
+          selectedContextId = null;
+          loadContext(fileSelector.value);
+        };
+        if (files.length) loadContext(files[0]);
+      } catch (e) {
+        console.error('Could not populate file list', e);
+      }
+    }
+
+    // Load & render one selected JSONL file
+    async function loadContext(filename) {
+      try {
+        const resp = await fetch(contextFileUrl(filename, true));
+        const text = await resp.text();
+        const lines = text.trim().split('\n');
+        allNodes = lines
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter(o => o && o.context_id && o.timestamp)
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+        renderSidebar();
+
+        // If user has a selected node, re-apply that selection
+        if (selectedContextId) {
+          const idx = allNodes.findIndex(n => n.context_id === selectedContextId);
+          if (idx >= 0) {
+            const div = sidebar.children[idx];
+            selectNode(idx, div);
+            return;
+          }
+        }
+
+        // No selection or selected ID not found: reset detail pane
+        detail.innerHTML = '<h2>Select a node</h2><div>Click on a context node in the sidebar to see details here.</div>';
+      } catch (e) {
+        console.error('Failed to load', filename, e);
+      }
+    }
+
+    // Render the node list
+    function renderSidebar() {
+      sidebar.innerHTML = '';
+      allNodes.forEach((node, idx) => {
+        const div = document.createElement('div');
+        div.className = 'node';
+        div.textContent = `[${node.timestamp.slice(11,19)}] ${node.component}:${node.semantic_label}`;
+        div.onclick = () => selectNode(idx, div);
+        sidebar.appendChild(div);
+      });
+    }
+
+    // Show one node’s details
+    function selectNode(idx, div) {
+      // highlight in sidebar
+      sidebar.querySelectorAll('.node').forEach(n => n.classList.remove('selected'));
+      div.classList.add('selected');
+      // remember selection
+      selectedContextId = allNodes[idx].context_id;
+
+      // render detail pane
+      const o = allNodes[idx];
+      detail.innerHTML = '';
+      const h2 = document.createElement('h2');
+      h2.textContent = `${o.component} | ${o.semantic_label}`;
+      detail.appendChild(h2);
+
+      const tbl = document.createElement('table');
+      ['context_id','timestamp','domain'].forEach(k => {
+        if (o[k] != null) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td class="key">${k}</td><td>${o[k]}</td>`;
+          tbl.appendChild(tr);
+        }
+      });
+      if (o.summary || o.ctx_txt) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td class="key">summary</td>
+          <td><pre style="white-space:pre-wrap;">${(o.summary||o.ctx_txt)}</pre></td>`;
+        tbl.appendChild(tr);
+      }
+      Object.keys(o).forEach(k => {
+        if (!['context_id','timestamp','component','semantic_label','domain','summary','ctx_txt','references'].includes(k)) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td class="key">${k}</td>
+            <td><pre style="white-space:pre-wrap;">${JSON.stringify(o[k],null,2)}</pre></td>`;
+          tbl.appendChild(tr);
+        }
+      });
+      detail.appendChild(tbl);
+
+      if (Array.isArray(o.references) && o.references.length) {
+        const divRefs = document.createElement('div');
+        divRefs.className = 'refs';
+        divRefs.innerHTML = `<strong>References:</strong> `;
+        o.references.forEach(ref => {
+          const a = document.createElement('a');
+          a.textContent = ref;
+          a.href = '#';
+          a.onclick = ev => {
+            ev.preventDefault();
+            const i = allNodes.findIndex(n => n.context_id === ref);
+            if (i >= 0) sidebar.children[i].click();
+          };
+          divRefs.appendChild(a);
+        });
+        detail.appendChild(divRefs);
+      }
+    }
+
+    // Kick things off
+    populateFileSelector();
+
+    // Poll for updates every 2s without losing manual selection
+    setInterval(() => {
+      const sel = fileSelector.value;
+      if (sel) loadContext(sel);
+    }, 2000);
+  </script>
+</body>
+</html>
