@@ -258,6 +258,10 @@ SETUP_MARKER = os.path.join(os.path.dirname(__file__), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
     log_message("Installing system & Python deps…", "PROCESS")
 
+    # Determine architecture for the correct Chromium package
+    arch = platform.machine().lower()
+    chromium_pkg = "chromium-browser" if arch in ("aarch64", "arm64") else "chromium"
+
     # System packages on Debian/Ubuntu
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
         log_message("Installing system packages via apt-get...", "PROCESS")
@@ -268,7 +272,7 @@ if not os.path.exists(SETUP_MARKER):
             "ffmpeg",
             "wget",
             "unzip",
-            "chromium",
+            chromium_pkg,
             "python3.10-venv",
             "python3.11-venv",
             "python3.12-venv",
@@ -340,7 +344,7 @@ if not os.path.exists(SETUP_MARKER):
         f.write("done")
     log_message("Dependencies installed. Restarting…", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
-
+    
 CONFIG_FILE = "config.json"
 DEFAULT_CFG = {
     # core LLM models
