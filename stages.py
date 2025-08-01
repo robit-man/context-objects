@@ -1828,7 +1828,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     # ─── 2) Tool outputs ─────────────────────────────────────────────
     # First, try to pull actual ContextObjects with semantic_label "tool_output"
     full_tool_ctxs = state.get("tool_ctxs", []) or []
-    LAST_N = 1  # ← only keep the last 5 tool runs (tweak as you like)
+    LAST_N = 3  # ← only keep the last 5 tool runs (tweak as you like)
     tool_ctxs = full_tool_ctxs[-LAST_N:]
     #tool_ctxs = self.repo.query(lambda c: c.semantic_label == "tool_output")
     # Fallback to state if none found
