@@ -1478,10 +1478,22 @@ def _stage9b_reflection_and_replan(
 ) -> Optional[str]:
     """
     Reflect on the full context (user question, clarifier notes/keywords,
-    **all** tool outputs, original plan).  If everything satisfied the intent,
+    the most recent 1-3 tool outputs, original plan).  If everything satisfied the intent,
     return None; otherwise return only the corrected JSON plan.
     """
     import json, re
+    from datetime import datetime
+
+    def _parse(ts: str) -> datetime:
+        if not ts:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(ts.rstrip("Z"))
+        except Exception:
+            try:
+                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+            except Exception:
+                return datetime.min
 
     # 1) Gather clarifier info
     clar_notes = clar_metadata.get("notes", "")
@@ -1495,8 +1507,16 @@ def _stage9b_reflection_and_replan(
     if clar_keywords:
         parts.append(f"=== CLARIFIER KEYWORDS ===\n{', '.join(clar_keywords)}")
 
-    # 3) Append every single tool output, unfiltered
-    for c in tool_ctxs:
+    # 3) Take only the most recent 1-3 tool outputs by timestamp
+    sorted_tool_ctxs = sorted(
+        tool_ctxs,
+        key=lambda c: _parse(getattr(c, "timestamp", "") or ""),
+        reverse=True
+    )
+    capped_tool_ctxs = sorted_tool_ctxs[:3]
+
+    # 4) Append those tool outputs
+    for c in capped_tool_ctxs:
         payload = c.metadata.get("output_short") or c.metadata.get("output_full")
 
         try:
@@ -1505,17 +1525,17 @@ def _stage9b_reflection_and_replan(
             blob = repr(payload)
         parts.append(f"=== TOOL OUTPUT [{c.stage_id}] ===\n{blob}")
 
-    # 4) Finally, the original plan
+    # 5) Finally, the original plan
     parts.append(f"=== ORIGINAL PLAN ===\n{plan_output}")
 
     context_blob = "\n\n".join(parts)
 
-    # 5) Reflection prompt
+    # 6) Reflection prompt
     system_msg = self._get_prompt("reflection_prompt")
     user_payload = (
         context_blob
         + "\n\nDid these tool outputs satisfy the original intent? "
-            "If yes, reply OK.  If not, return only the corrected JSON plan."
+          "If yes, reply OK.  If not, return only the corrected JSON plan."
     )
 
     msgs = [
@@ -1531,9 +1551,8 @@ def _stage9b_reflection_and_replan(
         if new_plan == old_plan:
             ok_ctx = ContextObject.make_success(
                 description="Reflection confirmed plan (identical echo)",
-                refs=[c.context_id for c in tool_ctxs]
+                refs=[c.context_id for c in capped_tool_ctxs]
             )
-            #ok_ctx.touch(); self.repo.save(ok_ctx)
             self._persist_and_index([ok_ctx])
             return None
     except:
@@ -1543,23 +1562,21 @@ def _stage9b_reflection_and_replan(
     if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp):
         ok_ctx = ContextObject.make_success(
             description="Reflection confirmed plan satisfied intent",
-            refs=[c.context_id for c in tool_ctxs]
+            refs=[c.context_id for c in capped_tool_ctxs]
         )
-        #ok_ctx.touch(); self.repo.save(ok_ctx)
         self._persist_and_index([ok_ctx])
         return None
 
     # ── Else record replan
     fail_ctx = ContextObject.make_failure(
         description="Reflection triggered replan",
-        refs=[c.context_id for c in tool_ctxs]
+        refs=[c.context_id for c in capped_tool_ctxs]
     )
-    #fail_ctx.touch(); self.repo.save(fail_ctx)
     self._persist_and_index([fail_ctx])
 
     repl = ContextObject.make_stage(
         "reflection_and_replan",
-        [c.context_id for c in tool_ctxs],
+        [c.context_id for c in capped_tool_ctxs],
         {"replan": resp}
     )
     repl.stage_id = "reflection_and_replan"
@@ -1810,79 +1827,158 @@ def _await_if_needed(obj):
 
 
 def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> str:
-    import json, pprint
+    import json, pprint, logging
     from collections import OrderedDict
     from context import ContextObject
     from types import SimpleNamespace
+    from datetime import datetime, timedelta
+
+    logger = logging.getLogger(__name__)
+
+    # ─── helpers ─────────────────────────────────────────────────────
+    def _parse(ts: str) -> datetime:
+        if not ts:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(ts.rstrip("Z"))
+        except Exception:
+            try:
+                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+            except Exception:
+                return datetime.min
+
+    def normalize_tc(raw):
+        if isinstance(raw, dict):
+            meta = raw.get("metadata", {}) or {}
+            stage_id = raw.get("stage_id") or raw.get("call") or raw.get("tool_name", "unknown_tool")
+            context_id = raw.get("context_id", stage_id)
+            timestamp = ""
+            result = raw.get("result", raw.get("output", {}))
+            if isinstance(result, dict):
+                timestamp = result.get("timestamp", "")
+            summary = raw.get("summary", None)
+            if summary is None:
+                try:
+                    summary = json.dumps(result, ensure_ascii=False)
+                except Exception:
+                    summary = pprint.pformat(result)
+            return SimpleNamespace(
+                metadata=meta if isinstance(meta, dict) else {},
+                summary=summary,
+                stage_id=stage_id,
+                timestamp=timestamp,
+                context_id=context_id,
+            )
+        else:
+            meta = getattr(raw, "metadata", {}) or {}
+            stage_id = getattr(raw, "stage_id", None) or getattr(raw, "stage", None) or "unknown_tool"
+            context_id = getattr(raw, "context_id", stage_id)
+            timestamp = getattr(raw, "timestamp", "")
+            summary = getattr(raw, "summary", None)
+            if summary is None:
+                candidate = meta.get("output", meta.get("output_full", None))
+                if candidate is None:
+                    summary = ""
+                elif isinstance(candidate, (dict, list)):
+                    try:
+                        summary = json.dumps(candidate, ensure_ascii=False)
+                    except Exception:
+                        summary = pprint.pformat(candidate)
+                else:
+                    summary = str(candidate)
+            return SimpleNamespace(
+                metadata=meta if isinstance(meta, dict) else {},
+                summary=summary,
+                stage_id=stage_id,
+                timestamp=timestamp,
+                context_id=context_id,
+            )
 
     # ─── 1) Conversation snippets ────────────────────────────────────
-    MAX_CTX_OBJS = 32
-    merged = state.get("merged", [])
+    merged = state.get("merged", []) or []
+
+    # ─── 2) Tool outputs: grab only most recent 1–3 ──────────────────
+    raw_tool_ctxs = []
+    try:
+        repo_tool_ctxs = list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
+    except Exception:
+        repo_tool_ctxs = []
+    # sort newest first by timestamp
+    repo_tool_ctxs_sorted = sorted(
+        repo_tool_ctxs,
+        key=lambda c: _parse(getattr(c, "timestamp", "") or ""),
+        reverse=True
+    )
+    if repo_tool_ctxs_sorted:
+        raw_tool_ctxs = repo_tool_ctxs_sorted[:3]
+    else:
+        raw_tool_ctxs = (state.get("tool_ctxs", []) or [])[-3:]
+        if not raw_tool_ctxs:
+            tool_summaries = state.get("tool_summaries", []) or []
+            for summ in tool_summaries[-3:]:
+                call_name = summ.get("call") or summ.get("tool_name", "unknown_tool")
+                result = summ.get("result")
+                ts = ""
+                if isinstance(result, dict):
+                    ts = result.get("timestamp", "")
+                tc = {
+                    "metadata": {"output": result},
+                    "summary": json.dumps(result, ensure_ascii=False, indent=2),
+                    "stage_id": call_name,
+                    "timestamp": ts,
+                    "context_id": summ.get("context_id", call_name),
+                }
+                raw_tool_ctxs.append(tc)
+            raw_tool_ctxs = raw_tool_ctxs[-3:]
+
+    tool_ctxs = []
+    for raw in raw_tool_ctxs:
+        try:
+            norm = normalize_tc(raw)
+            tool_ctxs.append(norm)
+        except Exception as e:
+            logger.exception("Failed to normalize tool context entry: %s", e)
+
+    # dynamic recent context size based on number of tools captured (fallback to 32 if none)
+    num_tools = len(tool_ctxs)
+    MAX_CTX_OBJS = num_tools if num_tools > 0 else 32
     recent = merged[-MAX_CTX_OBJS:]
-    convo_lines = [c.summary or "" for c in recent]
+    convo_lines = [getattr(c, "summary", "") or "" for c in recent]
     conversation_block = (
         "[Conversation so far]\n" + "\n".join(convo_lines)
         if convo_lines else ""
     )
 
-    # ─── 2) Tool outputs ─────────────────────────────────────────────
-    # First, try to pull actual ContextObjects with semantic_label "tool_output"
-    full_tool_ctxs = state.get("tool_ctxs", []) or []
-    LAST_N = 3  # ← only keep the last 5 tool runs (tweak as you like)
-    tool_ctxs = full_tool_ctxs[-LAST_N:]
-    #tool_ctxs = self.repo.query(lambda c: c.semantic_label == "tool_output")
-    # Fallback to state if none found
-    if not tool_ctxs:
-        tool_ctxs = state.get("tool_ctxs", []) or []
-    # And fallback to summaries list if still empty
-    tool_summaries = state.get("tool_summaries", []) or []
-    if not tool_ctxs and tool_summaries:
-        for summ in tool_summaries:
-            call_name = summ.get("call") or summ.get("tool_name")
-            result    = summ.get("result")
-            ts        = ""
-            if isinstance(result, dict):
-                ts = result.get("timestamp", "")
-            tc = SimpleNamespace(
-                metadata={"output": result},
-                summary=json.dumps(result, ensure_ascii=False, indent=2),
-                stage_id=call_name,
-                timestamp=ts,
-                context_id=summ.get("context_id", call_name)
-            )
-            tool_ctxs.append(tc)
-
+    # build tools_block
     tool_blocks = []
     for tc in tool_ctxs:
-        meta = getattr(tc, "metadata", {})
-        data = meta.get("output", meta.get("output_full", meta))
+        meta = getattr(tc, "metadata", {}) or {}
+        data = meta.get("output", meta.get("output_full", None))
+        if data is None:
+            data = tc.summary or ""
         try:
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            if isinstance(data, (dict, list)):
+                payload = json.dumps(data, ensure_ascii=False, indent=2)
+            else:
+                payload = str(data)
         except Exception:
             payload = pprint.pformat(data, compact=True)
-        call_name = meta.get("tool_call", tc.stage_id)
-        ts        = getattr(tc, "timestamp", "")
-        tool_blocks.append(f"--- {tc.stage_id} ({call_name}) @ {ts} ---")
+        call_name = meta.get("tool_call") or getattr(tc, "stage_id", "unknown_tool")
+        ts = getattr(tc, "timestamp", "")
+        tool_blocks.append(f"--- {getattr(tc, 'stage_id', 'unknown_tool')} ({call_name}) @ {ts} ---")
         tool_blocks.append(payload)
-
-    tools_block = (
-        "[Tool outputs]\n" + "\n\n".join(tool_blocks)
-        if tool_blocks else ""
-    )
+    tools_block = "[Tool outputs]\n" + "\n\n".join(tool_blocks) if tool_blocks else ""
 
     # ─── 3) Narrative block ──────────────────────────────────────────
     narr_ctx = self._load_narrative_context()
     narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
 
-    # ─── 4) Recent‑history bullets ───────────────────────────────────
+    # ─── 4) Recent-history bullets ───────────────────────────────────
     recent_hist = recent[-5:]
-    bullets = [f"- {c.semantic_label}: {c.summary}" for c in recent_hist]
-    recent_hist_block = (
-        "[Recent History]\n" + "\n".join(bullets)
-        if bullets else ""
-    )
+    bullets = [f"- {getattr(c, 'semantic_label', '')}: {getattr(c, 'summary', '')}" for c in recent_hist]
+    recent_hist_block = "[Recent History]\n" + "\n".join(bullets) if bullets else ""
 
-    # ─── 5) Plan & user question ────────────────────────────────────
+    # ─── 5) Plan & user question ───────────────────────────────────
     raw_plan = state.get("plan_output", "(no plan)")
     if not isinstance(raw_plan, str):
         try:
@@ -1892,22 +1988,22 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     plan_block = "[Plan]\n" + raw_plan
     user_block = "[User question]\n" + user_text
 
-    # ─── 6) Compose LLM messages ─────────────────────────────────────
+    # ─── 6) Compose LLM messages ───────────────────────────────────
     final_sys = self._get_prompt("final_inference_prompt")
-    msgs = [
-        {"role": "system", "content": final_sys},
-    ]
+    msgs = [{"role": "system", "content": final_sys}]
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
     if recent_hist_block:
         msgs.append({"role": "system", "content": recent_hist_block})
     msgs.append({"role": "system", "content": plan_block})
     msgs.append({"role": "system", "content": user_block})
-    msgs.append({"role": "user",   "content": user_text})
+    msgs.append({"role": "user", "content": user_text})
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
 
     # ─── 7) DEBUG payload ────────────────────────────────────────────
+    merged_ids = [getattr(c, "context_id", None) for c in recent]
+    tool_ctx_ids = [getattr(tc, "context_id", getattr(tc, "stage_id", "unknown_tool")) for tc in tool_ctxs]
     debug_payload = OrderedDict([
         ("conversation_block", conversation_block),
         ("tools_block",        tools_block),
@@ -1916,8 +2012,8 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
         ("plan_block",         plan_block),
         ("user_block",         user_block),
         ("assembled_msgs",     json.dumps(msgs, ensure_ascii=False, indent=2)),
-        ("merged_ids",         [c.context_id for c in recent]),
-        ("tool_ctx_ids",       [getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs]),
+        ("merged_ids",         merged_ids),
+        ("tool_ctx_ids",       tool_ctx_ids),
     ])
     self._print_stage_context("assemble_and_infer", debug_payload)
 
@@ -1933,21 +2029,19 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     reply = (raw_reply or "").strip()
 
     # ─── 9) Persist assistant reply ─────────────────────────────────
-    refs = debug_payload["merged_ids"] + debug_payload["tool_ctx_ids"]
+    refs = merged_ids + tool_ctx_ids
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
-    resp_ctx.summary  = reply
+    resp_ctx.summary = reply
     self._persist_and_index([resp_ctx])
 
-    seg = ContextObject.make_segment("assistant",
-                                     [resp_ctx.context_id],
-                                     tags=["assistant"])
-    seg.summary  = reply
+    seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
+    seg.summary = reply
     seg.stage_id = "assistant"
     seg.touch()
     self.repo.save(seg)
 
-    state["draft"]         = reply
+    state["draft"] = reply
     state["assistant_ctx"] = resp_ctx
     return reply
 
@@ -1959,61 +2053,145 @@ def _stage10b_response_critique_and_safety(
     tool_ctxs: list["ContextObject"],
     state: dict[str, Any],
 ) -> str:
-    import json, difflib, pprint
+    import json, difflib, pprint, logging
     from context import ContextObject
     from types import SimpleNamespace
+    from datetime import datetime
+
+    logger = logging.getLogger(__name__)
 
     if not draft:
         return draft
 
-    # Gather real ContextObjects or fallback to state/tool_summaries
-    real_tool_ctxs = tool_ctxs or self.repo.query(lambda c: c.semantic_label == "tool_output")
-    if not real_tool_ctxs:
-        real_tool_ctxs = state.get("tool_ctxs", [])
-    if not real_tool_ctxs:
+    # ─── helpers ─────────────────────────────────────────────────────
+    def _parse(ts: str) -> datetime:
+        if not ts:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(ts.rstrip("Z"))
+        except Exception:
+            try:
+                return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+            except Exception:
+                return datetime.min
+
+    def normalize_tc(raw):
+        if isinstance(raw, dict):
+            meta = raw.get("metadata", {}) or {}
+            stage_id = raw.get("stage_id") or raw.get("call") or raw.get("tool_name", "unknown_tool")
+            context_id = raw.get("context_id", stage_id)
+            timestamp = ""
+            result = raw.get("result", raw.get("output", {}))
+            if isinstance(result, dict):
+                timestamp = result.get("timestamp", "")
+            summary = raw.get("summary", None)
+            if summary is None:
+                try:
+                    summary = json.dumps(result, ensure_ascii=False)
+                except Exception:
+                    summary = pprint.pformat(result)
+            return SimpleNamespace(
+                metadata=meta if isinstance(meta, dict) else {},
+                summary=summary,
+                stage_id=stage_id,
+                timestamp=timestamp,
+                context_id=context_id,
+            )
+        else:
+            meta = getattr(raw, "metadata", {}) or {}
+            stage_id = getattr(raw, "stage_id", None) or getattr(raw, "stage", None) or "unknown_tool"
+            context_id = getattr(raw, "context_id", stage_id)
+            timestamp = getattr(raw, "timestamp", "")
+            summary = getattr(raw, "summary", None)
+            if summary is None:
+                candidate = meta.get("output", meta.get("output_full", None))
+                if candidate is None:
+                    summary = ""
+                elif isinstance(candidate, (dict, list)):
+                    try:
+                        summary = json.dumps(candidate, ensure_ascii=False)
+                    except Exception:
+                        summary = pprint.pformat(candidate)
+                else:
+                    summary = str(candidate)
+            return SimpleNamespace(
+                metadata=meta if isinstance(meta, dict) else {},
+                summary=summary,
+                stage_id=stage_id,
+                timestamp=timestamp,
+                context_id=context_id,
+            )
+
+    # ─── 1) Gather real ContextObjects or fallback ───────────────────
+    raw_tool_ctxs = tool_ctxs or []
+    if not raw_tool_ctxs:
+        try:
+            raw_tool_ctxs = list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
+        except Exception:
+            raw_tool_ctxs = []
+
+    if not raw_tool_ctxs:
+        raw_tool_ctxs = state.get("tool_ctxs", []) or []
+
+    if not raw_tool_ctxs:
         for summ in state.get("tool_summaries", []):
-            call_name = summ.get("call") or summ.get("tool_name")
-            result    = summ.get("result")
-            ts        = ""
+            call_name = summ.get("call") or summ.get("tool_name", "unknown_tool")
+            result = summ.get("result")
+            ts = ""
             if isinstance(result, dict):
                 ts = result.get("timestamp", "")
-            tc = SimpleNamespace(
-                metadata={"output": result},
-                summary=json.dumps(result, ensure_ascii=False, indent=2),
-                stage_id=call_name,
-                timestamp=ts,
-                context_id=summ.get("context_id", call_name)
-            )
-            real_tool_ctxs.append(tc)
+            tc = {
+                "metadata": {"output": result},
+                "summary": json.dumps(result, ensure_ascii=False, indent=2),
+                "stage_id": call_name,
+                "timestamp": ts,
+                "context_id": summ.get("context_id", call_name)
+            }
+            raw_tool_ctxs.append(tc)
 
-    # Full merged context text
-    merged_ctxs = state.get("merged", [])
-    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs)
+    # ─── 2) Sort and cap to most recent up to 3 tool outputs ────────
+    normalized = []
+    for raw in raw_tool_ctxs:
+        try:
+            normalized.append(normalize_tc(raw))
+        except Exception as e:
+            logger.exception("Failed to normalize tool context entry: %s", e)
+    normalized.sort(key=lambda c: _parse(getattr(c, "timestamp", "") or ""), reverse=True)
+    MAX_TOOL_CTXS = 3
+    real_tool_ctxs = normalized[:MAX_TOOL_CTXS]
 
-    # Plan text
+    # ─── 3) Full merged context text ────────────────────────────────
+    merged_ctxs = state.get("merged", []) or []
+    merged_texts = "\n\n".join(f"[{getattr(c, 'stage_id', '')}] {getattr(c, 'summary', '')}" for c in merged_ctxs)
+
+    # ─── 4) Plan text ──────────────────────────────────────────────
     plan_text = state.get("plan_output", "(no plan)")
 
-    # Serialize outputs
+    # ─── 5) Serialize selected (capped) tool outputs ───────────────
     outputs = []
     for c in real_tool_ctxs:
-        raw = c.metadata.get("output", c.metadata)
-        if isinstance(raw, dict) and "results" in raw:
+        raw = getattr(c, "metadata", {}) or {}
+        # prefer structured output
+        candidate = raw.get("output") if isinstance(raw, dict) else None
+        if candidate is None:
+            candidate = raw.get("output_full", raw) if isinstance(raw, dict) else raw
+        if isinstance(candidate, dict) and "results" in candidate:
             fragment = "\n".join(f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
-                                 for r in raw["results"])
+                                 for r in candidate["results"])
         else:
             try:
-                fragment = json.dumps(raw, indent=2, ensure_ascii=False)
+                fragment = json.dumps(candidate, indent=2, ensure_ascii=False)
             except Exception:
-                fragment = pprint.pformat(raw, compact=True)
-        outputs.append(f"[{c.stage_id}]\n{fragment}")
+                fragment = pprint.pformat(candidate, compact=True)
+        outputs.append(f"[{getattr(c, 'stage_id', '')}]\n{fragment}")
 
-    # 1) Relevance Extraction
+    # ─── 6) Relevance Extraction ───────────────────────────────────
     extractor_sys = self._get_prompt("extractor_sys_prompt")
     extractor_user = "\n\n".join([
         f"USER QUESTION:\n{user_text}",
         f"PLAN EXECUTED:\n{plan_text}",
         "MERGED CONTEXT SNIPPETS:\n" + (merged_texts or "(none)"),
-        "RAW TOOL OUTPUTS:\n" + ("\n\n".join(outputs) or "(none)"),
+        "RAW TOOL OUTPUTS (most recent up to 3):\n" + ("\n\n".join(outputs) or "(none)"),
         "DRAFT RESPONSE:\n" + draft,
         "Your goal: identify exactly the facts, data points, or insights that should shape the revised response."
     ])
@@ -2029,10 +2207,10 @@ def _stage10b_response_critique_and_safety(
 
     sum_ctx = ContextObject.make_stage("relevance_summary", [], {"summary": bullets})
     sum_ctx.stage_id = "relevance_summary"
-    sum_ctx.summary  = bullets
+    sum_ctx.summary = bullets
     self._persist_and_index([sum_ctx])
 
-    # 2) Polishing / Safety Critique
+    # ─── 7) Polishing / Safety Critique ─────────────────────────────
     editor_sys = self._get_prompt("editor_sys_prompt")
     editor_user = "\n\n".join([
         f"USER QUESTION:\n{user_text}",
@@ -2052,14 +2230,14 @@ def _stage10b_response_critique_and_safety(
     if polished == draft.strip():
         return polished
 
-    # diff & dynamic patch
+    # ─── 8) diff & dynamic patch ───────────────────────────────────
     diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
     diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
 
     patch_rows = self.repo.query(
         lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
     )
-    patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
+    patch_rows.sort(key=lambda c: getattr(c, "timestamp", ""), reverse=True)
     dynamic_patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
         "dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"]
     )
@@ -2070,7 +2248,7 @@ def _stage10b_response_critique_and_safety(
 
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
     resp_ctx.stage_id = "response_critique"
-    resp_ctx.summary  = polished
+    resp_ctx.summary = polished
     self._persist_and_index([resp_ctx])
 
     critique_ctx = ContextObject.make_stage(
@@ -2078,7 +2256,7 @@ def _stage10b_response_critique_and_safety(
         [resp_ctx.context_id] + [c.context_id for c in real_tool_ctxs],
         {"critique": polished, "diff": diff_summary},
     )
-    critique_ctx.component      = "analysis"
+    critique_ctx.component = "analysis"
     critique_ctx.semantic_label = "plan_critique"
     self._persist_and_index([critique_ctx])
 
