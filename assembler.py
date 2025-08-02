@@ -3502,75 +3502,75 @@ class Assembler:
             status_cb("reflection_and_replan_error", str(e))
 
 
-    # ---------------------------------------------------------------------
-    # Stage 10 — Assemble & Infer (includes tool outputs)
-    # ---------------------------------------------------------------------
-    _check_cancel()
-    try:
-        draft = await _to_thread_safe(
-            self._stage10_assemble_and_infer,
-            user_text,
-            state
-        )
-        state["draft"] = draft
-        status_cb("assemble_and_infer", draft)
-    except Exception as e:
-        state.setdefault("errors", []).append(("assemble_and_infer", str(e)))
-        status_cb("assemble_and_infer_error", str(e))
-        draft = state.get("draft", "")
-
-    # ---------------------------------------------------------------------
-    # Stage 10b — Response Critique & Safety (bypassed)
-    # ---------------------------------------------------------------------
-    # Simply never enter this block, so `state["draft"]` stays as the original reply.
-    if False:
+        # ---------------------------------------------------------------------
+        # Stage 10 — Assemble & Infer (includes tool outputs)
+        # ---------------------------------------------------------------------
         _check_cancel()
         try:
-            patched = await _to_thread_safe(
-                self._stage10b_response_critique_and_safety,
-                state["draft"],
+            draft = await _to_thread_safe(
+                self._stage10_assemble_and_infer,
                 user_text,
-                state.get("tool_ctxs", []),
                 state
             )
-            if patched:
-                state["draft"] = patched
-            status_cb("response_critique", state["draft"])
+            state["draft"] = draft
+            status_cb("assemble_and_infer", draft)
         except Exception as e:
-            state.setdefault("errors", []).append(("response_critique", str(e)))
-            status_cb("response_critique_error", str(e))
+            state.setdefault("errors", []).append(("assemble_and_infer", str(e)))
+            status_cb("assemble_and_infer_error", str(e))
+            draft = state.get("draft", "")
 
-    # ---------------------------------------------------------------------
-    # Stage 11 — Final inference pass (include all tool outputs)
-    # ---------------------------------------------------------------------
-    _check_cancel()
-    tool_ctxs = state.get("tool_ctxs", [])
-    state["tool_ctxs"] = tool_ctxs  # ensure these persist into memory write-back
+        # ---------------------------------------------------------------------
+        # Stage 10b — Response Critique & Safety (bypassed)
+        # ---------------------------------------------------------------------
+        # Simply never enter this block, so `state["draft"]` stays as the original reply.
+        if False:
+            _check_cancel()
+            try:
+                patched = await _to_thread_safe(
+                    self._stage10b_response_critique_and_safety,
+                    state["draft"],
+                    user_text,
+                    state.get("tool_ctxs", []),
+                    state
+                )
+                if patched:
+                    state["draft"] = patched
+                status_cb("response_critique", state["draft"])
+            except Exception as e:
+                state.setdefault("errors", []).append(("response_critique", str(e)))
+                status_cb("response_critique_error", str(e))
 
-    # build “Tool outputs” block
-    tool_block = []
-    for ctx in tool_ctxs:
-        name = ctx.metadata.get("tool_name") or ctx.stage_id.split("_", 1)[1]
-        output = ctx.metadata.get("output", ctx.metadata.get("output_full", ""))
-        tool_block.append(f"**{name}** → {output!s}")
+        # ---------------------------------------------------------------------
+        # Stage 11 — Final inference pass (include all tool outputs)
+        # ---------------------------------------------------------------------
+        _check_cancel()
+        tool_ctxs = state.get("tool_ctxs", [])
+        state["tool_ctxs"] = tool_ctxs  # ensure these persist into memory write-back
 
-    # assemble final prompt
-    final_system = self.assembler_prompt
-    final_user_parts = [user_text]
-    if state.get("draft"):
-        final_user_parts.append(state["draft"])
-    if tool_block:
-        final_user_parts.append("Tool outputs:\n" + "\n".join(tool_block))
-    final_user = "\n\n".join(final_user_parts)
+        # build “Tool outputs” block
+        tool_block = []
+        for ctx in tool_ctxs:
+            name = ctx.metadata.get("tool_name") or ctx.stage_id.split("_", 1)[1]
+            output = ctx.metadata.get("output", ctx.metadata.get("output_full", ""))
+            tool_block.append(f"**{name}** → {output!s}")
 
-    # invoke assemble & infer directly for final pass
-    final = await _to_thread_safe(
-        self._stage10_assemble_and_infer,
-        final_user,
-        state
-    )
-    state["final"] = final
-    status_cb("final_inference", final)
+        # assemble final prompt
+        final_system = self.assembler_prompt
+        final_user_parts = [user_text]
+        if state.get("draft"):
+            final_user_parts.append(state["draft"])
+        if tool_block:
+            final_user_parts.append("Tool outputs:\n" + "\n".join(tool_block))
+        final_user = "\n\n".join(final_user_parts)
+
+        # invoke assemble & infer directly for final pass
+        final = await _to_thread_safe(
+            self._stage10_assemble_and_infer,
+            final_user,
+            state
+        )
+        state["final"] = final
+        status_cb("final_inference", final)
 
 
         # ---------------------------------------------------------------------
