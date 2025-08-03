@@ -3,43 +3,52 @@
 assembler.py — Stage-driven pipeline with full observability and
 dynamic, chronological context windows per stage.
 """
+
+# ── Standard library ──────────────────────────────────────────────────────────
 import ast
-import inspect
-import json
-import math
-import uuid
-import numpy as np
 import os
-import time
-import asyncio
-import textwrap
-import random
-import tempfile
-import traceback
-import threading
 import re
-from tools import _thread_local
+import sys
+import math
+import json
+import uuid
+import time
+import base64
+import random
+import shutil
+import inspect
+import asyncio
 import hashlib
-import stages
+import tempfile
+import threading
+import traceback
+import textwrap
+from types import MethodType
 from pathlib import Path
-from copy import deepcopy
+from functools import lru_cache
+from dataclasses import dataclass, field
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Callable
+
+# ── Third-party ───────────────────────────────────────────────────────────────
+import numpy as np
+import requests
+from ollama import chat, embed
+from ollama._types import ResponseError as _OllamaError
+
+# ── Project-local ─────────────────────────────────────────────────────────────
+import stages
+import tools
+from tools import Tools, TOOL_SCHEMAS, _thread_local
 from context import (
     ContextObject,
     ContextRepository,
     HybridContextRepository,
     MemoryManager,
     default_clock,
+    sanitize_jsonl,
 )
-from dataclasses import dataclass, field
-from functools import lru_cache
-from ollama import chat, embed
-from tools import TOOL_SCHEMAS
-
-
-from types import MethodType
-from typing import Any, Dict, List, Optional, Tuple, Callable
-import re, base64, requests
-from context import sanitize_jsonl
 from grand_integrator import GrandIntegrator
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,8 +224,6 @@ class TaskExecutor:
         self.memman     = asm.memman
 
     def execute(self, node: TaskNode) -> None:
-        import json
-        from context import ContextObject
 
         # 1) Static validation / fix — always pull the real plan_ctx from the node itself
         plan_ctx_id  = node.context_ids[0]
@@ -374,7 +381,6 @@ class _LiveTTSBridge:
     """
     def __init__(self, tts_player, status_cb=None,
                  min_ms=120, max_ms=700, punct=r"[.!?…]\s*$"):
-        import re, time, threading, hashlib
         self.tts_player   = tts_player
         self.status_cb    = status_cb or (lambda *_: None)
         self.min_ms       = min_ms
@@ -531,7 +537,6 @@ class ContextQueryEngine:
         summary_regex: Optional[str] = None,
         top_k: int = 5
     ) -> List[ContextObject]:
-        import re, numpy as np
 
         # 1) fetch and filter...
         ctxs = self.repo.query(lambda c: True)
@@ -810,8 +815,6 @@ class Assembler:
             self.repo = repo
             self.context_path = self.repo.json_repo.path
         else:
-            from pathlib import Path
-            from context import sanitize_jsonl
 
             # ensure our storage directory exists
             base = Path("context_repos")
@@ -835,7 +838,6 @@ class Assembler:
             # remember the actual on‑disk JSONL path for later pruning
             self.context_path = str(jsonl_file)
 
-        import tools
         tools.repo = self.repo            # for module-level tools
         tools.Tools.repo = self.repo      # for any methods on the Tools class
 
@@ -862,10 +864,12 @@ class Assembler:
             config=integrator_config
         )
         
-        from context import sanitize_jsonl
+        self._prompts_ready_evt = threading.Event()
+
         sanitize_jsonl(self.repo.json_repo.path)
         self._seed_tool_schemas()
         self._seed_static_prompts()
+        self._prompts_ready_evt.set()
 
         self.tts_live_stages = set(
             self.cfg.get("tts_live_stages", [
@@ -882,7 +886,6 @@ class Assembler:
         self._telegram_bot = None
 
         # Self-review background thread control
-        import threading
         self._stop_self_review    = threading.Event()
         self._self_review_thread  = None
 
@@ -1026,33 +1029,6 @@ class Assembler:
         return provisional
 
 
-    def embed_text(text: str) -> np.ndarray:
-        """
-        Non-blocking embed: return a cached vector if available,
-        otherwise launch a background embed and return zeros.
-        """
-        with _CACHE_LOCK:
-            if text in _EMBED_CACHE:
-                return _EMBED_CACHE[text]
-
-        # not cached → kick off a background thread to populate it
-        def _worker(t: str):
-            try:
-                resp = embed(model="nomic-embed-text", input=t)
-                vec  = np.array(resp["embeddings"], dtype=float).flatten()
-                norm = np.linalg.norm(vec)
-                vec = vec / norm if norm > 0 else vec
-            except Exception:
-                vec = _ZERO
-            with _CACHE_LOCK:
-                _EMBED_CACHE[t] = vec
-
-        thr = threading.Thread(target=_worker, args=(text,), daemon=True)
-        thr.start()
-
-        # immediately return a zero vector;
-        # future calls (after the thread finishes) will return the real one
-        return _ZERO
     
     def _prune_jsonl_duplicates(self) -> None:
         """
@@ -1062,398 +1038,341 @@ class Assembler:
         - For everything else: keep newest per context_id.
         Malformed lines -> *.corrupt
 
-        Concurrency-safe: only one process runs at a time via lock-file.
+        Also canonicalizes metadata["schema"] to eliminate whitespace-induced mismatches.
         """
-        import os, sys, json, tempfile, time
 
-        path = self.repo.json_repo.path
+        path         = self.repo.json_repo.path
         corrupt_path = path + ".corrupt"
-        lock_path = path + ".prune.lock"
 
-        # ---- simple cross-platform lock (O_EXCL). Stale after 10 min. ----
-        def acquire_lock(p: str, ttl_sec: int = 600):
-            while True:
-                try:
-                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                    with os.fdopen(fd, "w", encoding="utf8") as lf:
-                        lf.write(f"{os.getpid()} {int(time.time())}\n")
-                    return True
-                except FileExistsError:
-                    try:
-                        with open(p, "r", encoding="utf8") as lf:
-                            _pid_ts = lf.read().strip().split()
-                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
-                        if time.time() - old_ts > ttl_sec:
-                            os.remove(p)
-                            continue
-                    except Exception:
-                        # lock looks broken; try to remove
-                        try:
-                            os.remove(p)
-                        except Exception:
-                            pass
-                    time.sleep(0.25)
+        total = bad = 0
+        keep_by_key: dict[str, dict] = {}
 
-        def release_lock(p: str):
+        def _canon_schema_str(s: str) -> str:
             try:
-                os.remove(p)
+                obj = json.loads(s)
+                return json.dumps(obj, sort_keys=True, separators=(',', ':'))
             except Exception:
-                pass
+                return s  # leave as-is if not valid JSON
 
-        acquire_lock(lock_path)
-        try:
-            total, bad = 0, 0
-            keep_by_key = {}  # logical key -> object (newest timestamp)
-            # helper: generate a logical dedupe key
-            def logical_key(obj):
-                comp = obj.get("component", "")
-                cid  = obj.get("context_id", "")
-                ts   = obj.get("timestamp", "")
-                if not isinstance(ts, str) or not isinstance(cid, str):
-                    return None
-                if comp == "prompt":
-                    label = (obj.get("semantic_label") or "").strip()
-                    if not label:
-                        return None  # malformed; will be handled as bad
-                    return f"prompt::{label}"
-                if comp == "schema":
-                    label = (obj.get("semantic_label") or "").strip()
-                    if not label:
-                        # fallback: parse schema.name from metadata
-                        try:
-                            blob = json.loads(obj.get("metadata", {}).get("schema", "{}"))
-                            name = (blob.get("name") or "").strip()
-                            if name:
-                                label = name
-                        except Exception:
-                            pass
-                    if not label:
-                        # as last resort, dedupe by context_id
-                        return f"cid::{cid}"
-                    return f"schema::{label}"
-                # other components: dedupe strictly by context_id
-                return f"cid::{cid}"
+        def _logical_key(obj: dict) -> str | None:
+            comp = obj.get("component", "")
+            cid  = obj.get("context_id", "")
+            ts   = obj.get("timestamp", "")
+            if not isinstance(cid, str) or not isinstance(ts, str):
+                return None
 
-            # ---- read & choose newest per key ----
-            with open(path, "r", encoding="utf8") as infile, \
-                open(corrupt_path, "a", encoding="utf8") as badf:
-                for line in infile:
-                    total += 1
+            if comp == "prompt":
+                label = (obj.get("semantic_label") or "").strip()
+                return f"prompt::{label}" if label else None
+
+            if comp == "schema":
+                label = (obj.get("semantic_label") or "").strip()
+                if not label:
+                    # fallback: parse schema.name from metadata
                     try:
-                        obj = json.loads(line)
-                        ts = obj.get("timestamp", "")
-                        if not isinstance(ts, str) or "context_id" not in obj:
-                            raise ValueError("missing basics")
-                        key = logical_key(obj)
-                        if not key:
-                            raise ValueError("no logical key")
-                    except Exception:
-                        bad += 1
-                        badf.write(line)
-                        continue
-
-                    prev = keep_by_key.get(key)
-                    if prev is None or obj["timestamp"] > prev["timestamp"]:
-                        keep_by_key[key] = obj
-
-            # ---- write survivors in timestamp order ----
-            survivors = sorted(keep_by_key.values(), key=lambda o: o["timestamp"])
-            tmp_dir = os.path.dirname(path) or "."
-            fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
-            with os.fdopen(fd, "w", encoding="utf8") as out:
-                for o in survivors:
-                    out.write(json.dumps(o, separators=(",", ":")) + "\n")
-
-            # ---- atomic replace (skip on Windows if locked) ----
-            if sys.platform.startswith("win"):
-                try:
-                    os.replace(tmp_path, path)
-                except Exception:
-                    try:
-                        os.remove(tmp_path)
+                        blob = json.loads(obj.get("metadata", {}).get("schema", "{}"))
+                        name = (blob.get("name") or "").strip()
+                        if name:
+                            label = name
                     except Exception:
                         pass
-            else:
-                os.replace(tmp_path, path)
+                return f"schema::{label}" if label else f"cid::{cid}"
 
-            print(f"[prune_jsonl_duplicates] {total} read, "
-                f"{len(survivors)} kept, {bad} malformed → wrote {path}")
-        finally:
-            release_lock(lock_path)
+            # everything else: dedupe by context_id
+            return f"cid::{cid}"
+
+        with open(path, "r", encoding="utf8") as infile, \
+            open(corrupt_path, "a", encoding="utf8") as badf:
+            for line in infile:
+                total += 1
+                try:
+                    obj = json.loads(line)
+                    key = _logical_key(obj)
+                    if not key:
+                        raise ValueError("no logical key")
+                except Exception:
+                    bad += 1
+                    badf.write(line)
+                    continue
+
+                # Canonicalize embedded schema JSON strings
+                if obj.get("component") == "schema":
+                    meta = obj.get("metadata") or {}
+                    sch  = meta.get("schema")
+                    if isinstance(sch, str):
+                        meta["schema"] = _canon_schema_str(sch)
+                        obj["metadata"] = meta
+
+                prev = keep_by_key.get(key)
+                if prev is None or obj["timestamp"] > prev["timestamp"]:
+                    keep_by_key[key] = obj
+
+        survivors = sorted(keep_by_key.values(), key=lambda o: o["timestamp"])
+
+        tmp_dir = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
+        with os.fdopen(fd, "w", encoding="utf8") as out:
+            for o in survivors:
+                out.write(json.dumps(o, separators=(',', ':')) + "\n")
+
+        # POSIX/Windows: atomic-ish replace
+        os.replace(tmp_path, path)
+
+        print(f"[prune_jsonl_duplicates] {total} read, {len(survivors)} kept, {bad} malformed → wrote {path}")
 
 
 
 
     def _seed_tool_schemas(self) -> None:
         """
-        Idempotent tool-schema seeding with concurrency guard.
-        - Lock so only one process seeds at a time.
+        Idempotent tool-schema seeding (no external lock).
         - Key on semantic_label (fallback to parsed schema.name).
-        - Keep newest per label; update in place; demote non-canonical to legacy.
-        - No mass sanitize/minify here; we call logical prune at the end.
+        - Keep newest per label; delete older dups.
+        - Canonicalize JSON before compare/store to avoid whitespace diffs.
+        - Demote non-canonical tools to legacy.
+        - If duplicates or updates happened, sanitize + logical prune.
         """
-        import os, json, time
-        from context import ContextObject
-        from tools import Tools, TOOL_SCHEMAS
 
-        path = self.repo.json_repo.path
-        lock_path = path + ".seed_tools.lock"
-        REQUIRED_TAGS = {"artifact", "tool_schema"}
+        def canon(obj) -> str:
+            return json.dumps(obj, sort_keys=True, separators=(',', ':'))
 
-        # ---- lock (same strategy as in prune) ----
-        def acquire_lock(p: str, ttl_sec: int = 600):
-            while True:
-                try:
-                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                    with os.fdopen(fd, "w", encoding="utf8") as lf:
-                        lf.write(f"{os.getpid()} {int(time.time())}\n")
-                    return True
-                except FileExistsError:
-                    try:
-                        with open(p, "r", encoding="utf8") as lf:
-                            _pid_ts = lf.read().strip().split()
-                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
-                        if time.time() - old_ts > ttl_sec:
-                            os.remove(p)
-                            continue
-                    except Exception:
-                        try: os.remove(p)
-                        except Exception: pass
-                    time.sleep(0.25)
+        changed_or_dupes = False
 
-        def release_lock(p: str):
-            try: os.remove(p)
-            except Exception: pass
-
-        acquire_lock(lock_path)
+        # 1) Build canonical set
         try:
-            # generate canonical schemas (no clears; generation should overwrite dict keys)
+            Tools.generate_all_tool_schemas()
+        except Exception:
+            return
+        canonical = {name: schema for name, schema in TOOL_SCHEMAS.items()}
+        if not canonical:
+            return
+
+        # 2) Read all schema rows (active + legacy so we can normalize)
+        rows = list(self.repo.query(
+            lambda c: c.component == "schema" and any(t in (c.tags or []) for t in ("tool_schema", "legacy_tool_schema"))
+        ))
+
+        def label_for(ctx) -> str:
+            lbl = (ctx.semantic_label or "").strip()
+            if lbl:
+                return lbl
+            # fallback: extract name from metadata.schema
             try:
-                Tools.generate_all_tool_schemas()
+                blob = json.loads(ctx.metadata.get("schema", "{}"))
+                name = (blob.get("name") or "").strip()
+                return name or f"__missing__::{ctx.context_id}"
             except Exception:
-                # if generation fails, do nothing
-                return
-            canonical = {name: schema for name, schema in TOOL_SCHEMAS.items()}
-            if not canonical:
-                return
+                return f"__missing__::{ctx.context_id}"
 
-            # ---- read existing schema rows ----
-            rows = self.repo.query(
-                lambda c: c.component == "schema" and any(t in (c.tags or []) for t in ("tool_schema", "legacy_tool_schema"))
-            )
+        # 3) Bucket and dedupe: keep newest per label
+        buckets: dict[str, list[ContextObject]] = {}
+        for ctx in rows:
+            buckets.setdefault(label_for(ctx), []).append(ctx)
 
-            def parsed_name(ctx):
-                try:
-                    blob = json.loads(ctx.metadata.get("schema", "{}"))
-                    return (blob.get("name") or "").strip()
-                except Exception:
-                    return ""
+        keepers: dict[str, ContextObject] = {}
+        for lbl, lst in buckets.items():
+            if len(lst) > 1:
+                lst.sort(key=lambda c: c.timestamp, reverse=True)
+                keeper, dups = lst[0], lst[1:]
+                for d in dups:
+                    try:
+                        self.repo.delete(d.context_id)
+                        changed_or_dupes = True
+                    except Exception:
+                        pass
+                keepers[lbl] = keeper
+            else:
+                keepers[lbl] = lst[0]
 
-            # bucket newest per semantic_label (or parsed_name if label missing)
-            newest_by_label = {}
-            all_by_label = {}
-            for ctx in rows:
-                label = (ctx.semantic_label or "").strip()
-                name = parsed_name(ctx)
-                if not label and name:
-                    # normalize label to tool name
-                    ctx.semantic_label = name
-                    ctx.touch(); self.repo.save(ctx)
-                    label = name
+        present_labels = { (ctx.semantic_label or label_for(ctx)).strip(): ctx for ctx in keepers.values() }
 
-                if not label:
-                    # nothing to do; leave it as-is; it will be keyed by context_id in prune
-                    label = f"__missing__::{ctx.context_id}"
+        # 4) Upsert/normalize canonical
+        for name, want in canonical.items():
+            want_json = canon(want)
+            cur = present_labels.get(name)
+            if cur is None:
+                # INSERT
+                sc = ContextObject.make_schema(
+                    label=name,
+                    schema_def=want_json,
+                    tags=["artifact", "tool_schema"],
+                )
+                sc.semantic_label = name
+                sc.touch()
+                self.repo.save(sc)
+                changed_or_dupes = True
+                present_labels[name] = sc
+                continue
 
-                prev = newest_by_label.get(label)
-                if prev is None or ctx.timestamp > prev.timestamp:
-                    newest_by_label[label] = ctx
+            # UPDATE only if content or tags differ
+            try:
+                have_json = canon(json.loads(cur.metadata.get("schema", "{}")))
+            except Exception:
+                have_json = ""
+            need_update = (have_json != want_json)
+            tags = set(cur.tags or [])
+            if "tool_schema" not in tags:
+                # promote legacy back to active if it's canonical
+                tags.discard("legacy_tool_schema")
+                tags.add("tool_schema")
+                need_update = True
+            if (cur.semantic_label or "").strip() != name:
+                cur.semantic_label = name
+                need_update = True
+            if need_update:
+                cur.metadata["schema"] = want_json
+                cur.tags = sorted(tags | {"artifact"})
+                cur.touch()
+                self.repo.save(cur)
+                changed_or_dupes = True
 
-                all_by_label.setdefault(label, []).append(ctx)
+        # 5) Demote any non-canonical active schemas to legacy
+        canonical_names = set(canonical.keys())
+        for lbl, ctx in list(present_labels.items()):
+            if lbl and lbl not in canonical_names:
+                tags = set(ctx.tags or [])
+                if "tool_schema" in tags:
+                    tags.remove("tool_schema")
+                    tags.add("legacy_tool_schema")
+                    ctx.tags = sorted(tags)
+                    ctx.touch()
+                    self.repo.save(ctx)
+                    changed_or_dupes = True
 
-            # delete older dups per label
-            for label, lst in all_by_label.items():
-                # keep the newest
-                keeper = newest_by_label[label]
-                for ctx in lst:
-                    if ctx.context_id != keeper.context_id:
-                        try:
-                            self.repo.delete(ctx.context_id)
-                        except Exception:
-                            pass
-
-            # rebuild after deletions
-            rows = list(newest_by_label.values())
-            present_labels = { (ctx.semantic_label or "").strip(): ctx for ctx in rows if (ctx.semantic_label or "").strip() }
-
-            # ---- upsert canonical ----
-            for name, want_obj in canonical.items():
-                want_json = json.dumps(want_obj, sort_keys=True)
-                cur = present_labels.get(name)
-
-                if cur is None:
-                    sc = ContextObject.make_schema(
-                        label=name,
-                        schema_def=want_json,
-                        tags=sorted(REQUIRED_TAGS),
-                    )
-                    sc.semantic_label = name
-                    sc.touch(); self.repo.save(sc)
-                    present_labels[name] = sc
-                    continue
-
-                # update in-place if JSON or tags differ or label drifted
-                changed = False
-                try:
-                    have_json = json.dumps(json.loads(cur.metadata.get("schema", "{}")), sort_keys=True)
-                except Exception:
-                    have_json = ""
-                if have_json != want_json:
-                    cur.metadata["schema"] = want_json
-                    changed = True
-
-                tags = set(cur.tags or [])
-                if not REQUIRED_TAGS.issubset(tags):
-                    cur.tags = sorted(tags | REQUIRED_TAGS)
-                    changed = True
-
-                if (cur.semantic_label or "").strip() != name:
-                    cur.semantic_label = name
-                    changed = True
-
-                if changed:
-                    cur.touch(); self.repo.save(cur)
-
-            # ---- demote any non-canonical active schema to legacy ----
-            canonical_names = set(canonical.keys())
-            for label, ctx in list(present_labels.items()):
-                if label and label not in canonical_names:
-                    tags = set(ctx.tags or [])
-                    if "tool_schema" in tags:
-                        tags.remove("tool_schema")
-                        tags.add("legacy_tool_schema")
-                        ctx.tags = sorted(tags)
-                        ctx.touch(); self.repo.save(ctx)
-
-            # final safety: logical prune to collapse anything left behind
-            self._prune_jsonl_duplicates()
-        finally:
-            release_lock(lock_path)
-
+        # 6) Sanitize + logical prune only if something changed/dupes existed
+        if changed_or_dupes:
+            jsonl_path = self.repo.json_repo.path
+            try:
+                sanitize_jsonl(jsonl_path)
+            finally:
+                # prune does canonicalization of schema strings too
+                self._prune_jsonl_duplicates()
 
 
     def _seed_static_prompts(self) -> None:
         """
-        Idempotent prompt seeding with concurrency guard.
-        - Upsert by semantic_label.
-        - Keep newest per label; update in place; ensure 'prompt' tag present.
-        - Logical prune at the end.
+        Idempotent seeding of static system prompts with a cross-process lock.
+
+        Rules
+        -----
+        • If a prompt with a given semantic_label exists: DO NOTHING to its text/tags.
+        • If multiple exist: keep newest, delete extras.
+        • If none exist: insert one.
+        • If we changed anything (inserted/deleted), sanitize + logical prune.
         """
-        import os, json, time
-        from context import ContextObject
 
-        path = self.repo.json_repo.path
-        lock_path = path + ".seed_prompts.lock"
-
-        def acquire_lock(p: str, ttl_sec: int = 600):
-            while True:
-                try:
-                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                    with os.fdopen(fd, "w", encoding="utf8") as lf:
-                        lf.write(f"{os.getpid()} {int(time.time())}\n")
-                    return True
-                except FileExistsError:
-                    try:
-                        with open(p, "r", encoding="utf8") as lf:
-                            _pid_ts = lf.read().strip().split()
-                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
-                        if time.time() - old_ts > ttl_sec:
-                            os.remove(p)
-                            continue
-                    except Exception:
-                        try: os.remove(p)
-                        except Exception: pass
-                    time.sleep(0.25)
-
-        def release_lock(p: str):
-            try: os.remove(p)
-            except Exception: pass
-
-        acquire_lock(lock_path)
-        try:
-            # desired prompts
-            self.system_prompts = {
-                "clarifier_prompt":        self.clarifier_prompt,
-                "assembler_prompt":        self.assembler_prompt,
-                "inference_prompt":        self.inference_prompt,
-                "planning_prompt":         self.planning_prompt,
-                "toolchain_prompt":        self.toolchain_prompt,
-                "reflection_prompt":       self.reflection_prompt,
-                "toolchain_retry_prompt":  self.toolchain_retry_prompt,
-                "final_inference_prompt":  self.final_inference_prompt,
-                "critic_prompt":           self.critic_prompt,
-                "narrative_mull_prompt":   self.narrative_mull_prompt,
-                "extractor_sys_prompt":    self.extractor_sys_prompt,
-                "editor_sys_prompt":       self.editor_sys_prompt,
-            }
-            desired = dict(self.system_prompts)
-
-            # existing prompts, newest per label
-            rows = self.repo.query(lambda c: c.component == "prompt")
-            newest_by_label = {}
-            all_by_label = {}
-            for ctx in rows:
-                label = (ctx.semantic_label or "").strip()
-                if not label:
-                    continue
-                prev = newest_by_label.get(label)
-                if prev is None or ctx.timestamp > prev.timestamp:
-                    newest_by_label[label] = ctx
-                all_by_label.setdefault(label, []).append(ctx)
-
-            # dedupe: keep newest
-            for label, lst in all_by_label.items():
-                keeper = newest_by_label[label]
-                for ctx in lst:
-                    if ctx.context_id != keeper.context_id:
+        # ---- small cross-process lock (POSIX flock / Windows msvcrt) ----
+        class _Lock:
+            def __init__(self, path: str, timeout: float = 30.0, poll: float = 0.1):
+                self.path, self.timeout, self.poll = path, timeout, poll
+                self._fh = None
+            def __enter__(self):
+                lock_dir = os.path.dirname(self.path) or "."
+                os.makedirs(lock_dir, exist_ok=True)
+                self._fh = open(self.path, "a+b")
+                start = time.time()
+                if os.name == "nt":
+                    import msvcrt
+                    while True:
                         try:
-                            self.repo.delete(ctx.context_id)
-                        except Exception:
-                            pass
+                            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            if time.time() - start > self.timeout:
+                                self._fh.close(); raise TimeoutError(f"Timeout acquiring lock {self.path}")
+                            time.sleep(self.poll)
+                else:
+                    import fcntl
+                    while True:
+                        try:
+                            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.time() - start > self.timeout:
+                                self._fh.close(); raise TimeoutError(f"Timeout acquiring lock {self.path}")
+                            time.sleep(self.poll)
+                return self
+            def __exit__(self, *_):
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        try:
+                            self._fh.seek(0); msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                        finally:
+                            self._fh.close()
+                    else:
+                        import fcntl
+                        try:
+                            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                        finally:
+                            self._fh.close()
+                finally:
+                    pass  # keep the lock file
 
-            # upsert/update
-            for label, text in desired.items():
-                cur = newest_by_label.get(label)
-                if cur is None:
+        # 1) Canonical source-of-truth dict (we do not overwrite existing text)
+        self.system_prompts = {
+            "clarifier_prompt":        self.clarifier_prompt,
+            "assembler_prompt":        self.assembler_prompt,
+            "inference_prompt":        self.inference_prompt,
+            "planning_prompt":         self.planning_prompt,
+            "toolchain_prompt":        self.toolchain_prompt,
+            "reflection_prompt":       self.reflection_prompt,
+            "toolchain_retry_prompt":  self.toolchain_retry_prompt,
+            "final_inference_prompt":  self.final_inference_prompt,
+            "critic_prompt":           self.critic_prompt,
+            "narrative_mull_prompt":   self.narrative_mull_prompt,
+            "extractor_sys_prompt":    self.extractor_sys_prompt,
+            "editor_sys_prompt":       self.editor_sys_prompt,
+        }
+        static = dict(self.system_prompts)
+
+        lock_path = os.path.join(os.path.dirname(self.repo.json_repo.path) or ".", ".seed_static_prompts.lock")
+        changed_or_dupes = False
+
+        with _Lock(lock_path):
+            # 2) Bucket existing by normalized semantic_label
+            buckets: dict[str, list[ContextObject]] = {}
+            for ctx in self.repo.query(lambda c: c.component == "prompt"):
+                lbl = (ctx.semantic_label or "").strip()
+                if lbl:
+                    buckets.setdefault(lbl, []).append(ctx)
+
+            # 3) Ensure existence per label; dedupe extras; never touch existing content
+            for label, desired_text in static.items():
+                label_norm = label.strip()
+                rows = buckets.get(label_norm, [])
+
+                if not rows:
                     new_ctx = ContextObject.make_prompt(
-                        label=label,
-                        prompt_text=text,
+                        label=label_norm,
+                        prompt_text=desired_text,
                         tags=["artifact", "prompt"],
                     )
-                    new_ctx.semantic_label = label
-                    new_ctx.touch(); self.repo.save(new_ctx)
-                    newest_by_label[label] = new_ctx
+                    new_ctx.touch()
+                    self.repo.save(new_ctx)
+                    changed_or_dupes = True
+                    # keep buckets in sync in case this function is ever extended
+                    buckets.setdefault(label_norm, []).append(new_ctx)
                     continue
 
-                changed = False
-                if cur.metadata.get("prompt") != text:
-                    cur.metadata["prompt"] = text
-                    changed = True
-                tags = set(cur.tags or [])
-                if "prompt" not in tags:
-                    cur.tags = sorted(tags | {"artifact", "prompt"})
-                    changed = True
-                if (cur.semantic_label or "").strip() != label:
-                    cur.semantic_label = label
-                    changed = True
-                if changed:
-                    cur.touch(); self.repo.save(cur)
+                if len(rows) > 1:
+                    rows.sort(key=lambda c: c.timestamp, reverse=True)
+                    keeper, dups = rows[0], rows[1:]
+                    for dup in dups:
+                        try:
+                            self.repo.delete(dup.context_id)
+                            changed_or_dupes = True
+                        except Exception:
+                            pass
+                    buckets[label_norm] = [keeper]
 
-            # final: logical prune
-            self._prune_jsonl_duplicates()
-        finally:
-            release_lock(lock_path)
-
+        # 4) Clean only if something changed or dupes were found
+        if changed_or_dupes:
+            jsonl_path = self.repo.json_repo.path
+            try:
+                sanitize_jsonl(jsonl_path)
+            finally:
+                self._prune_jsonl_duplicates()
 
 
 
@@ -1633,7 +1552,6 @@ class Assembler:
             ▙▄▄ END   … ▄▄▟
         • All lines are wrapped and padded to fit neatly inside the box.
         """
-        import shutil, textwrap, json
 
         # ── 1) Console dimensions ────────────────────────────────────────────
         W = max(60, shutil.get_terminal_size(fallback=(120, 20)).columns)
@@ -1799,7 +1717,6 @@ class Assembler:
         Given absolute file paths, load and base-64-encode each image
         (skipping any > max_bytes).  Returns the unique, ordered list.
         """
-        import base64, os
         out, seen = [], set()
         for p in paths:
             try:
@@ -1831,11 +1748,6 @@ class Assembler:
          • Ollama‑crash resilience + retry loop
          • optional automatic fall‑back to secondary model
         """
-        import re, time, requests
-        from pathlib import Path
-        from collections import deque
-        from ollama import chat
-        from ollama._types import ResponseError as _OllamaError
 
         # ── tweakables ───────────────────────────────────────────────
         TOKEN_WINDOW             = 2000
@@ -2065,7 +1977,6 @@ class Assembler:
         Ask the LLM if we need to show the plan to the user before running.
         Returns True if it replies 'yes', False otherwise.
         """
-        import re, json
 
         calls = state.get("fixed_calls", [])
         # build a one-line summary of the recent context
@@ -2100,7 +2011,6 @@ class Assembler:
 
     # helper: resume after user says yes/no
     def _handle_confirmation(self, reply: str) -> str:
-        import re
         ans = reply.strip().lower()
         # YES
         if re.search(r"\b(yes|y|sure|go ahead)\b", ans):
@@ -2150,8 +2060,7 @@ class Assembler:
                     pass
 
     def dump_architecture(self):
-        import inspect, json
-        from datetime import datetime
+        
 
         arch = {
             "stages":               self.STAGES,
@@ -2180,9 +2089,7 @@ class Assembler:
         Identify gaps in clarified intent, auto-mull or explicit follow-ups via RL,
         ask the LLM for answers, record Q&A as ContextObjects, return answers.
         """
-        from typing import Tuple, List
-        from datetime import datetime
-
+        
         probes: List[str] = []
         clar = state.get("clar_ctx")
         if clar is None:
@@ -2291,10 +2198,26 @@ class Assembler:
 
     
     def _get_prompt(self, label: str) -> str:
-        ctx = next(c for c in self.repo.query(lambda c:
-            c.semantic_label == label and c.component == "prompt"
-        ))
-        return ctx.metadata["prompt"]
+        # Ensure initial seeding completed (non-blocking if already set)
+        try:
+            self._await_prompts_ready(0.0)
+            self._ensure_prompts_present()
+        except Exception:
+            pass
+
+        # Prefer repo copy
+        rows = [c for c in self.repo.query(lambda c:
+            c.component == "prompt" and (c.semantic_label or "").strip() == label
+        )]
+        if rows:
+            rows.sort(key=lambda c: c.timestamp, reverse=True)
+            meta = rows[0].metadata or {}
+            val = meta.get("prompt")
+            if isinstance(val, str) and val.strip():
+                return val
+
+        # Fallback to the in-memory canonical prompt text
+        return getattr(self, "system_prompts", {}).get(label, "")
     
     def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
         """
@@ -2302,9 +2225,7 @@ class Assembler:
         into narrative, architecture, tool outcomes—and now a window of past
         evaluation events.
         """
-        import json, textwrap, os, shutil
-        from datetime import datetime
-        import io, contextlib
+        
 
         # — Helpers to pull in extra context —
         def _arch_dump() -> str:
@@ -2524,8 +2445,6 @@ class Assembler:
         Ask `self.decision_model` to choose exactly one item from `options`,
         returning first a one-sentence justification, then on its own line the choice.
         """
-        import re, json
-        from context import ContextObject
 
         # 1) Build mapping & primary system prompt
         mapping    = {vn: opt for vn, opt in zip(var_names, options)}
@@ -2596,7 +2515,6 @@ class Assembler:
 
             # record Q&A if desired
             if record:
-                from context import ContextObject
                 # question ctx
                 q_name = "decision_question" if attempt==0 else "decision_feedback_question"
                 q_ctx = ContextObject.make_stage(q_name, [narr_ctx.context_id], {
@@ -2631,12 +2549,11 @@ class Assembler:
         """
         Returns (should_respond, full_response_with_justification)
         """
-        import re
         resp = self.decision_callback(
             user_text=user_text,
             options=["YES","NO"],
             system_template=(
-                "You are attentive to the conversation; decide if you should reply. "
+                "You are attentive to the conversation; decide if you should reply. You have tools available outside of your knowledge so anything that would require additional context, respond knowing that you can use tools to get that context.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
@@ -2654,12 +2571,11 @@ class Assembler:
         """
         Returns (use_tools, full_response_with_justification)
         """
-        import re
         resp = self.decision_callback(
             user_text=user_text,
             options=["TOOLS","NO_TOOLS"],
             system_template=(
-                "Decide if this user query needs external tool calls. "
+                "You want to always call tools unless the prompt is extremely obviously a conversationally low complexity interaction.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
@@ -2687,7 +2603,6 @@ class Assembler:
         function in a worker thread.  All keyword‑only args are forwarded as
         **keywords**, preventing the positional‐argument crash.
         """
-        import asyncio
         return await asyncio.to_thread(
             self._stream_and_capture,
             model,
@@ -2737,7 +2652,6 @@ class Assembler:
         Returns a dict that can be merged straight into the master `state`
         object used by `_handle_turn`.
         """
-        import asyncio, uuid
 
         # ------------------------------------------------------------------
         # Build the minimal state skeleton **with all mandatory keys**.
@@ -2768,7 +2682,6 @@ class Assembler:
         except Exception as e:
             boot_state["errors"].append(("record_input", str(e)))
             # fall back to a dummy context object so later code never blows up
-            from context import ContextObject
             dummy = ContextObject.make_stage(
                 "record_input_failed",
                 [],
@@ -2794,6 +2707,35 @@ class Assembler:
 
         return boot_state
 
+
+    def _await_prompts_ready(self, timeout: float = 5.0) -> None:
+        """
+        Block until initial prompt seeding is done (or timeout).
+        No-op if the event is missing (backward compat).
+        """
+        evt = getattr(self, "_prompts_ready_evt", None)
+        if evt is not None:
+            evt.wait(timeout)
+
+    def _ensure_prompts_present(self) -> None:
+        """
+        If the repo is missing any of the canonical prompts (e.g., right
+        after a reload), reseed synchronously. Safe to call often.
+        """
+        try:
+            have = {
+                (c.semantic_label or "").strip()
+                for c in self.repo.query(lambda c: c.component == "prompt")
+            }
+            need = set(getattr(self, "system_prompts", {}).keys())
+            if need and not need.issubset(have):
+                self._seed_static_prompts()
+        except Exception:
+            # don't block the turn on hygiene
+            pass
+
+
+
     # ──────────────────────────────────────────────────────────────────────────
     #  PUBLIC ENTRY  –  three‑phase orchestrator  (dynamic quick‑prompts + narrative + tooling notice)
     # ──────────────────────────────────────────────────────────────────────────
@@ -2816,15 +2758,16 @@ class Assembler:
         Set skip_quick_phases=True to jump straight to the planner.
         """
 
-        import json, uuid, asyncio
-        from pathlib import Path
-        from datetime import datetime, timezone
-        from context import sanitize_jsonl
 
         # ─── 0. Hygiene & defaults ────────────────────────────────────
         await asyncio.to_thread(sanitize_jsonl, self.repo.json_repo.path)
+        # Wait for initial seeding & top off if hot-reload raced us
+        await asyncio.to_thread(self._await_prompts_ready, 5.0)
+        await asyncio.to_thread(self._ensure_prompts_present)
+
         if status_cb is None:
             status_cb = lambda stage, info=None: None
+
 
         # ─── 0.5 Narrative singleton ─────────────────────────────────
         narrative_ctx  = await asyncio.to_thread(self._load_narrative_context)
@@ -3007,10 +2950,6 @@ class Assembler:
           travels through `state` so the assistant can mention likely tools
           even before the planner has run.
         """
-        import asyncio, traceback, uuid
-        from typing import Any, Dict, List, Callable
-        from context import ContextObject
-
         # ---------------------------------------------------------------------
         # Sanity helper
         # ---------------------------------------------------------------------
@@ -3485,21 +3424,18 @@ class Assembler:
 
         clar_ctx = state.get("clar_ctx")
         if not clar_ctx:
-            from context import ContextObject
             clar_ctx = ContextObject.make_stage("intent_clarification_dummy", [], {"summary": ""})
             clar_ctx.touch(); self.repo.save(clar_ctx)
             state["clar_ctx"] = clar_ctx
 
         know_ctx = state.get("know_ctx")
         if not know_ctx:
-            from context import ContextObject
             know_ctx = ContextObject.make_stage("external_knowledge_dummy", clar_ctx.references or [], {"summary": ""})
             know_ctx.touch(); self.repo.save(know_ctx)
             state["know_ctx"] = know_ctx
 
         state.setdefault("early_phases", {})
 
-        import json
         planner_payload = {
             "user_question":      state["user_text"],
             "clarifier_notes":    clar_ctx.metadata.get("notes", ""),
@@ -3537,7 +3473,6 @@ class Assembler:
             try:
                 plan_output = json.loads(plan_output_raw)
             except Exception:
-                import ast
                 try:
                     plan_output = ast.literal_eval(plan_output_raw)
                 except Exception:

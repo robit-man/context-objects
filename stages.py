@@ -734,74 +734,42 @@ def _stage5_external_knowledge(
 
 
 
-# ──────────────────────────────────────────────────────────────────
-# Stage 6 – collect & deduplicate tool schemas (READ-ONLY)
-# ──────────────────────────────────────────────────────────────────
-def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
+def _stage6_prepare_tools(self) -> list[dict]:
     """
-    Return a de-duplicated, lexicographically sorted list of:
-      { "name": "<tool_name>",
-        "description": "<one-line truncated desc>",
-        "schema": <full JSON-RPC schema dict>
-      }
-    for every tool schema stored in the repo.
-
-    READ-ONLY: does not write, delete, or mutate the repository.
+    Return a list of tool specs for planning:
+      [{ "name": str, "schema": dict, "description": str }, ...]
+    Tries active tool_schema first, then falls back to legacy_tool_schema
+    to survive transient demotions during auto-reload.
     """
-    import json, textwrap
+    import json
 
-    # 1) Load every schema context object (do NOT rely on tags)
-    rows = self.repo.query(lambda c: c.component == "schema")
+    def _parse_schema(meta_schema):
+        # meta_schema may be already a dict or a compact JSON string
+        if isinstance(meta_schema, dict):
+            return meta_schema
+        try:
+            return json.loads(meta_schema)
+        except Exception:
+            return {}
 
-    # 2) Keep only the newest per tool name
-    buckets: Dict[str, Dict[str, Any]] = {}
-    corrupt = 0
-    for ctx in rows:
-        raw = ctx.metadata.get("schema")
-        # Some repos may store the schema as a dict already
-        if isinstance(raw, dict):
-            blob = raw
-        elif isinstance(raw, str):
-            try:
-                blob = json.loads(raw)
-            except Exception:
-                corrupt += 1
-                continue
-        else:
+    # Prefer active tools; fall back to legacy when none are active
+    rows = self.repo.query(lambda c: c.component == "schema" and "tool_schema" in (c.tags or []))
+    if not rows:
+        rows = self.repo.query(lambda c: c.component == "schema" and "legacy_tool_schema" in (c.tags or []))
+
+    tools: list[dict] = []
+    seen: set[str] = set()
+    for c in rows:
+        name = (c.semantic_label or "").strip()
+        if not name or name in seen:
             continue
+        sch = _parse_schema((c.metadata or {}).get("schema", "{}"))
+        desc = (sch.get("description") or "").strip() if isinstance(sch, dict) else ""
+        tools.append({"name": name, "schema": sch, "description": desc})
+        seen.add(name)
 
-        name = blob.get("name")
-        if not isinstance(name, str) or not name.strip():
-            continue
-        key = name.strip()
-
-        prev = buckets.get(key)
-        if prev is None or ctx.timestamp > prev["ctx"].timestamp:
-            buckets[key] = {"blob": blob, "ctx": ctx}
-
-    # 3) Build the list, sorted by tool name, with truncated description
-    tool_defs: List[Dict[str, Any]] = []
-    for name in sorted(buckets):
-        blob = buckets[name]["blob"]
-        full_desc = (blob.get("description") or "").split("\n", 1)[0]
-        short_desc = textwrap.shorten(full_desc, width=60, placeholder="…") if full_desc else ""
-        tool_defs.append({
-            "name":        name,
-            "description": short_desc,
-            "schema":      blob,
-        })
-
-    # Optional debug (safe; still read-only)
-    try:
-        self._print_stage_context("prepare_tools_full_list", {
-            "all_tool_names": [t["name"] for t in tool_defs],
-            "total_schema_rows": len(rows),
-            "corrupt_schemas_skipped": corrupt,
-        })
-    except Exception:
-        pass
-
-    return tool_defs
+    tools.sort(key=lambda t: t["name"])
+    return tools
 
 
 
@@ -824,6 +792,8 @@ def _stage7_planning_summary(
          the first pass, drop any args not in the schema, include only
          schema-defined keys, fill required params, and supply clarifier
          notes + user question so it picks real values.
+       — **New**: pulls in any prior “fix hints” saved for this tool
+                 and, upon success, saves the critic’s advice for future runs.
     6) Persist artefacts & plan tracker; return (ctx, raw-JSON)
     """
 
@@ -995,7 +965,7 @@ def _stage7_planning_summary(
                 for c in calls
             ]}
 
-        # ensure well‐formed
+        # ensure well-formed
         if not plan_obj or not isinstance(plan_obj.get("tasks"), list):
             plan_obj = {"tasks": []}
 
@@ -1021,8 +991,14 @@ def _stage7_planning_summary(
         props    = schema["parameters"].get("properties", {})
         schema_json = json.dumps(schema, indent=2)
 
-        # display only this tool’s schema
-        print(f"\n--- Schema for `{name}` ---\n{schema_json}\n")
+        # 5.a) Load any prior fix hints
+        prior_hints = [
+            c.metadata.get("hint")
+            for c in sorted(
+                self.repo.query(lambda c: c.component == "tool_fix" and c.semantic_label == name),
+                key=lambda c: c.timestamp
+            )
+        ]
 
         # start with the original tool_input from first pass
         refined = {
@@ -1039,6 +1015,10 @@ def _stage7_planning_summary(
                 errors.append(f"⚠️ Missing required parameters: {missing}")
 
             parts = []
+            # inject prior hints
+            if prior_hints:
+                parts.append("Previous successful-fix advice:\n" + "\n".join(prior_hints))
+
             # seed with original clarifier/user context
             parts.append(f"Clarified intent: {clar_ctx.metadata.get('notes') or clar_ctx.summary}")
             parts.append(f"User question: {user_text}")
@@ -1046,6 +1026,7 @@ def _stage7_planning_summary(
                 parts.append(f"💡 Critic: {critic}")
             if errors:
                 parts.append("=== ERRORS ===\n" + "\n".join(errors))
+
             parts.extend([
                 "=== CURRENT CALL ===\n```json\n" + json.dumps({"tasks":[refined]}, indent=2) + "\n```",
                 "Output **only** a JSON matching the schema exactly.",
@@ -1069,12 +1050,23 @@ def _stage7_planning_summary(
             try:
                 cand = json.loads(block)["tasks"][0]
                 ti = cand.get("tool_input", {}) or {}
-                # prune to schema props only
                 refined["tool_input"] = {k: ti[k] for k in props if k in ti}
             except:
                 pass
 
+            # success if no missing
             if not [p for p in required if p not in refined["tool_input"]]:
+                # — SAVE the critic advice that got us here —
+                if critic:
+                    fix_ctx = ContextObject.make_stage(
+                        "tool_fix",
+                        [],
+                        {"tool_name": name, "hint": critic}
+                    )
+                    fix_ctx.component      = "tool_fix"
+                    fix_ctx.semantic_label = name
+                    fix_ctx.touch()
+                    self.repo.save(fix_ctx)
                 return refined
 
             critic = self._stream_and_capture(
@@ -1105,7 +1097,7 @@ def _stage7_planning_summary(
     # ------------------------------------------------------------------ #
     # 6️⃣  Flatten → call_strings & record                              #
     # ------------------------------------------------------------------ #
-    def _flatten(t): 
+    def _flatten(t):
         out = [t]
         for s in t.get("subtasks", []):
             out.extend(_flatten(s))
@@ -1119,7 +1111,7 @@ def _stage7_planning_summary(
     for t in flat:
         ti = t.get("tool_input", {}) or {}
         if ti:
-            arg_s = ",".join(f"{k}={json.dumps(v)}" for k,v in ti.items())
+            arg_s = ",".join(f"{k}={json.dumps(v)}" for k, v in ti.items())
             call_strings.append(f"{t['call']}({arg_s})")
         else:
             call_strings.append(f"{t['call']}()")
@@ -1833,7 +1825,6 @@ def _await_if_needed(obj):
 def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> str:
     import json, pprint
     from collections import OrderedDict
-    from context import ContextObject
     from types import SimpleNamespace
 
     # ─── 1) Conversation snippets ────────────────────────────────────
@@ -1847,23 +1838,17 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     )
 
     # ─── 2) Tool outputs ─────────────────────────────────────────────
-    # First, try to pull actual ContextObjects with semantic_label "tool_output"
     all_tool_ctxs = self.repo.query(lambda c: c.semantic_label == "tool_output")
-    # sort chronologically and keep only the last 3
     all_tool_ctxs.sort(key=lambda c: c.timestamp)
     tool_ctxs = all_tool_ctxs[-3:]
-    # Fallback to state if none found
     if not tool_ctxs:
         tool_ctxs = state.get("tool_ctxs", []) or []
-    # And fallback to summaries list if still empty
     tool_summaries = state.get("tool_summaries", []) or []
     if not tool_ctxs and tool_summaries:
         for summ in tool_summaries:
             call_name = summ.get("call") or summ.get("tool_name")
             result    = summ.get("result")
-            ts        = ""
-            if isinstance(result, dict):
-                ts = result.get("timestamp", "")
+            ts        = result.get("timestamp", "") if isinstance(result, dict) else ""
             tc = SimpleNamespace(
                 metadata={"output": result},
                 summary=json.dumps(result, ensure_ascii=False, indent=2),
@@ -1895,7 +1880,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     narr_ctx = self._load_narrative_context()
     narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
 
-    # ─── 4) Recent‑history bullets ───────────────────────────────────
+    # ─── 4) Recent-history bullets ───────────────────────────────────
     recent_hist = recent[-5:]
     bullets = [f"- {c.semantic_label}: {c.summary}" for c in recent_hist]
     recent_hist_block = (
@@ -1915,9 +1900,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
 
     # ─── 6) Compose LLM messages ─────────────────────────────────────
     final_sys = self._get_prompt("final_inference_prompt")
-    msgs = [
-        {"role": "system", "content": final_sys},
-    ]
+    msgs = [{"role": "system", "content": final_sys}]
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
     if recent_hist_block:
@@ -1928,17 +1911,22 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
 
-    # ─── 7) DEBUG payload ────────────────────────────────────────────
+    # ─── 7) DEBUG payload: include exact prompt text ────────────────
+    try:
+        exact_prompt = self._gemma_format(msgs)
+    except Exception:
+        exact_prompt = json.dumps(msgs, ensure_ascii=False, indent=2)
+
     debug_payload = OrderedDict([
-        ("conversation_block", conversation_block),
-        ("tools_block",        tools_block),
-        ("narrative_block",    narrative_block),
-        ("recent_hist_block",  recent_hist_block),
-        ("plan_block",         plan_block),
-        ("user_block",         user_block),
-        ("assembled_msgs",     json.dumps(msgs, ensure_ascii=False, indent=2)),
-        ("merged_ids",         [c.context_id for c in recent]),
-        ("tool_ctx_ids",       [getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs]),
+        ("conversation_block",   conversation_block),
+        ("tools_block",          tools_block),
+        ("narrative_block",      narrative_block),
+        ("recent_hist_block",    recent_hist_block),
+        ("plan_block",           plan_block),
+        ("user_block",           user_block),
+        ("assembled_prompt_text", exact_prompt),
+        ("merged_ids",           [c.context_id for c in recent]),
+        ("tool_ctx_ids",         [getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs]),
     ])
     self._print_stage_context("assemble_and_infer", debug_payload)
 
@@ -1961,8 +1949,8 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     self._persist_and_index([resp_ctx])
 
     seg = ContextObject.make_segment("assistant",
-                                     [resp_ctx.context_id],
-                                     tags=["assistant"])
+                                        [resp_ctx.context_id],
+                                        tags=["assistant"])
     seg.summary  = reply
     seg.stage_id = "assistant"
     seg.touch()
@@ -1981,7 +1969,6 @@ def _stage10b_response_critique_and_safety(
     state: dict[str, Any],
 ) -> str:
     import json, difflib, pprint
-    from context import ContextObject
     from types import SimpleNamespace
 
     if not draft:
@@ -1995,9 +1982,7 @@ def _stage10b_response_critique_and_safety(
         for summ in state.get("tool_summaries", []):
             call_name = summ.get("call") or summ.get("tool_name")
             result    = summ.get("result")
-            ts        = ""
-            if isinstance(result, dict):
-                ts = result.get("timestamp", "")
+            ts        = result.get("timestamp", "") if isinstance(result, dict) else ""
             tc = SimpleNamespace(
                 metadata={"output": result},
                 summary=json.dumps(result, ensure_ascii=False, indent=2),
@@ -2019,8 +2004,10 @@ def _stage10b_response_critique_and_safety(
     for c in real_tool_ctxs:
         raw = c.metadata.get("output", c.metadata)
         if isinstance(raw, dict) and "results" in raw:
-            fragment = "\n".join(f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
-                                 for r in raw["results"])
+            fragment = "\n".join(
+                f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
+                for r in raw["results"]
+            )
         else:
             try:
                 fragment = json.dumps(raw, indent=2, ensure_ascii=False)
@@ -2074,8 +2061,14 @@ def _stage10b_response_critique_and_safety(
         return polished
 
     # diff & dynamic patch
-    diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
-    diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
+    diff = difflib.unified_diff(
+        draft.splitlines(),
+        polished.splitlines(),
+        lineterm="", n=1
+    )
+    diff_summary = "; ".join(
+        ln for ln in diff if ln.startswith(("+ ", "- "))
+    ) or "(format refined)"
 
     patch_rows = self.repo.query(
         lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
@@ -2104,6 +2097,7 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([critique_ctx])
 
     return polished
+
 
 
 
