@@ -1056,237 +1056,405 @@ class Assembler:
     
     def _prune_jsonl_duplicates(self) -> None:
         """
-        Rewrite self.context_path so that for each context_id
-        only the entry with the latest timestamp survives.
-        Malformed JSON lines go into context.jsonl.corrupt.
+        Logically dedupe the repo JSONL:
+        - For 'prompt': keep newest per semantic_label.
+        - For 'schema': keep newest per semantic_label (fallback to parsed schema.name).
+        - For everything else: keep newest per context_id.
+        Malformed lines -> *.corrupt
 
-        On Windows we skip the actual file‐swap because of lock issues.
+        Concurrency-safe: only one process runs at a time via lock-file.
         """
-        import os, sys, json, tempfile
+        import os, sys, json, tempfile, time
 
-        path         = self.repo.json_repo.path
+        path = self.repo.json_repo.path
         corrupt_path = path + ".corrupt"
-        seen: dict[str, dict] = {}
-        total, bad = 0, 0
+        lock_path = path + ".prune.lock"
 
-        # ── 1) Read & bucket by latest timestamp ───────────────────────
-        with open(path, "r", encoding="utf8") as infile, \
-             open(corrupt_path, "a", encoding="utf8") as badf:
-            for line in infile:
-                total += 1
+        # ---- simple cross-platform lock (O_EXCL). Stale after 10 min. ----
+        def acquire_lock(p: str, ttl_sec: int = 600):
+            while True:
                 try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    bad += 1
-                    badf.write(line)
-                    continue
+                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    with os.fdopen(fd, "w", encoding="utf8") as lf:
+                        lf.write(f"{os.getpid()} {int(time.time())}\n")
+                    return True
+                except FileExistsError:
+                    try:
+                        with open(p, "r", encoding="utf8") as lf:
+                            _pid_ts = lf.read().strip().split()
+                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
+                        if time.time() - old_ts > ttl_sec:
+                            os.remove(p)
+                            continue
+                    except Exception:
+                        # lock looks broken; try to remove
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                    time.sleep(0.25)
 
-                cid = obj.get("context_id")
-                ts  = obj.get("timestamp", "")
-                if not isinstance(cid, str) or not isinstance(ts, str):
-                    bad += 1
-                    badf.write(line)
-                    continue
-
-                prev = seen.get(cid)
-                if prev is None or ts > prev["timestamp"]:
-                    seen[cid] = obj
-
-        # ── 2) Sort survivors and write to temp ────────────────────────
-        survivors = sorted(seen.values(), key=lambda o: o["timestamp"])
-        tmp_dir = os.path.dirname(path) or "."
-        fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
-        with os.fdopen(fd, "w", encoding="utf8") as out:
-            for o in survivors:
-                out.write(json.dumps(o, separators=(",", ":")) + "\n")
-
-        # ── 3) Swap (or skip on Windows) ───────────────────────────────
-        if sys.platform.startswith("win"):
-            # Windows often locks context.jsonl; skip the swap
+        def release_lock(p: str):
             try:
-                os.remove(tmp_path)
-            except OSError:
+                os.remove(p)
+            except Exception:
                 pass
-            print(f"[prune_jsonl_duplicates] Skipped on Windows: "
-                  f"{total} read, {len(survivors)} unique, {bad} malformed")
-            return
 
-        # POSIX: atomic replace
-        os.replace(tmp_path, path)
-        print(f"[prune_jsonl_duplicates] {total} read, "
-              f"{len(survivors)} unique, {bad} malformed → wrote {path}")
+        acquire_lock(lock_path)
+        try:
+            total, bad = 0, 0
+            keep_by_key = {}  # logical key -> object (newest timestamp)
+            # helper: generate a logical dedupe key
+            def logical_key(obj):
+                comp = obj.get("component", "")
+                cid  = obj.get("context_id", "")
+                ts   = obj.get("timestamp", "")
+                if not isinstance(ts, str) or not isinstance(cid, str):
+                    return None
+                if comp == "prompt":
+                    label = (obj.get("semantic_label") or "").strip()
+                    if not label:
+                        return None  # malformed; will be handled as bad
+                    return f"prompt::{label}"
+                if comp == "schema":
+                    label = (obj.get("semantic_label") or "").strip()
+                    if not label:
+                        # fallback: parse schema.name from metadata
+                        try:
+                            blob = json.loads(obj.get("metadata", {}).get("schema", "{}"))
+                            name = (blob.get("name") or "").strip()
+                            if name:
+                                label = name
+                        except Exception:
+                            pass
+                    if not label:
+                        # as last resort, dedupe by context_id
+                        return f"cid::{cid}"
+                    return f"schema::{label}"
+                # other components: dedupe strictly by context_id
+                return f"cid::{cid}"
+
+            # ---- read & choose newest per key ----
+            with open(path, "r", encoding="utf8") as infile, \
+                open(corrupt_path, "a", encoding="utf8") as badf:
+                for line in infile:
+                    total += 1
+                    try:
+                        obj = json.loads(line)
+                        ts = obj.get("timestamp", "")
+                        if not isinstance(ts, str) or "context_id" not in obj:
+                            raise ValueError("missing basics")
+                        key = logical_key(obj)
+                        if not key:
+                            raise ValueError("no logical key")
+                    except Exception:
+                        bad += 1
+                        badf.write(line)
+                        continue
+
+                    prev = keep_by_key.get(key)
+                    if prev is None or obj["timestamp"] > prev["timestamp"]:
+                        keep_by_key[key] = obj
+
+            # ---- write survivors in timestamp order ----
+            survivors = sorted(keep_by_key.values(), key=lambda o: o["timestamp"])
+            tmp_dir = os.path.dirname(path) or "."
+            fd, tmp_path = tempfile.mkstemp(dir=tmp_dir)
+            with os.fdopen(fd, "w", encoding="utf8") as out:
+                for o in survivors:
+                    out.write(json.dumps(o, separators=(",", ":")) + "\n")
+
+            # ---- atomic replace (skip on Windows if locked) ----
+            if sys.platform.startswith("win"):
+                try:
+                    os.replace(tmp_path, path)
+                except Exception:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            else:
+                os.replace(tmp_path, path)
+
+            print(f"[prune_jsonl_duplicates] {total} read, "
+                f"{len(survivors)} kept, {bad} malformed → wrote {path}")
+        finally:
+            release_lock(lock_path)
+
+
 
 
     def _seed_tool_schemas(self) -> None:
         """
-        Ensure exactly one up-to-date ContextObject per entry in `TOOL_SCHEMAS`
-        and clean out any obsolete schemas that are no longer defined.
-
-        Behaviour
-        ---------
-        • INSERT        – if the tool isn’t in the repo yet.
-        • UPDATE        – if the stored JSON differs from canonical.
-        • DEDUPE in-repo– keep only the newest, delete extras.
-        • PURGE/ARCHIVE – if a schema exists for a tool name
-                        that's been removed from TOOL_SCHEMAS.
-        • DISK-CLEANUP  – rewrite the on‐disk JSONL to remove duplicate lines.
+        Idempotent tool-schema seeding with concurrency guard.
+        - Lock so only one process seeds at a time.
+        - Key on semantic_label (fallback to parsed schema.name).
+        - Keep newest per label; update in place; demote non-canonical to legacy.
+        - No mass sanitize/minify here; we call logical prune at the end.
         """
-        import json
-        from context import sanitize_jsonl
-
-        # ── regenerate the canonical schemas and cache them ───────────────
+        import os, json, time
+        from context import ContextObject
         from tools import Tools, TOOL_SCHEMAS
-        TOOL_SCHEMAS.clear()
-        Tools.generate_all_tool_schemas()
-        self.tool_schemas = {name: schema for name, schema in TOOL_SCHEMAS.items()}
 
-        # ── 1) bucket existing ContextObjects by tool name ────────────────
-        buckets: dict[str, list[ContextObject]] = {}
-        for ctx in self.repo.query(
-            lambda c: c.component == "schema" and "tool_schema" in c.tags
-        ):
+        path = self.repo.json_repo.path
+        lock_path = path + ".seed_tools.lock"
+        REQUIRED_TAGS = {"artifact", "tool_schema"}
+
+        # ---- lock (same strategy as in prune) ----
+        def acquire_lock(p: str, ttl_sec: int = 600):
+            while True:
+                try:
+                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    with os.fdopen(fd, "w", encoding="utf8") as lf:
+                        lf.write(f"{os.getpid()} {int(time.time())}\n")
+                    return True
+                except FileExistsError:
+                    try:
+                        with open(p, "r", encoding="utf8") as lf:
+                            _pid_ts = lf.read().strip().split()
+                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
+                        if time.time() - old_ts > ttl_sec:
+                            os.remove(p)
+                            continue
+                    except Exception:
+                        try: os.remove(p)
+                        except Exception: pass
+                    time.sleep(0.25)
+
+        def release_lock(p: str):
+            try: os.remove(p)
+            except Exception: pass
+
+        acquire_lock(lock_path)
+        try:
+            # generate canonical schemas (no clears; generation should overwrite dict keys)
             try:
-                name = json.loads(ctx.metadata["schema"])["name"]
-                buckets.setdefault(name, []).append(ctx)
+                Tools.generate_all_tool_schemas()
             except Exception:
-                continue
+                # if generation fails, do nothing
+                return
+            canonical = {name: schema for name, schema in TOOL_SCHEMAS.items()}
+            if not canonical:
+                return
 
-        # ── 2) upsert each canonical schema ────────────────────────────────
-        for name, canonical in TOOL_SCHEMAS.items():
-            blob = json.dumps(canonical, sort_keys=True)
-            rows = buckets.get(name, [])
+            # ---- read existing schema rows ----
+            rows = self.repo.query(
+                lambda c: c.component == "schema" and any(t in (c.tags or []) for t in ("tool_schema", "legacy_tool_schema"))
+            )
 
-            # A) new → INSERT
-            if not rows:
-                new_ctx = ContextObject.make_schema(
-                    label=name,
-                    schema_def=blob,
-                    tags=["artifact", "tool_schema"],
-                )
-                new_ctx.touch()
-                self.repo.save(new_ctx)
-                buckets[name] = [new_ctx]
-                continue
+            def parsed_name(ctx):
+                try:
+                    blob = json.loads(ctx.metadata.get("schema", "{}"))
+                    return (blob.get("name") or "").strip()
+                except Exception:
+                    return ""
 
-            # B) dedupe in-repo: keep newest, delete the rest
-            rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper, *dups = rows
-            for dup in dups:
-                self.repo.delete(dup.context_id)
+            # bucket newest per semantic_label (or parsed_name if label missing)
+            newest_by_label = {}
+            all_by_label = {}
+            for ctx in rows:
+                label = (ctx.semantic_label or "").strip()
+                name = parsed_name(ctx)
+                if not label and name:
+                    # normalize label to tool name
+                    ctx.semantic_label = name
+                    ctx.touch(); self.repo.save(ctx)
+                    label = name
 
-            # C) update if JSON changed
-            stored = json.dumps(json.loads(keeper.metadata["schema"]), sort_keys=True)
-            if stored != blob:
-                keeper.metadata["schema"] = blob
-                keeper.touch()
-                self.repo.save(keeper)
+                if not label:
+                    # nothing to do; leave it as-is; it will be keyed by context_id in prune
+                    label = f"__missing__::{ctx.context_id}"
 
-            buckets[name] = [keeper]
+                prev = newest_by_label.get(label)
+                if prev is None or ctx.timestamp > prev.timestamp:
+                    newest_by_label[label] = ctx
 
-        # ── 3) purge/archive any schemas no longer in TOOL_SCHEMAS ─────────
-        for name, rows in list(buckets.items()):
-            if name not in TOOL_SCHEMAS:
-                rows.sort(key=lambda c: c.timestamp, reverse=True)
-                keep, *extras = rows
-                for e in extras:
-                    self.repo.delete(e.context_id)
-                if "legacy_tool_schema" not in keep.tags:
-                    keep.tags.append("legacy_tool_schema")
-                keep.tags = [t for t in keep.tags if t != "tool_schema"]
-                keep.touch()
-                self.repo.save(keep)
+                all_by_label.setdefault(label, []).append(ctx)
 
-        # ── 4) cleanup the on‐disk JSONL ───────────────────────────────────
-        jsonl_path = self.repo.json_repo.path
-        sanitize_jsonl(jsonl_path)
-        self._prune_jsonl_duplicates()
+            # delete older dups per label
+            for label, lst in all_by_label.items():
+                # keep the newest
+                keeper = newest_by_label[label]
+                for ctx in lst:
+                    if ctx.context_id != keeper.context_id:
+                        try:
+                            self.repo.delete(ctx.context_id)
+                        except Exception:
+                            pass
+
+            # rebuild after deletions
+            rows = list(newest_by_label.values())
+            present_labels = { (ctx.semantic_label or "").strip(): ctx for ctx in rows if (ctx.semantic_label or "").strip() }
+
+            # ---- upsert canonical ----
+            for name, want_obj in canonical.items():
+                want_json = json.dumps(want_obj, sort_keys=True)
+                cur = present_labels.get(name)
+
+                if cur is None:
+                    sc = ContextObject.make_schema(
+                        label=name,
+                        schema_def=want_json,
+                        tags=sorted(REQUIRED_TAGS),
+                    )
+                    sc.semantic_label = name
+                    sc.touch(); self.repo.save(sc)
+                    present_labels[name] = sc
+                    continue
+
+                # update in-place if JSON or tags differ or label drifted
+                changed = False
+                try:
+                    have_json = json.dumps(json.loads(cur.metadata.get("schema", "{}")), sort_keys=True)
+                except Exception:
+                    have_json = ""
+                if have_json != want_json:
+                    cur.metadata["schema"] = want_json
+                    changed = True
+
+                tags = set(cur.tags or [])
+                if not REQUIRED_TAGS.issubset(tags):
+                    cur.tags = sorted(tags | REQUIRED_TAGS)
+                    changed = True
+
+                if (cur.semantic_label or "").strip() != name:
+                    cur.semantic_label = name
+                    changed = True
+
+                if changed:
+                    cur.touch(); self.repo.save(cur)
+
+            # ---- demote any non-canonical active schema to legacy ----
+            canonical_names = set(canonical.keys())
+            for label, ctx in list(present_labels.items()):
+                if label and label not in canonical_names:
+                    tags = set(ctx.tags or [])
+                    if "tool_schema" in tags:
+                        tags.remove("tool_schema")
+                        tags.add("legacy_tool_schema")
+                        ctx.tags = sorted(tags)
+                        ctx.touch(); self.repo.save(ctx)
+
+            # final safety: logical prune to collapse anything left behind
+            self._prune_jsonl_duplicates()
+        finally:
+            release_lock(lock_path)
 
 
 
     def _seed_static_prompts(self) -> None:
         """
-        Guarantee exactly one ContextObject for each static system prompt:
-        - INSERT if missing
-        - UPDATE if text differs
-        - DEDUPE extras
-
-        Afterwards, rewrite JSONL so that every JSON line is minified.
+        Idempotent prompt seeding with concurrency guard.
+        - Upsert by semantic_label.
+        - Keep newest per label; update in place; ensure 'prompt' tag present.
+        - Logical prune at the end.
         """
-        # ── 1) Build our table of desired prompts ───────────────────────
-        self.system_prompts = {
-            "clarifier_prompt":        self.clarifier_prompt,
-            "assembler_prompt":        self.assembler_prompt,
-            "inference_prompt":        self.inference_prompt,
-            "planning_prompt":         self.planning_prompt,
-            "toolchain_prompt":        self.toolchain_prompt,
-            "reflection_prompt":       self.reflection_prompt,
-            "toolchain_retry_prompt":  self.toolchain_retry_prompt,
-            "final_inference_prompt":  self.final_inference_prompt,
-            "critic_prompt":           self.critic_prompt,
-            "narrative_mull_prompt":   self.narrative_mull_prompt,
-            "extractor_sys_prompt":    self.extractor_sys_prompt,
-            "editor_sys_prompt":       self.editor_sys_prompt
-        }
-        static = dict(self.system_prompts)
+        import os, json, time
+        from context import ContextObject
 
-        # ── 2) Bucket existing ContextObjects by semantic_label ─────────
-        buckets: dict[str, list[ContextObject]] = {}
-        for ctx in self.repo.query(lambda c: c.component == "prompt"):
-            buckets.setdefault(ctx.semantic_label, []).append(ctx)
+        path = self.repo.json_repo.path
+        lock_path = path + ".seed_prompts.lock"
 
-        # ── 3) Upsert each prompt ────────────────────────────────────────
-        for label, desired_text in static.items():
-            rows = buckets.get(label, [])
-
-            # A) None exist → INSERT
-            if not rows:
-                new_ctx = ContextObject.make_prompt(
-                    label=label,
-                    prompt_text=desired_text,
-                    tags=["artifact", "prompt"],
-                )
-                new_ctx.touch()
-                self.repo.save(new_ctx)
-                continue
-
-            # B) Dedupe in-repo: keep the newest
-            rows.sort(key=lambda c: c.timestamp, reverse=True)
-            keeper, *dups = rows
-            for dup in dups:
-                self.repo.delete(dup.context_id)
-
-            # C) Update if text changed or missing tag
-            changed = False
-            if keeper.metadata.get("prompt") != desired_text:
-                keeper.metadata["prompt"] = desired_text
-                changed = True
-            if "prompt" not in keeper.tags:
-                keeper.tags.append("prompt")
-                changed = True
-            if changed:
-                keeper.touch()
-                self.repo.save(keeper)
-
-        # ── 4) Sanitize + prune duplicates ───────────────────────────────
-        from context import sanitize_jsonl
-        jsonl_path = self.repo.json_repo.path
-        sanitize_jsonl(jsonl_path)
-        self._prune_jsonl_duplicates()
-
-        # ── 5) Finally, rewrite *every* line as compact JSON ─────────────
-        import json
-        minified = []
-        with open(jsonl_path, "r", encoding="utf-8") as infile:
-            for line in infile:
+        def acquire_lock(p: str, ttl_sec: int = 600):
+            while True:
                 try:
-                    obj = json.loads(line)
-                    minified.append(obj)
-                except json.JSONDecodeError:
+                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    with os.fdopen(fd, "w", encoding="utf8") as lf:
+                        lf.write(f"{os.getpid()} {int(time.time())}\n")
+                    return True
+                except FileExistsError:
+                    try:
+                        with open(p, "r", encoding="utf8") as lf:
+                            _pid_ts = lf.read().strip().split()
+                            old_ts = int(_pid_ts[1]) if len(_pid_ts) > 1 else 0
+                        if time.time() - old_ts > ttl_sec:
+                            os.remove(p)
+                            continue
+                    except Exception:
+                        try: os.remove(p)
+                        except Exception: pass
+                    time.sleep(0.25)
+
+        def release_lock(p: str):
+            try: os.remove(p)
+            except Exception: pass
+
+        acquire_lock(lock_path)
+        try:
+            # desired prompts
+            self.system_prompts = {
+                "clarifier_prompt":        self.clarifier_prompt,
+                "assembler_prompt":        self.assembler_prompt,
+                "inference_prompt":        self.inference_prompt,
+                "planning_prompt":         self.planning_prompt,
+                "toolchain_prompt":        self.toolchain_prompt,
+                "reflection_prompt":       self.reflection_prompt,
+                "toolchain_retry_prompt":  self.toolchain_retry_prompt,
+                "final_inference_prompt":  self.final_inference_prompt,
+                "critic_prompt":           self.critic_prompt,
+                "narrative_mull_prompt":   self.narrative_mull_prompt,
+                "extractor_sys_prompt":    self.extractor_sys_prompt,
+                "editor_sys_prompt":       self.editor_sys_prompt,
+            }
+            desired = dict(self.system_prompts)
+
+            # existing prompts, newest per label
+            rows = self.repo.query(lambda c: c.component == "prompt")
+            newest_by_label = {}
+            all_by_label = {}
+            for ctx in rows:
+                label = (ctx.semantic_label or "").strip()
+                if not label:
+                    continue
+                prev = newest_by_label.get(label)
+                if prev is None or ctx.timestamp > prev.timestamp:
+                    newest_by_label[label] = ctx
+                all_by_label.setdefault(label, []).append(ctx)
+
+            # dedupe: keep newest
+            for label, lst in all_by_label.items():
+                keeper = newest_by_label[label]
+                for ctx in lst:
+                    if ctx.context_id != keeper.context_id:
+                        try:
+                            self.repo.delete(ctx.context_id)
+                        except Exception:
+                            pass
+
+            # upsert/update
+            for label, text in desired.items():
+                cur = newest_by_label.get(label)
+                if cur is None:
+                    new_ctx = ContextObject.make_prompt(
+                        label=label,
+                        prompt_text=text,
+                        tags=["artifact", "prompt"],
+                    )
+                    new_ctx.semantic_label = label
+                    new_ctx.touch(); self.repo.save(new_ctx)
+                    newest_by_label[label] = new_ctx
                     continue
 
-        with open(jsonl_path, "w", encoding="utf-8") as outfile:
-            for obj in minified:
-                outfile.write(json.dumps(obj, separators=(",", ":")) + "\n")
+                changed = False
+                if cur.metadata.get("prompt") != text:
+                    cur.metadata["prompt"] = text
+                    changed = True
+                tags = set(cur.tags or [])
+                if "prompt" not in tags:
+                    cur.tags = sorted(tags | {"artifact", "prompt"})
+                    changed = True
+                if (cur.semantic_label or "").strip() != label:
+                    cur.semantic_label = label
+                    changed = True
+                if changed:
+                    cur.touch(); self.repo.save(cur)
+
+            # final: logical prune
+            self._prune_jsonl_duplicates()
+        finally:
+            release_lock(lock_path)
+
+
 
 
 

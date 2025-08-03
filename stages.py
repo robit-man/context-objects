@@ -735,7 +735,7 @@ def _stage5_external_knowledge(
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 6 – collect & deduplicate tool schemas
+# Stage 6 – collect & deduplicate tool schemas (READ-ONLY)
 # ──────────────────────────────────────────────────────────────────
 def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
     """
@@ -744,44 +744,65 @@ def _stage6_prepare_tools(self) -> List[Dict[str, Any]]:
         "description": "<one-line truncated desc>",
         "schema": <full JSON-RPC schema dict>
       }
-    for every tool_schema in the repo.
+    for every tool schema stored in the repo.
+
+    READ-ONLY: does not write, delete, or mutate the repository.
     """
     import json, textwrap
 
-    # 1) Load every schema context object tagged "tool_schema"
-    rows = self.repo.query(
-        lambda c: c.component == "schema" and "tool_schema" in c.tags
-    )
+    # 1) Load every schema context object (do NOT rely on tags)
+    rows = self.repo.query(lambda c: c.component == "schema")
 
     # 2) Keep only the newest per tool name
-    buckets: Dict[str, Any] = {}
+    buckets: Dict[str, Dict[str, Any]] = {}
+    corrupt = 0
     for ctx in rows:
-        try:
-            blob = json.loads(ctx.metadata["schema"])
-            name = blob["name"]
-        except Exception:
+        raw = ctx.metadata.get("schema")
+        # Some repos may store the schema as a dict already
+        if isinstance(raw, dict):
+            blob = raw
+        elif isinstance(raw, str):
+            try:
+                blob = json.loads(raw)
+            except Exception:
+                corrupt += 1
+                continue
+        else:
             continue
-        # pick the most recent
-        if name not in buckets or ctx.timestamp > buckets[name].timestamp:
-            buckets[name] = ctx
 
-    # 3) Build the list, sorted by tool name, including truncated description + full schema
+        name = blob.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        key = name.strip()
+
+        prev = buckets.get(key)
+        if prev is None or ctx.timestamp > prev["ctx"].timestamp:
+            buckets[key] = {"blob": blob, "ctx": ctx}
+
+    # 3) Build the list, sorted by tool name, with truncated description
     tool_defs: List[Dict[str, Any]] = []
     for name in sorted(buckets):
-        blob = json.loads(buckets[name].metadata["schema"])
-        full_desc = blob.get("description", "").split("\n", 1)[0]
-        short_desc = textwrap.shorten(full_desc, width=60, placeholder="…")
+        blob = buckets[name]["blob"]
+        full_desc = (blob.get("description") or "").split("\n", 1)[0]
+        short_desc = textwrap.shorten(full_desc, width=60, placeholder="…") if full_desc else ""
         tool_defs.append({
             "name":        name,
             "description": short_desc,
             "schema":      blob,
         })
 
-    # Debug: show exactly what we're returning
-    self._print_stage_context("prepare_tools_full_list", {
-        "all_tool_names": [t["name"] for t in tool_defs]
-    })
+    # Optional debug (safe; still read-only)
+    try:
+        self._print_stage_context("prepare_tools_full_list", {
+            "all_tool_names": [t["name"] for t in tool_defs],
+            "total_schema_rows": len(rows),
+            "corrupt_schemas_skipped": corrupt,
+        })
+    except Exception:
+        pass
+
     return tool_defs
+
 
 
 
