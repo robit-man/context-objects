@@ -172,50 +172,47 @@ def _stage3_retrieve_and_merge_context(
     recall_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
-    Build the conversation memory window for downstream stages.
-
-    Returns:
-      merged        →  List[ContextObject]  (entire ordered context window)
-      merged_ids    →  List[str]            (ids of ^)
-      wm_ids        →  List[str]            (ids of working-memory slice)
-      history       →  last 8 user/assistant ContextObjects
-      tools         →  recent tool-output ContextObjects
-      semantic      →  semantic recall ContextObjects
-      assoc         →  associative recall ContextObjects
+    Retrieve & merge context for downstream stages, always ensuring the
+    latest user input is included, plus semantic & associative memory
+    and recent tool outputs, then contract to size.
     """
     from datetime import datetime, timedelta
-    now = datetime.utcnow()
 
-    # If there's no user context, nothing to build
-    if user_ctx is None:
-        return {
-            "merged":       [],
-            "merged_ids":   [],
-            "wm_ids":       [],
-            "history":      [],
-            "tools":        [],
-            "semantic":     [],
-            "assoc":        [],
-        }
-
-    # Helpers
-    def _to_dt(ts: str) -> datetime:
-        try:
-            return datetime.fromisoformat(ts.rstrip("Z"))
-        except Exception:
-            return now
-
+    # ─── Helpers ────────────────────────────────────────────────────────
     def _ensure_list(x):
         if x is None:
             return []
         return x if isinstance(x, list) else [x]
 
-    # Flatten inputs
+    def _to_dt(ts: str) -> datetime:
+        try:
+            return datetime.fromisoformat(ts.rstrip("Z"))
+        except Exception:
+            return datetime.min
+
+    def _prefix(ctx):
+        """Label summary as User: or Assistant: if not already."""
+        if not getattr(ctx, "summary", None):
+            return
+        txt = ctx.summary.lstrip()
+        if txt.startswith(("User:", "Assistant:")):
+            return
+        role = "Assistant" if ctx.semantic_label == "assistant" else "User"
+        ctx.summary = f"{role}: {ctx.summary}"
+
+    # ─── 1️⃣  Flatten inputs & identify conversation ───────────────────
     user_list  = _ensure_list(user_ctx)
     sys_list   = _ensure_list(sys_ctx)
     extra_list = extra_ctx or []
+    recall_ids = recall_ids or []
 
-    # Pull conversation & user IDs from the first user_ctx
+    if not user_list:
+        return {
+            "merged": [], "merged_ids": [],
+            "wm_ids": [], "history": [],
+            "tools": [], "semantic": [], "assoc": [],
+        }
+
     primary = user_list[0]
     conv_id = (
         primary.metadata.get("conversationid")
@@ -223,134 +220,119 @@ def _stage3_retrieve_and_merge_context(
     )
     user_id = primary.metadata.get("user_id")
 
-    # 1. Load raw conversation segments
+    # ─── 2️⃣  Raw conversation segments ────────────────────────────────
     segs = [
         c for c in self.repo.query(lambda c:
-            c.metadata.get("conversationid") == conv_id
-            or c.metadata.get("conversation_id") == conv_id
+            c.domain=="segment"
+            and c.semantic_label in ("user_input","assistant")
+            and (c.metadata.get("conversationid")==conv_id
+                 or c.metadata.get("conversation_id")==conv_id)
+            and c.metadata.get("user_id") in (user_id, None)
         )
-        if c.domain == "segment"
-        and c.metadata.get("user_id") in (user_id, None)
-        and c.semantic_label in ("user_input", "assistant")
     ]
-
-    # 1a. Prepend extra_ctx
-    seen_ids = {c.context_id for c in segs}
+    # prepend any extra_ctx
+    seen = {c.context_id for c in segs}
     for c in extra_list:
-        if c.context_id not in seen_ids:
-            segs.append(c)
-            seen_ids.add(c.context_id)
-
-    # 1b. Include explicit recall_ids
-    if recall_ids:
-        for rid in recall_ids:
-            try:
-                c = self.repo.get(rid)
-                if c.context_id not in seen_ids:
-                    segs.append(c)
-                    seen_ids.add(c.context_id)
-            except KeyError:
-                pass
+        if c.context_id not in seen:
+            segs.append(c); seen.add(c.context_id)
+    # include explicit recall_ids
+    for rid in recall_ids:
+        try:
+            c = self.repo.get(rid)
+            if c.context_id not in seen:
+                segs.append(c); seen.add(c.context_id)
+        except KeyError:
+            pass
 
     segs.sort(key=lambda c: _to_dt(c.timestamp))
 
-    # 2. Working-memory & short-term slices
-    WM_TURNS   = 20
-    ST_MINUTES = 120
-    wm_slice   = segs[-WM_TURNS:]
-    cutoff     = now - timedelta(minutes=ST_MINUTES)
-    st_slice   = [c for c in segs if _to_dt(c.timestamp) >= cutoff]
+    # ─── 3️⃣  Working-memory & history slice ───────────────────────────
+    # keep the last WM_TURNS segments as “working memory”
+    WM_TURNS    = getattr(self, "max_history_items", 20)
+    history_slice = segs[-WM_TURNS:]
+    wm_ids        = [c.context_id for c in history_slice]
 
-    # 3. Semantic & associative recall
-    semantic, assoc = [], []
-    if self.rl.should_run("semantic_retrieval", 0.0):
-        hits = self.engine.query(
-            stage_id="semantic_retrieval",
-            similarity_to=user_text,
-            exclude_tags=self.STAGES + ["tool_schema", "tool_output"],
-            top_k=self.top_k,
+    # ─── 4️⃣  Semantic recall around latest user_text ───────────────────
+    semantic = self.engine.query(
+        stage_id="semantic_retrieval",
+        similarity_to=user_text,
+        top_k=getattr(self, "max_semantic_items", 10)
+    )
+
+    # ─── 5️⃣  Associative (memory) recall seeded from working memory ────
+    assoc = []
+    seeds = wm_ids.copy()
+    if self.rl.should_run("memory_retrieval", 0.0) and seeds:
+        scores = self.memman.spread_activation(
+            seed_ids=seeds, hops=3, decay=0.7,
+            assoc_weight=1.0, recency_weight=0.5
         )
-        semantic = [
-            h for h in hits
-            if (h.metadata.get("conversationid") == conv_id
-                or h.metadata.get("conversation_id") == conv_id)
-        ]
-
-    if self.rl.should_run("memory_retrieval", 0.0):
-        seeds  = [primary.context_id]
-        scores = self.memman.spread_activation(seeds, hops=3, decay=0.7)
-        for cid in sorted(scores, key=scores.get, reverse=True)[: self.top_k]:
+        top_ids = sorted(scores, key=scores.get, reverse=True)[: getattr(self, "max_memory_items", 10)]
+        for cid in top_ids:
             try:
                 c = self.repo.get(cid)
-                if (c.metadata.get("conversationid") == conv_id
-                    or c.metadata.get("conversation_id") == conv_id):
-                    c.retrieval_score = scores[cid]
-                    assoc.append(c)
+                assoc.append(c)
             except KeyError:
                 pass
 
-    # 4. Recent tool outputs
-    recent_tools = [
+    # ─── 6️⃣  Recent tool-output contexts ──────────────────────────────
+    tools = [
         c for c in self.repo.query(lambda c:
-            c.component == "tool_output"
-            and ((c.metadata.get("conversationid") == conv_id)
-                 or (c.metadata.get("conversation_id") == conv_id))
+            c.component=="tool_output"
+            and (c.metadata.get("conversationid")==conv_id
+                 or c.metadata.get("conversation_id")==conv_id)
         )
     ]
-    recent_tools.sort(key=lambda c: _to_dt(c.timestamp))
-    recent_tools = recent_tools[-self.top_k:]
+    tools.sort(key=lambda c: _to_dt(c.timestamp))
+    tools = tools[- getattr(self, "max_tool_outputs", 10):]
 
-    # 5. Prefix summaries once
-    def _prefix(ctx):
-        if not getattr(ctx, "summary", None):
-            return
-        if ctx.summary.lstrip().startswith(("User:", "Assistant:")):
-            return
-        role = "Assistant" if ctx.semantic_label == "assistant" else "User"
-        ctx.summary = f"{role}: {ctx.summary or ''}"
-
-    for c in sys_list + user_list + segs + semantic + assoc + recent_tools:
+    # ─── 7️⃣  Prefix role labels for clarity ────────────────────────────
+    for c in sys_list + user_list + history_slice + semantic + assoc + tools:
         _prefix(c)
 
-    # 6. Assemble merged list, de-duped
-    merged, seen = [], set()
-    def _add(objs):
-        for c in objs:
-            cid = c.context_id
-            if cid not in seen:
+    # ─── 8️⃣  Merge in a fixed order & dedupe ──────────────────────────
+    merged: list[ContextObject] = []
+    seen = set()
+    def _add_list(lst):
+        for c in lst:
+            if c.context_id not in seen:
                 merged.append(c)
-                seen.add(cid)
+                seen.add(c.context_id)
 
-    _add(sys_list)
-    _add(user_list)
-    _add(wm_slice)
-    _add(st_slice)
-    _add(semantic)
-    _add(assoc)
-    _add(recent_tools)
+    _add_list(sys_list)
+    _add_list(user_list)
+    _add_list(history_slice)
+    _add_list(semantic)
+    _add_list(assoc)
+    _add_list(tools)
 
-    # 7. Build return dict
-    result = {
-        "merged":      merged,
-        "merged_ids":  [c.context_id for c in merged],
-        "wm_ids":      [c.context_id for c in wm_slice],
-        "history":     merged[-8:],
-        "tools":       recent_tools,
-        "semantic":    semantic,
-        "assoc":       assoc,
-    }
+    # ensure the very latest user turn is *last* in the window
+    last_user = user_list[-1]
+    if last_user.context_id in seen:
+        merged = [c for c in merged if c.context_id != last_user.context_id] + [last_user]
 
-    # 8. Debug logging
+    merged_ids = [c.context_id for c in merged]
+
+    # ─── 9️⃣  Debug banner ─────────────────────────────────────────────
     self._print_stage_context("retrieve_and_merge_context", {
-        "total_segments": len(segs),
-        "merged_ids":     result["merged_ids"][:12],
-        "wm_ids":         result["wm_ids"],
-        "semantic_ids":   [c.context_id for c in semantic],
-        "assoc_ids":      [c.context_id for c in assoc],
-        "tool_ids":       [c.context_id for c in recent_tools],
+        "merged_ids":   merged_ids[:12],
+        "wm_ids":       wm_ids,
+        "semantic_ids": [c.context_id for c in semantic],
+        "assoc_ids":    [c.context_id for c in assoc],
+        "tool_ids":     [c.context_id for c in tools],
     })
 
-    return result
+    # ─── 🔟 Return ─────────────────────────────────────────────────────
+    return {
+        "merged":     merged,
+        "merged_ids": merged_ids,
+        "wm_ids":     wm_ids,
+        "history":    history_slice,
+        "tools":      tools,
+        "semantic":   semantic,
+        "assoc":      assoc,
+    }
+
 
 
 
@@ -1827,110 +1809,112 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     from collections import OrderedDict
     from types import SimpleNamespace
 
-    # ─── 1) Conversation snippets ────────────────────────────────────
+    # ─── (0) System: final-inference prompt ──────────────────────────
+    final_sys = self._get_prompt("final_inference_prompt")
+
+    # ─── (1) System: clarified intent ────────────────────────────────
+    # grab the most recent clarifier output
+    clar_rows = sorted(
+        self.repo.query(lambda c: c.stage_id == "clarifier"),
+        key=lambda c: c.timestamp
+    )
+    clarifier_txt = clar_rows[-1].summary if clar_rows else "(no clarifier notes)"
+    clarifier_block = "[Clarified intent]\n" + clarifier_txt
+
+    # ─── (2) User: latest question ───────────────────────────────────
+    latest_user_block = "[Latest user question]\n" + user_text
+
+    # ─── (3) System: Conversation snippets ───────────────────────────
     MAX_CTX_OBJS = 32
-    merged = state.get("merged", [])
-    recent = merged[-MAX_CTX_OBJS:]
-    convo_lines = [c.summary or "" for c in recent]
+    merged   = state.get("merged", [])
+    segments = [c for c in merged if getattr(c, "domain", None) == "segment"]
+    recent   = segments[-MAX_CTX_OBJS:]
+    convo_lines = []
+    for c in recent:
+        role = "User:" if c.semantic_label == "user_input" else "Assistant:"
+        convo_lines.append(f"{role} {c.summary or ''}")
     conversation_block = (
         "[Conversation so far]\n" + "\n".join(convo_lines)
         if convo_lines else ""
     )
 
-    # ─── 2) Tool outputs ─────────────────────────────────────────────
-    all_tool_ctxs = self.repo.query(lambda c: c.semantic_label == "tool_output")
-    all_tool_ctxs.sort(key=lambda c: c.timestamp)
-    tool_ctxs = all_tool_ctxs[-3:]
-    if not tool_ctxs:
-        tool_ctxs = state.get("tool_ctxs", []) or []
-    tool_summaries = state.get("tool_summaries", []) or []
-    if not tool_ctxs and tool_summaries:
-        for summ in tool_summaries:
-            call_name = summ.get("call") or summ.get("tool_name")
-            result    = summ.get("result")
-            ts        = result.get("timestamp", "") if isinstance(result, dict) else ""
-            tc = SimpleNamespace(
-                metadata={"output": result},
-                summary=json.dumps(result, ensure_ascii=False, indent=2),
-                stage_id=call_name,
-                timestamp=ts,
-                context_id=summ.get("context_id", call_name)
-            )
-            tool_ctxs.append(tc)
+    # ─── (4) System: Recent-history bullets ──────────────────────────
+    hist5 = recent[-5:]
+    bullets = [f"- {c.semantic_label}: {c.summary}" for c in hist5]
+    recent_hist_block = (
+        "[Recent History]\n" + "\n".join(bullets)
+        if bullets else ""
+    )
 
+    # ─── (5) System: Plan ────────────────────────────────────────────
+    raw_plan = state.get("plan_output", "(no plan)")
+    if not isinstance(raw_plan, str):
+        try:
+            raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
+        except:
+            raw_plan = pprint.pformat(raw_plan, compact=True)
+    plan_block = "[Plan]\n" + raw_plan
+
+    # ─── (6) System: Narrative mulls ─────────────────────────────────
+    narr_ctx = self._load_narrative_context()
+    narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
+
+    # ─── (7) System: Tool outputs ────────────────────────────────────
+    all_tool_ctxs = list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
+    all_tool_ctxs.sort(key=lambda c: c.timestamp)
+    tool_ctxs = all_tool_ctxs[-3:] or state.get("tool_ctxs", []) or []
     tool_blocks = []
     for tc in tool_ctxs:
         meta = getattr(tc, "metadata", {})
         data = meta.get("output", meta.get("output_full", meta))
         try:
             payload = json.dumps(data, ensure_ascii=False, indent=2)
-        except Exception:
+        except:
             payload = pprint.pformat(data, compact=True)
         call_name = meta.get("tool_call", tc.stage_id)
         ts        = getattr(tc, "timestamp", "")
         tool_blocks.append(f"--- {tc.stage_id} ({call_name}) @ {ts} ---")
         tool_blocks.append(payload)
-
     tools_block = (
         "[Tool outputs]\n" + "\n\n".join(tool_blocks)
         if tool_blocks else ""
     )
 
-    # ─── 3) Narrative block ──────────────────────────────────────────
-    narr_ctx = self._load_narrative_context()
-    narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
-
-    # ─── 4) Recent-history bullets ───────────────────────────────────
-    recent_hist = recent[-5:]
-    bullets = [f"- {c.semantic_label}: {c.summary}" for c in recent_hist]
-    recent_hist_block = (
-        "[Recent History]\n" + "\n".join(bullets)
-        if bullets else ""
-    )
-
-    # ─── 5) Plan & user question ────────────────────────────────────
-    raw_plan = state.get("plan_output", "(no plan)")
-    if not isinstance(raw_plan, str):
-        try:
-            raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
-        except Exception:
-            raw_plan = pprint.pformat(raw_plan, compact=True)
-    plan_block = "[Plan]\n" + raw_plan
-    user_block = "[User question]\n" + user_text
-
-    # ─── 6) Compose LLM messages ─────────────────────────────────────
-    final_sys = self._get_prompt("final_inference_prompt")
-    msgs = [{"role": "system", "content": final_sys}]
+    # ─── (8) Assemble LLM messages ───────────────────────────────────
+    msgs = [
+        {"role": "system", "content": final_sys},
+        {"role": "system", "content": clarifier_block},
+        {"role": "user",   "content": latest_user_block},
+    ]
     if conversation_block:
         msgs.append({"role": "system", "content": conversation_block})
     if recent_hist_block:
         msgs.append({"role": "system", "content": recent_hist_block})
     msgs.append({"role": "system", "content": plan_block})
-    msgs.append({"role": "system", "content": user_block})
-    msgs.append({"role": "user",   "content": user_text})
+    if narrative_block:
+        msgs.append({"role": "system", "content": narrative_block})
     if tools_block:
         msgs.append({"role": "system", "content": tools_block})
 
-    # ─── 7) DEBUG payload: include exact prompt text ────────────────
+    # ─── (9) Debug: capture exact prompt ─────────────────────────────
     try:
         exact_prompt = self._gemma_format(msgs)
-    except Exception:
+    except:
         exact_prompt = json.dumps(msgs, ensure_ascii=False, indent=2)
-
     debug_payload = OrderedDict([
-        ("conversation_block",   conversation_block),
-        ("tools_block",          tools_block),
-        ("narrative_block",      narrative_block),
-        ("recent_hist_block",    recent_hist_block),
-        ("plan_block",           plan_block),
-        ("user_block",           user_block),
+        ("final_sys",           final_sys),
+        ("clarifier_block",     clarifier_block),
+        ("latest_user_block",   latest_user_block),
+        ("conversation_block",  conversation_block),
+        ("recent_hist_block",   recent_hist_block),
+        ("plan_block",          plan_block),
+        ("narrative_block",     narrative_block),
+        ("tools_block",         tools_block),
         ("assembled_prompt_text", exact_prompt),
-        ("merged_ids",           [c.context_id for c in recent]),
-        ("tool_ctx_ids",         [getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs]),
     ])
     self._print_stage_context("assemble_and_infer", debug_payload)
 
-    # ─── 8) Call the model ───────────────────────────────────────────
+    # ─── (10) Call the model ─────────────────────────────────────────
     raw_reply = _await_if_needed(
         self._stream_and_capture(
             self.primary_model,
@@ -1941,16 +1925,16 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     )
     reply = (raw_reply or "").strip()
 
-    # ─── 9) Persist assistant reply ─────────────────────────────────
-    refs = debug_payload["merged_ids"] + debug_payload["tool_ctx_ids"]
+    # ─── (11) Persist assistant reply ───────────────────────────────
+    refs = [c.context_id for c in recent] + [
+        getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs
+    ]
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
     self._persist_and_index([resp_ctx])
 
-    seg = ContextObject.make_segment("assistant",
-                                        [resp_ctx.context_id],
-                                        tags=["assistant"])
+    seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
     seg.summary  = reply
     seg.stage_id = "assistant"
     seg.touch()
@@ -1961,6 +1945,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     return reply
 
 
+
 def _stage10b_response_critique_and_safety(
     self,
     draft: str,
@@ -1969,15 +1954,17 @@ def _stage10b_response_critique_and_safety(
     state: dict[str, Any],
 ) -> str:
     import json, difflib, pprint
+    from collections import OrderedDict
     from types import SimpleNamespace
 
     if not draft:
         return draft
 
-    # Gather real ContextObjects or fallback to state/tool_summaries
-    real_tool_ctxs = tool_ctxs or self.repo.query(lambda c: c.semantic_label == "tool_output")
+    # ─── Gather tool outputs ─────────────────────────────────────────
+    real_tool_ctxs = tool_ctxs or list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
     if not real_tool_ctxs:
-        real_tool_ctxs = state.get("tool_ctxs", [])
+        real_tool_ctxs = state.get("tool_ctxs", []) or []
+    # fallback to summaries
     if not real_tool_ctxs:
         for summ in state.get("tool_summaries", []):
             call_name = summ.get("call") or summ.get("tool_name")
@@ -1992,14 +1979,14 @@ def _stage10b_response_critique_and_safety(
             )
             real_tool_ctxs.append(tc)
 
-    # Full merged context text
-    merged_ctxs = state.get("merged", [])
-    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs)
+    # ─── Build merged-context snippet block ──────────────────────────
+    merged_ctxs  = state.get("merged", [])
+    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs) or "(none)"
 
-    # Plan text
-    plan_text = state.get("plan_output", "(no plan)")
+    # ─── Plan block ──────────────────────────────────────────────────
+    plan_txt = state.get("plan_output", "(no plan)")
 
-    # Serialize outputs
+    # ─── Tool-outputs block ─────────────────────────────────────────
     outputs = []
     for c in real_tool_ctxs:
         raw = c.metadata.get("output", c.metadata)
@@ -2011,26 +1998,24 @@ def _stage10b_response_critique_and_safety(
         else:
             try:
                 fragment = json.dumps(raw, indent=2, ensure_ascii=False)
-            except Exception:
+            except:
                 fragment = pprint.pformat(raw, compact=True)
         outputs.append(f"[{c.stage_id}]\n{fragment}")
+    tools_block = "[Tool outputs]\n" + "\n\n".join(outputs)
 
-    # 1) Relevance Extraction
+    # ─── 1) Relevance Extraction ────────────────────────────────────
     extractor_sys = self._get_prompt("extractor_sys_prompt")
-    extractor_user = "\n\n".join([
-        f"USER QUESTION:\n{user_text}",
-        f"PLAN EXECUTED:\n{plan_text}",
-        "MERGED CONTEXT SNIPPETS:\n" + (merged_texts or "(none)"),
-        "RAW TOOL OUTPUTS:\n" + ("\n\n".join(outputs) or "(none)"),
-        "DRAFT RESPONSE:\n" + draft,
-        "Your goal: identify exactly the facts, data points, or insights that should shape the revised response."
-    ])
+    extractor_msgs = [
+        {"role": "system", "content": extractor_sys},
+        {"role": "system", "content": "[Latest user question]\n" + user_text},
+        {"role": "system", "content": "[Draft response]\n" + draft},
+        {"role": "system", "content": "[Plan executed]\n" + plan_txt},
+        {"role": "system", "content": "[Merged context snippets]\n" + merged_texts},
+        {"role": "system", "content": tools_block},
+    ]
     bullets = self._stream_and_capture(
         self.secondary_model,
-        [
-            {"role": "system", "content": extractor_sys},
-            {"role": "user",   "content": extractor_user},
-        ],
+        extractor_msgs,
         tag="[RelevExtract]",
         images=state.get("images"),
     ).strip()
@@ -2040,19 +2025,17 @@ def _stage10b_response_critique_and_safety(
     sum_ctx.summary  = bullets
     self._persist_and_index([sum_ctx])
 
-    # 2) Polishing / Safety Critique
+    # ─── 2) Polishing / Safety Critique ─────────────────────────────
     editor_sys = self._get_prompt("editor_sys_prompt")
-    editor_user = "\n\n".join([
-        f"USER QUESTION:\n{user_text}",
-        "RELEVANCE BULLETS:\n" + bullets,
-        "CURRENT DRAFT:\n" + draft
-    ])
+    editor_msgs = [
+        {"role": "system", "content": editor_sys},
+        {"role": "system", "content": "[Latest user question]\n" + user_text},
+        {"role": "system", "content": "[Relevance bullets]\n" + bullets},
+        {"role": "system", "content": "[Current draft]\n" + draft},
+    ]
     polished = self._stream_and_capture(
         self.secondary_model,
-        [
-            {"role": "system", "content": editor_sys},
-            {"role": "user",   "content": editor_user},
-        ],
+        editor_msgs,
         tag="[Polisher]",
         images=state.get("images"),
     ).strip()
@@ -2060,28 +2043,26 @@ def _stage10b_response_critique_and_safety(
     if polished == draft.strip():
         return polished
 
-    # diff & dynamic patch
+    # ─── diff & dynamic prompt patch ────────────────────────────────
     diff = difflib.unified_diff(
-        draft.splitlines(),
-        polished.splitlines(),
-        lineterm="", n=1
+        draft.splitlines(), polished.splitlines(), lineterm="", n=1
     )
-    diff_summary = "; ".join(
-        ln for ln in diff if ln.startswith(("+ ", "- "))
-    ) or "(format refined)"
+    diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
 
-    patch_rows = self.repo.query(
-        lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"
+    patch_rows = sorted(
+        self.repo.query(lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"),
+        key=lambda c: c.timestamp, reverse=True
     )
-    patch_rows.sort(key=lambda c: c.timestamp, reverse=True)
     dynamic_patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
         "dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"]
     )
     if dynamic_patch.summary != diff_summary:
         dynamic_patch.summary = diff_summary
         dynamic_patch.metadata["policy"] = diff_summary
-        dynamic_patch.touch(); self.repo.save(dynamic_patch)
+        dynamic_patch.touch()
+        self.repo.save(dynamic_patch)
 
+    # ─── Persist polished reply & critique ──────────────────────────
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
     resp_ctx.stage_id = "response_critique"
     resp_ctx.summary  = polished
@@ -2097,6 +2078,7 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([critique_ctx])
 
     return polished
+
 
 
 

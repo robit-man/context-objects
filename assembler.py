@@ -2737,7 +2737,7 @@ class Assembler:
 
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  PUBLIC ENTRY  –  three‑phase orchestrator  (dynamic quick‑prompts + narrative + tooling notice)
+    #  PUBLIC ENTRY  –  three-phase orchestrator  (dynamic quick-prompts + narrative + tooling notice)
     # ──────────────────────────────────────────────────────────────────────────
     async def run_with_meta_context(
         self,
@@ -2749,15 +2749,18 @@ class Assembler:
         skip_quick_phases: bool = False,   # ← new flag
     ) -> str:
         """
-        Two‑phase orchestrator:
+        Two-phase orchestrator:
 
-            1) Quick‑Take  – immediate one‑liner (streamed via TTS)
+            1) Quick-Take  – immediate one-liner (streamed via TTS)
             2) Planner     – full pipeline (tools, RAG, reflection, etc.);
-                              runs concurrently so user can barge‑in
+                            runs concurrently so user can barge-in
 
         Set skip_quick_phases=True to jump straight to the planner.
         """
 
+        import asyncio
+        from datetime import datetime, timezone
+        from context import sanitize_jsonl
 
         # ─── 0. Hygiene & defaults ────────────────────────────────────
         await asyncio.to_thread(sanitize_jsonl, self.repo.json_repo.path)
@@ -2768,7 +2771,6 @@ class Assembler:
         if status_cb is None:
             status_cb = lambda stage, info=None: None
 
-
         # ─── 0.5 Narrative singleton ─────────────────────────────────
         narrative_ctx  = await asyncio.to_thread(self._load_narrative_context)
         narrative_text = narrative_ctx.summary or "(no narrative yet)"
@@ -2777,10 +2779,10 @@ class Assembler:
         prev_final = getattr(self, "_last_final", "")
 
         # ─── timestamp helper ─────────────────────────────────────────
-        def now_ts(fmt: str = "%Y‑%m‑%d %H:%M UTC") -> str:
+        def now_ts(fmt: str = "%Y-%m-%d %H:%M UTC") -> str:
             return datetime.now(timezone.utc).strftime(fmt)
 
-        # ─── live‑TTS setup ───────────────────────────────────────────
+        # ─── live-TTS setup ───────────────────────────────────────────
         bridge = _LiveTTSBridge(self.tts) if getattr(self, "tts", None) else None
         self._tts_bridge = bridge
         if bridge:
@@ -2804,7 +2806,7 @@ class Assembler:
             if bridge and stage in getattr(self, "tts_live_stages", ()):
                 _speak(str(info))
 
-        # ─── Cancel any in‑flight planner ─────────────────────────────
+        # ─── Cancel any in-flight planner ─────────────────────────────
         if hasattr(self, "_turn_task") and not self._turn_task.done():
             self._turn_cancel.set(); self._turn_task.cancel()
         self._turn_cancel = asyncio.Event()
@@ -2823,18 +2825,19 @@ class Assembler:
             "stages_run":   set(),
         }
 
-        # ─── Build a quick tool‑preview hint ───────────────────────────
+        # ─── Build a quick tool-preview hint ───────────────────────────
         try:
             schemas = await asyncio.to_thread(self._stage6_prepare_tools)
             tool_preview = ", ".join(t["name"] for t in schemas[:6]) if use_tools else ""
         except:
+            schemas = []
             tool_preview = ""
 
         async def _quick_take() -> str:
             """
-            Quick‑Take micro‑stage (immediate reply).
+            Quick-Take micro-stage (immediate reply).
             Provides an immediate ack/placeholder response based on very limited context,
-            deferring any up‑to‑date factual information to downstream stages.
+            deferring any up-to-date factual information to downstream stages.
             """
             # Skip if already run or explicitly disabled
             if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
@@ -2853,21 +2856,24 @@ class Assembler:
             snippet = " | ".join(seeds) if seeds else "(none)"
 
             # Prepare dynamic info
-            tool_preview    = state.get("tool_preview", "(none)")
-            narrative_text  = state.get("narrative_text", "(no narrative available)")
-            current_time    = now_ts()  # should return an ISO timestamp or human-readable time
-            cutoff_notice   = "Your internal training data is current only through 2023 and may be outdated. You do not need to mention this to the user, but acknowledge it internally."
+            tp = state.get("tool_preview", tool_preview)
+            nt = narrative_text
+            current_time = now_ts()
+            cutoff_notice = (
+                "Your internal training data is current only through 2023 and may be outdated. "
+                "You do not need to mention this to the user, but acknowledge it internally."
+            )
 
             # 2️⃣ Build system prompt with limitations & deferral
             sys_txt = (
-                "You are QuickResponder, a fast front‑line assistant. "
+                "You are QuickResponder, a fast front-line assistant. "
                 f"{cutoff_notice} "
-                "For any request requiring current or real‑time information, acknowledge that you will "
+                "For any request requiring current or real-time information, acknowledge that you will "
                 "retrieve updated data in subsequent stages rather than attempt to answer now. "
                 "Do NOT hallucinate or invent facts. "
-                f"Tools available: {tool_preview}. "
+                f"Tools available: {tp}. "
                 f"Current time: {current_time}. "
-                f"Context: {narrative_text}."
+                f"Context: {nt}."
             )
 
             # 3️⃣ Invoke model and stream
@@ -2877,19 +2883,19 @@ class Assembler:
                     {"role": "system",  "content": sys_txt},
                     {"role": "user",    "content": f"{user_text}\nRecent: {snippet}"}
                 ],
-                tag="[Quick‑Take]",
+                tag="[Quick-Take]",
                 on_token=_tok_to_sentence,
             )
             text = (reply or "").strip()
 
-            # Record and mark this micro‑stage as run
+            # Record and mark this micro-stage as run
             state.setdefault("early_phases", {})["quick_take"] = text
             state.setdefault("stages_run", set()).add("quick_take")
 
             return text
 
         # ──────────────────────────────────────────────────────────────
-        # 2) Planner micro‑stage (full pipeline; silent TTS)
+        # 2) Planner micro-stage (full pipeline; silent TTS)
         async def _planner() -> str:
             return await self._handle_turn(
                 user_text,
@@ -2901,14 +2907,17 @@ class Assembler:
                 tool_preview=tool_preview,
             )
 
-        # ─── Shortcut: skip Quick‑Take entirely ───────────────────────
+        # ─── Shortcut: skip Quick-Take entirely ───────────────────────
         if skip_quick_phases:
             final = await _planner()
             self._last_final = final
             return final
 
-        # ─── Orchestrate Quick‑Take → Planner ⁠(background) → await ──
+        # ─── Orchestrate Quick-Take → Planner ⁠(background) → await ──
         quick = await _quick_take()
+        # ensure planner sees the quick-take
+        state.setdefault("early_phases", {})["quick_take"] = quick
+
         # kick off heavy planner in background
         self._turn_task = asyncio.create_task(_planner())
 
