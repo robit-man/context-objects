@@ -203,9 +203,8 @@ def _stage3_retrieve_and_merge_context(
     recall_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
-    Retrieve & merge context for downstream stages, always ensuring the
-    latest user input is included, plus semantic & associative memory
-    and recent tool outputs, then contract to size.
+    Retrieve & merge context for downstream stages, using RL gating
+    and past relevance to bias what comes back.
     """
     from datetime import datetime, timedelta
 
@@ -231,27 +230,21 @@ def _stage3_retrieve_and_merge_context(
         role = "Assistant" if ctx.semantic_label == "assistant" else "User"
         ctx.summary = f"{role}: {ctx.summary}"
 
-    # ─── 1️⃣  Flatten inputs & identify conversation ───────────────────
+    # ─── 1️⃣ Flatten inputs & conversation metadata ────────────────────
     user_list  = _ensure_list(user_ctx)
     sys_list   = _ensure_list(sys_ctx)
     extra_list = extra_ctx or []
     recall_ids = recall_ids or []
 
     if not user_list:
-        return {
-            "merged": [], "merged_ids": [],
-            "wm_ids": [], "history": [],
-            "tools": [], "semantic": [], "assoc": [],
-        }
+        return {"merged": [], "merged_ids": [], "wm_ids": [], "history": [],
+                "tools": [], "semantic": [], "assoc": []}
 
     primary = user_list[0]
-    conv_id = (
-        primary.metadata.get("conversationid")
-        or primary.metadata.get("conversation_id")
-    )
+    conv_id = primary.metadata.get("conversationid") or primary.metadata.get("conversation_id")
     user_id = primary.metadata.get("user_id")
 
-    # ─── 2️⃣  Raw conversation segments ────────────────────────────────
+    # ─── 2️⃣ Gather raw conversation segments ──────────────────────────
     segs = [
         c for c in self.repo.query(lambda c:
             c.domain=="segment"
@@ -261,12 +254,11 @@ def _stage3_retrieve_and_merge_context(
             and c.metadata.get("user_id") in (user_id, None)
         )
     ]
-    # prepend any extra_ctx
+    # include extra_ctx and explicit recall_ids
     seen = {c.context_id for c in segs}
     for c in extra_list:
         if c.context_id not in seen:
             segs.append(c); seen.add(c.context_id)
-    # include explicit recall_ids
     for rid in recall_ids:
         try:
             c = self.repo.get(rid)
@@ -274,39 +266,59 @@ def _stage3_retrieve_and_merge_context(
                 segs.append(c); seen.add(c.context_id)
         except KeyError:
             pass
-
     segs.sort(key=lambda c: _to_dt(c.timestamp))
 
-    # ─── 3️⃣  Working-memory & history slice ───────────────────────────
-    # keep the last WM_TURNS segments as “working memory”
-    WM_TURNS    = getattr(self, "max_history_items", 20)
+    # ─── 3️⃣ Working memory slice ─────────────────────────────────────
+    WM_TURNS     = getattr(self, "max_history_items", 20)
     history_slice = segs[-WM_TURNS:]
     wm_ids        = [c.context_id for c in history_slice]
 
-    # ─── 4️⃣  Semantic recall around latest user_text ───────────────────
-    semantic = self.engine.query(
-        stage_id="semantic_retrieval",
-        similarity_to=user_text,
-        top_k=getattr(self, "max_semantic_items", 10)
-    )
+    # ─── Compute recall feature for RL gating ─────────────────────────
+    rf = 0.0
+    if wm_ids:
+        activation_map = self.memman.spread_activation(
+            seed_ids=wm_ids, hops=2, decay=0.6,
+            assoc_weight=1.0, recency_weight=0.5
+        )
+        top_vals = sorted(activation_map.values(), reverse=True)[: len(wm_ids)]
+        if top_vals:
+            rf = sum(top_vals) / len(top_vals)
 
-    # ─── 5️⃣  Associative (memory) recall seeded from working memory ────
+    # ─── 4️⃣ Semantic retrieval (RL-gated, relevance‐biased) ─────────
+    semantic = []
+    if self.rl.should_run("semantic_retrieval", rf):
+        # fetch a few more candidates
+        candidates = self.engine.query(
+            stage_id="semantic_retrieval",
+            similarity_to=user_text,
+            top_k=getattr(self, "max_semantic_items", 10) * 2
+        )
+        now = datetime.utcnow()
+        ttl = getattr(self, "context_ttl_days", 7)
+        # scoring: combine past relevance_score and recency
+        def _score(c):
+            rel = float(c.metadata.get("relevance_score", 0.0) or 0.0)
+            age_days = (now - _to_dt(c.timestamp)).total_seconds() / 86400
+            recency = max(0.0, 1.0 - age_days / ttl)
+            return rel * 0.7 + recency * 0.3
+        candidates.sort(key=_score, reverse=True)
+        semantic = candidates[: getattr(self, "max_semantic_items", 10) ]
+
+    # ─── 5️⃣ Associative (memory) recall (RL-gated) ───────────────────
     assoc = []
-    seeds = wm_ids.copy()
-    if self.rl.should_run("memory_retrieval", 0.0) and seeds:
+    if self.rl.should_run("memory_retrieval", rf) and wm_ids:
         scores = self.memman.spread_activation(
-            seed_ids=seeds, hops=3, decay=0.7,
+            seed_ids=wm_ids, hops=3, decay=0.7,
             assoc_weight=1.0, recency_weight=0.5
         )
         top_ids = sorted(scores, key=scores.get, reverse=True)[: getattr(self, "max_memory_items", 10)]
         for cid in top_ids:
             try:
-                c = self.repo.get(cid)
-                assoc.append(c)
+                assoc.append(self.repo.get(cid))
             except KeyError:
                 pass
 
-    # ─── 6️⃣  Recent tool-output contexts ──────────────────────────────
+    # ─── 6️⃣ Recent tool outputs ──────────────────────────────────────
     tools = [
         c for c in self.repo.query(lambda c:
             c.component=="tool_output"
@@ -317,40 +329,39 @@ def _stage3_retrieve_and_merge_context(
     tools.sort(key=lambda c: _to_dt(c.timestamp))
     tools = tools[- getattr(self, "max_tool_outputs", 10):]
 
-    # ─── 7️⃣  Prefix role labels for clarity ────────────────────────────
+    # ─── 7️⃣ Prefix role labels ───────────────────────────────────────
     for c in sys_list + user_list + history_slice + semantic + assoc + tools:
         _prefix(c)
 
-    # ─── 8️⃣  Merge in a fixed order & dedupe ──────────────────────────
-    merged: list[ContextObject] = []
+    # ─── 8️⃣ Merge in order & dedupe ─────────────────────────────────
+    merged = []
     seen = set()
-    def _add_list(lst):
+    def _add(lst):
         for c in lst:
             if c.context_id not in seen:
                 merged.append(c)
                 seen.add(c.context_id)
-
-    _add_list(sys_list)
-    _add_list(user_list)
-    _add_list(history_slice)
-    _add_list(semantic)
-    _add_list(assoc)
-    _add_list(tools)
-
-    # ensure the very latest user turn is *last* in the window
-    last_user = user_list[-1]
-    if last_user.context_id in seen:
-        merged = [c for c in merged if c.context_id != last_user.context_id] + [last_user]
+    _add(sys_list)
+    _add(user_list)
+    _add(history_slice)
+    _add(semantic)
+    _add(assoc)
+    _add(tools)
+    # ensure latest user turn is last
+    last_u = user_list[-1]
+    if last_u.context_id in seen:
+        merged = [c for c in merged if c.context_id != last_u.context_id] + [last_u]
 
     merged_ids = [c.context_id for c in merged]
 
-    # ─── 9️⃣  Debug banner ─────────────────────────────────────────────
+    # ─── 9️⃣ Debug banner ─────────────────────────────────────────────
     self._print_stage_context("retrieve_and_merge_context", {
         "merged_ids":   merged_ids[:12],
         "wm_ids":       wm_ids,
         "semantic_ids": [c.context_id for c in semantic],
         "assoc_ids":    [c.context_id for c in assoc],
         "tool_ids":     [c.context_id for c in tools],
+        "recall_feat":  round(rf, 3),
     })
 
     # ─── 🔟 Return ─────────────────────────────────────────────────────
@@ -2661,11 +2672,14 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     else:
         scoped = segments[-2:]  # keep it tiny if we have no tool run
 
-    convo_lines = [
-        ("User:" if c.semantic_label == "user_input" else "Assistant:") + " " + (c.summary or "")
-        for c in scoped
-    ]
-    conversation_block = "[Conversation (current turn)]\n" + "\n".join(convo_lines) if convo_lines else ""
+    convo_lines = []
+    for c in scoped:
+        role = "User" if c.semantic_label == "user_input" else "Assistant"
+        src  = f"{c.component}/{c.semantic_label or c.stage_id}"
+        text = c.summary or ""
+        convo_lines.append(f"[{src}] {role}: {text}")
+
+    conversation_block = "[Conversation (current turn)]\n" + "\n".join(convo_lines)
 
     # ─── (4) Plan (normalized) ──────────────────────────────────────
     raw_plan = state.get("plan_output", "(no plan)")
@@ -2729,6 +2743,15 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
+
+    # ─── NEW: compute embedding‐based relevance between user & reply ──
+    from numpy import dot
+    from numpy.linalg import norm
+    uvec = self.embed_text(user_text)
+    rvec = self.embed_text(reply)
+    sim = float(dot(uvec, rvec) / (norm(uvec) * norm(rvec) + 1e-9))
+    resp_ctx.metadata["relevance_score"] = sim
+
     self._persist_and_index([resp_ctx])
 
     seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
@@ -2949,10 +2972,19 @@ def _stage12_performance_rating(self, state: dict[str, Any]) -> None:
 
     # --- 1) crude heuristic reward -----------------------------------
     err_penalty  = -0.4 if state.get("errors") else 0.0
-    tool_penalty = -0.2 if any(tc.metadata.get("exception")
-                               for tc in state.get("tool_ctxs", [])) else 0.0
+    tool_penalty = -0.2 if any(tc.metadata.get("exception") for tc in state.get("tool_ctxs", [])) else 0.0
     speed_bonus  = +0.2 if state.get("provisional_sent") else 0.0
-    reward = max(-1.0, min(1.0, 1.0 + err_penalty + tool_penalty + speed_bonus))
+
+    # ─── NEW: boost reward if reply was highly relevant ───────────
+    perf_objs = self.repo.query(lambda c: c.component=="stage" and c.semantic_label=="final_inference")
+    last_resp = max(perf_objs, key=lambda c: c.timestamp, default=None)
+    rel_bonus = 0.0
+    if last_resp and isinstance(last_resp.metadata.get("relevance_score"), float):
+        rel = last_resp.metadata["relevance_score"]
+        # scale so if sim > .8 give up to +0.2
+        rel_bonus = max(0.0, (rel - 0.8)) * 1.0
+
+    reward = max(-1.0, min(1.0, 1.0 + err_penalty + tool_penalty + speed_bonus + rel_bonus))
 
     # --- 2) persist stage-performance object -------------------------
     perf = ContextObject.make_performance(
@@ -2985,6 +3017,16 @@ def _stage12_performance_rating(self, state: dict[str, Any]) -> None:
     # --- 4) tell the RL controllers ----------------------------------
     self.rl.update(list(state.get("stages_run", [])), reward)
     self.curiosity_rl.update(state.get("curiosity_used", []), reward)
+
+    # --- 5) record our reward in the rolling metacognitive context ----
+    try:
+        lines = (self.metacog_ctx.summary or "").splitlines()
+        lines.append(f"stage12 reward={reward:+.2f}")
+        self.metacog_ctx.summary = "\n".join(lines)
+        self.metacog_ctx.touch()
+        self.repo.save(self.metacog_ctx)
+    except Exception:
+        pass
 
 
 
