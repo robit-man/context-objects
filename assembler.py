@@ -1253,13 +1253,16 @@ class Assembler:
         """
         Idempotent seeding of static system prompts with a cross-process lock.
 
-        Rules
-        -----
-        • If a prompt with a given semantic_label exists: DO NOTHING to its text/tags.
-        • If multiple exist: keep newest, delete extras.
-        • If none exist: insert one.
-        • If we changed anything (inserted/deleted), sanitize + logical prune.
+        • Fast-path: if we’ve already seeded in this process, do nothing.
+        • Pre-flight: if _all_ semantic_labels are already in the repo, do nothing.
+        • Otherwise: acquire lock, bucket, insert missing, delete duplicates.
         """
+
+        import os, time, json
+
+        # ─── FAST-PATH GUARD ───────────────────────────────────────────
+        if getattr(self, "_static_prompts_seeded", False):
+            return
 
         # ---- small cross-process lock (POSIX flock / Windows msvcrt) ----
         class _Lock:
@@ -1324,38 +1327,46 @@ class Assembler:
             "extractor_sys_prompt":    self.extractor_sys_prompt,
             "editor_sys_prompt":       self.editor_sys_prompt,
         }
-        static = dict(self.system_prompts)
+        static_labels = set(self.system_prompts.keys())
+
+        # ─── PRE-FLIGHT CHECK ──────────────────────────────────────────
+        existing_labels = {
+            (c.semantic_label or "").strip()
+            for c in self.repo.query(lambda c: c.component == "prompt")
+        }
+        if existing_labels.issuperset(static_labels):
+            # nothing to do
+            self._static_prompts_seeded = True
+            return
+
+        # 2) Bucket existing by normalized semantic_label
+        buckets: dict[str, list[ContextObject]] = {}
+        for ctx in self.repo.query(lambda c: c.component == "prompt"):
+            lbl = (ctx.semantic_label or "").strip()
+            if lbl:
+                buckets.setdefault(lbl, []).append(ctx)
 
         lock_path = os.path.join(os.path.dirname(self.repo.json_repo.path) or ".", ".seed_static_prompts.lock")
         changed_or_dupes = False
 
         with _Lock(lock_path):
-            # 2) Bucket existing by normalized semantic_label
-            buckets: dict[str, list[ContextObject]] = {}
-            for ctx in self.repo.query(lambda c: c.component == "prompt"):
-                lbl = (ctx.semantic_label or "").strip()
-                if lbl:
-                    buckets.setdefault(lbl, []).append(ctx)
-
             # 3) Ensure existence per label; dedupe extras; never touch existing content
-            for label, desired_text in static.items():
-                label_norm = label.strip()
-                rows = buckets.get(label_norm, [])
-
+            for label, desired_text in self.system_prompts.items():
+                lbl = label.strip()
+                rows = buckets.get(lbl, [])
                 if not rows:
+                    # missing → insert once
                     new_ctx = ContextObject.make_prompt(
-                        label=label_norm,
+                        label=lbl,
                         prompt_text=desired_text,
                         tags=["artifact", "prompt"],
                     )
                     new_ctx.touch()
                     self.repo.save(new_ctx)
+                    buckets.setdefault(lbl, []).append(new_ctx)
                     changed_or_dupes = True
-                    # keep buckets in sync in case this function is ever extended
-                    buckets.setdefault(label_norm, []).append(new_ctx)
-                    continue
-
-                if len(rows) > 1:
+                elif len(rows) > 1:
+                    # dedupe extras
                     rows.sort(key=lambda c: c.timestamp, reverse=True)
                     keeper, dups = rows[0], rows[1:]
                     for dup in dups:
@@ -1364,7 +1375,7 @@ class Assembler:
                             changed_or_dupes = True
                         except Exception:
                             pass
-                    buckets[label_norm] = [keeper]
+                    buckets[lbl] = [keeper]
 
         # 4) Clean only if something changed or dupes were found
         if changed_or_dupes:
@@ -1373,6 +1384,9 @@ class Assembler:
                 sanitize_jsonl(jsonl_path)
             finally:
                 self._prune_jsonl_duplicates()
+
+        # mark that we’ve done this once
+        self._static_prompts_seeded = True
 
 
 
