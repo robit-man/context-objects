@@ -3497,6 +3497,7 @@ class Tools:
     def auxiliary_inference(
         prompt: str,
         *,
+        temperature: float = 0.7,
         system: str | None = None,
         context: object | None = None,
         retrieval_count: int = 0,
