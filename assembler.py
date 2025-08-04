@@ -3083,21 +3083,18 @@ class Assembler:
             schemas = []; tool_preview = ""
 
         # ─── Pre-seed context for Quick-Take ──────────────────────────
-        # 1️⃣ Record user input
         try:
             user_ctx = await asyncio.to_thread(self._stage1_record_input, user_text, state)
             state["user_ctx"] = user_ctx
         except:
             user_ctx = None
 
-        # 2️⃣ Load system prompts
         try:
             sys_ctx = await asyncio.to_thread(self._stage2_load_system_prompts)
             state["sys_ctx"] = sys_ctx
         except:
             sys_ctx = None
 
-        # 3️⃣ Retrieve & merge context (RAG + memory)
         try:
             out3 = await asyncio.to_thread(
                 self._stage3_retrieve_and_merge_context,
@@ -3111,7 +3108,6 @@ class Assembler:
                 "tools": [], "semantic": [], "assoc": [],
             })
 
-        # 4️⃣ Load last dynamic prompt patches
         dyn = self.repo.query(lambda c:
             c.component=="policy" and "dynamic_prompt" in (c.tags or [])
         )
@@ -3120,7 +3116,6 @@ class Assembler:
             for p in sorted(dyn, key=lambda c: c.timestamp)[-3:]
         )
 
-        # 5️⃣ Load last performance-rating summary (stage12)
         perf = self.repo.query(lambda c: c.component=="stage_performance")
         perf_text = ""
         if perf:
@@ -3134,18 +3129,26 @@ class Assembler:
             Provides a concise, natural-language placeholder response
             based on a small, relevance-driven context window.
             """
-            # Skip if already run or explicitly disabled
             if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
                 return ""
 
+            # Helper: robust timestamp parser
+            def parse_timestamp(ts: str) -> datetime:
+                for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y%m%dT%H%M%S"):
+                    try:
+                        return datetime.strptime(ts, fmt)
+                    except:
+                        continue
+                try:
+                    return datetime.fromisoformat(ts)
+                except:
+                    return datetime.min
+
             # 1️⃣ Gather & label prioritized context for quick take
             seeds: list[tuple[str, str]] = []
-
-            # • Use the previous final answer if available
             if state.get("prev_final"):
                 seeds.append((state["prev_final"].strip(), "prev_final"))
 
-            # • Compute a recall-feature score from recent history
             hist_ids = state.get("wm_ids", [])
             rf = 0.0
             if hist_ids:
@@ -3156,7 +3159,6 @@ class Assembler:
                 top_scores = sorted(activation.values(), reverse=True)[:len(hist_ids)]
                 rf = sum(top_scores) / len(top_scores) if top_scores else 0.0
 
-            # • On first run, fetch top-k semantically similar snippets (RAG + RL gate)
             if not state.get("prev_final") and self.rl.should_run("semantic_retrieval", rf):
                 candidates = self.engine.query(
                     stage_id="semantic_retrieval",
@@ -3166,7 +3168,9 @@ class Assembler:
                 now = datetime.utcnow()
                 def _score(c):
                     rel = float(c.metadata.get("relevance_score", 0.0))
-                    age_days = (now - datetime.fromisoformat(c.timestamp.rstrip("Z"))).total_seconds() / 86400
+                    ts = c.timestamp.rstrip("Z")
+                    dt = parse_timestamp(ts)
+                    age_days = (now - dt).total_seconds() / 86400
                     recency = max(0, 1 - age_days / self.context_ttl_days)
                     return rel * 0.7 + recency * 0.3
 
@@ -3178,7 +3182,6 @@ class Assembler:
                         src = f"{c.component}/{c.semantic_label or c.stage_id}"
                         seeds.append((c.summary.strip(), src))
 
-            # • Fallback to the most recent turns if we still need more
             if len(seeds) < 3:
                 recent = await asyncio.to_thread(self._get_history)
                 for c in reversed(recent):
@@ -3188,7 +3191,6 @@ class Assembler:
                         src = f"{c.domain}/{c.semantic_label}"
                         seeds.append((c.summary.strip(), src))
 
-            # • Build the snippet string (max 3 items), with explicit tags
             formatted = [f"[{src}] {text}" for text, src in seeds[:3]]
             snippet = " | ".join(formatted) if formatted else "(none)"
 
@@ -3225,10 +3227,8 @@ class Assembler:
                 except ValueError:
                     pass
 
-            # 5️⃣ Record and mark this micro-stage as run
             state.setdefault("early_phases", {})["quick_take"] = text
             state.setdefault("stages_run", set()).add("quick_take")
-
             return text
 
         async def _planner() -> str:
@@ -3248,7 +3248,6 @@ class Assembler:
             self._last_final = final
             return final
 
-        # ─── Orchestrate Quick-Take → Planner (background) → await ────
         quick = await _quick_take()
         state.setdefault("early_phases", {})["quick_take"] = quick
         self._turn_task = asyncio.create_task(_planner())
@@ -3261,7 +3260,6 @@ class Assembler:
             if bridge:
                 bridge.flush(force=True)
 
-        # ─── stash for next turn ─────────────────────────────────────
         self._last_final = final
         return final
 
