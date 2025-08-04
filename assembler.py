@@ -3012,7 +3012,7 @@ class Assembler:
         to inform the quick reply system prompt.
         """
 
-        import time
+        import time, numpy as np
         from datetime import datetime, timezone
 
         # ─── 0. Hygiene & defaults ────────────────────────────────────
@@ -3108,6 +3108,7 @@ class Assembler:
                 "tools": [], "semantic": [], "assoc": [],
             })
 
+        # ─── Load dynamic prompt patches & last perf───────────────────
         dyn = self.repo.query(lambda c:
             c.component=="policy" and "dynamic_prompt" in (c.tags or [])
         )
@@ -3115,7 +3116,6 @@ class Assembler:
             p.metadata.get("policy", p.summary or "")
             for p in sorted(dyn, key=lambda c: c.timestamp)[-3:]
         )
-
         perf = self.repo.query(lambda c: c.component=="stage_performance")
         perf_text = ""
         if perf:
@@ -3124,31 +3124,15 @@ class Assembler:
 
         # ─── Quick-Take micro-stage ───────────────────────────────────
         async def _quick_take() -> str:
-            """
-            Quick-Take micro-stage (immediate reply).
-            Provides a concise, natural-language placeholder response
-            based on a small, relevance-driven context window.
-            """
             if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
                 return ""
 
-            # Helper: robust timestamp parser
-            def parse_timestamp(ts: str) -> datetime:
-                for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y%m%dT%H%M%S"):
-                    try:
-                        return datetime.strptime(ts, fmt)
-                    except:
-                        continue
-                try:
-                    return datetime.fromisoformat(ts)
-                except:
-                    return datetime.min
-
-            # 1️⃣ Gather & label prioritized context for quick take
+            # 1️⃣ Gather & label prioritized context
             seeds: list[tuple[str, str]] = []
             if state.get("prev_final"):
                 seeds.append((state["prev_final"].strip(), "prev_final"))
 
+            # recall-feature from history
             hist_ids = state.get("wm_ids", [])
             rf = 0.0
             if hist_ids:
@@ -3159,78 +3143,97 @@ class Assembler:
                 top_scores = sorted(activation.values(), reverse=True)[:len(hist_ids)]
                 rf = sum(top_scores) / len(top_scores) if top_scores else 0.0
 
+            # 2️⃣ Try RAG, but catch any embedding‐shape errors
+            candidates = []
             if not state.get("prev_final") and self.rl.should_run("semantic_retrieval", rf):
-                candidates = self.engine.query(
-                    stage_id="semantic_retrieval",
-                    similarity_to=user_text,
-                    top_k=5
-                )
+                try:
+                    candidates = self.engine.query(
+                        stage_id="semantic_retrieval",
+                        similarity_to=user_text,
+                        top_k=5
+                    )
+                except ValueError as e:
+                    # flatten any 2D embeddings in metadata and retry once
+                    for c in self.repo.query(lambda c: True):
+                        emb = c.metadata.get("embedding")
+                        if emb is not None:
+                            arr = np.asarray(emb)
+                            c.metadata["embedding"] = arr.reshape(-1).tolist()
+                    try:
+                        candidates = self.engine.query(
+                            stage_id="semantic_retrieval",
+                            similarity_to=user_text,
+                            top_k=5
+                        )
+                    except:
+                        candidates = []
+
+            # score & pick up to 3
+            if candidates:
                 now = datetime.utcnow()
                 def _score(c):
                     rel = float(c.metadata.get("relevance_score", 0.0))
-                    ts = c.timestamp.rstrip("Z")
-                    dt = parse_timestamp(ts)
-                    age_days = (now - dt).total_seconds() / 86400
-                    recency = max(0, 1 - age_days / self.context_ttl_days)
-                    return rel * 0.7 + recency * 0.3
-
+                    try:
+                        dt = datetime.fromisoformat(c.timestamp.rstrip("Z"))
+                        age = (now - dt).total_seconds()/86400
+                        rec = max(0, 1 - age/self.context_ttl_days)
+                    except:
+                        rec = 0
+                    return rel*0.7 + rec*0.3
                 candidates.sort(key=_score, reverse=True)
                 for c in candidates:
-                    if len(seeds) >= 3:
-                        break
+                    if len(seeds)>=3: break
                     if c.summary:
                         src = f"{c.component}/{c.semantic_label or c.stage_id}"
                         seeds.append((c.summary.strip(), src))
 
-            if len(seeds) < 3:
+            # 3️⃣ Fallback to recent history if needed
+            if len(seeds)<3:
                 recent = await asyncio.to_thread(self._get_history)
                 for c in reversed(recent):
-                    if len(seeds) >= 3:
-                        break
+                    if len(seeds)>=3: break
                     if c.summary:
                         src = f"{c.domain}/{c.semantic_label}"
-                        seeds.append((c.summary.strip(), src))
+                        pair = (c.summary.strip(), src)
+                        if pair not in seeds:
+                            seeds.append(pair)
 
-            formatted = [f"[{src}] {text}" for text, src in seeds[:3]]
-            snippet = " | ".join(formatted) if formatted else "(none)"
+            snippet = " | ".join(f"[{src}] {txt}" for txt,src in seeds[:3]) or "(none)"
 
-            # 2️⃣ Build system prompt: include dynamic patches & perf
-            cutoff_notice = (
-                "Your training data is current only through 2023 and may be outdated. "
-                "Defer factual details to later stages."
-            )
+            # 4️⃣ Build system prompt
+            cutoff = "Your data is current only through 2023; defer facts to later stages."
             sys_txt = "\n".join([
                 "You are QuickResponder, a fast front-line assistant.",
                 dyn_text.strip(),
                 perf_text.strip(),
-                "Respond in concise, natural language only—no JSON or structured output.",
-                cutoff_notice
+                "Respond in concise, natural language only—no JSON.",
+                cutoff
             ])
 
-            # 3️⃣ Invoke model and stream
+            # 5️⃣ Invoke & TTS-stream
             reply = await self._stream_and_capture_async(
                 self.primary_model,
                 [
-                    {"role": "system", "content": sys_txt},
-                    {"role": "user",   "content": f"{user_text}\nContext: {snippet}"}
+                    {"role":"system", "content":sys_txt},
+                    {"role":"user",   "content":f"{user_text}\nContext: {snippet}"}
                 ],
                 tag="[Quick-Take]",
-                on_token=_tok_to_sentence,
+                on_token=_tok_to_sentence
             )
             text = (reply or "").strip()
 
-            # 4️⃣ Strip any leading JSON block if the model still emitted it
+            # strip any leading “{…}” block
             if text.startswith("{"):
                 try:
-                    end = text.index("}") + 1
-                    text = text[end:].lstrip("\n ")
-                except ValueError:
+                    text = text[text.index("}")+1:].lstrip()
+                except:
                     pass
 
             state.setdefault("early_phases", {})["quick_take"] = text
             state.setdefault("stages_run", set()).add("quick_take")
             return text
 
+        # ─── Planner micro-stage (silent TTS) ─────────────────────────
         async def _planner() -> str:
             return await self._handle_turn(
                 user_text,
@@ -3242,12 +3245,13 @@ class Assembler:
                 tool_preview=tool_preview,
             )
 
-        # ─── Shortcut: skip Quick-Take entirely ───────────────────────
+        # ─── Shortcut: skip Quick-Take ────────────────────────────────
         if skip_quick_phases:
             final = await _planner()
             self._last_final = final
             return final
 
+        # ─── Run Quick-Take, then kick off Planner in bg ──────────────
         quick = await _quick_take()
         state.setdefault("early_phases", {})["quick_take"] = quick
         self._turn_task = asyncio.create_task(_planner())
@@ -3263,7 +3267,6 @@ class Assembler:
         self._last_final = final
         return final
 
-    
 
 
     # ─────────────────────────────────────────────────────────────────────────────
