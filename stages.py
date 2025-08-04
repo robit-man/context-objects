@@ -20,7 +20,9 @@ import contextlib
 import textwrap
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
-
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
 import numpy as np
 from ollama import chat, embed
 from tools import Tools
@@ -36,7 +38,6 @@ from context import (
 
 def _utc_iso() -> str:
     """UTC timestamp ending with 'Z' (e.g. 2025-07-07T18:04:31.123456Z)."""
-    from datetime import datetime
     return datetime.utcnow().isoformat() + "Z"
 
 def _stamp(ctx, state):
@@ -116,24 +117,54 @@ def _dump_ai_state(state: dict[str, Any]) -> None:
 ╚══════════════════════════════════════════════════════════════════╝
 """
     print(block.strip("\n"))
-import uuid
+
+@dataclass
+class TurnStateModel:
+    turn_id: str = ""
+    plan_id: str = ""
+    graph: dict | None = None           # {"nodes":[{"id","tool","args","after":[]}], "meta":{...}}
+    pending_nodes: set = field(default_factory=set)
+    completed_nodes: set = field(default_factory=set)
+    tool_ctx_ids: list[str] = field(default_factory=list)
+    budgets: dict = field(default_factory=lambda: {"tokens": 128_000, "time": 60, "calls": 20})
+    last_results: dict = field(default_factory=dict)   # node_id -> raw output
+
+def _ensure_turn_state(state: dict) -> TurnStateModel:
+    """Attach a TurnStateModel into state['turn'] and return it."""
+    ts = state.get("turn")
+    if isinstance(ts, TurnStateModel):
+        return ts
+    ts = TurnStateModel()
+    # create a new turn_id each user message if missing
+    if not ts.turn_id:
+        ts.turn_id = f"turn_{uuid.uuid4().hex[:8]}"
+    state["turn"] = ts
+    return ts
+
 def _ensure_ids(ctx, conv_id, user_id):
     ctx.metadata.setdefault("conversation_id", conv_id)
     ctx.metadata.setdefault("user_id",         user_id)
 
 def _stage1_record_input(self, user_text: str, state: Dict[str, Any]) -> ContextObject:
+    turn = _ensure_turn_state(state)
+
     ctx = ContextObject.make_segment("user_input", [], tags=["user_input"])
-    ctx.summary = user_text
+    ctx.summary  = user_text
     ctx.stage_id = "user_input"
 
-    # 🔑  inject routing metadata so Stage 3 can find it later
+    # 🔑 inject routing + turn metadata
     ctx.metadata.update({
         "conversation_id": state["conversation_id"],
         "user_id":         state["user_id"],
+        "turn_id":         turn.turn_id,
     })
 
     ctx.touch()
     self.repo.save(ctx)
+
+    # keep for downstream
+    state["user_ctx"] = ctx
+    state["user_text"] = user_text
     return ctx
 
 def _stage2_load_system_prompts(self) -> List[ContextObject]:
@@ -714,6 +745,52 @@ def _stage5_external_knowledge(
 
     return ext_ctx
 
+def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
+    import json
+    nodes, edges = {}, []
+    # tool + param nodes
+    for t in tools_list:
+        tn = f"tool:{t['name']}"; nodes[tn] = {"type":"tool"}
+        props = (t.get("schema",{}).get("parameters",{}).get("properties",{}) or {})
+        for p in props:
+            pn = f"param:{t['name']}.{p}"; nodes[pn] = {"type":"param"}
+            edges.append((tn, "has_param", pn))
+    # concepts from clarifier + snippets
+    kws = (clar_ctx.metadata.get("keywords") or []) + re.findall(r"\b[A-Za-z][\w-]{2,}\b", know_ctx.summary or "")
+    kws = list(dict.fromkeys(kws))[:50]
+    for kw in kws:
+        cn = f"concept:{kw}"; nodes[cn] = {"type":"concept"}
+
+    # simple affinity: embedding cosine between kw and tool/param descriptions
+    def emb(x): return self.embed_text(x or "")
+    tool_desc = {t['name']: (t['description'] or "") for t in tools_list}
+    kw_vecs = {kw: emb(kw) for kw in kws}
+    t_vecs  = {name: emb(desc) for name,desc in tool_desc.items()}
+    def cos(a,b): 
+        import numpy as np
+        a=np.array(a); b=np.array(b)
+        den = (np.linalg.norm(a)*np.linalg.norm(b)) or 1.0
+        return float(np.dot(a,b)/den)
+    affinities = []
+    for kw in kws:
+        for name in tool_desc:
+            score = cos(kw_vecs[kw], t_vecs[name])
+            if score >= 0.25:
+                affinities.append((f"concept:{kw}", "affinity", f"tool:{name}", score))
+    affinities.sort(key=lambda x: x[3], reverse=True)
+    top_pairs = affinities[: min(100, len(affinities))]
+
+    kg = {"nodes": nodes, "edges": edges + [(a,b,c) for a,b,c,_ in top_pairs],
+          "top_tool_candidates": sorted(
+              {c.split(':',1)[1] for _,_,c,_ in top_pairs}, key=lambda n: max(s for a,b,c,s in top_pairs if c.endswith(n)), reverse=True)[:10]
+    }
+
+    kg_ctx = ContextObject.make_knowledge("planning_kg", kg, tags=["planning","kg"])
+    kg_ctx.summary = json.dumps({"top_tool_candidates": kg["top_tool_candidates"]}, ensure_ascii=False)
+    self.repo.save(kg_ctx)
+    self.memman.register_relationships(kg_ctx, self.embed_text)
+    state["planning_kg"] = kg
+    return kg_ctx
 
 
 def _stage6_prepare_tools(self) -> list[dict]:
@@ -754,8 +831,6 @@ def _stage6_prepare_tools(self) -> list[dict]:
     return tools
 
 
-
-
 def _stage7_planning_summary(
     self,
     clar_ctx: ContextObject,
@@ -765,27 +840,195 @@ def _stage7_planning_summary(
     state: Dict[str, Any],
 ) -> Tuple[ContextObject, str]:
     """
-    1) Load the latest planning_prompt artifact (or fallback to config)
-    2) Inject a “Conversation so far” block from merged context
-    3) Inject truncated tool list (name + first sentence of description)
-    4) Run up to 3 JSON-only planning passes, halving snippets each retry
-    5) For each selected tool, refine the call against its schema
-       — in this second pass, seed with the original tool_input from
-         the first pass, drop any args not in the schema, include only
-         schema-defined keys, fill required params, and supply clarifier
-         notes + user question so it picks real values.
-       — **New**: pulls in any prior “fix hints” saved for this tool
-                 and, upon success, saves the critic’s advice for future runs.
-    6) Persist artefacts & plan tracker; return (ctx, raw-JSON)
-    """
+    Updated for DAG + TurnState (+ robustness + schema/hint replan):
 
+      1) Load the latest planning_prompt (or config fallback)
+      2) Provide compact conversation + knowledge snippets to the planner
+      3) Run an initial JSON-only planning pass (no schemas yet)
+      4) Build a **selected-tool-only** schema catalog + pull prior confirmed retry-hints
+         and run a second internal planning pass that includes those schemas + hints
+      5) Refine each chosen tool against its schema (fill only missing/invalid)
+         • Persist a 'tool_retry_critique' analysis row for each refinement candidate
+           (tagged ['tool_retry','candidate'] with plan/turn/tool metadata)
+      6) Convert tasks → DAG graph if planner did not emit a graph
+      7) Inject implicit deps from placeholders like [n1.output.foo] or {{alias}}
+      8) Validate graph (unique IDs, missing deps, acyclicity, known tools)
+      9) Initialize TurnState: plan_id, graph, pending/completed, budgets
+     10) Persist planning_summary + plan_tracker; return (ctx, plan_json)
+
+    NOTE on retry-hints:
+      • This stage *reads* previously confirmed hints (status in {'confirmed','success'})
+        and includes them during the schema-augmented second pass.
+      • This stage *writes* new candidate hints when it fills missing params; downstream
+        execution/observation code can later promote them by setting status='confirmed'.
+    """
     import json, re, hashlib, datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # ------------------------------------------------------------------ #
-    # 0️⃣  Diagnostic print                                             #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers (local to stage)
+    # ──────────────────────────────────────────────────────────────────
+    def _clean_json_block(text: str) -> str:
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", flags=re.S)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
+        return (m2.group(1) if m2 else (text or "")).strip()
+
+    def _first_sentence(desc: str) -> str:
+        head = (desc or "").split(".", 1)[0]
+        return head + ("." if head and not head.endswith(".") else "")
+
+    def _is_valid_plan_obj(obj: dict) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if "graph" in obj and isinstance(obj["graph"], dict):
+            nodes = obj["graph"].get("nodes")
+            return isinstance(nodes, list) and any(isinstance(n, dict) and n.get("tool") for n in nodes)
+        if "tasks" in obj and isinstance(obj["tasks"], list):
+            return any(isinstance(t, dict) and t.get("call") for t in obj["tasks"])
+        return False
+
+    def _extract_calls(plan_obj: dict) -> List[str]:
+        names = []
+        if not isinstance(plan_obj, dict):
+            return names
+        if "graph" in plan_obj and isinstance(plan_obj["graph"], dict):
+            for n in (plan_obj["graph"].get("nodes") or []):
+                nm = (n or {}).get("tool")
+                if nm:
+                    names.append(nm)
+        elif "tasks" in plan_obj and isinstance(plan_obj["tasks"], list):
+            for t in plan_obj["tasks"]:
+                nm = (t or {}).get("call")
+                if nm:
+                    names.append(nm)
+        return names
+
+    # Graph validation (IDs, deps, cycles, tools)
+    def _validate_graph(graph: dict, tools_list: list[dict]) -> list[str]:
+        from collections import deque, defaultdict
+        errs: list[str] = []
+        nodes = graph.get("nodes") or []
+        ids = [n.get("id") for n in nodes if n.get("id")]
+        if len(ids) != len(set(ids)):
+            errs.append("duplicate node ids")
+        idset = set(ids)
+        # after refs exist
+        for n in nodes:
+            for dep in (n.get("after") or []):
+                if dep not in idset:
+                    errs.append(f"node {n.get('id')} after-> {dep} missing")
+        # unknown tools
+        known = {t["name"] for t in tools_list}
+        for n in nodes:
+            if n.get("tool") not in known:
+                errs.append(f"unknown tool '{n.get('tool')}' in node {n.get('id')}")
+        # acyclicity (Kahn)
+        indeg = defaultdict(int)
+        g = defaultdict(list)
+        for n in nodes:
+            for dep in (n.get("after") or []):
+                g[dep].append(n["id"]); indeg[n["id"]] += 1
+        q = deque([i for i in ids if indeg[i]==0])
+        seen = 0
+        while q:
+            u = q.popleft(); seen += 1
+            for v in g[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0: q.append(v)
+        if seen != len(ids):
+            errs.append("cycle detected")
+        return errs
+
+    # Implicit dependency injection via placeholders
+    _PL_RE = re.compile(
+        r"\[([A-Za-z0-9_-]+)\.output(?:\.([A-Za-z0-9_.-]+))?\]|\{\{([A-Za-z0-9_-]+)\}\}"
+    )
+    def _inject_implicit_deps(graph: dict) -> None:
+        nodes = graph.get("nodes") or []
+        idset = {n["id"] for n in nodes if n.get("id")}
+        alias2id = {(n.get("alias") or n["id"]): n["id"] for n in nodes if n.get("id")}
+        for n in nodes:
+            for _, v in (n.get("args") or {}).items():
+                s = v if isinstance(v, str) else None
+                if not s:
+                    continue
+                for m in _PL_RE.finditer(s):
+                    ref = m.group(1) or m.group(3)
+                    target = alias2id.get(ref) or (ref if ref in idset else None)
+                    if target and target != n["id"]:
+                        n.setdefault("after", [])
+                        if target not in n["after"]:
+                            n["after"].append(target)
+
+    # Retry-hint helpers ------------------------------------------------
+    def _load_retry_hints(tool_names: List[str]) -> Dict[str, List[str]]:
+        """Return {tool_name: [hint_line, ...]} for confirmed/success retry critiques."""
+        if not tool_names:
+            return {}
+        names = set(tool_names)
+        rows = self.repo.query(lambda c:
+            c.component == "analysis"
+            and c.semantic_label == "tool_retry_critique"
+            and isinstance((c.metadata or {}).get("tool_name"), str)
+            and (c.metadata.get("status") in ("confirmed","success","refined"))  # prefer confirmed/success; allow refined
+            and c.metadata.get("tool_name") in names
+        )
+        hints: Dict[str, List[str]] = {}
+        for r in rows:
+            tname = r.metadata.get("tool_name")
+            text  = r.metadata.get("hint") or r.summary or ""
+            if not text:
+                # synthesize from keys if missing
+                req  = r.metadata.get("schema_required") or []
+                ex   = r.metadata.get("filled_params") or {}
+                text = f"When calling {tname}, include required {req}. Example keys used previously: {list(ex.keys())}."
+            hints.setdefault(tname, [])
+            if text not in hints[tname]:
+                hints[tname].append(text)
+        # keep up to 3 per tool
+        for k in list(hints.keys()):
+            hints[k] = hints[k][:3]
+        return hints
+
+    def _persist_retry_candidate(tool_name: str, required: List[str], props: Dict[str, Any],
+                                 filled: Dict[str, Any], turn_id: str, plan_id: str) -> None:
+        """Save a candidate retry-critique row to be promoted later on success."""
+        from context import ContextObject as _CO
+        # Make a short, reusable hint text
+        arg_list = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in filled.items()) if filled else ""
+        req_list = ", ".join(required) if required else "(none)"
+        hint = f"When using {tool_name}, supply required [{req_list}]. Example: {tool_name}({arg_list})"
+        meta = {
+            "tool_name": tool_name,
+            "status": "refined",  # candidate; can be promoted to 'confirmed' later
+            "schema_required": list(required or []),
+            "schema_properties": list((props or {}).keys()),
+            "filled_params": dict(filled or {}),
+            "plan_id": plan_id,
+            "turn_id": turn_id,
+            "hint": hint,
+        }
+        crit = _CO.make_stage("tool_retry_critique", [], meta)
+        crit.component = "analysis"
+        crit.semantic_label = "tool_retry_critique"
+        crit.tags = (crit.tags or []) + ["tool_retry", "candidate"]
+        crit.summary = hint[:250]
+        # propagate ids if available
+        try:
+            _stamp(crit, state)
+        except Exception:
+            pass
+        crit.touch(); self.repo.save(crit)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 0) Turn state + diagnostics
+    # ──────────────────────────────────────────────────────────────────
+    turn = _ensure_turn_state(state)
+
     incoming = {
+        "turn_id":         turn.turn_id,
         "user_text":       user_text,
         "clarifier_notes": clar_ctx.summary,
         "knowledge_snips": len((know_ctx.summary or "").splitlines()),
@@ -805,71 +1048,48 @@ def _stage7_planning_summary(
     })
     self._print_stage_context("planning_summary_incoming", incoming)
 
-    # ------------------------------------------------------------------ #
-    # 1️⃣  Build “Conversation so far” from merged contexts             #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 1) Conversation so far (compact)
+    # ──────────────────────────────────────────────────────────────────
     merged = state.get("merged", [])
     N = min(10, len(merged))
     convo_lines = [f"- {c.summary}" for c in merged[-N:]]
-    convo_block = (
-        "Conversation so far:\n" + "\n".join(convo_lines)
-    ) if convo_lines else ""
+    convo_block = ("Conversation so far:\n" + "\n".join(convo_lines)) if convo_lines else ""
 
-    # ------------------------------------------------------------------ #
-    # Helper utilities                                                  #
-    # ------------------------------------------------------------------ #
-    def _clean_json_block(text: str) -> str:
-        m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
-        if m:
-            return m.group(1)
-        m2 = re.search(r"(\{.*\})", text, flags=re.S)
-        return (m2.group(1) if m2 else text).strip()
-
-    def _first_sentence(desc: str) -> str:
-        head = desc.split(".", 1)[0]
-        return head + ("." if not head.endswith(".") else "")
-
-    # ------------------------------------------------------------------ #
-    # 2️⃣  Fetch critique & prompt                                       #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 2) Critique + planner prompt
+    # ──────────────────────────────────────────────────────────────────
     critique_rows = sorted(
-        self.repo.query(lambda c:
-            c.component == "analysis" and c.semantic_label == "plan_critique"
-        ),
+        self.repo.query(lambda c: c.component == "analysis" and c.semantic_label == "plan_critique"),
         key=lambda c: c.timestamp,
     )
     critique_ids = [c.context_id for c in critique_rows]
 
     prompt_rows = sorted(
-        self.repo.query(lambda c:
-            c.component == "artifact" and c.semantic_label == "planning_prompt"
-        ),
+        self.repo.query(lambda c: c.component == "artifact" and c.semantic_label == "planning_prompt"),
         key=lambda c: c.timestamp,
         reverse=True,
     )
-    raw_prompt = (
-        prompt_rows[0].summary
-        if prompt_rows else
-        self._get_prompt("planning_prompt")
-    )
-    first_two = ".".join(raw_prompt.split(".", 2)[:2]) + "."
+    raw_prompt = (prompt_rows[0].summary if prompt_rows else self._get_prompt("planning_prompt"))
+    first_two  = ".".join(raw_prompt.split(".", 2)[:2]) + "."
 
-    # one-line description per tool
     tool_lines = "\n".join(
-        f"- **{t['name']}**: {_first_sentence(t['description'])}"
+        f"- **{t['name']}**: {_first_sentence(t.get('description',''))}"
         for t in tools_list
     ) or "(none)"
+
     base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
-    replan_system = (
-        "Your last plan was invalid—**OUTPUT ONLY** the JSON, no extra text.\n\n"
+    replan_system_base = (
+        "Your last plan may be incomplete—**OUTPUT ONLY** the JSON, no extra text.\n\n"
         f"Available tools:\n{tool_lines}"
     )
 
-    # ------------------------------------------------------------------ #
-    # 3️⃣  Build USER message                                           #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 3) Build USER message to planner
+    # ──────────────────────────────────────────────────────────────────
     original_snips = (know_ctx.summary or "").splitlines()
-    def build_user(snips):
+
+    def build_user(snips: List[str]) -> str:
         blocks = [
             convo_block,
             f"User question:\n{user_text}",
@@ -889,273 +1109,338 @@ def _stage7_planning_summary(
             blocks.append("Previous plan:\n" + state["plan_output_prev"])
         if state.get("draft"):
             blocks.append("Assistant draft:\n" + state["draft"])
-        return "\n\n".join(blocks)
+        return "\n\n".join([b for b in blocks if b])
 
     full_user = build_user(original_snips)
 
-    # ------------------------------------------------------------------ #
-    # 4️⃣  High‐level planning loop                                    #
-    # ------------------------------------------------------------------ #
-    last_calls = None
-    plan_obj   = None
+    # ──────────────────────────────────────────────────────────────────
+    # 4) Planner passes: initial, then schema+hint replan
+    # ──────────────────────────────────────────────────────────────────
+    valid_tool_names = {t["name"] for t in tools_list}
 
-    for attempt in range(1, 4):
-        if attempt == 1:
-            sys_p, user_p, tag = base_system, full_user, "[Planner]"
-        else:
-            keep = max(1, len(original_snips) // (2 ** (attempt - 1)))
-            sys_p, user_p, tag = (
-                replan_system,
-                build_user(original_snips[:keep]),
-                "[PlannerReplan]"
-            )
-
+    def _run_planner(sys_p: str, user_p: str, tag: str) -> dict:
         raw = self._stream_and_capture(
             self.secondary_model,
-            [{"role": "system", "content": sys_p},
-             {"role": "user",   "content": user_p}],
+            [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
             tag=tag,
             images=state.get("images"),
         ).strip()
-        cleaned = _clean_json_block(raw)
 
+        cleaned = _clean_json_block(raw)
         try:
             cand = json.loads(cleaned)
-        except:
+        except Exception:
             cand = None
 
-        # normalize into {"tasks":[...]}
-        if isinstance(cand, dict) and "tasks" in cand and isinstance(cand["tasks"], list):
+        # normalize into {"tasks":[...]} or {"graph":{...}}
+        if isinstance(cand, dict) and ("graph" in cand or "tasks" in cand):
             plan_obj = cand
         elif isinstance(cand, dict) and "tool_calls" in cand:
+            def _name_args(tc):
+                if isinstance(tc, str):
+                    return tc, {}
+                name = (
+                    tc.get("call")
+                    or tc.get("tool_call")
+                    or tc.get("tool")
+                    or tc.get("tool_name")
+                    or tc.get("name")
+                )
+                args = (
+                    tc.get("tool_input")
+                    or tc.get("arguments")
+                    or tc.get("args")
+                    or {}
+                )
+                return name, args
+
             tasks = []
             for tc in cand["tool_calls"]:
-                if isinstance(tc, str):
-                    tasks.append({"call": tc, "tool_input": {}, "subtasks": []})
-                else:
-                    name = tc.get("call") or tc.get("tool_call")
-                    inp  = tc.get("tool_input", {}) or {}
-                    subs = tc.get("subtasks", []) or []
-                    tasks.append({"call": name, "tool_input": inp, "subtasks": subs})
+                name, inp = _name_args(tc)
+                if not name:
+                    continue  # skip nameless entries; avoids None()
+                subs = (tc.get("subtasks") if isinstance(tc, dict) else None) or []
+                tasks.append({"call": name, "tool_input": inp, "subtasks": subs})
             plan_obj = {"tasks": tasks}
         elif isinstance(cand, dict):
             plan_obj = {"tasks": [cand]}
         else:
             calls = re.findall(r"\b[A-Za-z_]\w*\([^)]*\)", cleaned or raw)
-            plan_obj = {"tasks": [
-                {"call": c, "tool_input": {}, "subtasks": []}
-                for c in calls
-            ]}
+            plan_obj = {"tasks": [{"call": c, "tool_input": {}, "subtasks": []} for c in calls]}
 
-        # ensure well-formed
-        if not plan_obj or not isinstance(plan_obj.get("tasks"), list):
-            plan_obj = {"tasks": []}
+        # prune unknown tools immediately (lets us replan cleanly)
+        if isinstance(plan_obj, dict) and isinstance(plan_obj.get("tasks"), list):
+            plan_obj["tasks"] = [t for t in plan_obj["tasks"] if t.get("call") in valid_tool_names]
+        return plan_obj if isinstance(plan_obj, dict) else {"tasks": []}
 
-        valid_names = {t["name"] for t in tools_list}
-        if any(t.get("call") not in valid_names for t in plan_obj["tasks"]):
-            continue
+    # First pass (no schemas)
+    first_plan = _run_planner(base_system, full_user, tag="[Planner]")
 
-        calls_now = [t.get("call") for t in plan_obj["tasks"]]
-        if calls_now == last_calls:
-            continue
-        last_calls = calls_now
-        break
+    # Prepare second pass extras based on *selected* tools from first pass
+    selected_names_1 = _extract_calls(first_plan)
+    selected_names_1 = [n for n in selected_names_1 if n in valid_tool_names]
+    schema_map_all = {t["name"]: (t.get("schema") or {}) for t in tools_list}
+    selected_schema_catalog = {n: schema_map_all.get(n, {}) for n in dict.fromkeys(selected_names_1)}
+    retry_hints_map = _load_retry_hints(selected_names_1)
 
-    # ------------------------------------------------------------------ #
-    # 5️⃣  Refine each chosen tool with its schema                     #
-    # ------------------------------------------------------------------ #
-    schema_map = {t["name"]: t["schema"] for t in tools_list}
+    # Build replan system with schemas + hints (only selected tools)
+    replan_system = replan_system_base
+    if selected_schema_catalog:
+        replan_system += "\n\n[Selected Tool Schemas]\n" + json.dumps(selected_schema_catalog, ensure_ascii=False)
+    if retry_hints_map:
+        # compact, per-tool bullet list
+        lines = []
+        for nm, hints in retry_hints_map.items():
+            for h in hints:
+                lines.append(f"- ({nm}) {h}")
+        replan_system += "\n\n[Retry Hints]\n" + "\n".join(lines[:12])
+
+    # Second pass (schema + hints). Use fewer snippets to make room.
+    half_snips = original_snips[: max(1, len(original_snips)//2)]
+    second_plan = _run_planner(replan_system, build_user(half_snips), tag="[PlannerReplanSchemas]")
+
+    # Choose better of the two: prefer second if valid & non-empty; else fallback
+    plan_obj: dict = second_plan if _is_valid_plan_obj(second_plan) else first_plan
+    if not _is_valid_plan_obj(plan_obj):
+        # one more minimal attempt with aggressive truncation (still includes schemas/hints if any)
+        tiny_snips = original_snips[:1]
+        third_plan = _run_planner(replan_system, build_user(tiny_snips), tag="[PlannerReplanMin]")
+        if _is_valid_plan_obj(third_plan):
+            plan_obj = third_plan
+
+    # ──────────────────────────────────────────────────────────────────
+    # 5) Refine each chosen tool with schema (fill only missing)
+    #    + persist candidate retry-critique records
+    # ──────────────────────────────────────────────────────────────────
+    schema_map = schema_map_all  # already built
 
     def refine_single_tool(task: dict) -> dict:
-        name     = task["call"]
-        schema   = schema_map[name]
-        required = schema["parameters"].get("required", [])
-        props    = schema["parameters"].get("properties", {})
-        schema_json = json.dumps(schema, indent=2)
+        name   = task.get("call")
+        schema = schema_map.get(name, {}) or {}
+        required = (schema.get("parameters", {}) or {}).get("required", []) or []
+        props    = (schema.get("parameters", {}) or {}).get("properties", {}) or {}
 
-        # 5.a) Load any prior fix hints
-        prior_hints = [
-            c.metadata.get("hint")
-            for c in sorted(
-                self.repo.query(lambda c: c.component == "tool_fix" and c.semantic_label == name),
-                key=lambda c: c.timestamp
-            )
-        ]
-
-        # start with the original tool_input from first pass
         refined = {
             "call":       name,
-            "tool_input": dict(task.get("tool_input", {})),
-            "subtasks":   list(task.get("subtasks", []))
+            "tool_input": dict(task.get("tool_input", {}) or {}),
+            "subtasks":   list(task.get("subtasks", []) or []),
         }
-        critic = ""
-        errors = []
 
-        for retry in range(3):
-            missing = [p for p in required if p not in refined["tool_input"]]
-            if missing:
-                errors.append(f"⚠️ Missing required parameters: {missing}")
+        # Only attempt to fix missing requireds (no extra fields invented)
+        missing = [p for p in required if p not in refined["tool_input"]]
+        if not missing or not schema or not name:
+            return refined
 
-            parts = []
-            # inject prior hints
-            if prior_hints:
-                parts.append("Previous successful-fix advice:\n" + "\n".join(prior_hints))
+        prompt = {
+            "description": "Fill only the truly missing required parameters for this tool call. Do not add extra keys.",
+            "missing":     missing,
+            "schema":      schema,
+            "call":        refined,
+            "user_text":   user_text,
+            "clar_notes":  (clar_ctx.metadata.get("notes") or clar_ctx.summary or ""),
+        }
+        out = self._stream_and_capture(
+            self.secondary_model,
+            [
+                {"role": "system", "content": "Return ONLY JSON {\"call\":{...}} with missing params filled. No extra keys."},
+                {"role": "user",   "content": json.dumps(prompt, ensure_ascii=False)}
+            ],
+            tag=f"[PlannerRefine_{name}]",
+            images=state.get("images"),
+        ).strip()
+        filled_now = {}
+        try:
+            cand = json.loads(_clean_json_block(out)).get("call", {})
+            ti   = cand.get("tool_input", {}) or {}
+            # accept only keys that exist in props
+            for k, v in ti.items():
+                if k in props:
+                    refined["tool_input"][k] = v
+                    filled_now[k] = v
+        except Exception:
+            pass
 
-            # seed with original clarifier/user context
-            parts.append(f"Clarified intent: {clar_ctx.metadata.get('notes') or clar_ctx.summary}")
-            parts.append(f"User question: {user_text}")
-            if critic:
-                parts.append(f"💡 Critic: {critic}")
-            if errors:
-                parts.append("=== ERRORS ===\n" + "\n".join(errors))
-
-            parts.extend([
-                "=== CURRENT CALL ===\n```json\n" + json.dumps({"tasks":[refined]}, indent=2) + "\n```",
-                "Output **only** a JSON matching the schema exactly.",
-                "• Drop any args not in schema.",
-                "• Include all required params; do not invent extra keys.",
-                "• Use only these parameters and types:\n"
-                + "\n".join(f"- `{k}`: {props[k]['type']}" for k in props),
-                "=== SCHEMA ===\n```json\n" + schema_json + "\n```",
-            ])
-
-            out = self._stream_and_capture(
-                self.secondary_model,
-                [
-                    {"role": "system", "content": "\n\n".join(parts)},
-                    {"role": "user",   "content": json.dumps({"tasks":[refined]})},
-                ],
-                tag=f"[PlannerRefine_{name}]_retry{retry}",
-                images=state.get("images"),
+        # Persist a candidate retry-critique for this tool if we actually filled anything
+        if filled_now:
+            _persist_retry_candidate(
+                tool_name=name,
+                required=list(required),
+                props=props,
+                filled=filled_now,
+                turn_id=getattr(turn, "turn_id", ""),
+                plan_id=getattr(turn, "plan_id", ""),
             )
-            block = _clean_json_block(out)
-            try:
-                cand = json.loads(block)["tasks"][0]
-                ti = cand.get("tool_input", {}) or {}
-                refined["tool_input"] = {k: ti[k] for k in props if k in ti}
-            except:
-                pass
-
-            # success if no missing
-            if not [p for p in required if p not in refined["tool_input"]]:
-                # — SAVE the critic advice that got us here —
-                if critic:
-                    fix_ctx = ContextObject.make_stage(
-                        "tool_fix",
-                        [],
-                        {"tool_name": name, "hint": critic}
-                    )
-                    fix_ctx.component      = "tool_fix"
-                    fix_ctx.semantic_label = name
-                    fix_ctx.touch()
-                    self.repo.save(fix_ctx)
-                return refined
-
-            critic = self._stream_and_capture(
-                self.secondary_model,
-                [
-                    {"role": "system", "content":
-                        "In one sentence, tell me how to fix this call to match the schema exactly."
-                    },
-                    {"role": "user",   "content":
-                        "SCHEMA:\n" + schema_json + "\n\nCALL:\n" + json.dumps(refined)
-                    },
-                ],
-                tag=f"[ToolCritic_{name}]",
-                images=state.get("images"),
-            ).strip()
 
         return refined
 
-    tasks_in = plan_obj["tasks"]
-    with ThreadPoolExecutor(max_workers=len(tasks_in) or 1) as pool:
-        futures = [pool.submit(refine_single_tool, t) for t in tasks_in]
-        refined = [f.result() for f in as_completed(futures)]
+    tasks_in = plan_obj.get("tasks", [])
+    if isinstance(tasks_in, list) and tasks_in:
+        with ThreadPoolExecutor(max_workers=len(tasks_in) or 1) as pool:
+            futures = [pool.submit(refine_single_tool, t) for t in tasks_in]
+            refined_list = [f.result() for f in as_completed(futures)]
+        # preserve input order
+        call2ref = {t.get("call"): t for t in refined_list if isinstance(t, dict)}
+        plan_obj["tasks"] = [call2ref.get(t.get("call"), t) for t in tasks_in]
+    else:
+        plan_obj["tasks"] = []
 
-    # preserve order
-    order_map = {t["call"]: t for t in refined}
-    plan_obj["tasks"] = [order_map.get(t["call"], t) for t in tasks_in]
+    # ──────────────────────────────────────────────────────────────────
+    # 6) Ensure DAG graph exists; convert tasks → graph if needed
+    # ──────────────────────────────────────────────────────────────────
+    def _flatten_with_edges(task: dict, parent_id: str | None, idx_seed: List[int], acc_nodes: list):
+        """Produce node list with 'after' edges; depth-first numbering."""
+        idx_seed[0] += 1
+        node_id = task.get("id") or f"n{idx_seed[0]}"
+        node = {
+            "id":    node_id,
+            "tool":  task.get("call"),
+            "args":  task.get("tool_input", {}) or {},
+            "after": [parent_id] if parent_id else [],
+        }
+        # Preserve alias/retry/timeout if already in task
+        for k in ("alias", "retries", "timeout_s"):
+            if k in task:
+                node[k] = task[k]
+        acc_nodes.append(node)
+        for sub in (task.get("subtasks") or []):
+            _flatten_with_edges(sub, node_id, idx_seed, acc_nodes)
 
-    # ------------------------------------------------------------------ #
-    # 6️⃣  Flatten → call_strings & record                              #
-    # ------------------------------------------------------------------ #
-    def _flatten(t):
-        out = [t]
-        for s in t.get("subtasks", []):
-            out.extend(_flatten(s))
-        return out
+    if "graph" not in plan_obj:
+        nodes: list = []
+        counter = [0]
+        for t in (plan_obj.get("tasks") or []):
+            if not isinstance(t, dict) or not t.get("call"):
+                continue
+            _flatten_with_edges(t, None, counter, nodes)
 
-    flat = []
-    for t in plan_obj["tasks"]:
-        flat.extend(_flatten(t))
+        # If no explicit dependencies and multiple top-level tasks, chain them
+        if nodes:
+            tops = [n for n in nodes if not n.get("after")]
+            if len(tops) > 1:
+                for i in range(1, len(tops)):
+                    tops[i].setdefault("after", []).append(tops[i-1]["id"])
 
-    call_strings = []
-    for t in flat:
-        ti = t.get("tool_input", {}) or {}
-        if ti:
-            arg_s = ",".join(f"{k}={json.dumps(v)}" for k, v in ti.items())
-            call_strings.append(f"{t['call']}({arg_s})")
-        else:
-            call_strings.append(f"{t['call']}()")
+        plan_obj = {
+            "graph": {
+                "nodes": nodes,
+                "meta": {
+                    "goal": clar_ctx.summary or user_text,
+                    "created_by": "planner",
+                },
+            }
+        }
 
-    state["plan_calls"]  = call_strings
-    state["valid_calls"] = call_strings
-    state["fixed_calls"] = call_strings
+    # Normalize graph + meta defaults (parallelism/retries/timeout)
+    graph = plan_obj.get("graph", {"nodes": [], "meta": {}})
+    graph.setdefault("nodes", [])
+    meta = graph.setdefault("meta", {})
+    # Provide executor hints; executor will honor these if present
+    default_parallelism = int(getattr(turn, "budgets", {}).get("parallelism", 2))
+    meta.setdefault("parallelism", default_parallelism)
+    meta.setdefault("retries", 0)
+    meta.setdefault("timeout_s", 0.0)
 
-    # ------------------------------------------------------------------ #
-    # 7️⃣  Persist artefacts & plan_tracker                            #
-    # ------------------------------------------------------------------ #
-    plan_json = json.dumps(plan_obj, ensure_ascii=False)
-    plan_sig = hashlib.md5(plan_json.encode()).hexdigest()[:8]
+    # Ensure per-node fields and inject implicit deps from placeholders
+    for n in graph["nodes"]:
+        n.setdefault("args", {})
+        n.setdefault("after", [])
+        n.setdefault("retries", meta.get("retries", 0))
+        n.setdefault("timeout_s", meta.get("timeout_s", 0.0))
+        # keep optional 'alias' if present
 
+    _inject_implicit_deps(graph)                # <── NEW
+    errs = _validate_graph(graph, tools_list)   # <── NEW
+    if errs:
+        # Surface to subsequent stages/prompts and persist a small marker
+        state["plan_errors"] = errs
+        err_ctx = ContextObject.make_failure(
+            description="plan graph validation errors",
+            refs=[clar_ctx.context_id, know_ctx.context_id],
+        )
+        err_ctx.summary = "; ".join(errs)
+        _stamp(err_ctx := err_ctx, state)
+        err_ctx.touch(); self.repo.save(err_ctx)
+
+    # Recompute a stable plan signature from the (possibly adjusted) graph
+    plan_json_sorted = json.dumps(graph, ensure_ascii=False, sort_keys=True)
+    plan_sig = hashlib.md5(plan_json_sorted.encode("utf-8")).hexdigest()[:8]
+
+    # ──────────────────────────────────────────────────────────────────
+    # 7) Initialize TurnState for this turn
+    # ──────────────────────────────────────────────────────────────────
+    turn.plan_id         = f"plan_{plan_sig}"
+    turn.graph           = graph
+    turn.completed_nodes = set()
+    turn.pending_nodes   = {n["id"] for n in graph.get("nodes", []) if n.get("id")}
+    turn.tool_ctx_ids    = []
+    # budgets kept from turn.budgets or state override
+
+    # ──────────────────────────────────────────────────────────────────
+    # 8) Persist artefacts & plan_tracker
+    # ──────────────────────────────────────────────────────────────────
+    plan_json_out = json.dumps({"graph": graph}, ensure_ascii=False)
+
+    # Planning summary ctx
     ctx = ContextObject.make_stage(
         "planning_summary",
         clar_ctx.references + know_ctx.references + critique_ids,
-        {"plan": plan_obj, "attempt": attempt, "plan_id": plan_sig},
+        {"graph": graph, "plan_id": turn.plan_id, "turn_id": turn.turn_id},
     )
     ctx.stage_id = f"planning_summary_{plan_sig}"
-    ctx.summary  = plan_json
-    ctx.touch()
-    self.repo.save(ctx)
+    ctx.summary  = plan_json_out
+    ctx.metadata.update({"plan_id": turn.plan_id, "turn_id": turn.turn_id})
+    _stamp(ctx, state)
+    ctx.touch(); self.repo.save(ctx)
 
-    succ_cls  = ContextObject.make_success if call_strings else ContextObject.make_failure
-    succ_msg  = (
-        f"Planner → {len(call_strings)} task(s)"
-        if call_strings else "Planner → empty plan"
+    # Success/failure signal
+    succ_cls = ContextObject.make_success if graph.get("nodes") and not state.get("plan_errors") else ContextObject.make_failure
+    succ_msg = (
+        f"Planner → {len(graph.get('nodes', []))} DAG node(s)"
+        if graph.get("nodes") else "Planner → empty graph"
     )
+    if state.get("plan_errors"):
+        succ_msg += f" (validation errors: {len(state['plan_errors'])})"
     succ = succ_cls(succ_msg, refs=[ctx.context_id])
     succ.stage_id = f"planning_summary_signal_{plan_sig}"
-    succ.touch()
-    self.repo.save(succ)
+    _stamp(succ, state)
+    succ.touch(); self.repo.save(succ)
 
+    # Plan tracker
     tracker = ContextObject.make_stage(
         "plan_tracker",
         [ctx.context_id],
         {
-            "plan_id":     plan_sig,
-            "plan_calls":  call_strings,
-            "total_calls": len(call_strings),
-            "succeeded":   0,
-            "attempts":    0,
-            "status":      "in_progress",
-            "started_at":  datetime.datetime.utcnow().isoformat() + "Z",
+            "plan_id":       turn.plan_id,
+            "turn_id":       turn.turn_id,
+            "total_nodes":   len(graph.get("nodes", [])),
+            "pending_nodes": list(turn.pending_nodes),
+            "completed":     [],
+            "attempts":      0,
+            "status":        "in_progress" if not state.get("plan_errors") else "needs_fix",
+            "started_at":    datetime.datetime.utcnow().isoformat() + "Z",
+            # executor hints copied here for convenience
+            "parallelism":   meta.get("parallelism"),
+            "default_retries": int(meta.get("retries", 0)),
+            "default_timeout_s": float(meta.get("timeout_s", 0.0)),
+            "validation_errors": state.get("plan_errors", []),
         },
     )
     tracker.semantic_label = plan_sig
     tracker.stage_id       = f"plan_tracker_{plan_sig}"
     tracker.summary        = "initialized plan tracker"
-    tracker.touch()
-    self.repo.save(tracker)
+    _stamp(tracker, state)
+    tracker.touch(); self.repo.save(tracker)
 
-    state["plan_ctx"]    = ctx
-    state["plan_output"] = plan_json
-    state["tools_list"]  = tools_list
-    state["tc_ctx"]      = None
+    # ──────────────────────────────────────────────────────────────────
+    # 9) Expose to downstream
+    # ──────────────────────────────────────────────────────────────────
+    state["plan_ctx"]        = ctx
+    state["plan_output"]     = {"graph": graph}  # keep as object for DAG stages
+    state["tools_list"]      = tools_list
+    state["tc_ctx"]          = None
+    state["plan_output_prev"] = json.dumps(first_plan, ensure_ascii=False)  # for diagnostics / reflection
 
-    return ctx, plan_json
-
-
-
+    return ctx, plan_json_out
 
 def _stage7b_plan_validation(
     self,
@@ -1165,254 +1450,437 @@ def _stage7b_plan_validation(
     state: Dict[str, Any]
 ) -> Tuple[List[str], List[Tuple[str, str]], List[str]]:
     """
-    Robust JSON-based plan validation. Keeps original tool_input intact,
-    asks the LLM to fill in only truly missing parameters, and then
-    reconstructs call-strings with full, exact arguments.
+    DAG-aware plan validation & light repair.
 
-    Now *honors* the tools_list you passed in and injects full docstrings
-    for just those tools you actually plan to call.
+    • Accepts either {"graph":{...}} or legacy {"tasks":[...]} and normalizes to a graph.
+    • Injects implicit deps from placeholders like [n1.output.foo] or {{alias}}.
+    • Validates: unique node ids, after-refs exist, acyclic, tool exists.
+    • Checks required parameters against tool schemas; up to 3 LLM repair passes
+      to fill ONLY truly missing required args (preserving everything else).
+    • Persists a 'plan_validation' context with results and errors.
+
+    Returns:
+        (fixed_calls_for_display, errors_by_node, fixed_calls_for_display)
+
+    NOTE: In DAG execution we don't *need* the call strings, but they are useful
+    for UX / audit trails and are consumed by downstream tooling that expects them.
     """
     import json, re, inspect, importlib
 
-    # A) Load all known tool schemas from your repo
-    all_schemas = {
-        json.loads(c.metadata["schema"])["name"]: json.loads(c.metadata["schema"])
-        for c in self.repo.query(
-            lambda c: c.component == "schema" and "tool_schema" in c.tags
-        )
-    }
+    from context import ContextObject
+    from tools import Tools
 
-    # B) Parse the planner’s JSON output
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────
+    def _clean_json_block(text: str) -> str:
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", flags=re.S)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
+        return (m2.group(1) if m2 else (text or "")).strip()
+
+    def _flatten_with_edges(task: dict, parent_id: str | None, idx_seed: list[int], acc_nodes: list):
+        idx_seed[0] += 1
+        node_id = task.get("id") or f"n{idx_seed[0]}"
+        node = {
+            "id":    node_id,
+            "tool":  task.get("call"),
+            "args":  task.get("tool_input", {}) or {},
+            "after": [parent_id] if parent_id else [],
+        }
+        for k in ("alias", "retries", "timeout_s"):
+            if k in task:
+                node[k] = task[k]
+        acc_nodes.append(node)
+        for sub in task.get("subtasks", []) or []:
+            _flatten_with_edges(sub, node_id, idx_seed, acc_nodes)
+
+    # prefer class-level helpers if present (as recommended), else local fallbacks
+    _validator = getattr(self, "_validate_graph", None)
+    _injector  = getattr(self, "_inject_implicit_deps", None)
+
+    def _validate_graph_local(graph: dict, tools_list: list[dict]) -> list[str]:
+        from collections import deque, defaultdict
+        errs = []
+        nodes = graph.get("nodes") or []
+        ids = [n.get("id") for n in nodes if n.get("id")]
+        if len(ids) != len(set(ids)):
+            errs.append("duplicate node ids")
+        idset = set(ids)
+        for n in nodes:
+            for dep in (n.get("after") or []):
+                if dep not in idset:
+                    errs.append(f"node {n.get('id')} after-> {dep} missing")
+        known = {t["name"] for t in tools_list}
+        for n in nodes:
+            if n.get("tool") not in known:
+                errs.append(f"unknown tool '{n.get('tool')}' in node {n.get('id')}")
+        indeg = defaultdict(int); g = defaultdict(list)
+        for n in nodes:
+            for dep in (n.get("after") or []):
+                g[dep].append(n["id"]); indeg[n["id"]] += 1
+        q = deque([i for i in ids if indeg[i]==0]); seen = 0
+        while q:
+            u = q.popleft(); seen += 1
+            for v in g[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0: q.append(v)
+        if seen != len(ids):
+            errs.append("cycle detected")
+        return errs
+
+    _PL_RE = re.compile(r"\[([A-Za-z0-9_-]+)\.output(?:\.([A-Za-z0-9_.-]+))?\]|\{\{([A-Za-z0-9_-]+)\}\}")
+    def _inject_implicit_deps_local(graph: dict) -> None:
+        nodes = graph.get("nodes") or []
+        idset = {n["id"] for n in nodes if n.get("id")}
+        alias2id = {(n.get("alias") or n["id"]): n["id"] for n in nodes if n.get("id")}
+        for n in nodes:
+            for _, v in (n.get("args") or {}).items():
+                s = v if isinstance(v, str) else None
+                if not s: continue
+                for m in _PL_RE.finditer(s):
+                    ref = m.group(1) or m.group(3)
+                    target = alias2id.get(ref) or (ref if ref in idset else None)
+                    if target and target != n["id"]:
+                        n.setdefault("after", [])
+                        if target not in n["after"]:
+                            n["after"].append(target)
+
+    def _ensure_graph(plan_any: str | dict) -> dict:
+        """Return {'graph': {'nodes': [...], 'meta': {...}}} from various shapes."""
+        plan_obj: dict = {}
+        if isinstance(plan_any, dict):
+            plan_obj = plan_any
+        else:
+            try:
+                plan_obj = json.loads(_clean_json_block(plan_any))
+            except Exception:
+                plan_obj = {}
+
+        # Already a graph
+        if "graph" in plan_obj and isinstance(plan_obj["graph"], dict):
+            g = plan_obj["graph"]
+            g.setdefault("nodes", []); g.setdefault("meta", {})
+            for n in g["nodes"]:
+                n.setdefault("args", {}); n.setdefault("after", [])
+            return {"graph": g}
+
+        # Helper to convert a single call object to a task dict
+        def _to_task(tc: dict | str) -> dict:
+            if isinstance(tc, str):
+                return {"call": tc, "tool_input": {}, "subtasks": []}
+            name = (
+                tc.get("call")
+                or tc.get("tool_call")
+                or tc.get("tool")
+                or tc.get("tool_name")
+                or tc.get("name")
+            )
+            args = (
+                tc.get("tool_input")
+                or tc.get("arguments")
+                or tc.get("args")
+                or {}
+            )
+            subs = tc.get("subtasks", []) or []
+            return {"call": name, "tool_input": args, "subtasks": subs}
+
+        # Accept legacy shapes
+        tasks = []
+        if isinstance(plan_obj.get("tasks"), list):
+            tasks = [ _to_task(t) for t in plan_obj["tasks"] ]
+        elif isinstance(plan_obj.get("tool_calls"), list):
+            tasks = [ _to_task(t) for t in plan_obj["tool_calls"] ]
+
+        # Flatten tasks -> nodes (depth-first), chaining top-level if needed
+        def _flatten_with_edges(task: dict, parent_id: str | None, idx_seed: list[int], acc_nodes: list):
+            idx_seed[0] += 1
+            node_id = task.get("id") or f"n{idx_seed[0]}"
+            node = {
+                "id":    node_id,
+                "tool":  task.get("call"),
+                "args":  task.get("tool_input", {}) or {},
+                "after": [parent_id] if parent_id else [],
+            }
+            for k in ("alias", "retries", "timeout_s"):
+                if k in task:
+                    node[k] = task[k]
+            acc_nodes.append(node)
+            for sub in task.get("subtasks", []) or []:
+                _flatten_with_edges(sub, node_id, idx_seed, acc_nodes)
+
+        nodes: list[dict] = []
+        counter = [0]
+        for t in tasks or []:
+            # Skip nameless tasks (prevents None())
+            if not t.get("call"):
+                continue
+            _flatten_with_edges(t, None, counter, nodes)
+
+        # If multiple roots without deps, chain to preserve order
+        tops = [n for n in nodes if not n.get("after")]
+        if len(tops) > 1:
+            for i in range(1, len(tops)):
+                tops[i].setdefault("after", []).append(tops[i-1]["id"])
+
+        return {"graph": {"nodes": nodes, "meta": plan_obj.get("meta", {}) or {}}}
+
+    # ──────────────────────────────────────────────────────────────────
+    # 1) Normalize plan → graph
+    # ──────────────────────────────────────────────────────────────────
+    plan_norm = _ensure_graph(plan_output)
+    graph     = plan_norm["graph"]
+    graph.setdefault("meta", {})
+    graph["meta"].setdefault("retries", 0)
+    graph["meta"].setdefault("timeout_s", 0.0)
+
+    # Ensure node defaults
+    for n in graph.get("nodes", []):
+        n.setdefault("args", {})
+        n.setdefault("after", [])
+        n.setdefault("retries", graph["meta"].get("retries", 0))
+        n.setdefault("timeout_s", graph["meta"].get("timeout_s", 0.0))
+
+    # Inject implicit deps then validate
+    (_injector or _inject_implicit_deps_local)(graph)
+    errs = (_validator or _validate_graph_local)(graph, tools_list)
+    state["plan_errors"] = errs[:]  # copy
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2) Schema collection and docstring enrichment
+    # ──────────────────────────────────────────────────────────────────
+    # Load all known tool schemas from repo
     try:
-        plan_obj = json.loads(plan_output)
-        tasks    = plan_obj.get("tasks", [])
+        all_schema_ctxs = {
+            json.loads(c.metadata["schema"])["name"]: c
+            for c in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in (c.tags or []))
+        }
+        all_schemas = {k: json.loads(v.metadata["schema"]) for k, v in all_schema_ctxs.items()}
     except Exception:
-        raise RuntimeError("Planner output was not valid JSON; cannot validate tool_input parameters")
+        all_schema_ctxs, all_schemas = {}, {}
 
-    # C) Figure out which tools the plan actually calls
-    selected_calls = [t.get("call") for t in tasks if isinstance(t.get("call"), str)]
-    available     = {t["name"] for t in tools_list}
-    selected      = [name for name in selected_calls if name in available]
+    # Only for tools used in this graph
+    used_tools = sorted({n.get("tool") for n in graph.get("nodes", []) if n.get("tool")})
+    schemas_for_prompt = {name: all_schemas[name] for name in used_tools if name in all_schemas}
 
-    # D) Build a filtered schema map for *just* those selected tools
-    schemas_for_prompt = {
-        name: all_schemas[name]
-        for name in selected
-        if name in all_schemas
-    }
-
-    # E) Inject full docstring into each filtered schema
+    # Enrich description with full docstrings where available
     for name, schema in schemas_for_prompt.items():
         doc = None
-        # 1) try Tools.<name>
         if hasattr(Tools, name):
             doc = inspect.getdoc(getattr(Tools, name))
         else:
-            # 2) try top-level tools module
             try:
                 mod = importlib.import_module("tools")
                 if hasattr(mod, name):
                     doc = inspect.getdoc(getattr(mod, name))
             except ImportError:
                 pass
-
         if doc:
-            schema["description"] = doc  # overwrite truncated desc
+            schema["description"] = doc
 
-    # F) Up to 3 repair passes: fill any missing required params
-    missing = {}
-    for _ in range(3):
-        missing.clear()
-        for idx, task in enumerate(tasks):
-            name       = task.get("call")
-            schema     = schemas_for_prompt.get(name)
-            tool_input = task.get("tool_input", {}) or {}
+    # ──────────────────────────────────────────────────────────────────
+    # 3) Up to 3 repair passes for missing required args per node
+    # ──────────────────────────────────────────────────────────────────
+    missing_by_node: dict[str, list[str]] = {}
+
+    def _scan_missing():
+        missing_by_node.clear()
+        for n in graph.get("nodes", []):
+            name = n.get("tool"); schema = schemas_for_prompt.get(name)
             if not schema:
                 continue
-            required = set(schema["parameters"].get("required", []))
-            found    = set(tool_input.keys())
-            miss     = list(required - found)
+            req = set(schema.get("parameters", {}).get("required", []) or [])
+            found = set((n.get("args") or {}).keys())
+            miss = list(req - found)
             if miss:
-                missing[idx] = miss
+                missing_by_node[n["id"]] = sorted(miss)
 
-        if not missing:
+    _scan_missing()
+    for _ in range(3):
+        if not missing_by_node:
             break
-
         prompt = {
-            "description": "Some tool calls are missing required arguments.",
-            "missing":     missing,
-            "plan":        plan_obj,
-            "schemas":     schemas_for_prompt
+            "description": "Some DAG nodes are missing required tool parameters. "
+                           "Fill only the truly missing keys in each node's args. Do NOT invent extra keys.",
+            "missing_by_node": missing_by_node,
+            "graph": graph,
+            "schemas": schemas_for_prompt,
         }
-        repair = self._stream_and_capture(
+        repair_raw = self._stream_and_capture(
             self.secondary_model,
             [
-                {"role": "system", "content":
-                    "Return ONLY a JSON {'tasks':[...]} with each task’s tool_input now complete."},
-                {"role": "user",   "content": json.dumps(prompt)},
+                {"role":"system","content": "Return ONLY JSON in one of these forms:\n"
+                                            "1) {\"graph\": {\"nodes\":[...]}}\n"
+                                            "2) {\"nodes\":[...]}\n"
+                                            "3) {\"repairs\": {\"<node_id>\": {\"key\": <value>, ...}, ...}}"},
+                {"role":"user","content": json.dumps(prompt, ensure_ascii=False)}
             ],
-            tag="[PlanFix]",
+            tag="[PlanFix_DAG]",
             images=state.get("images", None)
         ).strip()
 
+        # Accept several shapes
+        applied = False
         try:
-            plan_obj = json.loads(repair)
-            tasks    = plan_obj.get("tasks", [])
+            rj = json.loads(_clean_json_block(repair_raw))
+            if isinstance(rj, dict):
+                if "graph" in rj and isinstance(rj["graph"], dict) and isinstance(rj["graph"].get("nodes"), list):
+                    # adopt full nodes (preserve meta)
+                    graph["nodes"] = rj["graph"]["nodes"]
+                    applied = True
+                elif "nodes" in rj and isinstance(rj["nodes"], list):
+                    graph["nodes"] = rj["nodes"]
+                    applied = True
+                elif "repairs" in rj and isinstance(rj["repairs"], dict):
+                    nid2node = {n["id"]: n for n in graph.get("nodes", []) if n.get("id")}
+                    for nid, patch in rj["repairs"].items():
+                        if nid in nid2node and isinstance(patch, dict):
+                            nid2node[nid].setdefault("args", {}).update(patch)
+                    applied = True
         except Exception:
+            applied = False
+
+        if applied:
+            # Re-ensure defaults and implicit deps after repair
+            for n in graph.get("nodes", []):
+                n.setdefault("args", {})
+                n.setdefault("after", [])
+                n.setdefault("retries", graph["meta"].get("retries", 0))
+                n.setdefault("timeout_s", graph["meta"].get("timeout_s", 0.0))
+            (_injector or _inject_implicit_deps_local)(graph)
+            _scan_missing()
+        else:
             break
 
-    # G) Re-serialize every task into a real call string
-    fixed_calls = []
-    for task in tasks:
-        name = task["call"].split("(", 1)[0]            # strip if planner already added ()
-        ti   = task.get("tool_input", {}) or {}
-        if ti:
-            args = ",".join(
-                f'{k}={json.dumps(v, ensure_ascii=False)}' for k, v in ti.items()
-            )
-            fixed_calls.append(f"{name}({args})")
-        else:
-            fixed_calls.append(f"{name}()")
+    # Merge validation errors with any remaining missing args
+    err_pairs: list[Tuple[str, str]] = []
+    for e in errs:
+        err_pairs.append(("graph", e))
+    for nid, miss in missing_by_node.items():
+        err_pairs.append((nid, f"missing required: {', '.join(miss)}"))
 
+    # ──────────────────────────────────────────────────────────────────
+    # 4) Build display call-strings (for audit / confirmation UI)
+    # ──────────────────────────────────────────────────────────────────
+    def _json_args(args: dict) -> str:
+        if not args:
+            return ""
+        return ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in args.items())
 
-    # H) Persist the validation step
+    fixed_calls: list[str] = []
+    for n in graph.get("nodes", []):
+        name = (n.get("tool") or "").split("(", 1)[0]
+        arg_s = _json_args(n.get("args", {}))
+        fixed_calls.append(f"{name}({arg_s})" if arg_s else f"{name}()")
+
+    # ──────────────────────────────────────────────────────────────────
+    # 5) Persist validation context
+    # ──────────────────────────────────────────────────────────────────
     meta = {
-        "valid":       fixed_calls,
-        "errors":      [],  
-        "fixed_calls": fixed_calls
+        "valid_calls": fixed_calls,
+        "errors": err_pairs,
+        "graph_nodes": len(graph.get("nodes", [])),
+        "repaired_nodes": [nid for nid, _ in err_pairs if nid != "graph"],  # nodes still with issues will appear here
+        "missing_by_node": missing_by_node,
     }
     pv_ctx = ContextObject.make_stage("plan_validation", plan_ctx.references, meta)
     pv_ctx.stage_id = "plan_validation"
-    pv_ctx.summary  = "OK" if not missing else f"Repaired {len(missing)} task(s)"
-    #pv_ctx.touch(); self.repo.save(pv_ctx)
+    pv_ctx.summary  = "OK" if not err_pairs else f"Issues: {len(err_pairs)}"
     self._persist_and_index([pv_ctx])
     self._print_stage_context("plan_validation", meta)
 
-    return fixed_calls, [], fixed_calls
+    # Expose (possibly updated) normalized plan to downstream as text
+    state["plan_output"] = {"graph": graph}
+
+    return fixed_calls, err_pairs, fixed_calls
+
 
 def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
-    plan_output: str,
+    plan_output: str | dict,
     tools_list: List[Dict[str, Any]],
     state: Dict[str, Any],
     *,
     on_token: Callable[[str], None] | None = None,
 ) -> Tuple[ContextObject, List[str], List[ContextObject]]:
     """
-    1) Parse the plan JSON into call-strings.
-    2) Substitute any tool-output placeholders from `state["last_tool_outputs"]`.
-    3) Validate against known schemas.
-    4) Emit a ContextObject ("tool_chaining") that records the final list.
+    DAG-aware tool chaining summary.
+
+    • If a DAG graph is present, we emit a *display* list of call-strings in node order
+      (no placeholder substitution here; executor resolves at runtime).
+    • Collect and return the schema ContextObjects for the referenced tools.
+    • Persist a 'tool_chaining' context with the final list.
     """
-    import json, re
+    import json
     from context import ContextObject
-    from tools import Tools
 
-    # Ensure Tools.repo is set
-    Tools.repo = self.repo
+    # Normalize plan → graph
+    def _clean_json_block(text: str) -> str:
+        import re
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", flags=re.S)
+        if m: return m.group(1)
+        m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
+        return (m2.group(1) if m2 else (text or "")).strip()
 
-    # Load schemas once
-    try:
-        all_schemas = {
-            json.loads(c.metadata["schema"])["name"]: c
-            for c in self.repo.query(
-                lambda c: c.component == "schema" and "tool_schema" in c.tags
-            )
-        }
-    except Exception:
-        all_schemas = {}
+    if isinstance(plan_output, str):
+        try:
+            plan = json.loads(_clean_json_block(plan_output))
+        except Exception:
+            plan = {}
+    else:
+        plan = plan_output or {}
 
-    # Step A: Extract raw call objects from JSON plan
+    graph = plan.get("graph")
     calls: List[str] = []
-    try:
-        plan = json.loads(plan_output)
-        def _collect(tasks):
-            out = []
-            for t in tasks or []:
-                out.append(t)
-                out.extend(_collect(t.get("subtasks", [])))
-            return out
 
-        for t in _collect(plan.get("tasks", [])):
-            name = t.get("call", "")
-            if not name:
-                continue
-            # JSON-encode any arguments
+    if isinstance(graph, dict) and isinstance(graph.get("nodes"), list):
+        nodes = graph["nodes"]
+        def _json_args(args: dict) -> str:
+            if not args: return ""
+            return ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in args.items())
+        for n in nodes:
+            name = (n.get("tool") or "").split("(", 1)[0]
+            arg_s = _json_args(n.get("args", {}))
+            calls.append(f"{name}({arg_s})" if arg_s else f"{name}()")
+    else:
+        # Legacy fallback: try to render tasks
+        tasks = (plan.get("tasks") or []) if isinstance(plan.get("tasks"), list) else []
+        for t in tasks:
+            name = t.get("call") or ""
             kwargs = t.get("tool_input", {}) or {}
             if kwargs:
-                arg_s = ",".join(
-                    f"{k}={json.dumps(v, ensure_ascii=False)}"
-                    for k,v in kwargs.items()
-                )
+                arg_s = ",".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in kwargs.items())
                 calls.append(f"{name}({arg_s})")
             else:
                 calls.append(f"{name}()")
+
+    # Collect schema ctxs for referenced tools
+    try:
+        all_schema_ctxs = {
+            json.loads(c.metadata["schema"])["name"]: c
+            for c in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in (c.tags or []))
+        }
     except Exception:
-        # Fallback regex
-        salvage = set()
-        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(([^)]*)\)", plan_output or ""):
-            fn, raw = m.group(1), m.group(2).strip()
-            salvage.add(f"{fn}({raw})" if raw else f"{fn}()")
-        calls = sorted(salvage)
+        all_schema_ctxs = {}
 
-    # Dedupe
-    calls = list(dict.fromkeys(calls))
+    tool_names = [c.split("(", 1)[0] for c in calls]
+    selected_schemas = [all_schema_ctxs[n] for n in tool_names if n in all_schema_ctxs]
 
-    # Step B: Placeholder substitution
-    # state["last_tool_outputs"] is a dict: { "tool_name": <python obj> }
-    last_out = state.get("last_tool_outputs", {})
-    def _substitute( call_str: str ) -> str:
-        # matches [tool.method.output] or {{tool}}
-        def _replace(match):
-            key = match.group(1) or match.group(2)
-            val = last_out.get(key)
-            return json.dumps(val, ensure_ascii=False) if val is not None else match.group(0)
-        # square bracket style
-        call_str = re.sub(r"\[([A-Za-z_]\w*)\.output\]", _replace, call_str)
-        # moustache style
-        call_str = re.sub(r"\{\{([A-Za-z_]\w*)\}\}", _replace, call_str)
-        return call_str
-
-    calls = [_substitute(c) for c in calls]
-
-    # Step C: Schema validation / repair loop
-    broken = []
-    final_calls = []
-    for call_str in calls:
-        tool_name = call_str.split("(",1)[0]
-        schema_ctx = all_schemas.get(tool_name)
-        if not schema_ctx:
-            # unknown tool → drop it & record error
-            broken.append(f"Unknown tool `{tool_name}`")
-            continue
-        final_calls.append(call_str)
-
-    # If anything broke, bubble it up
-    if broken:
-        raise RuntimeError(f"Tool chaining failed: {broken}")
-
-    # Step D: Pick schema ContextObjects
-    selected_schemas = []
-    for c in final_calls:
-        nm = c.split("(",1)[0]
-        ctx = all_schemas.get(nm)
-        if ctx:
-            selected_schemas.append(ctx)
-
-    # Step E: Save the stage context
+    # Persist summary
     ctx_refs = plan_ctx.references + [s.context_id for s in selected_schemas]
     tc_ctx = ContextObject.make_stage(
         "tool_chaining",
         ctx_refs,
-        {"tool_calls": final_calls}
+        {"tool_calls": calls}
     )
     tc_ctx.stage_id = "tool_chaining"
-    tc_ctx.summary  = json.dumps(final_calls, ensure_ascii=False)
-    tc_ctx.touch()
-    self.repo.save(tc_ctx)
+    tc_ctx.summary  = json.dumps(calls, ensure_ascii=False)
+    tc_ctx.touch(); self.repo.save(tc_ctx)
 
-    return tc_ctx, final_calls, selected_schemas
+    return tc_ctx, calls, selected_schemas
+
 
 def _stage8_5_user_confirmation(
     self,
@@ -1420,43 +1888,32 @@ def _stage8_5_user_confirmation(
     user_text: str
 ) -> list[str]:
     """
-    Surface the to-be-invoked calls for user approval.
-    Auto-converts ANY function-call object Gemma might emit into the
-    canonical string form `tool_name(arg1=...,arg2=...)`.
+    Surface the to-be-invoked calls for user approval (DAG-friendly).
+
+    • Accepts strings or function-call dicts and renders `tool(arg=...)`.
+    • For DAGs, this list is informational; the executor schedules by dependencies.
     """
     import json
 
     def _obj2str(item) -> str:
-        # Gemma-style or OpenAI function_call object
         if isinstance(item, dict):
             name = item.get("name") or item.get("tool_name") or item.get("call")
             if not name:
                 return str(item).strip()
-
-            # accept either "arguments" or "parameters"
             args_blob = item.get("arguments", item.get("parameters", {})) or {}
             if isinstance(args_blob, dict) and args_blob:
-                arg_str = ",".join(
-                    f'{k}={json.dumps(v, ensure_ascii=False)}'
-                    for k, v in args_blob.items()
-                )
+                arg_str = ",".join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k, v in args_blob.items())
                 return f"{name}({arg_str})"
             return f"{name}()"
-
-        # already a string
         return str(item).strip()
 
-    confirmed: list[str] = [_obj2str(c) for c in calls]
+    confirmed = [_obj2str(c) for c in calls]
 
-    # diagnostics
     self._print_stage_context("user_confirmation", {"calls": confirmed})
 
-    ctx = ContextObject.make_stage(
-        "user_confirmation", [], {"confirmed_calls": confirmed}
-    )
+    ctx = ContextObject.make_stage("user_confirmation", [], {"confirmed_calls": confirmed})
     ctx.stage_id = "user_confirmation"
     ctx.summary  = f"Auto-approved: {confirmed}"
-    #ctx.touch(); self.repo.save(ctx)
     self._persist_and_index([ctx])
 
     return confirmed
@@ -1472,96 +1929,339 @@ def _stage9b_reflection_and_replan(
     max_tokens: int = 128000
 ) -> Optional[str]:
     """
-    Reflect on the full context (user question, clarifier notes/keywords,
-    **all** tool outputs, original plan).  If everything satisfied the intent,
-    return None; otherwise return only the corrected JSON plan.
+    DAG-aware reflection & replan.
+
+    Reviews:
+      • user question + clarifier notes/keywords
+      • current DAG graph and tracker status (completed/pending/ready/errors)
+      • all tool outputs from this turn
+
+    Behavior:
+      • If intent is satisfied (and DAG effectively complete) → returns None (and writes a success marker).
+      • Otherwise prompts the model to return ONLY a corrected plan.
+        - Prefers {"graph": {"nodes":[...], "meta":{...}}}
+        - Accepts {"tasks":[...]} and converts it to a graph.
+      • Persists a 'reflection_and_replan' context with old/new graphs and deltas.
+      • Updates TurnState (graph, plan_id, pending/completed) if a new plan is produced.
     """
-    import json, re
+    import json, re, hashlib, datetime
+    from typing import Any, Dict
 
-    # 1) Gather clarifier info
-    clar_notes = clar_metadata.get("notes", "")
-    clar_keywords = clar_metadata.get("keywords", [])
+    # ----------------------------- helpers -----------------------------
 
-    # 2) Build the full context blob
+    def _clean_json_block(text: str) -> str:
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(\{.*\})", text, flags=re.S)
+        return (m2.group(1) if m2 else (text or "")).strip()
+
+    def _pretty(obj: Any) -> str:
+        try:
+            return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return repr(obj)
+
+    def _sig_from_graph(graph: Dict[str, Any]) -> str:
+        try:
+            s = json.dumps(graph or {}, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            s = str(graph)
+        return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+
+    def _flatten_with_edges(task: dict, parent_id: str | None, idx_seed: list[int], acc_nodes: list):
+        """Convert nested tasks → flat nodes with 'after' edges (depth-first)."""
+        idx_seed[0] += 1
+        node_id = task.get("id") or f"n{idx_seed[0]}"
+        node = {
+            "id":    node_id,
+            "tool":  task.get("call"),
+            "args":  task.get("tool_input", {}) or {},
+            "after": [parent_id] if parent_id else [],
+        }
+        acc_nodes.append(node)
+        for sub in task.get("subtasks", []) or []:
+            _flatten_with_edges(sub, node_id, idx_seed, acc_nodes)
+
+    def _ensure_graph(plan_any: Any) -> Dict[str, Any]:
+        """Normalize an input plan (dict/str) to {'graph': {...}} with nodes/meta."""
+        plan_obj: Dict[str, Any] = {}
+        if isinstance(plan_any, dict):
+            plan_obj = plan_any
+        elif isinstance(plan_any, str) and plan_any.strip():
+            try:
+                plan_obj = json.loads(_clean_json_block(plan_any))
+            except Exception:
+                plan_obj = {}
+        else:
+            plan_obj = {}
+
+        if "graph" in plan_obj and isinstance(plan_obj["graph"], dict):
+            g = plan_obj["graph"]
+            g.setdefault("nodes", [])
+            g.setdefault("meta", {})
+            return {"graph": g}
+
+        # fallback from tasks → graph
+        tasks = plan_obj.get("tasks", []) if isinstance(plan_obj.get("tasks"), list) else []
+        nodes: list[dict] = []
+        counter = [0]
+        for t in tasks:
+            _flatten_with_edges(t, None, counter, nodes)
+
+        # if multiple top-level nodes have no deps, chain them in order
+        tops = [n for n in nodes if not n.get("after")]
+        if len(tops) > 1:
+            for i in range(1, len(tops)):
+                tops[i].setdefault("after", []).append(tops[i-1]["id"])
+
+        return {"graph": {"nodes": nodes, "meta": plan_obj.get("meta", {}) or {}}}
+
+    def _deps_satisfied(node: dict, completed: set[str]) -> bool:
+        return all((dep in completed) for dep in (node.get("after") or []))
+
+    # ----------------------- gather current state ----------------------
+
+    turn = _ensure_turn_state(state)  # provides .turn_id, .plan_id, .graph, .pending_nodes, .completed_nodes
+
+    # Current (old) plan normalization → graph
+    old_plan_norm = _ensure_graph(plan_output)
+    old_graph     = old_plan_norm["graph"]
+    old_sig       = _sig_from_graph(old_graph)
+
+    # Pull tracker to summarize run status (fallback to TurnState)
+    tracker = next(
+        (c for c in self.repo.query(
+            lambda c: c.component == "plan_tracker" and (
+                c.metadata.get("plan_id") == getattr(turn, "plan_id", None)
+                or c.semantic_label == old_sig
+            )
+        )), None
+    )
+
+    completed_nodes: set[str] = set()
+    pending_nodes: set[str]   = set()
+    errors_by_node: Dict[str, str] = {}
+
+    if tracker:
+        completed_nodes = set(tracker.metadata.get("completed", []) or [])
+        pending_nodes   = set(tracker.metadata.get("pending_nodes", []) or [])
+        errors_by_node  = dict(tracker.metadata.get("errors_by_node", {}) or {})
+    else:
+        # fallback to TurnState
+        completed_nodes = set(getattr(turn, "completed_nodes", set()) or set())
+        pending_nodes   = set(getattr(turn, "pending_nodes", set()) or set())
+
+    # Compute ready nodes from old_graph + completed
+    id_to_node = {n.get("id"): n for n in (old_graph.get("nodes") or []) if n.get("id")}
+    ready_nodes = [
+        nid for nid, n in id_to_node.items()
+        if (nid in pending_nodes) and _deps_satisfied(n, completed_nodes)
+    ]
+
+    # -------------------- build reflection context ---------------------
+
+    clar_notes = (clar_metadata or {}).get("notes", "")
+    clar_keywords = (clar_metadata or {}).get("keywords", [])
+
     parts = [
+        f"=== TURN ===\nturn_id={getattr(turn,'turn_id','')}\nplan_id={getattr(turn,'plan_id','')}",
         f"=== USER QUESTION ===\n{user_text}",
-        f"=== CLARIFIER NOTES ===\n{clar_notes}"
+        f"=== CLARIFIER NOTES ===\n{clar_notes or '(none)'}"
     ]
     if clar_keywords:
         parts.append(f"=== CLARIFIER KEYWORDS ===\n{', '.join(clar_keywords)}")
 
-    # 3) Append every single tool output, unfiltered
+    # Execution status summary
+    status_summary = {
+        "nodes_total":   len(old_graph.get("nodes", [])),
+        "completed":     sorted(list(completed_nodes)),
+        "pending":       sorted(list(pending_nodes)),
+        "ready_now":     sorted(list(ready_nodes)),
+        "errors_by_node": errors_by_node,
+    }
+    parts.append("=== EXECUTION STATUS (CURRENT DAG) ===\n" + _pretty(status_summary))
+
+    # Append tool outputs from this turn (verbatim/short)
     for c in tool_ctxs:
         payload = c.metadata.get("output_short") or c.metadata.get("output_full")
-
         try:
             blob = json.dumps(payload, indent=2, ensure_ascii=False)
         except Exception:
             blob = repr(payload)
-        parts.append(f"=== TOOL OUTPUT [{c.stage_id}] ===\n{blob}")
+        nid  = c.metadata.get("node_id") or "?"
+        tnm  = c.metadata.get("tool_name") or "tool"
+        parts.append(f"=== TOOL OUTPUT [node={nid} tool={tnm}] ===\n{blob}")
 
-    # 4) Finally, the original plan
-    parts.append(f"=== ORIGINAL PLAN ===\n{plan_output}")
+    # Original plan (graph) at the end
+    parts.append("=== ORIGINAL PLAN (GRAPH) ===\n" + _pretty(old_graph))
 
     context_blob = "\n\n".join(parts)
 
-    # 5) Reflection prompt
+    # ------------------------- reflection prompt -----------------------
+
     system_msg = self._get_prompt("reflection_prompt")
-    user_payload = (
-        context_blob
-        + "\n\nDid these tool outputs satisfy the original intent? "
-            "If yes, reply OK.  If not, return only the corrected JSON plan."
+    # Clear instruction that we prefer a graph and the exact formats allowed.
+    instruction = (
+        "\n\nDid these tool outputs satisfy the user's intent and complete the needed steps?\n"
+        "• If YES, reply exactly: OK\n"
+        "• If NO, return ONLY a corrected plan in one of the following formats (prefer the first):\n"
+        "  1) {\"graph\": {\"nodes\": [{\"id\": \"n1\", \"tool\": \"name\", \"args\": {...}, \"after\": [\"n0\", ...]}, ...], \"meta\": {...}}}\n"
+        "     - Keep stable node ids when a node is retained; update 'after' where dependencies change.\n"
+        "     - You may add/remove/update nodes or args. Placeholders allowed: \"[<node_id>.output]\" or \"{{alias}}\".\n"
+        "  2) {\"tasks\": [{\"call\":\"tool\",\"tool_input\":{...},\"subtasks\":[...]}, ...]}\n"
+        "     - If you return tasks, they will be converted to a DAG automatically.\n"
+        "Return ONLY JSON for a new plan or the single token OK."
     )
+    user_payload = context_blob + instruction
 
     msgs = [
         {"role": "system", "content": system_msg},
         {"role": "user",   "content": user_payload},
     ]
-    resp = self._stream_and_capture(self.secondary_model, msgs, tag="[Reflection]").strip()
+    resp_raw = self._stream_and_capture(self.secondary_model, msgs, tag="[Reflection]").strip()
 
-    # ── NEW GUARD: identical-equals treat as OK
-    try:
-        new_plan = json.loads(resp)
-        old_plan = json.loads(plan_output)
-        if new_plan == old_plan:
-            ok_ctx = ContextObject.make_success(
-                description="Reflection confirmed plan (identical echo)",
-                refs=[c.context_id for c in tool_ctxs]
-            )
-            #ok_ctx.touch(); self.repo.save(ok_ctx)
-            self._persist_and_index([ok_ctx])
-            return None
-    except:
-        pass
+    # --------------------- success short-circuit -----------------------
 
-    # ── If literally "OK", keep original
-    if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp):
+    # Literal OK → no changes
+    if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp_raw):
         ok_ctx = ContextObject.make_success(
             description="Reflection confirmed plan satisfied intent",
             refs=[c.context_id for c in tool_ctxs]
         )
-        #ok_ctx.touch(); self.repo.save(ok_ctx)
         self._persist_and_index([ok_ctx])
         return None
 
-    # ── Else record replan
-    fail_ctx = ContextObject.make_failure(
-        description="Reflection triggered replan",
-        refs=[c.context_id for c in tool_ctxs]
-    )
-    #fail_ctx.touch(); self.repo.save(fail_ctx)
-    self._persist_and_index([fail_ctx])
+    # ------------------ parse/normalize returned plan ------------------
+
+    def _normalize_returned(resp_text: str) -> Dict[str, Any] | None:
+        try:
+            cand = json.loads(_clean_json_block(resp_text))
+        except Exception:
+            return None
+        if not isinstance(cand, dict):
+            return None
+        if "graph" in cand:
+            g = cand["graph"]
+            if isinstance(g, dict):
+                g.setdefault("nodes", [])
+                g.setdefault("meta", {})
+                return {"graph": g}
+            return None
+        # accept tasks and convert
+        if "tasks" in cand and isinstance(cand["tasks"], list):
+            return _ensure_graph(cand)
+        # bare single task dict → wrap then convert
+        if "call" in cand:
+            return _ensure_graph({"tasks": [cand]})
+        return None
+
+    new_norm = _normalize_returned(resp_raw)
+
+    # If not JSON or unparsable, record and return the raw text (caller may handle)
+    if new_norm is None:
+        fail_ctx = ContextObject.make_failure(
+            description="Reflection returned non-JSON / unparsable plan",
+            refs=[c.context_id for c in tool_ctxs]
+        )
+        self._persist_and_index([fail_ctx])
+
+        repl_ctx = ContextObject.make_stage(
+            "reflection_and_replan",
+            [c.context_id for c in tool_ctxs],
+            {"replan_raw": resp_raw, "old_graph": old_graph}
+        )
+        repl_ctx.stage_id = "reflection_and_replan"
+        repl_ctx.summary  = resp_raw
+        _stamp(repl_ctx, state)
+        repl_ctx.touch(); self.repo.save(repl_ctx)
+        return resp_raw  # preserve original behavior (string)
+
+    # If JSON plan equals old graph → treat as OK
+    new_graph = new_norm["graph"]
+    if _sig_from_graph(new_graph) == old_sig:
+        ok_ctx = ContextObject.make_success(
+            description="Reflection confirmed plan (identical graph)",
+            refs=[c.context_id for c in tool_ctxs]
+        )
+        self._persist_and_index([ok_ctx])
+        return None
+
+    # --------------------- persist replan + deltas ---------------------
+
+    # Compute simple deltas
+    old_ids = {n.get("id") for n in (old_graph.get("nodes") or []) if n.get("id")}
+    new_ids = {n.get("id") for n in (new_graph.get("nodes") or []) if n.get("id")}
+    added   = sorted(list(new_ids - old_ids))
+    removed = sorted(list(old_ids - new_ids))
+    changed = []
+    old_map = {n["id"]: n for n in (old_graph.get("nodes") or []) if n.get("id")}
+    new_map = {n["id"]: n for n in (new_graph.get("nodes") or []) if n.get("id")}
+    for nid in (old_ids & new_ids):
+        if _pretty(old_map[nid]) != _pretty(new_map[nid]):
+            changed.append(nid)
+
+    delta = {"added": added, "removed": removed, "changed": sorted(changed)}
 
     repl = ContextObject.make_stage(
         "reflection_and_replan",
         [c.context_id for c in tool_ctxs],
-        {"replan": resp}
+        {
+            "old_graph": old_graph,
+            "new_graph": new_graph,
+            "delta":     delta,
+            "turn_id":   getattr(turn, "turn_id", ""),
+            "old_plan_id": getattr(turn, "plan_id", ""),
+        }
     )
     repl.stage_id = "reflection_and_replan"
-    repl.summary  = resp
+    repl.summary  = _pretty({"delta": delta, "new_graph_nodes": len(new_graph.get("nodes", []))})
+    _stamp(repl, state)
     repl.touch(); self.repo.save(repl)
 
-    return resp
+    # ----------------------- update TurnState/Tracker ------------------
+
+    new_sig   = _sig_from_graph(new_graph)
+    new_pid   = f"plan_{new_sig}"
+
+    # Update TurnState
+    turn.plan_id = new_pid
+    turn.graph   = new_graph
+
+    # Reconcile completed/pending with the new graph:
+    #   keep any already-completed node IDs that still exist, and mark the rest pending
+    still_present_completed = {nid for nid in completed_nodes if nid in new_ids}
+    turn.completed_nodes = still_present_completed
+    turn.pending_nodes   = new_ids - still_present_completed
+
+    # Initialize/refresh tracker for the new plan signature
+    tracker_new = ContextObject.make_stage(
+        "plan_tracker",
+        [repl.context_id],
+        {
+            "plan_id":       new_pid,
+            "turn_id":       getattr(turn, "turn_id", ""),
+            "total_nodes":   len(new_graph.get("nodes", [])),
+            "pending_nodes": sorted(list(turn.pending_nodes)),
+            "completed":     sorted(list(turn.completed_nodes)),
+            "errors_by_node": {},
+            "attempts":      0,
+            "status":        "in_progress",
+            "started_at":    datetime.datetime.utcnow().isoformat() + "Z",
+        },
+    )
+    tracker_new.semantic_label = new_sig
+    tracker_new.stage_id       = f"plan_tracker_{new_sig}"
+    tracker_new.summary        = "initialized plan tracker (from reflection)"
+    _stamp(tracker_new, state)
+    tracker_new.touch(); self.repo.save(tracker_new)
+
+    # ----------------------- return normalized plan --------------------
+
+    # Always return a normalized JSON string {'graph': ...}
+    out_json = json.dumps({"graph": new_graph}, ensure_ascii=False)
+    return out_json
+
 
 
 def _stage9_invoke_with_retries(
@@ -1573,37 +2273,104 @@ def _stage9_invoke_with_retries(
     clar_metadata: Dict[str, Any],
     state: Dict[str, Any]
 ) -> List[ContextObject]:
-    import json, re, hashlib, datetime, logging
+    """
+    DAG-based executor with budgets and TurnState.
+
+    Executes only the **ready** DAG nodes (all dependencies satisfied) and
+    persists a tool_output ContextObject **per executed node** with
+    metadata {plan_id, turn_id, node_id, tool_call, output, exception}.
+
+    Notes:
+      • Only IMMEDIATE runs from this invocation are returned / added to state["tool_ctxs"].
+      • Does not surface historical tool outputs.
+      • Respects simple budgets: calls (and optional time if provided).
+    """
+    import json, re, hashlib, datetime, logging, time
     from tools import Tools
-    # --- utilities -------------------------------------------------
+
+    # Ensure Tools has repo bound
+    Tools.repo = self.repo
+
+    # Utilities ---------------------------------------------------------
     def _smart_truncate(text: str, max_len: int = 4000) -> str:
+        if text is None:
+            return ""
         if len(text) <= max_len:
             return text
         head = text[: max_len // 2]
         tail = text[-max_len // 2 :]
         return head + f"\n… ⟪{len(text)-max_len} chars elided⟫ …\n" + tail
 
-    plan_sig = hashlib.md5(plan_output.encode("utf-8")).hexdigest()[:8]
+    def _validate(res: dict) -> tuple[bool, str]:
+        exc = res.get("exception")
+        return (exc is None, str(exc) if exc else "")
+
+    def normalize_key(k: str) -> str:
+        return re.sub(r"\W+", "", str(k)).lower()
+
+    def _clean_json_block(text: str) -> str:
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(\{.*\})", text, flags=re.S)
+        return (m2.group(1) if m2 else text).strip()
+
+    # Turn / Plan -------------------------------------------------------
+    turn = _ensure_turn_state(state)  # must provide .turn_id, .plan_id, .graph, .pending_nodes, .completed_nodes, .tool_ctx_ids, .budgets
+    # parse plan_output into graph when provided as a string
+    graph_obj = None
+    try:
+        if isinstance(plan_output, str) and plan_output.strip():
+            maybe = json.loads(_clean_json_block(plan_output))
+            graph_obj = maybe.get("graph") if isinstance(maybe, dict) else None
+    except Exception:
+        graph_obj = None
+
+    if not graph_obj:
+        graph_obj = getattr(turn, "graph", None) or {}
+
+    nodes = list(graph_obj.get("nodes", []))
+    if not isinstance(nodes, list):
+        nodes = []
+
+    # Build schema map for refs
+    schema_map: dict[str, ContextObject] = {}
+    for s in selected_schemas or []:
+        try:
+            sch = json.loads(s.metadata["schema"])
+            nm = sch["name"]
+            schema_map[nm] = s
+        except Exception:
+            continue
+
+    # Load or create plan tracker --------------------------------------
+    # Prefer tracker by explicit plan_id; fallback to semantic plan_sig
+    plan_sig_src = json.dumps(graph_obj, ensure_ascii=False, sort_keys=True) if graph_obj else (plan_output or "")
+    plan_sig = hashlib.md5((plan_sig_src or "").encode("utf-8")).hexdigest()[:8]
+
     tracker = next(
         (c for c in self.repo.query(
-            lambda c: c.component == "plan_tracker" and c.semantic_label == plan_sig
+            lambda c: c.component == "plan_tracker"
+                      and (c.metadata.get("plan_id") == getattr(turn, "plan_id", None)
+                           or c.semantic_label == plan_sig)
         )), None
     )
 
-    # initialize or refresh tracker
     if not tracker:
         tracker = ContextObject.make_stage(
-            "plan_tracker", [], {
-                "plan_id":       plan_sig,
-                "plan_calls":    raw_calls.copy(),
-                "total_calls":   len(raw_calls),
-                "succeeded":     0,
+            "plan_tracker",
+            [],
+            {
+                "plan_id":       getattr(turn, "plan_id", f"plan_{plan_sig}"),
+                "turn_id":       getattr(turn, "turn_id", ""),
+                "total_nodes":   len(nodes),
+                "pending_nodes": [n.get("id") for n in nodes],
+                "completed":     [],
+                "errors_by_node": {},
                 "attempts":      0,
-                "call_status_map": {},
-                "errors_by_call": {},
                 "status":        "in_progress",
-                "started_at":    datetime.datetime.utcnow().isoformat() + "Z"
-            }
+                "started_at":    datetime.datetime.utcnow().isoformat() + "Z",
+            },
         )
         tracker.semantic_label = plan_sig
         tracker.stage_id       = f"plan_tracker_{plan_sig}"
@@ -1611,11 +2378,12 @@ def _stage9_invoke_with_retries(
         tracker.touch(); self.repo.save(tracker)
     else:
         meta = tracker.metadata
-        meta.setdefault("plan_calls", raw_calls.copy())
-        meta.setdefault("total_calls", len(raw_calls))
-        meta.setdefault("succeeded", 0)
-        meta.setdefault("call_status_map", {})
-        meta.setdefault("errors_by_call", {})
+        meta.setdefault("plan_id", getattr(turn, "plan_id", f"plan_{plan_sig}"))
+        meta.setdefault("turn_id", getattr(turn, "turn_id", ""))
+        meta.setdefault("total_nodes", len(nodes))
+        meta.setdefault("pending_nodes", [n.get("id") for n in nodes])
+        meta.setdefault("completed", [])
+        meta.setdefault("errors_by_node", {})
         meta.setdefault("status", "in_progress")
         tracker.touch(); self.repo.save(tracker)
 
@@ -1623,99 +2391,150 @@ def _stage9_invoke_with_retries(
     tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     tracker.touch(); self.repo.save(tracker)
 
-    # normalize and helper funcs
-    def _norm(calls):
-        out = []
-        for c in calls:
-            if isinstance(c, dict) and "tool_call" in c:
-                out.append(c["tool_call"])
-            elif isinstance(c, str):
-                out.append(c)
-        return out
+    # Budgets -----------------------------------------------------------
+    budgets = getattr(turn, "budgets", {}) or state.get("budgets", {}) or {}
+    calls_budget = int(budgets.get("calls", 1_000_000))
+    time_budget_s = float(budgets.get("time", 1e9))  # optional
+    start_time = time.time()
 
-    def _validate(res):
-        exc = res.get("exception")
-        return (exc is None, exc or "")
+    # Prepare execution state ------------------------------------------
+    # Respect TurnState sets; default to all nodes pending when not present
+    if not getattr(turn, "pending_nodes", None):
+        turn.pending_nodes = {n.get("id") for n in nodes if n.get("id")}
+    if not getattr(turn, "completed_nodes", None):
+        turn.completed_nodes = set()
+    if not getattr(turn, "tool_ctx_ids", None):
+        turn.tool_ctx_ids = []
 
-    def normalize_key(k):
-        return re.sub(r"\W+", "", k).lower()
+    # store results for placeholders
+    last_results: dict[str, Any] = {}
+    # Allow addressing by node id and also by normalized id / tool name
+    def _record_result(node_id: str, tool_name: str, value: Any):
+        last_results[node_id] = value
+        last_results[normalize_key(node_id)] = value
+        if tool_name:
+            last_results[tool_name] = value
+            last_results[normalize_key(tool_name)] = value
+        alias = node.get("alias")
+        if alias:
+            last_results[alias] = value
+            last_results[normalize_key(alias)] = value
+    # Placeholder substitution in args ---------------------------------
+    # Replaces:
+    #   • exact value "[node_id.output]"  → returns python object
+    #   • exact value "{{alias}}"         → returns python object
+    #   • inline occurrences inside strings → json-dumps the object
+    def _subst_in_str(s: str) -> Any:
+        if not isinstance(s, str):
+            return s
+        m1 = re.fullmatch(r"\[([^\]]+)\.output\]", s)
+        if m1:
+            key = m1.group(1)
+            keyn = normalize_key(key[:-7]) if key.endswith(".output") else normalize_key(key)
+            return last_results.get(key) or last_results.get(keyn)
+        m2 = re.fullmatch(r"\{\{([^}]+)\}\}", s)
+        if m2:
+            key = m2.group(1)
+            keyn = normalize_key(key)
+            return last_results.get(key) or last_results.get(keyn)
+        # inline replacement
+        def _rep_bracket(m):
+            key = m.group(1)
+            val = last_results.get(key) or last_results.get(normalize_key(key)) or ""
+            try: return json.dumps(val, ensure_ascii=False)
+            except: return str(val)
+        def _rep_must(m):
+            key = m.group(1)
+            val = last_results.get(key) or last_results.get(normalize_key(key)) or ""
+            try: return json.dumps(val, ensure_ascii=False)
+            except: return str(val)
+        s = re.sub(r"\[([^\]]+)\.output\]", _rep_bracket, s)
+        s = re.sub(r"\{\{([^}]+)\}\}", _rep_must, s)
+        return s
 
-    all_calls = _norm(raw_calls)
-    call_status = tracker.metadata.setdefault("call_status_map", {})
-    pending = [c for c in all_calls if not call_status.get(c, False)]
-    last_results = {}
-    tool_ctxs = []
+    def _subst_in_obj(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _subst_in_obj(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_subst_in_obj(v) for v in obj]
+        if isinstance(obj, str):
+            return _subst_in_str(obj)
+        return obj
 
-    # ─── fast‐path: nothing to run ─────────────────────────────
-    if not pending:
+    # Determine ready nodes --------------------------------------------
+    def _deps_satisfied(node: dict) -> bool:
+        after = node.get("after") or []
+        return all((dep in turn.completed_nodes) for dep in after)
+
+    def _next_ready_nodes() -> list[dict]:
+        ready = []
+        for n in nodes:
+            nid = n.get("id")
+            if not nid or nid not in turn.pending_nodes:
+                continue
+            if _deps_satisfied(n):
+                ready.append(n)
+        return ready
+
+    # Execution loop ----------------------------------------------------
+    tool_ctxs: list[ContextObject] = []
+
+    # FAST-PATH: nothing to run
+    if not turn.pending_nodes:
         tracker.metadata["status"] = "success"
         tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         tracker.touch(); self.repo.save(tracker)
 
-        existing = []
-        for call in all_calls:
-            matches = [
-                c for c in self.repo.query(
-                    lambda c: c.component == "tool_output"
-                              and c.metadata.get("tool_call") == call
-                )
-            ]
-            if matches:
-                matches.sort(key=lambda c: c.timestamp, reverse=True)
-                existing.append(matches[0])
+        # As requested: IMMEDIATE runs only → return empty when nothing executed now
+        state["tool_ctxs"] = []
+        return []
 
-        state["tool_ctxs"] = existing
-        self.integrator.ingest(existing)
-        state["merged"].extend(existing)
-        return existing
-
-    # ─── retry loop ────────────────────────────────────────────
-    max_retries, prev = 10, None
-    for _ in range(max_retries):
-        if prev is not None and pending == prev:
-            logging.warning("plateau, giving up retries")
+    # iterate until no ready nodes or budgets exhausted
+    plateau_guard = 0
+    while True:
+        if calls_budget <= 0 or (time.time() - start_time) > time_budget_s:
             break
-        prev = pending.copy()
 
-        import random; random.shuffle(pending)
-        for original in list(pending):
-            call_str = original
+        ready = _next_ready_nodes()
+        if not ready:
+            plateau_guard += 1
+            if plateau_guard >= 2:
+                # No progress across two checks → break
+                break
+            # small wait not necessary; continue loop
+            if not turn.pending_nodes:
+                break
+            # no ready yet (maybe circular deps) -> break
+            break
 
-            # placeholder chaining
-            for ph in re.findall(r"\[([^\]]+)\]", call_str):
-                key = normalize_key(ph[:-7]) if ph.endswith(".output") else normalize_key(ph)
-                if key in last_results:
-                    call_str = call_str.replace(f"[{ph}]", repr(last_results[key]))
+        plateau_guard = 0
 
-            # alias chaining
-            for ph in re.findall(r"\{\{([^}]+)\}\}", call_str):
-                phn = normalize_key(ph)
-                if phn in last_results:
-                    call_str = call_str.replace(f"{{{{{ph}}}}}", repr(last_results[phn]))
+        for node in ready:
+            if calls_budget <= 0 or (time.time() - start_time) > time_budget_s:
+                break
 
-            # nested zero-arg calls
-            for inner in re.findall(r"\b([A-Za-z_]\w*)\(\)", call_str):
-                if inner not in last_results:
-                    r_i = Tools.run_tool_once(f"{inner}()")
-                    ok_i, err_i = _validate(r_i)
-                    last_results[inner] = r_i.get("output")
-                    call_str = re.sub(rf"\b{inner}\(\)", repr(last_results[inner]), call_str)
-                    # persist nested result
-                    try:
-                        sch_i = next(
-                            s for s in selected_schemas
-                            if json.loads(s.metadata["schema"])["name"] == inner
-                        )
-                        ctx_i = ContextObject.make_stage("tool_output", [sch_i.context_id], r_i)
-                        ctx_i.stage_id = f"tool_output_nested_{inner}"
-                        ctx_i.summary = str(r_i.get("output")) if ok_i else f"ERROR: {err_i}"
-                        ctx_i.metadata.update(r_i)
-                        ctx_i.touch(); self.repo.save(ctx_i)
-                        tool_ctxs.append(ctx_i)
-                    except StopIteration:
-                        pass
+            node_id   = node.get("id")
+            tool_name = node.get("tool")
+            raw_args  = node.get("args", {}) or {}
 
-            # ─── invoke main call ─────────────────────────────────
+            # Resolve placeholders
+            args_resolved = _subst_in_obj(raw_args)
+
+            # Build call string (for logging & compatibility)
+            if args_resolved:
+                try:
+                    arg_s = ",".join(
+                        f"{k}={json.dumps(v, ensure_ascii=False)}"
+                        for k, v in args_resolved.items()
+                    )
+                except Exception:
+                    # fallback repr
+                    arg_s = ",".join(f"{k}={repr(v)}" for k, v in args_resolved.items())
+                call_str = f"{tool_name}({arg_s})"
+            else:
+                call_str = f"{tool_name}()"
+
+            # Invoke tool ------------------------------------------------
             res = Tools.run_tool_once(call_str)
             ok, err = _validate(res)
             raw_out = res.get("output")
@@ -1723,78 +2542,83 @@ def _stage9_invoke_with_retries(
             # pretty/short formatting
             try:
                 pretty = json.dumps(raw_out, ensure_ascii=False, indent=2)
-            except:
+            except Exception:
                 pretty = repr(raw_out)
             short = _smart_truncate(pretty)
 
             # find schema ref
-            name = original.split("(", 1)[0]
             refs = []
-            for s in selected_schemas:
-                if json.loads(s.metadata["schema"])["name"] == name:
-                    refs = [s.context_id]
-                    break
+            sch_ctx = schema_map.get(tool_name)
+            if sch_ctx:
+                refs = [sch_ctx.context_id]
 
-            # persist final tool_output
+            conv_id = state.get("conversation_id")
+            usr_id  = state.get("user_id")
+
             meta = {
-                "tool_call":    original,
-                "output_full":  pretty,
+                "turn_id":     getattr(turn, "turn_id", ""),
+                "plan_id":     getattr(turn, "plan_id", f"plan_{plan_sig}"),
+                "node_id":     node_id,
+                "tool_call":   call_str,
+                "tool_name":   tool_name,
+                "args":        args_resolved,
+                "output_full": pretty,
                 "output_short": short,
-                "output":       raw_out,
-                "exception":    res.get("exception"),
+                "output":      raw_out,
+                "exception":   res.get("exception"),
+                "conversation_id": conv_id,
+                "user_id": usr_id,
             }
             ctx = ContextObject.make_stage("tool_output", refs, meta)
-            ctx.stage_id = f"tool_output_{name}"
+            ctx.stage_id = f"tool_output_{tool_name}"
             ctx.summary  = ("ERROR: " + str(err)) if not ok else repr(raw_out)
             ctx.touch(); self.repo.save(ctx)
             tool_ctxs.append(ctx)
+            turn.tool_ctx_ids.append(ctx.context_id)
 
-            # track success/failure
-            call_status[original] = ok
-            tracker.metadata["succeeded"] = tracker.metadata.get("succeeded", 0) + int(ok)
-            if not ok:
-                tracker.metadata.setdefault("errors_by_call", {})[original] = err
+            # Update progress -------------------------------------------
+            calls_budget -= 1
+            tracker.metadata.setdefault("node_status", {})[node_id] = bool(ok)
+            if ok:
+                _record_result(node_id, tool_name, raw_out)
+                turn.completed_nodes.add(node_id)
+                if node_id in turn.pending_nodes:
+                    turn.pending_nodes.remove(node_id)
+                comp = tracker.metadata.setdefault("completed", [])
+                if node_id not in comp:
+                    comp.append(node_id)
+            else:
+                tracker.metadata.setdefault("errors_by_node", {})[node_id] = err
+                # leave node in pending to allow later re-run if desired
             tracker.touch(); self.repo.save(tracker)
 
-            if ok:
-                pending.remove(original)
+        # loop exits when no pending left or budgets/time exceeded
+        if not turn.pending_nodes:
+            break
 
-        if not pending:
-            # ─── on successful retry ────────────────────────────
-            tracker.metadata["status"] = "success"
-            tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-            self.repo.save(tracker)
+        # if after executing readies, still have pending but none are ready, break
+        if not _next_ready_nodes():
+            break
 
-            existing = []
-            for call in all_calls:
-                matches = [
-                    c for c in self.repo.query(
-                        lambda c: c.component == "tool_output"
-                                  and c.metadata.get("tool_call") == call
-                    )
-                ]
-                if matches:
-                    matches.sort(key=lambda c: c.timestamp, reverse=True)
-                    existing.append(matches[0])
-
-            state["tool_ctxs"] = existing
-            self.integrator.ingest(existing)    # ★ ensure integrator knows them
-            state["merged"].extend(existing)    # ★ and Stage10 sees them
-            return existing
-
-        # if still pending, abort retry loop
-        break
-
-    # ─── final fail ───────────────────────────────────────────────
-    tracker.metadata["status"] = "failed"
-    tracker.metadata["last_errors"] = list(tracker.metadata.get("errors_by_call", {}).values())
+    # Finalize tracker status ------------------------------------------
+    if not turn.pending_nodes:
+        tracker.metadata["status"] = "success"
+    elif calls_budget <= 0:
+        tracker.metadata["status"] = "budget_exhausted"
+    else:
+        tracker.metadata["status"] = "partial"  # some nodes remain or blocked
     tracker.metadata["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     tracker.touch(); self.repo.save(tracker)
 
+    # Only immediate runs should be surfaced downstream
     state["tool_ctxs"] = tool_ctxs
-    self.integrator.ingest(tool_ctxs)
-    state["merged"].extend(tool_ctxs)
+    # keep integrator in sync with only these outputs
+    if tool_ctxs:
+        self.integrator.ingest(tool_ctxs)
+        state.setdefault("merged", []).extend(tool_ctxs)
+
     return tool_ctxs
+
 
 def _await_if_needed(obj):
     """Return result synchronously whether obj is a coroutine or not.
@@ -1807,128 +2631,101 @@ def _await_if_needed(obj):
 def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> str:
     import json, pprint
     from collections import OrderedDict
-    from types import SimpleNamespace
+    from datetime import datetime
+
+    def _as_dt(ts: str) -> datetime:
+        try:    return datetime.fromisoformat((ts or "").rstrip("Z"))
+        except: return datetime.min
 
     # ─── (0) System: final-inference prompt ──────────────────────────
     final_sys = self._get_prompt("final_inference_prompt")
 
-    # ─── (1) System: clarified intent ────────────────────────────────
-    # grab the most recent clarifier output
-    clar_rows = sorted(
-        self.repo.query(lambda c: c.stage_id == "clarifier"),
-        key=lambda c: c.timestamp
-    )
-    clarifier_txt = clar_rows[-1].summary if clar_rows else "(no clarifier notes)"
-    clarifier_block = "[Clarified intent]\n" + clarifier_txt
+    # ─── (1) Clarified intent (compact) ─────────────────────────────
+    clar_notes = ""
+    clar_ctx = state.get("clar_ctx")
+    if clar_ctx:
+        clar_notes = (clar_ctx.metadata.get("notes") or clar_ctx.summary or "").strip()
+    clarifier_block = "[Clarified intent]\n" + (clar_notes or "(none)")
 
-    # ─── (2) User: latest question ───────────────────────────────────
-    latest_user_block = "[Latest user question]\n" + user_text
+    # ─── (2) Latest user question ───────────────────────────────────
+    latest_user_block = "[Latest user question]\n" + (user_text or "")
 
-    # ─── (3) System: Conversation snippets ───────────────────────────
-    MAX_CTX_OBJS = 32
-    merged   = state.get("merged", [])
-    segments = [c for c in merged if getattr(c, "domain", None) == "segment"]
-    recent   = segments[-MAX_CTX_OBJS:]
-    convo_lines = []
-    for c in recent:
-        role = "User:" if c.semantic_label == "user_input" else "Assistant:"
-        convo_lines.append(f"{role} {c.summary or ''}")
-    conversation_block = (
-        "[Conversation so far]\n" + "\n".join(convo_lines)
-        if convo_lines else ""
-    )
+    # ─── (3) Conversation since last tool output (fallback: last 2) ─
+    merged = state.get("merged", [])
+    segments = [c for c in merged if c.domain == "segment" and c.semantic_label in ("user_input","assistant")]
 
-    # ─── (4) System: Recent-history bullets ──────────────────────────
-    hist5 = recent[-5:]
-    bullets = [f"- {c.semantic_label}: {c.summary}" for c in hist5]
-    recent_hist_block = (
-        "[Recent History]\n" + "\n".join(bullets)
-        if bullets else ""
-    )
+    tool_ctxs = state.get("tool_ctxs", []) or []
+    last_tool_ts = max((_as_dt(getattr(c, "timestamp", "")) for c in tool_ctxs), default=None)
+    if last_tool_ts:
+        scoped = [c for c in segments if _as_dt(getattr(c,"timestamp","")) >= last_tool_ts]
+    else:
+        scoped = segments[-2:]  # keep it tiny if we have no tool run
 
-    # ─── (5) System: Plan ────────────────────────────────────────────
+    convo_lines = [
+        ("User:" if c.semantic_label == "user_input" else "Assistant:") + " " + (c.summary or "")
+        for c in scoped
+    ]
+    conversation_block = "[Conversation (current turn)]\n" + "\n".join(convo_lines) if convo_lines else ""
+
+    # ─── (4) Plan (normalized) ──────────────────────────────────────
     raw_plan = state.get("plan_output", "(no plan)")
     if not isinstance(raw_plan, str):
-        try:
-            raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
-        except:
-            raw_plan = pprint.pformat(raw_plan, compact=True)
+        try:    raw_plan = json.dumps(raw_plan, ensure_ascii=False, indent=2)
+        except: raw_plan = pprint.pformat(raw_plan, compact=True)
     plan_block = "[Plan]\n" + raw_plan
 
-    # ─── (6) System: Narrative mulls ─────────────────────────────────
-    narr_ctx = self._load_narrative_context()
-    narrative_block = "[Narrative]\n" + (getattr(narr_ctx, "summary", "") or "")
-
-    # ─── (7) System: Tool outputs ────────────────────────────────────
-    all_tool_ctxs = list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
-    all_tool_ctxs.sort(key=lambda c: c.timestamp)
-    tool_ctxs = all_tool_ctxs[-3:] or state.get("tool_ctxs", []) or []
+    # ─── (5) Tool outputs (IMMEDIATE only, already in state) ────────
+    tool_ctxs.sort(key=lambda c: getattr(c, "timestamp", ""))
     tool_blocks = []
     for tc in tool_ctxs:
-        meta = getattr(tc, "metadata", {})
+        meta = tc.metadata or {}
         data = meta.get("output", meta.get("output_full", meta))
-        try:
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
-        except:
-            payload = pprint.pformat(data, compact=True)
+        try:    payload = json.dumps(data, ensure_ascii=False, indent=2)
+        except: payload = pprint.pformat(data, compact=True)
         call_name = meta.get("tool_call", tc.stage_id)
         ts        = getattr(tc, "timestamp", "")
         tool_blocks.append(f"--- {tc.stage_id} ({call_name}) @ {ts} ---")
         tool_blocks.append(payload)
-    tools_block = (
-        "[Tool outputs]\n" + "\n\n".join(tool_blocks)
-        if tool_blocks else ""
-    )
+    tools_block = "[Tool outputs]\n" + "\n\n".join(tool_blocks) if tool_blocks else ""
 
-    # ─── (8) Assemble LLM messages ───────────────────────────────────
+    # IMPORTANT: **DROP** Narrative entirely to avoid cross-turn bleed
+    # (was: narrative_block = "[Narrative] ...")
+
+    # ─── (6) Assemble messages ───────────────────────────────────────
     msgs = [
         {"role": "system", "content": final_sys},
         {"role": "system", "content": clarifier_block},
         {"role": "user",   "content": latest_user_block},
     ]
     if conversation_block:
-        msgs.append({"role": "system", "content": conversation_block})
-    if recent_hist_block:
-        msgs.append({"role": "system", "content": recent_hist_block})
-    msgs.append({"role": "system", "content": plan_block})
-    if narrative_block:
-        msgs.append({"role": "system", "content": narrative_block})
+        msgs.append({"role":"system","content": conversation_block})
+    msgs.append({"role":"system","content": plan_block})
     if tools_block:
-        msgs.append({"role": "system", "content": tools_block})
+        msgs.append({"role":"system","content": tools_block})
 
-    # ─── (9) Debug: capture exact prompt ─────────────────────────────
+    # ─── (7) Debug (trimmed) ─────────────────────────────────────────
     try:
         exact_prompt = self._gemma_format(msgs)
     except:
-        exact_prompt = json.dumps(msgs, ensure_ascii=False, indent=2)
-    debug_payload = OrderedDict([
-        ("final_sys",           final_sys),
-        ("clarifier_block",     clarifier_block),
-        ("latest_user_block",   latest_user_block),
-        ("conversation_block",  conversation_block),
-        ("recent_hist_block",   recent_hist_block),
-        ("plan_block",          plan_block),
-        ("narrative_block",     narrative_block),
-        ("tools_block",         tools_block),
+        import json as _json
+        exact_prompt = _json.dumps(msgs, ensure_ascii=False, indent=2)
+
+    turn = _ensure_turn_state(state)
+    debug = OrderedDict([
+        ("turn_id",           getattr(turn, "turn_id", "")),
+        ("plan_id",           getattr(turn, "plan_id", "")),
         ("assembled_prompt_text", exact_prompt),
     ])
-    self._print_stage_context("assemble_and_infer", debug_payload)
+    self._print_stage_context("assemble_and_infer", debug)
 
-    # ─── (10) Call the model ─────────────────────────────────────────
+    # ─── (8) Call the model ─────────────────────────────────────────
     raw_reply = _await_if_needed(
-        self._stream_and_capture(
-            self.primary_model,
-            msgs,
-            tag="[Assistant]",
-            images=state.get("images")
-        )
+        self._stream_and_capture(self.primary_model, msgs, tag="[Assistant]", images=state.get("images"))
     )
     reply = (raw_reply or "").strip()
 
-    # ─── (11) Persist assistant reply ───────────────────────────────
-    refs = [c.context_id for c in recent] + [
-        getattr(tc, "context_id", tc.stage_id) for tc in tool_ctxs
-    ]
+    # ─── (9) Persist reply (only this turn’s refs) ───────────────────
+    refs = [c.context_id for c in scoped] + [c.context_id for c in tool_ctxs]
     resp_ctx = ContextObject.make_stage("final_inference", refs, {"text": reply})
     resp_ctx.stage_id = "final_inference"
     resp_ctx.summary  = reply
@@ -1937,8 +2734,7 @@ def _stage10_assemble_and_infer(self, user_text: str, state: dict[str, Any]) -> 
     seg = ContextObject.make_segment("assistant", [resp_ctx.context_id], tags=["assistant"])
     seg.summary  = reply
     seg.stage_id = "assistant"
-    seg.touch()
-    self.repo.save(seg)
+    seg.touch(); self.repo.save(seg)
 
     state["draft"]         = reply
     state["assistant_ctx"] = resp_ctx
@@ -1954,68 +2750,53 @@ def _stage10b_response_critique_and_safety(
     state: dict[str, Any],
 ) -> str:
     import json, difflib, pprint
-    from types import SimpleNamespace
 
     if not draft:
         return draft
 
-    # ─── Grab the actual assistant reply ContextObject (if any) ─────
-    assistant_ctx = state.get("assistant_ctx")
-    assistant_text = assistant_ctx.summary if assistant_ctx else draft
-    assistant_block = "[Assistant response]\n" + assistant_text
+    # ─── 1) Build blocks ───────────────────────────────────────────
+    # Use only the original user_text here:
+    user_block  = "[Latest user question]\n" + user_text
+    draft_block = "[Draft response]\n"       + draft
 
-    # ─── Gather real ContextObjects or fallback to state/tool_summaries
-    real_tool_ctxs = tool_ctxs or list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
-    if not real_tool_ctxs:
-        real_tool_ctxs = state.get("tool_ctxs", []) or []
-    if not real_tool_ctxs:
-        for summ in state.get("tool_summaries", []):
-            call_name = summ.get("call") or summ.get("tool_name")
-            result    = summ.get("result")
-            ts        = result.get("timestamp", "") if isinstance(result, dict) else ""
-            tc = SimpleNamespace(
-                metadata={"output": result},
-                summary=json.dumps(result, ensure_ascii=False, indent=2),
-                stage_id=call_name,
-                timestamp=ts,
-                context_id=summ.get("context_id", call_name)
-            )
-            real_tool_ctxs.append(tc)
+    # Merge snippets as before
+    merged = state.get("merged", [])
+    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged) or "(none)"
+    merged_block = "[Merged context snippets]\n" + merged_texts
 
-    # ─── Build merged-context snippet block ─────────────────────────
-    merged_ctxs  = state.get("merged", [])
-    merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs) or "(none)"
-
-    # ─── Plan block ─────────────────────────────────────────────────
+    # Plan block
     plan_txt = state.get("plan_output", "(no plan)")
+    plan_block = "[Plan executed]\n" + plan_txt
 
-    # ─── Tool-outputs block ─────────────────────────────────────────
+    # ─── 2) Immediate tool‐outputs only ────────────────────────────
     outputs = []
-    for c in real_tool_ctxs:
-        raw = c.metadata.get("output", c.metadata)
+    for tc in (tool_ctxs or []):
+        raw = tc.metadata.get("output", tc.metadata)
         if isinstance(raw, dict) and "results" in raw:
-            fragment = "\n".join(
+            frag = "\n".join(
                 f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
                 for r in raw["results"]
             )
         else:
             try:
-                fragment = json.dumps(raw, indent=2, ensure_ascii=False)
+                frag = json.dumps(raw, indent=2, ensure_ascii=False)
             except:
-                fragment = pprint.pformat(raw, compact=True)
-        outputs.append(f"[{c.stage_id}]\n{fragment}")
-    tools_block = "[Tool outputs]\n" + "\n\n".join(outputs)
+                frag = pprint.pformat(raw, compact=True)
+        outputs.append(f"[{tc.stage_id}]\n{frag}")
+    tools_block = "[Tool outputs]\n" + "\n\n".join(outputs) if outputs else ""
 
-    # ─── 1) Relevance Extraction ────────────────────────────────────
+    # ─── 3) Relevance Extraction ────────────────────────────────────
     extractor_sys = self._get_prompt("extractor_sys_prompt")
     extractor_msgs = [
-        {"role": "system", "content": extractor_sys},
-        {"role": "system", "content": "[Latest user question]\n"   + user_text},
-        {"role": "system", "content": assistant_block},
-        {"role": "system", "content": "[Plan executed]\n"         + plan_txt},
-        {"role": "system", "content": "[Merged context snippets]\n" + merged_texts},
-        {"role": "system", "content": tools_block},
+        {"role":"system", "content": extractor_sys},
+        {"role":"system", "content": user_block},
+        {"role":"system", "content": draft_block},
+        {"role":"system", "content": plan_block},
+        {"role":"system", "content": merged_block},
     ]
+    if tools_block:
+        extractor_msgs.append({"role":"system","content":tools_block})
+
     bullets = self._stream_and_capture(
         self.secondary_model,
         extractor_msgs,
@@ -2024,17 +2805,16 @@ def _stage10b_response_critique_and_safety(
     ).strip()
 
     sum_ctx = ContextObject.make_stage("relevance_summary", [], {"summary": bullets})
-    sum_ctx.stage_id = "relevance_summary"
-    sum_ctx.summary  = bullets
+    sum_ctx.stage_id = "relevance_summary"; sum_ctx.summary = bullets
     self._persist_and_index([sum_ctx])
 
-    # ─── 2) Polishing / Safety Critique ─────────────────────────────
+    # ─── 4) Polishing / Safety Critique ─────────────────────────────
     editor_sys = self._get_prompt("editor_sys_prompt")
     editor_msgs = [
-        {"role": "system", "content": editor_sys},
-        {"role": "system", "content": "[Latest user question]\n"   + user_text},
-        {"role": "system", "content": "[Assistant response]\n"      + assistant_text},
-        {"role": "system", "content": "[Relevance bullets]\n"      + bullets},
+        {"role":"system","content":editor_sys},
+        {"role":"system","content": user_block},
+        {"role":"system","content": draft_block},
+        {"role":"system","content":"[Relevance bullets]\n"+bullets},
     ]
     polished = self._stream_and_capture(
         self.secondary_model,
@@ -2046,34 +2826,28 @@ def _stage10b_response_critique_and_safety(
     if polished == draft.strip():
         return polished
 
-    # ─── diff & dynamic prompt patch ────────────────────────────────
-    diff = difflib.unified_diff(
-        draft.splitlines(), polished.splitlines(), lineterm="", n=1
-    )
+    # ─── 5) diff & dynamic_patch (unchanged) ────────────────────────
+    diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
     diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
 
-    patch_rows = sorted(
-        self.repo.query(lambda c: c.component == "policy" and c.semantic_label == "dynamic_prompt_patch"),
+    rows = sorted(
+        self.repo.query(lambda c: c.component=="policy" and c.semantic_label=="dynamic_prompt_patch"),
         key=lambda c: c.timestamp, reverse=True
     )
-    dynamic_patch = patch_rows[0] if patch_rows else ContextObject.make_policy(
-        "dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"]
-    )
-    if dynamic_patch.summary != diff_summary:
-        dynamic_patch.summary = diff_summary
-        dynamic_patch.metadata["policy"] = diff_summary
-        dynamic_patch.touch()
-        self.repo.save(dynamic_patch)
+    patch = rows[0] if rows else ContextObject.make_policy("dynamic_prompt_patch", diff_summary, tags=["dynamic_prompt"])
+    if patch.summary != diff_summary:
+        patch.summary = diff_summary
+        patch.metadata["policy"] = diff_summary
+        patch.touch(); self.repo.save(patch)
 
-    # ─── Persist polished reply & critique ──────────────────────────
+    # ─── 6) Persist polished & critique ─────────────────────────────
     resp_ctx = ContextObject.make_stage("response_critique", [sum_ctx.context_id], {"text": polished})
-    resp_ctx.stage_id = "response_critique"
-    resp_ctx.summary  = polished
+    resp_ctx.stage_id = "response_critique"; resp_ctx.summary = polished
     self._persist_and_index([resp_ctx])
 
     critique_ctx = ContextObject.make_stage(
         "plan_critique",
-        [resp_ctx.context_id] + [c.context_id for c in real_tool_ctxs],
+        [resp_ctx.context_id] + [tc.context_id for tc in (tool_ctxs or [])],
         {"critique": polished, "diff": diff_summary},
     )
     critique_ctx.component      = "analysis"
@@ -2081,6 +2855,7 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([critique_ctx])
 
     return polished
+
 
 
 
@@ -2098,6 +2873,13 @@ def _stage11_memory_writeback(
     • narrative     → one new row per turn (intended)
     • every object is persisted exactly ONCE
     """
+
+    turn = None
+    try:
+        # not fatal if missing
+        turn = _ensure_turn_state(getattr(self, "_state", {}))
+    except Exception:
+        pass
 
     # ── 1)  Up-sert the single `auto_memory` row ────────────────────────
     mem_candidates = self.repo.query(
@@ -2135,6 +2917,10 @@ def _stage11_memory_writeback(
             continue
 
     self.memman.reinforce(mem.context_id, valid_refs)
+
+    if turn:
+        mem.metadata.setdefault("turn_ids", []).append(turn.turn_id)
+        mem.metadata.setdefault("plan_ids", []).append(turn.plan_id)
 
     # One narrative row per *unique* answer – duplicates are skipped
     narr = ContextObject.make_narrative(
@@ -2391,27 +3177,68 @@ def _stage_narrative_mull(self, state: Dict[str, Any]) -> str:
             # run plan_calls via real pipeline
             if plan_calls:
                 try:
-                    plan_obj = {"tasks":[
-                        {"call":c.split("(",1)[0], "tool_input":{}, "subtasks": []}
-                        for c in plan_calls
-                    ]}
-                    pj = json.dumps(plan_obj)
-                    p_ctx = ContextObject.make_stage("internal_plan",[a_ctx.context_id],{"plan":plan_obj})
-                    #p_ctx.touch(); self.repo.save(p_ctx)
-                    self._persist_and_index([p_ctx])
+                    # Build a linear mini-DAG from plan_calls in order
+                    nodes = []
+                    prev_id = None
+                    for i, c in enumerate(plan_calls, 1):
+                        name = c.split("(",1)[0]
+                        args_str = c.split("(",1)[1][:-1] if "(" in c else ""
+                        # naive args parse: keep it simple, executor will JSON-load where possible
+                        # or leave as string and Tools.run_tool_once() will accept it.
+                        node_id = f"m{i}"
+                        node = {"id": node_id, "tool": name, "args": {}, "after": ([prev_id] if prev_id else [])}
+                        if args_str.strip():
+                            # VERY SIMPLE parse: k=v pairs split on commas at top-level
+                            # (safe enough for your existing call style)
+                            kvs = [p for p in args_str.split(",") if p.strip()]
+                            parsed = {}
+                            for kv in kvs:
+                                k, _, v = kv.partition("=")
+                                k = k.strip()
+                                v = v.strip()
+                                try:
+                                    parsed[k] = json.loads(v)
+                                except Exception:
+                                    parsed[k] = v
+                            node["args"] = parsed
+                        nodes.append(node)
+                        prev_id = node_id
 
+                    graph = {"nodes": nodes, "meta": {"goal": q_text or "(narrative mull)"}}
+                    # Initialize TurnState for this mini-run
+                    turn = _ensure_turn_state(state)
+                    plan_sig = hashlib.md5(json.dumps(graph, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+                    turn.plan_id = f"plan_{plan_sig}"
+                    turn.graph = graph
+                    turn.pending_nodes = {n["id"] for n in nodes}
+                    turn.completed_nodes = set()
+                    turn.tool_ctx_ids = []
+
+                    # Persist a lightweight internal plan ctx
+                    p_ctx = ContextObject.make_stage("internal_plan_dag", [a_ctx.context_id], {"graph": graph})
+                    _stamp(p_ctx, state)
+                    p_ctx.touch(); self.repo.save(p_ctx)
+
+                    # Collect schemas for referenced tools
                     tools = self._stage6_prepare_tools()
-                    fixed,_,_ = self._stage7b_plan_validation(p_ctx,pj,tools)
-                    tc, calls, schemas = self._stage8_tool_chaining(p_ctx,"\n".join(fixed),tools)
+                    name_to_schema_ctx = {
+                        json.loads(c.metadata["schema"])["name"]: c
+                        for c in self.repo.query(lambda c: c.component == "schema" and "tool_schema" in (c.tags or []))
+                    }
+                    selected_schema_ctxs = [name_to_schema_ctx[n["tool"]] for n in nodes if n["tool"] in name_to_schema_ctxs]
+
+                    # Execute DAG immediately
                     self._stage9_invoke_with_retries(
-                        raw_calls=calls, plan_output="\n".join(fixed),
-                        selected_schemas=schemas,
-                        user_text="(self-review)", clar_metadata={}
+                        raw_calls=[],  # ignored in DAG mode
+                        plan_output=json.dumps({"graph": graph}, ensure_ascii=False),
+                        selected_schemas=selected_schema_ctxs,
+                        user_text="(self-review DAG)",
+                        clar_metadata={},
+                        state=state,
                     )
                 except Exception as e:
-                    err = ContextObject.make_failure(
-                        f"narrative_mull plan error: {e}", refs=[a_ctx.context_id]
-                    )
+                    err = ContextObject.make_failure(f"narrative_mull DAG error: {e}", refs=[a_ctx.context_id])
+                    _stamp(err, state)
                     err.touch(); self.repo.save(err)
 
     # start thread
