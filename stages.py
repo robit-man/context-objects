@@ -1954,17 +1954,20 @@ def _stage10b_response_critique_and_safety(
     state: dict[str, Any],
 ) -> str:
     import json, difflib, pprint
-    from collections import OrderedDict
     from types import SimpleNamespace
 
     if not draft:
         return draft
 
-    # ─── Gather tool outputs ─────────────────────────────────────────
+    # ─── Grab the actual assistant reply ContextObject (if any) ─────
+    assistant_ctx = state.get("assistant_ctx")
+    assistant_text = assistant_ctx.summary if assistant_ctx else draft
+    assistant_block = "[Assistant response]\n" + assistant_text
+
+    # ─── Gather real ContextObjects or fallback to state/tool_summaries
     real_tool_ctxs = tool_ctxs or list(self.repo.query(lambda c: c.semantic_label == "tool_output"))
     if not real_tool_ctxs:
         real_tool_ctxs = state.get("tool_ctxs", []) or []
-    # fallback to summaries
     if not real_tool_ctxs:
         for summ in state.get("tool_summaries", []):
             call_name = summ.get("call") or summ.get("tool_name")
@@ -1979,11 +1982,11 @@ def _stage10b_response_critique_and_safety(
             )
             real_tool_ctxs.append(tc)
 
-    # ─── Build merged-context snippet block ──────────────────────────
+    # ─── Build merged-context snippet block ─────────────────────────
     merged_ctxs  = state.get("merged", [])
     merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged_ctxs) or "(none)"
 
-    # ─── Plan block ──────────────────────────────────────────────────
+    # ─── Plan block ─────────────────────────────────────────────────
     plan_txt = state.get("plan_output", "(no plan)")
 
     # ─── Tool-outputs block ─────────────────────────────────────────
@@ -2007,9 +2010,9 @@ def _stage10b_response_critique_and_safety(
     extractor_sys = self._get_prompt("extractor_sys_prompt")
     extractor_msgs = [
         {"role": "system", "content": extractor_sys},
-        {"role": "system", "content": "[Latest user question]\n" + user_text},
-        {"role": "system", "content": "[Draft response]\n" + draft},
-        {"role": "system", "content": "[Plan executed]\n" + plan_txt},
+        {"role": "system", "content": "[Latest user question]\n"   + user_text},
+        {"role": "system", "content": assistant_block},
+        {"role": "system", "content": "[Plan executed]\n"         + plan_txt},
         {"role": "system", "content": "[Merged context snippets]\n" + merged_texts},
         {"role": "system", "content": tools_block},
     ]
@@ -2029,9 +2032,9 @@ def _stage10b_response_critique_and_safety(
     editor_sys = self._get_prompt("editor_sys_prompt")
     editor_msgs = [
         {"role": "system", "content": editor_sys},
-        {"role": "system", "content": "[Latest user question]\n" + user_text},
-        {"role": "system", "content": "[Relevance bullets]\n" + bullets},
-        {"role": "system", "content": "[Current draft]\n" + draft},
+        {"role": "system", "content": "[Latest user question]\n"   + user_text},
+        {"role": "system", "content": "[Assistant response]\n"      + assistant_text},
+        {"role": "system", "content": "[Relevance bullets]\n"      + bullets},
     ]
     polished = self._stream_and_capture(
         self.secondary_model,
@@ -2078,7 +2081,6 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([critique_ctx])
 
     return polished
-
 
 
 

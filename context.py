@@ -454,7 +454,8 @@ class ContextObject:
 def sanitize_jsonl(path: str):
     """
     Reads 'path' under shared lock, drops any corrupted JSON lines,
-    logs them into 'path.corrupt', and atomically rewrites with only valid ones.
+    logs them into 'path.corrupt', and—only if invalid lines are found—
+    atomically rewrites with the remaining valid ones.
     """
     if not os.path.exists(path):
         return
@@ -473,13 +474,16 @@ def sanitize_jsonl(path: str):
                 logging.warning(f"sanitize_jsonl: dropping invalid JSON at line {idx} in {path}: {e}")
                 bad_entries.append((idx, line.rstrip("\n")))
 
-        # 2) If we found bad lines, log them out
-        if bad_entries:
-            with open(corrupt_path, "a", encoding="utf-8") as cf:
-                for idx, text in bad_entries:
-                    cf.write(f"{datetime.utcnow().isoformat()} LINE {idx}: {text}\n")
+        # 2) If no bad entries, leave file as-is
+        if not bad_entries:
+            return
 
-        # 3) Rewrite the JSONL in-place
+        # 3) Log all bad lines
+        with open(corrupt_path, "a", encoding="utf-8") as cf:
+            for idx, text in bad_entries:
+                cf.write(f"{datetime.utcnow().isoformat()} LINE {idx}: {text}\n")
+
+        # 4) Rewrite only when there were bad lines
         f.seek(0)
         f.truncate()
         f.writelines(good_lines)

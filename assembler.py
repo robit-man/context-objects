@@ -825,9 +825,6 @@ class Assembler:
             jsonl_file   = base / filename
             sqlite_file  = base / filename.replace(".jsonl", ".db")
 
-            # initialize empty JSONL if needed
-            sanitize_jsonl(str(jsonl_file))
-
             # create the Hybrid repo
             self.repo = HybridContextRepository(
                 jsonl_path=str(jsonl_file),
@@ -866,7 +863,6 @@ class Assembler:
         
         self._prompts_ready_evt = threading.Event()
 
-        sanitize_jsonl(self.repo.json_repo.path)
         self._seed_tool_schemas()
         self._seed_static_prompts()
         self._prompts_ready_evt.set()
@@ -1756,11 +1752,11 @@ class Assembler:
     ) -> str:
         """
         Stream a response from Ollama with:
-         • automatic image‑inlining
-         • token‑level callback for TTS / UI
-         • four run‑away guards (token, line, pattern, multi‑token)
-         • Ollama‑crash resilience + retry loop
-         • optional automatic fall‑back to secondary model
+        • automatic image-inlining
+        • token-level callback for TTS / UI
+        • five run-away guards (token, line, pattern, multi-token, suffix)
+        • Ollama-crash resilience + retry loop
+        • optional automatic fall-back to secondary model
         """
 
         # ── tweakables ───────────────────────────────────────────────
@@ -1826,13 +1822,18 @@ class Assembler:
 
         session_start = time.time()
 
-        # ── inner single‑pass streamer ───────────────────────────────
+        # ── inner single-pass streamer ───────────────────────────────
         def one_pass() -> tuple[str, bool]:
             buf_tokens = deque(maxlen=TOKEN_WINDOW)
             buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
             chunks: list[str] = []
             inside_json = False
             first_output = None
+
+            # ── NEW suffix-guard params ───────────────────────────────
+            SUFFIX_WINDOW    = 100
+            SUFFIX_THRESHOLD = 0.8      # 80% of tokens
+            SUFFIX_PATTERN   = "Professional"
 
             print(f"{tag} ", end="", flush=True)
 
@@ -1886,17 +1887,38 @@ class Assembler:
                         if s:
                             buf_lines.append(s)
 
+                    # ── guards after delay ───────────────────────────────
                     if first_output and (time.time() - first_output) > GUARD_DELAY_SEC:
-                        if token_guard(buf_tokens) or line_guard(buf_lines) or multi_token_guard(buf_tokens):
-                            print("\n[Run‑away guard] aborting pass.")
+                        # 1) token-repeat guard
+                        if token_guard(buf_tokens):
+                            print("\n[Run-away guard] token repeat → aborting pass.")
                             return "".join(chunks), True
+                        # 2) line-repeat guard
+                        if line_guard(buf_lines):
+                            print("\n[Run-away guard] line repeat → aborting pass.")
+                            return "".join(chunks), True
+                        # 3) multi-token sequence guard
+                        if multi_token_guard(buf_tokens):
+                            print("\n[Run-away guard] multi-token loop → aborting pass.")
+                            return "".join(chunks), True
+
+                        # 4) NEW suffix-guard
+                        if len(buf_tokens) >= SUFFIX_WINDOW:
+                            count_suffix = sum(1 for t in buf_tokens if SUFFIX_PATTERN in t)
+                            if (count_suffix / len(buf_tokens)) >= SUFFIX_THRESHOLD:
+                                print(
+                                    f"\n[Suffix-runaway guard] ≥{int(SUFFIX_THRESHOLD*100)}% tokens "
+                                    f"contain “{SUFFIX_PATTERN}” → aborting pass."
+                                )
+                                return "".join(chunks), True
+
+                        # 5) repeated-pattern guard
                         full = "".join(chunks)
                         if pat_regex.search(full) or full.count("```json") > 1:
-                            print("\n[Run‑away guard] pattern repetition → aborting pass.")
+                            print("\n[Run-away guard] pattern repetition → aborting pass.")
                             return full, True
 
             except _OllamaError as e:
-                # streaming crashed mid‑generation
                 print(f"\n[Ollama crash] {e}")
                 return "".join(chunks), True
 
@@ -1929,8 +1951,9 @@ class Assembler:
             )
 
         # give up after retries / fallback
-        print(f"[Run‑away guard] giving up after {MAX_ATTEMPTS} attempts.")
+        print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
+
 
 
 
