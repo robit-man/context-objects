@@ -2991,7 +2991,6 @@ class Assembler:
             pass
 
 
-
     async def run_with_meta_context(
         self,
         user_text: str,
@@ -3129,116 +3128,142 @@ class Assembler:
             perf_text = latest.summary or ""
 
         # ─── Quick-Take micro-stage ───────────────────────────────────
-    async def _quick_take() -> str:
-        """
-        Quick-Take micro-stage (immediate reply).
-        Provides a concise, natural-language placeholder response
-        based on a small, relevance-driven context window.
-        """
-        # Skip if already run or explicitly disabled
-        if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
-            return ""
+        async def _quick_take() -> str:
+            """
+            Quick-Take micro-stage (immediate reply).
+            Provides a concise, natural-language placeholder response
+            based on a small, relevance-driven context window.
+            """
+            # Skip if already run or explicitly disabled
+            if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
+                return ""
 
-        # 1️⃣ Gather & label prioritized context for quick take
-        seeds: list[tuple[str, str]] = []
+            # 1️⃣ Gather & label prioritized context for quick take
+            seeds: list[tuple[str, str]] = []
 
-        # • Use the previous final answer if available
-        if state.get("prev_final"):
-            seeds.append((state["prev_final"].strip(), "prev_final"))
+            # • Use the previous final answer if available
+            if state.get("prev_final"):
+                seeds.append((state["prev_final"].strip(), "prev_final"))
 
-        # • Compute a recall‐feature score from recent history
-        hist_ids = state.get("wm_ids", [])
-        rf = 0.0
-        if hist_ids:
-            activation = self.memman.spread_activation(
-                seed_ids=hist_ids, hops=2, decay=0.6,
-                assoc_weight=1.0, recency_weight=0.5
+            # • Compute a recall-feature score from recent history
+            hist_ids = state.get("wm_ids", [])
+            rf = 0.0
+            if hist_ids:
+                activation = self.memman.spread_activation(
+                    seed_ids=hist_ids, hops=2, decay=0.6,
+                    assoc_weight=1.0, recency_weight=0.5
+                )
+                top_scores = sorted(activation.values(), reverse=True)[:len(hist_ids)]
+                rf = sum(top_scores) / len(top_scores) if top_scores else 0.0
+
+            # • On first run, fetch top-k semantically similar snippets (RAG + RL gate)
+            if not state.get("prev_final") and self.rl.should_run("semantic_retrieval", rf):
+                candidates = self.engine.query(
+                    stage_id="semantic_retrieval",
+                    similarity_to=user_text,
+                    top_k=5
+                )
+                now = datetime.utcnow()
+                def _score(c):
+                    rel = float(c.metadata.get("relevance_score", 0.0))
+                    age_days = (now - datetime.fromisoformat(c.timestamp.rstrip("Z"))).total_seconds() / 86400
+                    recency = max(0, 1 - age_days / self.context_ttl_days)
+                    return rel * 0.7 + recency * 0.3
+
+                candidates.sort(key=_score, reverse=True)
+                for c in candidates:
+                    if len(seeds) >= 3:
+                        break
+                    if c.summary:
+                        src = f"{c.component}/{c.semantic_label or c.stage_id}"
+                        seeds.append((c.summary.strip(), src))
+
+            # • Fallback to the most recent turns if we still need more
+            if len(seeds) < 3:
+                recent = await asyncio.to_thread(self._get_history)
+                for c in reversed(recent):
+                    if len(seeds) >= 3:
+                        break
+                    if c.summary:
+                        src = f"{c.domain}/{c.semantic_label}"
+                        seeds.append((c.summary.strip(), src))
+
+            # • Build the snippet string (max 3 items), with explicit tags
+            formatted = [f"[{src}] {text}" for text, src in seeds[:3]]
+            snippet = " | ".join(formatted) if formatted else "(none)"
+
+            # 2️⃣ Build system prompt: include dynamic patches & perf
+            cutoff_notice = (
+                "Your training data is current only through 2023 and may be outdated. "
+                "Defer factual details to later stages."
             )
-            top_scores = sorted(activation.values(), reverse=True)[: len(hist_ids)]
-            rf = sum(top_scores) / len(top_scores) if top_scores else 0.0
+            sys_txt = "\n".join([
+                "You are QuickResponder, a fast front-line assistant.",
+                dyn_text.strip(),
+                perf_text.strip(),
+                "Respond in concise, natural language only—no JSON or structured output.",
+                cutoff_notice
+            ])
 
-        # • On first run, fetch top-k semantically similar snippets (RAG + RL gate)
-        if not state.get("prev_final") and self.rl.should_run("semantic_retrieval", rf):
-            candidates = self.engine.query(
-                stage_id="semantic_retrieval",
-                similarity_to=user_text,
-                top_k=5
+            # 3️⃣ Invoke model and stream
+            reply = await self._stream_and_capture_async(
+                self.primary_model,
+                [
+                    {"role": "system", "content": sys_txt},
+                    {"role": "user",   "content": f"{user_text}\nContext: {snippet}"}
+                ],
+                tag="[Quick-Take]",
+                on_token=_tok_to_sentence,
             )
-            now = datetime.utcnow()
-            def _score(c):
-                rel = float(c.metadata.get("relevance_score", 0.0))
-                age_days = (now - datetime.fromisoformat(c.timestamp.rstrip("Z"))).total_seconds() / 86400
-                recency = max(0, 1 - age_days / self.context_ttl_days)
-                return rel * 0.7 + recency * 0.3
+            text = (reply or "").strip()
 
-            candidates.sort(key=_score, reverse=True)
-            for c in candidates:
-                if len(seeds) >= 3:
-                    break
-                if c.summary:
-                    src = f"{c.component}/{c.semantic_label or c.stage_id}"
-                    seeds.append((c.summary.strip(), src))
+            # 4️⃣ Strip any leading JSON block if the model still emitted it
+            if text.startswith("{"):
+                try:
+                    end = text.index("}") + 1
+                    text = text[end:].lstrip("\n ")
+                except ValueError:
+                    pass
 
-        # • Fallback to the most recent turns if we still need more
-        if len(seeds) < 3:
-            recent = await asyncio.to_thread(self._get_history)
-            for c in reversed(recent):
-                if len(seeds) >= 3:
-                    break
-                if c.summary:
-                    src = f"{c.domain}/{c.semantic_label}"
-                    pair = (c.summary.strip(), src)
-                    if pair not in seeds:
-                        seeds.append(pair)
+            # 5️⃣ Record and mark this micro-stage as run
+            state.setdefault("early_phases", {})["quick_take"] = text
+            state.setdefault("stages_run", set()).add("quick_take")
 
-        # • Build the snippet string (max 3 items), with explicit tags
-        formatted = [f"[{src}] {text}" for text, src in seeds[:3]]
-        snippet = " | ".join(formatted) if formatted else "(none)"
+            return text
 
-        # 2️⃣ Pull the latest performance‐rating summary (stage12) for meta‐analysis
-        perf_objs = self.repo.query(lambda c: c.component == "stage_performance")
-        perf_text = ""
-        if perf_objs:
-            latest = sorted(perf_objs, key=lambda c: c.timestamp, reverse=True)[0]
-            perf_text = latest.summary or ""
+        async def _planner() -> str:
+            return await self._handle_turn(
+                user_text,
+                _status_and_speak,
+                images or [],
+                on_token,
+                early_phases=state["early_phases"],
+                tools_list=schemas,
+                tool_preview=tool_preview,
+            )
 
-        # 3️⃣ Build system prompt: plain text only, no JSON!
-        cutoff_notice = (
-            "Your training data is current only through 2023 and may be outdated. "
-            "Defer factual details to later stages."
-        )
-        sys_txt = "\n".join([
-            "You are QuickResponder, a fast front-line assistant.",
-            "Respond in concise, natural language only—no JSON or structured output.",
-            perf_text.strip(),
-            cutoff_notice
-        ])
+        # ─── Shortcut: skip Quick-Take entirely ───────────────────────
+        if skip_quick_phases:
+            final = await _planner()
+            self._last_final = final
+            return final
 
-        # 4️⃣ Invoke model and stream
-        reply = await self._stream_and_capture_async(
-            self.primary_model,
-            [
-                {"role": "system", "content": sys_txt},
-                {"role": "user",   "content": f"{user_text}\nContext: {snippet}"}
-            ],
-            tag="[Quick-Take]",
-            on_token=_tok_to_sentence,
-        )
-        text = (reply or "").strip()
+        # ─── Orchestrate Quick-Take → Planner (background) → await ────
+        quick = await _quick_take()
+        state.setdefault("early_phases", {})["quick_take"] = quick
+        self._turn_task = asyncio.create_task(_planner())
 
-        # 5️⃣ Strip any leading JSON block if the model still emitted it
-        if text.startswith("{"):
-            try:
-                end = text.index("}") + 1
-                text = text[end:].lstrip("\n ")
-            except ValueError:
-                pass
+        try:
+            final = await self._turn_task
+        except asyncio.CancelledError:
+            final = ""
+        finally:
+            if bridge:
+                bridge.flush(force=True)
 
-        # 6️⃣ Record and mark this micro-stage as run
-        state.setdefault("early_phases", {})["quick_take"] = text
-        state.setdefault("stages_run", set()).add("quick_take")
-
-        return text
+        # ─── stash for next turn ─────────────────────────────────────
+        self._last_final = final
+        return final
 
     
 
