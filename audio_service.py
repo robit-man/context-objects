@@ -79,6 +79,7 @@ class AudioService:
         self._tts_lms         = StreamingLMSFilter(num_taps=taps, mu=mu, safe=True)
         self._lms_ref_buf     = np.zeros(0, dtype=np.float32)   # dedicated TTS reference
         self._lms_lock        = threading.Lock()
+        self._time_of_last_transcript: float = 0.0
 
         # worker threads & streams
         self._stop_evt        = threading.Event()
@@ -320,6 +321,8 @@ class AudioService:
             self._spoken_seconds = 0.0
             self._last_live_text = ""
             self._last_live_decode_ts = 0.0
+            # reset our “since last transcript” timer
+            self._time_of_last_transcript = time.time()
 
         # While capturing, append audio and track durations
         if self._capturing:
@@ -348,10 +351,9 @@ class AudioService:
         return " ".join(curr_t[i:]).strip()
 
     def _transcribe_np(self, pcm: np.ndarray, full: bool = False) -> str:
-        """Resample to 16 kHz and run Whisper. For live preview, use base-only."""
+        """Resample to 16 kHz and run Whisper. For live preview, use base-only; for full, run both models in parallel with consensus."""
         if pcm.size == 0:
             return ""
-        # avoid integer division error if sample_rate not int
         sr_in = int(self.sample_rate)
         if sr_in != 16000:
             try:
@@ -362,26 +364,66 @@ class AudioService:
         else:
             audio_16k = pcm
 
+        # quick live preview
+        if not full:
+            try:
+                return self.model_base.transcribe(
+                    audio_16k, language="en", fp16=False
+                )["text"].strip()
+            except Exception as e:
+                self.log(f"Whisper base error: {e}", "ERROR")
+                return ""
+
+        # full transcription: run both models concurrently
         try:
-            if not full:
-                tb = self.model_base.transcribe(audio_16k, language="en", fp16=False)["text"].strip()
-                return tb
-            else:
-                tb = self.model_base.transcribe(audio_16k, language="en", fp16=False)["text"].strip()
-                tm = self.model_small.transcribe(audio_16k, language="en", fp16=False)["text"].strip()
-                if tb and tm and SequenceMatcher(None, tb, tm).ratio() >= self.consensus_threshold:
-                    return tb if len(tb) >= len(tm) else tm
-                # fall back to the longer non-empty
-                return tb if len(tb) >= len(tm) else tm
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def run_base():
+                return self.model_base.transcribe(
+                    audio_16k, language="en", fp16=False
+                )["text"].strip()
+
+            def run_small():
+                return self.model_small.transcribe(
+                    audio_16k, language="en", fp16=False
+                )["text"].strip()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    executor.submit(run_base): "base",
+                    executor.submit(run_small): "small"
+                }
+                results = {}
+                for fut in as_completed(futures, timeout=120):
+                    results[futures[fut]] = fut.result()
+
+            tb = results.get("base", "")
+            tm = results.get("small", "")
+
+            # if both transcribed, check consensus
+            if tb and tm:
+                ratio = SequenceMatcher(None, tb, tm).ratio()
+                if ratio < self.consensus_threshold:
+                    self.log(
+                        f"Consensus below threshold ({ratio:.2f} < {self.consensus_threshold}); dropping transcription",
+                        "INFO"
+                    )
+                    return ""
+
+            # otherwise choose the longer non-empty result
+            chosen = tb if len(tb) >= len(tm) else tm
+            return chosen
+
         except Exception as e:
-            self.log(f"Whisper error: {e}", "ERROR")
+            self.log(f"Whisper concurrent error: {e}", "ERROR")
             return ""
+
 
     # ─── Main loop ────────────────────────────────────────────────────────────
     def _stream_loop(self):
         sr = getattr(self._stream, "samplerate", self.sample_rate)
-
         while not self._stop_evt.is_set():
+            now = time.time()
             time.sleep(self.stream_step)
 
             # If currently muting TTS, show suppression dB indicator and skip
@@ -396,12 +438,10 @@ class AudioService:
                 continue
 
             # Live preview: decode trailing window while capturing
-            now = time.time()
             if self._capturing:
-                # throttle live decodes
+                # ── Live preview decode ───────────────────────────────
                 if (now - self._last_live_decode_ts) >= self._live_decode_interval:
                     self._last_live_decode_ts = now
-                    # take tail window (2.5 s) of the active chunk
                     tail_len = int(self._live_window_seconds * self.sample_rate)
                     tail = self._chunk[-tail_len:] if len(self._chunk) > tail_len else self._chunk
                     live_text = self._transcribe_np(tail, full=False)
@@ -410,14 +450,20 @@ class AudioService:
                         if new_suffix:
                             for w in new_suffix.split():
                                 print(w, end=" ", flush=True)
+                            # reset countdown on each new transcription
+                            self._time_of_last_transcript = time.time()
                         self._last_live_text = live_text
 
-                # End‑of‑utterance check (dynamic timeout)
-                dynamic_timeout = min(self.base_silence + 0.25 * self._spoken_seconds, 3.0)
-                remaining = max(0.0, dynamic_timeout - self._silence_run)
+                # ── Countdown based on time since last transcript ─────
+                dynamic_timeout = min(
+                    self.base_silence + 0.25 * self._spoken_seconds,
+                    3.0
+                )
+                elapsed = now - self._time_of_last_transcript
+                remaining = max(0.0, dynamic_timeout - elapsed)
                 print(f"\r⏱ {remaining:4.2f}s until send", end="", flush=True)
 
-                if self._silence_run >= dynamic_timeout:
+                if elapsed >= dynamic_timeout:
                     # finalize: transcribe the whole chunk once
                     print()  # newline after countdown
                     final_text = self._transcribe_np(self._chunk, full=True)
@@ -426,13 +472,13 @@ class AudioService:
                             self.on_transcription(final_text.strip())
                         except Exception as cb_err:
                             self.log(f"AudioService callback error: {cb_err}", "ERROR")
-                    # reset chunk state
+                    # reset state
                     self._capturing = False
                     self._chunk = np.zeros(0, dtype=np.float32)
                     self._spoken_seconds = 0.0
                     self._last_live_text = ""
                     self._last_live_decode_ts = 0.0
-                    self._silence_run = 0.0
-                    self._speech_run  = 0.0
+                    # reset the transcript timer so a new utterance restarts countdown
+                    self._time_of_last_transcript = time.time()
 
         self.log("AudioService: stream loop exiting.", "DEBUG")
