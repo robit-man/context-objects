@@ -1833,11 +1833,11 @@ class Assembler:
         PHRASE_REPEAT_LIMIT        = 6            # similar phrase count to trigger
         FUZZY_SIM_THRESH           = 0.90         # SequenceMatcher ratio
 
-        # NEW fuzzy token n-gram repetition
-        NGRAM_TOKEN_WINDOW         = 240          # last tokens to inspect
-        NGRAM_MIN, NGRAM_MAX       = 2, 8
-        NGRAM_REPEAT_LIMIT         = 8            # similar n-gram count to trigger
-        NGRAM_FUZZY_SIM_THRESH     = 0.92
+        # NEW fuzzy token n-gram repetition (tuned to avoid bullet-list false positives)
+        NGRAM_TOKEN_WINDOW         = 120          # was 240; smaller window reduces cross-bullet accumulation
+        NGRAM_MIN, NGRAM_MAX       = 5, 20        # was 2,8; require more substantive n-grams
+        NGRAM_REPEAT_LIMIT         = 15           # was 8; allow structured lists without tripping
+        NGRAM_FUZZY_SIM_THRESH     = 0.95         # was 0.92; tighter similarity to count as a repeat
 
         # NEW erosion / left-shift detector
         EROSION_CHAR_WINDOW        = 200
@@ -1846,7 +1846,7 @@ class Assembler:
         EROSION_SIM_THRESH         = 0.94
         EROSION_MIN_TRIGGERS       = 6
 
-        MAX_ATTEMPTS               = 20
+        MAX_ATTEMPTS               = 3
         SESSION_TIMEOUT_SEC        = 10 * 60
         GUARD_DELAY_SEC            = 5
         # ──────────────────────────────────────────────────────────────────
