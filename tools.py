@@ -3497,7 +3497,6 @@ class Tools:
     def auxiliary_inference(
         prompt: str,
         *,
-        temperature: float = 0.7,
         system: str | None = None,
         context: object | None = None,
         retrieval_count: int = 0,
@@ -3505,12 +3504,15 @@ class Tools:
         images: list[bytes] | None = None
     ) -> str:
         """
-        Invoke an LLM with a prompt, optional system instructions, and an
+        Invoke an LLM with a prompt, optional system instructions (system), and an
         explicit *narrative/context injection* mechanism:
-
-        - `context`: supply a high-level narrative object (e.g. the output of
+        - `prompt`: the main user query or instruction to the LLM instance.
+        - `system`: system instructions to set the LLM's role or context.
             `_load_narrative_context()`) so the model can ground its response
             in the overall story arc.
+        - `context`: supply a high-level narrative object (e.g. the output of
+            `get_narrative_context()`) or a string of recent context snippets to provide
+            the LLM with relevant background information.
         - `retrieval_count`: indicate how many of the most recent context snippets
             the LLM should consider.  If >0, callers are encouraged to prepend
             a block like:
