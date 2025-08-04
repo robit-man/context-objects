@@ -3530,7 +3530,7 @@ class Tools:
 
         Returns the raw string output from the chosen LLM.
         """
-        import re, json, requests
+        import re, json, requests, time
 
         # 1) choose model
         tier_map = {
@@ -3543,11 +3543,9 @@ class Tools:
                                     config.get("primary_model"))
 
         # 2) assemble messages
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
-
-        # if context is provided, treat it as a narrative block
         if context is not None:
             messages.append({
                 "role": "system",
@@ -3556,7 +3554,6 @@ class Tools:
                     f"{context}"
                 )
             })
-
         messages.append({"role": "user", "content": prompt})
 
         # 3) load images if none explicitly provided
@@ -3564,7 +3561,6 @@ class Tools:
         if images:
             images_data = images
         else:
-            # scan for HTTP or absolute local paths ending in image exts
             pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
             for loc in re.findall(pattern, prompt, flags=re.IGNORECASE):
                 try:
@@ -3578,36 +3574,60 @@ class Tools:
                 except Exception:
                     continue
 
-        # 4) inject images into the last message if present
         if images_data:
             messages[-1]["images"] = images_data
 
-        # 5) stream via chat()
-        try:
-            log_message(
-                f"auxiliary_inference(model={model_selected}, "
-                f"temp={temperature}, tier={model_tier}, "
-                f"retrievals={retrieval_count}, images={len(images_data)})",
-                "PROCESS"
-            )
-            content = ""
-            print("⟳ Auxiliary-LLM stream:", end="", flush=True)
-            for part in chat(
-                model=model_selected,
-                messages=messages,
-                stream=True,
-                options={"temperature": temperature},
-            ):
-                tok = part["message"]["content"]
-                content += tok
-                print(tok, end="", flush=True)
-            print()
-            log_message("auxiliary_inference complete.", "SUCCESS")
-            return content
+        # 4) helper to log
+        def _log(msg: str, level: str = "INFO"):
+            log_message(f"auxiliary_inference: {msg}", level)
 
-        except Exception as e:
-            log_message(f"auxiliary_inference error: {e}", "ERROR")
-            return json.dumps({"error": str(e)})
+        attempt = 0
+        while True:
+            attempt += 1
+            start_ts = time.time()
+            content = ""
+            prev_tok = None
+            repeat_count = 0
+
+            _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})", "PROCESS")
+            try:
+                print("⟳ Auxiliary-LLM stream:", end="", flush=True)
+                for part in chat(
+                    model=model_selected,
+                    messages=messages,
+                    stream=True,
+                    options={"temperature": temperature},
+                ):
+                    tok = part["message"]["content"]
+                    now = time.time()
+
+                    # timeout after 5 minutes
+                    if now - start_ts > 300:
+                        raise TimeoutError("stream exceeded 5 minute limit")
+
+                    # simple repetition detection
+                    if tok == prev_tok:
+                        repeat_count += 1
+                        if repeat_count > 10:
+                            raise RuntimeError("detected repeated tokens")
+                    else:
+                        repeat_count = 0
+                    prev_tok = tok
+
+                    content += tok
+                    print(tok, end="", flush=True)
+                print()
+                _log("auxiliary_inference complete.", "SUCCESS")
+                return content
+
+            except (TimeoutError, RuntimeError) as e:
+                _log(f"{e}; retrying after 5 minutes", "WARNING")
+                time.sleep(300)
+                continue
+
+            except Exception as e:
+                _log(f"error: {e}", "ERROR")
+                return json.dumps({"error": str(e)})
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:
