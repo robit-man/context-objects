@@ -88,7 +88,12 @@ class ContextObject:
 
     # Retrieval & similarity
     embedding: Optional[List[float]] = None
-    retrieval_score: Optional[float] = None
+    retrieval_score: Optional[float] = None      # static similarity score
+
+    # ─ Reinforcement-Learning signals (NEW) ──────────────────────────
+    value_estimate: Optional[float]  = None      # Q-value / critic estimate
+    outcome_reward: Optional[float]  = None      # immediate scalar reward
+    advantage:      Optional[float]  = None      # reward − baseline
     retrieval_metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Provenance & transformation
@@ -241,7 +246,27 @@ class ContextObject:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
-    
+
+
+    @classmethod
+    def make_performance(
+        cls,
+        reward: float,
+        stage_ids: List[str],
+        metrics: Dict[str, Any] | None = None,
+    ) -> "ContextObject":
+        """
+        Factory for a stage_performance object that carries
+        the scalar `reward` and any extra metrics.
+        """
+        obj = cls(domain="stage",
+                component="stage_performance",
+                semantic_label="stage_performance")
+        obj.outcome_reward = reward
+        obj.metadata.update(metrics or {})
+        obj.references = stage_ids
+        obj.tags = ["performance"]
+        return obj
 
 
     @classmethod

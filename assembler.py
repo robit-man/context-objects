@@ -23,11 +23,12 @@ import tempfile
 import threading
 import traceback
 import textwrap
-from types import MethodType
 from pathlib import Path
-from functools import lru_cache
-from dataclasses import dataclass, field
+from types import MethodType
 from collections import deque
+from functools import lru_cache
+from difflib import SequenceMatcher
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
@@ -588,6 +589,7 @@ class Assembler:
         "tool_chaining",
         "assemble_prompt",
         "final_inference",
+        "performance_rating",
     ]
 
     def __init__(
@@ -882,6 +884,7 @@ class Assembler:
             embedder=embed_text,
             memman=self.memman
         )
+        self.embed_text = embed_text          # ← ADD THIS LINE
         
         integrator_config = {
             # maximum number of nodes to keep in the graph at once
@@ -1291,8 +1294,6 @@ class Assembler:
         • Pre-flight: if _all_ semantic_labels are already in the repo, do nothing.
         • Otherwise: acquire lock, bucket, insert missing, delete duplicates.
         """
-
-        import os, time, json
 
         # ─── FAST-PATH GUARD ───────────────────────────────────────────
         if getattr(self, "_static_prompts_seeded", False):
@@ -1801,10 +1802,6 @@ class Assembler:
         - ngram_guard_fuzzy: catches repeated n-grams of tokens with approximate matches
         - erosion_guard: catches “left-shift” stutter where each step drops/changes 1 char (e.g., “…each form / ach form / ch form …”)
         """
-        import re, time, requests
-        from pathlib import Path
-        from collections import deque
-        from difflib import SequenceMatcher
 
         # You should already have these in scope:
         # from your_ollama_wrapper import chat, _OllamaError
@@ -3002,10 +2999,6 @@ class Assembler:
         Set skip_quick_phases=True to jump straight to the planner.
         """
 
-        import asyncio
-        from datetime import datetime, timezone
-        from context import sanitize_jsonl
-
         # ─── 0. Hygiene & defaults ────────────────────────────────────
         await asyncio.to_thread(sanitize_jsonl, self.repo.json_repo.path)
         # Wait for initial seeding & top off if hot-reload raced us
@@ -3889,21 +3882,34 @@ class Assembler:
         status_cb("final_inference", final)
 
 
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Stage 11.5 — Memory write-back
-        # ---------------------------------------------------------------------
-        _check_cancel()
+        # ------------------------------------------------------------------
         try:
-            await _to_thread_safe(self._stage11_memory_writeback, final, state["tool_ctxs"])
+            await _to_thread_safe(
+                self._stage11_memory_writeback,
+                final,
+                state["tool_ctxs"],
+            )
             status_cb("memory_writeback", "(queued)")
         except Exception as e:
             state["errors"].append(("memory_writeback", str(e)))
             status_cb("memory_writeback_error", str(e))
 
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Stage 12 — Performance rating
+        # ------------------------------------------------------------------
+        try:
+            await _to_thread_safe(self._stage12_performance_rating, state)
+            state.setdefault("stages_run", set()).add("performance_rating")
+            status_cb("performance_rating", "(ok)")
+        except Exception as e:
+            state.setdefault("errors", []).append(("performance_rating", str(e)))
+            status_cb("performance_rating_error", str(e))
+
+        # ------------------------------------------------------------------
         # Done
-        # ---------------------------------------------------------------------
-        _check_cancel()
+        # ------------------------------------------------------------------
         out = state["final"].strip()
         status_cb("output", out)
         return out

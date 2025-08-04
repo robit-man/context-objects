@@ -2934,6 +2934,60 @@ def _stage11_memory_writeback(
         narr.touch()
         self.repo.save(narr)
 
+
+# ──────────────────────────────────────────────────────────────────
+def _stage12_performance_rating(self, state: dict[str, Any]) -> None:
+    """
+    Compute a scalar reward (−1 … +1) for this turn,
+    • persist it via ContextObject.make_performance()
+    • copy the reward into every ContextObject touched this turn
+      (so MemoryManager can later use outcome_reward for pruning /
+       promotion decisions).
+    """
+    import time
+    from context import ContextObject
+
+    # --- 1) crude heuristic reward -----------------------------------
+    err_penalty  = -0.4 if state.get("errors") else 0.0
+    tool_penalty = -0.2 if any(tc.metadata.get("exception")
+                               for tc in state.get("tool_ctxs", [])) else 0.0
+    speed_bonus  = +0.2 if state.get("provisional_sent") else 0.0
+    reward = max(-1.0, min(1.0, 1.0 + err_penalty + tool_penalty + speed_bonus))
+
+    # --- 2) persist stage-performance object -------------------------
+    perf = ContextObject.make_performance(
+        reward = reward,
+        stage_ids = list(state.get("stages_run", [])),
+        metrics = {
+            "latency_ms": round((time.time() - state.get("start_ts", time.time())) * 1000),
+            "errors": state.get("errors", []),
+        },
+    )
+    self.repo.save(perf)
+    self.memman.register_relationships(perf, self.embed_text)
+
+    # --- 3) propagate reward into all objects written this turn ------
+    touched_ids = (
+        state.get("merged_ids", []) +
+        [c.context_id for c in state.get("tool_ctxs", [])] +
+        [perf.context_id]
+    )
+    for cid in touched_ids:
+        try:
+            obj = self.repo.get(cid)
+            if obj.outcome_reward is None:        # don’t overwrite later passes
+                obj.outcome_reward = reward
+                obj.touch()
+                self.repo.save(obj)
+        except KeyError:
+            continue
+
+    # --- 4) tell the RL controllers ----------------------------------
+    self.rl.update(list(state.get("stages_run", [])), reward)
+    self.curiosity_rl.update(state.get("curiosity_used", []), reward)
+
+
+
 def _stage_generate_narrative(self, state: Dict[str, Any]) -> ContextObject:
     """
     Build a running narrative of this conversation turn by turn,
