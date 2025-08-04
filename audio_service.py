@@ -422,6 +422,7 @@ class AudioService:
     # ─── Main loop ────────────────────────────────────────────────────────────
     def _stream_loop(self):
         sr = getattr(self._stream, "samplerate", self.sample_rate)
+        max_timeout = 3.0
         while not self._stop_evt.is_set():
             now = time.time()
             time.sleep(self.stream_step)
@@ -457,10 +458,14 @@ class AudioService:
                 # ── Countdown based on time since last transcript ─────
                 dynamic_timeout = min(
                     self.base_silence + 0.25 * self._spoken_seconds,
-                    3.0
+                    max_timeout
                 )
+
                 elapsed = now - self._time_of_last_transcript
-                remaining = max(0.0, dynamic_timeout - elapsed)
+                remaining = dynamic_timeout - elapsed
+                # never show more than max_timeout and never negative
+                remaining = max(0.0, min(remaining, max_timeout))
+
                 print(f"\r⏱ {remaining:4.2f}s until send", end="", flush=True)
 
                 if elapsed >= dynamic_timeout:
@@ -472,13 +477,13 @@ class AudioService:
                             self.on_transcription(final_text.strip())
                         except Exception as cb_err:
                             self.log(f"AudioService callback error: {cb_err}", "ERROR")
-                    # reset state
+                    # reset chunk state
                     self._capturing = False
                     self._chunk = np.zeros(0, dtype=np.float32)
                     self._spoken_seconds = 0.0
                     self._last_live_text = ""
                     self._last_live_decode_ts = 0.0
-                    # reset the transcript timer so a new utterance restarts countdown
+                    # reset transcript timer so the next utterance restarts countdown
                     self._time_of_last_transcript = time.time()
 
         self.log("AudioService: stream loop exiting.", "DEBUG")
