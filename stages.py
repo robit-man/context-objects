@@ -965,7 +965,18 @@ def _stage7_planning_summary(
 
     # Implicit dependency injection via placeholders
     _PL_RE = re.compile(
-        r"\[([A-Za-z0-9_-]+)\.output(?:\.([A-Za-z0-9_.-]+))?\]|\{\{([A-Za-z0-9_-]+)\}\}"
+        r"""
+        \[            # opening [
+        \s*<?\s*    # optional leading ‘<’
+        (?P<id>[A-Za-z0-9_-]+)
+        \s*>?\s*    # optional trailing ‘>’
+        \.output    # literal
+        (?:\.[A-Za-z0-9_.-]+)?   # optional attribute access
+        \]            # closing ]
+        |
+        \{\{(?P<alias>[A-Za-z0-9_-]+)\}\}   # {{alias}}
+        """,
+        re.X,
     )
     def _inject_implicit_deps(graph: dict) -> None:
         nodes = graph.get("nodes") or []
@@ -2270,30 +2281,35 @@ def _stage9_invoke_with_retries(
 
     # ------------------------------------------------------------------ PLAN / TURN
     turn = _ensure_turn_state(state)
-
-    # Normalise the incoming plan → graph obj
+    # ────────────────────────────────────────────────────────────────
+    # 1)  Normalise the incoming plan → graph obj
+    # ────────────────────────────────────────────────────────────────
     try:
         plan_obj = json.loads(_clean_json_block(plan_output)) if plan_output else {}
     except Exception:
         plan_obj = {}
-    graph_obj = plan_obj.get("graph") or getattr(turn, "graph", {}) or {}
+    graph_obj: Dict[str, Any] = plan_obj.get("graph") or getattr(turn, "graph", {}) or {}
     nodes: List[Dict[str, Any]] = graph_obj.get("nodes") or []
     if not isinstance(nodes, list):
         nodes = []
 
-    # quick id → node map for O(1) lookups
+    # quick id → node map
     graph_index: Dict[str, Dict[str, Any]] = {n.get("id"): n for n in nodes if n.get("id")}
 
-    # ------------------------------------------------------------------ SCHEMAS (for citations)
+    # ────────────────────────────────────────────────────────────────
+    # 2)  SCHEMAS (for citations)
+    # ────────────────────────────────────────────────────────────────
     schema_map: Dict[str, ContextObject] = {}
     for s in selected_schemas or []:
         try:
             nm = json.loads(s.metadata["schema"])["name"]
             schema_map[nm] = s
         except Exception:
-            pass
+            continue
 
-    # ------------------------------------------------------------------ PLAN-TRACKER row
+    # ────────────────────────────────────────────────────────────────
+    # 3)  PLAN-TRACKER row bootstrap / update
+    # ────────────────────────────────────────────────────────────────
     plan_sig_src = json.dumps(graph_obj, ensure_ascii=False, sort_keys=True)
     plan_sig = hashlib.md5(plan_sig_src.encode("utf-8")).hexdigest()[:8]
 
@@ -2331,53 +2347,61 @@ def _stage9_invoke_with_retries(
         tracker.stage_id = f"plan_tracker_{plan_sig}"
     tracker.metadata["attempts"] = tracker.metadata.get("attempts", 0) + 1
     tracker.metadata["last_attempt_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-    tracker.touch()
-    self.repo.save(tracker)
+    tracker.touch(); self.repo.save(tracker)
 
-    # ------------------------------------------------------------------ TURN bookkeeping
+    # ────────────────────────────────────────────────────────────────
+    # 4)  TURN bookkeeping
+    # ────────────────────────────────────────────────────────────────
     if not getattr(turn, "pending_nodes", None):
         turn.pending_nodes = {nid for nid in graph_index}
     if not getattr(turn, "completed_nodes", None):
         turn.completed_nodes = set()
-    # handy alias
-    turn.done = turn.completed_nodes
+    turn.done = turn.completed_nodes                          # handy alias
 
-    # result & retry dicts
+    # results & retry counters
     turn.results = getattr(turn, "results", {})
     turn.attempts_left = getattr(turn, "attempts_left", {})
     for nid in graph_index:
-        turn.attempts_left.setdefault(nid, 3)          # default 3 tries / node
+        turn.attempts_left.setdefault(nid, 3)                 # default retries / node
 
-    # ------------------------------------------------------------------ placeholder memory
+    # ────────────────────────────────────────────────────────────────
+    # 5)  Placeholder memory + helpers
+    # ────────────────────────────────────────────────────────────────
     last_results: Dict[str, Any] = {}
 
     def _record_result(node_id: str, tool_name: str, alias: str | None, value: Any):
-        """Store results under several keys for later placeholder subs."""
         for k in filter(None, [node_id, tool_name, alias]):
             last_results[k] = value
             last_results[normalize_key(k)] = value
 
-    # ------------------------------------------------------------------ placeholder substitution
+    # — regex for [n1.output] or [<n1>.output] and for {{alias}} —
+    _BRACKET_RE = re.compile(
+        r"\[\s*<?\s*([A-Za-z0-9_-]+)\s*>?\s*\.output(?:\.[A-Za-z0-9_.-]+)?\s*\]"
+    )
+    _ALIAS_RE = re.compile(r"\{\{([A-Za-z0-9_-]+)\}\}")
+
     def _subst_in_str(s: str) -> Any:
         if not isinstance(s, str):
             return s
-        m = re.fullmatch(r"\[([^\]]+)\.output\]", s)
+
+        # stand-alone replacements
+        m = _BRACKET_RE.fullmatch(s)
         if m:
             key = m.group(1)
             return last_results.get(key) or last_results.get(normalize_key(key))
-        m = re.fullmatch(r"\{\{([^}]+)\}\}", s)
+        m = _ALIAS_RE.fullmatch(s)
         if m:
             key = m.group(1)
             return last_results.get(key) or last_results.get(normalize_key(key))
 
         # inline replacements
-        def _rep_bracket(mo):
+        def _rep(mo):
             key = mo.group(1)
             val = last_results.get(key) or last_results.get(normalize_key(key)) or ""
             return json.dumps(val, ensure_ascii=False)
 
-        s = re.sub(r"\[([^\]]+)\.output\]", _rep_bracket, s)
-        s = re.sub(r"\{\{([^}]+)\}\}", _rep_bracket, s)
+        s = _BRACKET_RE.sub(_rep, s)
+        s = _ALIAS_RE.sub(_rep, s)
         return s
 
     def _subst(obj: Any) -> Any:
@@ -2389,7 +2413,9 @@ def _stage9_invoke_with_retries(
             return _subst_in_str(obj)
         return obj
 
-    # ------------------------------------------------------------------ ready-node helpers
+    # ────────────────────────────────────────────────────────────────
+    # 6)  Ready-node helpers
+    # ────────────────────────────────────────────────────────────────
     def _deps_satisfied(nid: str) -> bool:
         deps = graph_index.get(nid, {}).get("after", []) or []
         return all(d in turn.done for d in deps)
@@ -2401,13 +2427,14 @@ def _stage9_invoke_with_retries(
             if n.get("id") in turn.pending_nodes and _deps_satisfied(n["id"])
         ]
 
-    # ------------------------------------------------------------------ budgets
+    # ────────────────────────────────────────────────────────────────
+    # 7)  Budgets & execution scaffolding
+    # ────────────────────────────────────────────────────────────────
     budgets = getattr(turn, "budgets", {}) or state.get("budgets", {}) or {}
-    calls_budget = int(budgets.get("calls", 1_000_000))
+    calls_budget  = int(budgets.get("calls", 1_000_000))
     time_budget_s = float(budgets.get("time", 1e9))
     start_time = time.time()
 
-    # ------------------------------------------------------------------ execution loop
     tool_ctxs: List[ContextObject] = []
     pending_backoff: Dict[str, float] = {}
 

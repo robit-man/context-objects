@@ -3505,44 +3505,33 @@ class Tools:
         images: list[bytes] | None = None
     ) -> str:
         """
-        Invoke an LLM with a prompt, optional system instructions (system), and an
-        explicit *narrative/context injection* mechanism:
-        - `prompt`: the main user query or instruction to the LLM instance.
-        - `system`: system instructions to set the LLM's role or context.
-            `_load_narrative_context()`) so the model can ground its response
-            in the overall story arc.
-        - `context`: supply a high-level narrative object (e.g. the output of
-            `get_narrative_context()`) or a string of recent context snippets to provide
-            the LLM with relevant background information.
-        - `retrieval_count`: indicate how many of the most recent context snippets
-            the LLM should consider.  If >0, callers are encouraged to prepend
-            a block like:
-                “Here are the last {retrieval_count} context snippets: …”
-            to the `prompt` (or via `context=`) so that the model can weave them
-            into its auxiliary inference.
-        - `model_tier`: choose among "primary", "secondary", or "decision" tiers.
-        - `images`: raw bytes to embed directly in the final user message;
-            falls back to scanning `prompt` for image URLs or file paths.
+        Call an LLM in a *fire-and-forget* fashion, enriched with optional narrative
+        context / recent retrievals.
 
-        This helper is designed both for programmatic use *and* as a tool that
-        an LLM can call when it wants to “pull in” narrative context and recent
-        retrievals before performing its reasoning.
+        Improvements vs. prior version
+        ------------------------------
+        • If the streaming call runs ≥ 5 minutes we abort **and retry immediately**.  
+        • Robust repetition guard: aborts if
+            – the exact same token repeats > 10 times consecutively, **or**
+            – any single line appears ≥ 10 times, **or**
+            – a recent substring (20-120 chars) shows up ≥ 10 times.
+          All retries happen instantly (1 s back-off).
 
-        Returns the raw string output from the chosen LLM.
+        Parameters & return value are unchanged – see original doc-string.
         """
-        import re, json, requests, time
+        import re, json, requests, time, collections, hashlib
 
-        # 1) choose model
+        # ────────────── 1) choose model ──────────────
         tier_map = {
             "primary":   config.get("primary_model"),
             "secondary": config.get("secondary_model", config.get("primary_model")),
             "decision":  config.get("decision_model",
-                        config.get("secondary_model", config.get("primary_model")))
+                         config.get("secondary_model", config.get("primary_model")))
         }
         model_selected = tier_map.get((model_tier or "primary").lower(),
-                                    config.get("primary_model"))
+                                      config.get("primary_model"))
 
-        # 2) assemble messages
+        # ────────────── 2) assemble messages ─────────
         messages: list[dict[str, Any]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
@@ -3556,13 +3545,13 @@ class Tools:
             })
         messages.append({"role": "user", "content": prompt})
 
-        # 3) load images if none explicitly provided
+        # ────────────── 3) embed images if any ───────
         images_data: list[bytes] = []
         if images:
             images_data = images
         else:
-            pattern = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
-            for loc in re.findall(pattern, prompt, flags=re.IGNORECASE):
+            patt = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+            for loc in re.findall(patt, prompt, flags=re.I):
                 try:
                     if loc.lower().startswith(("http://", "https://")):
                         resp = requests.get(loc, timeout=5)
@@ -3573,21 +3562,26 @@ class Tools:
                             images_data.append(f.read())
                 except Exception:
                     continue
-
         if images_data:
             messages[-1]["images"] = images_data
 
-        # 4) helper to log
+        # ────────────── 4) helpers ───────────────────
         def _log(msg: str, level: str = "INFO"):
             log_message(f"auxiliary_inference: {msg}", level)
 
+        # return the number of occurrences of `substr` in `text`
+        def _substr_count(text: str, substr: str) -> int:
+            return text.count(substr)
+
+        # ────────────── 5) retry loop ────────────────
         attempt = 0
         while True:
             attempt += 1
             start_ts = time.time()
             content = ""
             prev_tok = None
-            repeat_count = 0
+            exact_repeat_cnt = 0
+            line_counter = collections.Counter()
 
             _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})", "PROCESS")
             try:
@@ -3601,33 +3595,55 @@ class Tools:
                     tok = part["message"]["content"]
                     now = time.time()
 
-                    # timeout after 5 minutes
+                    # ── timeout guard (5 min) ──
                     if now - start_ts > 300:
-                        raise TimeoutError("stream exceeded 5 minute limit")
+                        raise TimeoutError("stream exceeded 5-minute limit")
 
-                    # simple repetition detection
+                    # ── identical-token spam ──
                     if tok == prev_tok:
-                        repeat_count += 1
-                        if repeat_count > 10:
-                            raise RuntimeError("detected repeated tokens")
+                        exact_repeat_cnt += 1
+                        if exact_repeat_cnt > 10:
+                            raise RuntimeError("detected repeated content")
                     else:
-                        repeat_count = 0
+                        exact_repeat_cnt = 0
                     prev_tok = tok
 
                     content += tok
                     print(tok, end="", flush=True)
+
+                    # ── line-based repetition ──
+                    if "\n" in tok:
+                        for line in tok.splitlines():
+                            ln = line.strip()
+                            if ln:
+                                line_counter[ln] += 1
+                                if line_counter[ln] >= 10:
+                                    raise RuntimeError("detected repeated content")
+
+                    # ── substring repetition (pattern length 20-120 chars) ──
+                    if len(content) > 240:
+                        tail = content[-120:]
+                        # find shortest meaningful tail ≥ 20 chars
+                        for L in range(20, 121, 10):
+                            sub = tail[-L:]
+                            if len(sub) < 20:
+                                continue
+                            if _substr_count(content, sub) >= 10:
+                                raise RuntimeError("detected repeated content")
+
                 print()
                 _log("auxiliary_inference complete.", "SUCCESS")
                 return content
 
             except (TimeoutError, RuntimeError) as e:
-                _log(f"{e}; retrying after 5 minutes", "WARNING")
-                time.sleep(300)
+                _log(f"{e}; immediate retry", "WARNING")
+                time.sleep(1.0)        # brief breather, NOT 5 min
                 continue
 
             except Exception as e:
                 _log(f"error: {e}", "ERROR")
                 return json.dumps({"error": str(e)})
+
         
     @staticmethod
     def generate_tool_schema(tool_name: str) -> Dict[str, Any]:

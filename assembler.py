@@ -671,10 +671,13 @@ class Assembler:
             "inference_prompt",
             "Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention. Dont repeat this instruction in your response!"
         )
+        # ──────────────────────────────────────────────────────────────────────
+        #  PROMPT DEFAULTS  (updated for richer placeholder syntax)
+        # ──────────────────────────────────────────────────────────────────────
         self.planning_prompt = self.cfg.get(
             "planning_prompt",
-            # ── DAG PLANNER PROMPT ─────────────────────────────────────────────────
-            "You are the Planner. Output **only** valid JSON for a small task graph (DAG).\n"
+            # ── DAG PLANNER PROMPT ────────────────────────────────────────────
+            "You are the Planner. Output **only** valid JSON for a small task-graph (DAG).\n"
             "Follow this schema exactly (no extra prose):\n"
             "{\n"
             "  \"graph\": {\n"
@@ -685,25 +688,29 @@ class Assembler:
             "        \"args\": { /* named params matching the tool schema */ },\n"
             "        \"after\": []                  // ids of nodes that must complete before this one\n"
             "      }\n"
-            "      // up to 6 nodes total; keep ≤3 runnable in any single layer\n"
+            "      // ≤ 6 nodes total; ≤ 3 runnable in any single layer\n"
             "    ],\n"
             "    \"meta\": {\n"
             "      \"goal\": \"<1–2 sentence summary of the user’s request>\",\n"
-            "      \"constraints\": [/* optional short constraints */]\n"
+            "      \"constraints\": [ /* optional constraints */ ]\n"
             "    }\n"
             "  }\n"
             "}\n"
             "\n"
             "Rules:\n"
-            "• Use ONLY tools from the provided Available tools list (names must match exactly).\n"
-            "• Keep the graph minimal: prefer 1–3 nodes; max 6 nodes; ≤3 runnable in parallel per layer.\n"
-            "• If a node needs output of a prior node, reference it with placeholders inside args as:\n"
-            "    \"[tX.output]\"  (or a dotted path like \"[tX.output.text]\") or  \"{{tX}}\".\n"
+            "• Use ONLY tools from the provided *Available tools* list (names must match exactly).\n"
+            "• Keep the graph minimal: prefer 1–3 nodes; max 6; ≤ 3 runnable in parallel per layer.\n"
+            "• To reference prior-node output inside args you may write **any** of:\n"
+            "      \"[tX.output]\"                     // full output object\n"
+            "      \"[tX.output.some.path]\"           // specific sub-field via dot-path\n"
+            "      \"[ <tX>.output ]\"                // same as first (angle-brackets allowed)\n"
+            "      \"{{tX}}\"                          // shorthand = full output\n"
+            "  (Whitespace inside […] is ignored.)\n"
             "• Do NOT invent argument keys; use exactly the keys/types from the tool’s schema.\n"
-            "• No cycles; every id used in \"after\" must exist.\n"
-            "• If a single tool suffices, return a graph with one node.\n"
+            "• No cycles; every id in \"after\" must exist.\n"
+            "• If a single tool suffices, return a graph with one node only.\n"
             "\n"
-            "Example (illustrative only):\n"
+            "Example (illustrative):\n"
             "{\n"
             "  \"graph\": {\n"
             "    \"nodes\": [\n"
@@ -714,13 +721,13 @@ class Assembler:
             "  }\n"
             "}\n"
             "\n"
-            "Return ONLY the JSON object above—no markdown fences, no commentary."
-            # ───────────────────────────────────────────────────────────────────────
+            "Return **ONLY** that JSON object—no markdown fences, no commentary."
+            # ──────────────────────────────────────────────────────────────────
         )
 
         self.toolchain_prompt = self.cfg.get(
             "toolchain_prompt",
-            # ── TOOLCHAIN (LAYER EXECUTOR) PROMPT ──────────────────────────────────
+            # ── TOOLCHAIN / EXECUTOR PROMPT ───────────────────────────────────
             "You will receive a single JSON object describing the next runnable DAG layer:\n"
             "{\n"
             "  \"ready_nodes\": [\n"
@@ -732,22 +739,24 @@ class Assembler:
             "}\n"
             "\n"
             "Your job:\n"
-            "1) Resolve placeholders in each node’s args using last_results:\n"
-            "   • \"[tX.output]\" → substitute the prior node’s full output\n"
-            "   • dotted paths like \"[tX.output.text]\" → substitute that field if present\n"
-            "   • \"{{tX}}\" → same as \"[tX.output]\"\n"
-            "2) Validate args against the corresponding tool JSON schema:\n"
-            "   • Drop unknown keys; keep types correct; do NOT invent new keys.\n"
-            "   • If a required arg is missing and no obvious default exists, leave it missing (executor may replan).\n"
-            "3) Output EXACTLY one JSON object (no prose) with parallel call strings aligned to ready_nodes order:\n"
+            "1) **Resolve placeholders** in each node’s args using last_results:\n"
+            "     • \"[tX.output]\"  or \"[ <tX>.output ]\"  → substitute the full output\n"
+            "     • dotted paths like \"[tX.output.text]\"   → substitute that sub-field\n"
+            "     • \"{{tX}}\"                              → same as full output\n"
+            "     • Whitespace inside […] is ignored.\n"
+            "2) **Validate** args against the tool’s JSON schema:\n"
+            "   • Drop unknown keys; keep types correct; do **NOT** invent new keys.\n"
+            "   • If a required arg is still missing and no safe default exists, leave it blank (the executor may re-plan).\n"
+            "3) Output **exactly** one JSON object (no prose) with parallel call-strings aligned to ready_nodes order:\n"
             "{\n"
-            "  \"tool_calls\": [\"toolA(arg1=...,arg2=...)\", \"toolB(arg=...)\"] ,\n"
-            "  \"node_ids\":   [\"t2\", \"t3\"]\n"
+            "  \"tool_calls\": [ \"toolA(arg1=...,arg2=...)\" , \"toolB(arg=...)\" ],\n"
+            "  \"node_ids\":   [ \"t2\", \"t3\" ]\n"
             "}\n"
             "\n"
-            "Do not add commentary, markdown, or extra fields. Return ONLY that JSON."
-            # ───────────────────────────────────────────────────────────────────────
+            "Do **not** add commentary, markdown, or extra fields. Return ONLY that JSON."
+            # ──────────────────────────────────────────────────────────────────
         )
+
 
         self.reflection_prompt = self.cfg.get(
             "reflection_prompt",
