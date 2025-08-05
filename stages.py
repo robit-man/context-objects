@@ -863,29 +863,44 @@ def _stage7_planning_summary(
 ) -> Tuple[ContextObject, str]:
     """
     Updated for DAG + TurnState (+ robustness + schema/hint replan):
-
-      1) Load the latest planning_prompt (or config fallback)
-      2) Provide compact conversation + knowledge snippets to the planner
-      3) Run an initial JSON-only planning pass (no schemas yet)
-      4) Build a **selected-tool-only** schema catalog + pull prior confirmed retry-hints
-         and run a second internal planning pass that includes those schemas + hints
-      5) Refine each chosen tool against its schema (fill only missing/invalid)
-         • Persist a 'tool_retry_critique' analysis row for each refinement candidate
-           (tagged ['tool_retry','candidate'] with plan/turn/tool metadata)
-      6) Convert tasks → DAG graph if planner did not emit a graph
-      7) Inject implicit deps from placeholders like [n1.output.foo] or {{alias}}
-      8) Validate graph (unique IDs, missing deps, acyclicity, known tools)
-      9) Initialize TurnState: plan_id, graph, pending/completed, budgets
-     10) Persist planning_summary + plan_tracker; return (ctx, plan_json)
-
-    NOTE on retry-hints:
-      • This stage *reads* previously confirmed hints (status in {'confirmed','success'})
-        and includes them during the schema-augmented second pass.
-      • This stage *writes* new candidate hints when it fills missing params; downstream
-        execution/observation code can later promote them by setting status='confirmed'.
+    ...
     """
     import json, re, hashlib, datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # ──────────────────────────────────────────────────────────────────
+    # Normalize required contexts (guard against None)
+    # ──────────────────────────────────────────────────────────────────
+    def _ensure_ctx(ctx, stage_id: str, label: str) -> ContextObject:
+        if ctx is not None:
+            return ctx
+        dummy = ContextObject.make_stage(stage_id, [], {"summary": ""})
+        dummy.component = stage_id
+        dummy.semantic_label = label
+        try:
+            _stamp(dummy, state)  # safe if available
+        except Exception:
+            pass
+        dummy.touch()
+        self.repo.save(dummy)
+        return dummy
+
+    clar_ctx = _ensure_ctx(clar_ctx, "intent_clarification_dummy", "intent_clarification")
+    know_ctx = _ensure_ctx(know_ctx, "external_knowledge_dummy", "external_knowledge")
+
+    # Precompute safe summaries (avoid repeated attribute access)
+    _clar_summary = (clar_ctx.summary or "").strip()
+    _know_summary = (know_ctx.summary or "").strip()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers (local to stage)
+    # ──────────────────────────────────────────────────────────────────
+    def _clean_json_block(text: str) -> str:
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", flags=re.S)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
+        return (m2.group(1) if m2 else (text or "")).strip()
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers (local to stage)
@@ -1063,8 +1078,8 @@ def _stage7_planning_summary(
     incoming = {
         "turn_id":         turn.turn_id,
         "user_text":       user_text,
-        "clarifier_notes": clar_ctx.summary,
-        "knowledge_snips": len((know_ctx.summary or "").splitlines()),
+        "clarifier_notes": _clar_summary,
+        "knowledge_snips": len((_know_summary or "").splitlines()),
         "merged_len":      len(state.get("merged", [])),
         "history_len":     len(state.get("history", [])),
         "available_tools": len(tools_list),
@@ -1120,7 +1135,7 @@ def _stage7_planning_summary(
     # ──────────────────────────────────────────────────────────────────
     # 3) Build USER message to planner
     # ──────────────────────────────────────────────────────────────────
-    original_snips = (know_ctx.summary or "").splitlines()
+    original_snips = (_know_summary or "").splitlines()
 
     def build_user(snips: List[str]) -> str:
         blocks = [
