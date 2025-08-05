@@ -3665,274 +3665,83 @@ class Assembler:
             status_cb("external_knowledge_error", str(e))
 
         # ──────────────────────────────────────────────────────────────────────────
-        # Stage 6 — prepare tool schemas (seed before planning)
+        # Stage 6 — ensure we have an in-memory catalogue of tool-schemas
         # ──────────────────────────────────────────────────────────────────────────
         _check_cancel()
         try:
-            tools_list = await _to_thread_safe(self._stage6_prepare_tools)
-            state["tools_list"] = tools_list
-            status_cb("prepare_tools", f"{len(tools_list)} tools")
-            preview = ", ".join(t["name"] for t in tools_list[:6])
-            state["tool_preview"] = preview
+            # If another stage hasn’t already cached them, load from repo now
+            if not state.get("tools_list"):
+                state["tools_list"] = await _to_thread_safe(self._stage6_prepare_tools)
+
+            tools = state["tools_list"]
+            if not tools:
+                raise RuntimeError(
+                    "No active tool_schema rows found (component=='schema' & tag 'tool_schema')."
+                )
+
+            # Keep a short comma-separated preview for logging / UX
+            state["tool_preview"] = ", ".join(t["name"] for t in tools[:6])
+            status_cb("prepare_tools", f"{len(tools)} tools")
         except Exception as e:
-            state["errors"].append(("prepare_tools", str(e)))
-            status_cb("prepare_tools_error", str(e))
+            err_msg = f"{type(e).__name__}: {e}"
+            state.setdefault("errors", []).append(("prepare_tools", err_msg))
+            status_cb("prepare_tools_error", err_msg)
+            # Proceed without tools – downstream planner can still answer text-only
             state["tools_list"]   = []
             state["tool_preview"] = ""
 
         # ──────────────────────────────────────────────────────────────────────────
-        # Stage 7 — Planner (DAG)
+        # Guarantee clarifier & knowledge contexts (orchestrator prerequisites)
         # ──────────────────────────────────────────────────────────────────────────
         _check_cancel()
-
-        if state.get("use_tools") and state["tools_list"]:
-            status_cb("tool_notice", f"I'm consulting these tools for a detailed answer: {state['tool_preview']}")
-
-        clar_ctx = state.get("clar_ctx")
-        if not clar_ctx:
-            clar_ctx = ContextObject.make_stage("intent_clarification_dummy", [], {"summary": ""})
-            clar_ctx.touch(); self.repo.save(clar_ctx)
-            state["clar_ctx"] = clar_ctx
-
-        know_ctx = state.get("know_ctx")
-        if not know_ctx:
-            know_ctx = ContextObject.make_stage("external_knowledge_dummy", clar_ctx.references or [], {"summary": ""})
-            know_ctx.touch(); self.repo.save(know_ctx)
-            state["know_ctx"] = know_ctx
-
-        state.setdefault("early_phases", {})
-
-        try:
-            plan_ctx, plan_output_raw = await _to_thread_safe(
-                self._stage7_planning_summary,
-                clar_ctx,
-                know_ctx,
-                state["tools_list"],
-                state["user_text"],
-                state,
-            )
-
-            if not isinstance(plan_output_raw, str):
-                plan_output_raw = json.dumps(plan_output_raw, ensure_ascii=False)
-
+        if "clar_ctx" not in state:
             try:
-                plan_output = json.loads(plan_output_raw)
-            except Exception:
-                try:
-                    plan_output = ast.literal_eval(plan_output_raw)
-                except Exception:
-                    plan_output = {}
-
-            state["plan_ctx"]        = plan_ctx
-            state["plan_output_raw"] = plan_output_raw
-            state["plan_output"]     = plan_output
-            status_cb("planner", "(ok)")
-
-        except Exception as e:
-            state["errors"].append(("planner", str(e)))
-            status_cb("planner_error", str(e))
-            state["plan_ctx"]        = None
-            state["plan_output_raw"] = ""
-            state["plan_output"]     = {}
-
-        # ensure the raw output is always a string
-        if not isinstance(state.get("plan_output_raw", ""), str):
-            state["plan_output_raw"] = json.dumps(state["plan_output_raw"], ensure_ascii=False)
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # Stage 7b — plan_validation (DAG-aware)
-        # ──────────────────────────────────────────────────────────────────────────
-        _check_cancel()
-        try:
-            _, _, fixed_calls = await _to_thread_safe(
-                self._stage7b_plan_validation,
-                state.get("plan_ctx"),
-                state["plan_output_raw"],
-                state["tools_list"],
-                state,
-            )
-            state["fixed_calls"] = fixed_calls or []
-            status_cb("plan_validation", f"{len(state['fixed_calls'])} calls")
-        except Exception as e:
-            state["errors"].append(("plan_validation", str(e)))
-            status_cb("plan_validation_error", str(e))
-            state["fixed_calls"] = []
-
-        # ---------------------------------------------------------------------
-        # Stage 8 — tool_chaining (display list; DAG executes by dependencies)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            chaining_input = state.get("plan_output_raw") or "\n".join(state["fixed_calls"])
-            tc_ctx, raw_calls, schemas = await _to_thread_safe(
-                self._stage8_tool_chaining,
-                state.get("plan_ctx"),
-                chaining_input,
-                state["tools_list"],
-                state,
-                on_token,
-            )
-            state["tc_ctx"]    = tc_ctx
-            state["raw_calls"] = raw_calls or []
-            state["schemas"]   = schemas or []
-            status_cb("tool_chaining", f"{len(state['raw_calls'])} calls")
-        except Exception as e:
-            state["errors"].append(("tool_chaining", str(e)))
-            status_cb("tool_chaining_error", str(e))
-            state["raw_calls"], state["schemas"] = [], []
-
-        # ---------------------------------------------------------------------
-        # Stage 8.5 — user_confirmation (informational in DAG mode)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        state["confirmed_calls"] = await _to_thread_safe(
-            self._stage8_5_user_confirmation,
-            state["raw_calls"] or state["fixed_calls"],
-            user_text
-        )
-        status_cb("user_confirmation", state["confirmed_calls"])
-
-        # ---------------------------------------------------------------------
-        # Stage 9 — Invoke tools (DAG executor with retries/timeouts)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            # Capture IMMEDIATE runs (the stage returns the ContextObjects)
-            tool_ctxs = await _to_thread_safe(
-                self._stage9_invoke_with_retries,
-                state["confirmed_calls"],
-                state.get("plan_output_raw"),
-                state["schemas"],
-                user_text,
-                state["clar_ctx"].metadata,
-                state,
-            )
-            state["tool_ctxs"] = tool_ctxs or []
-        except Exception as e:
-            state.setdefault("errors", []).append(("invoke_with_retries", str(e)))
-            status_cb("invoke_with_retries_error", str(e))
-            state["tool_ctxs"] = []
-
-        # Ingest IMMEDIATE tool outputs only (no repo re-query)
-        tool_ctxs = state.get("tool_ctxs", [])
-        if tool_ctxs:
-            try:
-                await _to_thread_safe(self.integrator.ingest, tool_ctxs)
-            except Exception:
-                status_cb("integrator_error", traceback.format_exc(limit=5))
-            state.setdefault("merged", []).extend(tool_ctxs)
-            state["last_tool_outputs"] = {
-                (t.metadata.get("tool_name") or t.stage_id):
-                    t.metadata.get("output", t.metadata.get("output_full"))
-                for t in tool_ctxs
-            }
-        status_cb("invoke_with_retries", f"{len(tool_ctxs)} runs")
-
-        # ---------------------------------------------------------------------
-        # Stage 9b — Reflection & Replan (DAG)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            rp = await _to_thread_safe(
-                self._stage9b_reflection_and_replan,
-                state["tool_ctxs"],
-                state.get("plan_output"),
-                user_text,
-                state["clar_ctx"].metadata,
-                state,
-            )
-            state["replan"] = rp
-            status_cb("reflection_and_replan", rp if rp is not None else "(ok)")
-            # If a new plan JSON string is returned, keep it in state for UI/audit
-            if isinstance(rp, str) and rp.strip() and not rp.strip().lower().startswith("ok"):
-                state["plan_output_raw"] = rp
-                try:
-                    state["plan_output"] = json.loads(rp)
-                except Exception:
-                    state["plan_output"] = {"graph": {}}
-        except Exception as e:
-            state.setdefault("errors", []).append(("reflection_and_replan", str(e)))
-            status_cb("reflection_and_replan_error", str(e))
-
-        # ---------------------------------------------------------------------
-        # Stage 10 — Assemble & Infer (includes IMMEDIATE tool outputs)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            draft = await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state)
-            state["draft"] = draft
-            status_cb("assemble_and_infer", draft)
-        except Exception as e:
-            state.setdefault("errors", []).append(("assemble_and_infer", str(e)))
-            status_cb("assemble_and_infer_error", str(e))
-            draft = state.get("draft", "")
-
-        # ---------------------------------------------------------------------
-        # Stage 10b — Response Critique & Safety (disabled by default)
-        # ---------------------------------------------------------------------
-        if False:
-            _check_cancel()
-            try:
-                patched = await _to_thread_safe(
-                    self._stage10b_response_critique_and_safety,
-                    state["draft"],
+                clar_ctx = await _to_thread_safe(
+                    self._stage4_intent_clarification,
                     user_text,
-                    state.get("tool_ctxs", []),
-                    state
+                    state,
+                    on_token=on_token,
                 )
-                if patched:
-                    state["draft"] = patched
-                status_cb("response_critique", state["draft"])
-            except Exception as e:
-                state.setdefault("errors", []).append(("response_critique", str(e)))
-                status_cb("response_critique_error", str(e))
+            except Exception:
+                clar_ctx = ContextObject.make_stage(
+                    "intent_clarification_failed", [], {"summary": ""}
+                )
+                clar_ctx.touch(); self.repo.save(clar_ctx)
+            state["clar_ctx"] = clar_ctx
+            status_cb("intent_clarification", clar_ctx.summary or "(created)")
 
-        # ---------------------------------------------------------------------
-        # Stage 11 — Final inference pass (this-turn only; no stitched tool dump)
-        # ---------------------------------------------------------------------
         _check_cancel()
-        # Ensure immediate tool outputs persist for Stage 10 and memory write-back
-        state["tool_ctxs"] = state.get("tool_ctxs", [])
+        if "know_ctx" not in state:
+            try:
+                know_raw = await _to_thread_safe(
+                    self._stage5_external_knowledge, state["clar_ctx"], state
+                )
+                know_ctx = (
+                    know_raw
+                    if isinstance(know_raw, ContextObject)
+                    else ContextObject.make_stage(
+                        "external_knowledge_retrieval",
+                        state["clar_ctx"].references,
+                        know_raw,
+                    )
+                )
+                know_ctx.touch(); self.repo.save(know_ctx)
+            except Exception:
+                know_ctx = ContextObject.make_stage(
+                    "external_knowledge_dummy", [], {"summary": ""}
+                )
+                know_ctx.touch(); self.repo.save(know_ctx)
+            state["know_ctx"] = know_ctx
+            status_cb("external_knowledge", know_ctx.summary or "(created)")
 
-        # Let Stage 10 compose the prompt from state (clarifier + plan + IMMEDIATE tool outputs).
-        # Pass only the real latest user_text to avoid duplicate/irrelevant context.
-        final = await _to_thread_safe(
-            self._stage10_assemble_and_infer,
+        # ──────────────────────────────────────────────────────────────────────────
+        # Stage 8 — unified orchestration  (plan ⇒ execute ⇒ draft ⇒ final)
+        # ──────────────────────────────────────────────────────────────────────────
+        _check_cancel()
+        reply, tool_outputs = await asyncio.to_thread(
+            self._stage8_orchestrate,
             user_text,
             state,
         )
-        state["final"] = final
-        status_cb("final_inference", final)
-
-
-        # ------------------------------------------------------------------
-        # Stage 11.5 — Memory write-back
-        # ------------------------------------------------------------------
-        try:
-            await _to_thread_safe(
-                self._stage11_memory_writeback,
-                final,
-                state["tool_ctxs"],
-            )
-            status_cb("memory_writeback", "(queued)")
-        except Exception as e:
-            state["errors"].append(("memory_writeback", str(e)))
-            status_cb("memory_writeback_error", str(e))
-
-        # ------------------------------------------------------------------
-        # Stage 12 — Performance rating
-        # ------------------------------------------------------------------
-        try:
-            await _to_thread_safe(self._stage12_performance_rating, state)
-            state.setdefault("stages_run", set()).add("performance_rating")
-            status_cb("performance_rating", "(ok)")
-        except Exception as e:
-            state.setdefault("errors", []).append(("performance_rating", str(e)))
-            status_cb("performance_rating_error", str(e))
-
-        # ------------------------------------------------------------------
-        # Done
-        # ------------------------------------------------------------------
-        out = state["final"].strip()
-        status_cb("output", out)
-        return out
+        state["tool_ctxs"] = tool_outputs
+        return reply

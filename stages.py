@@ -1807,6 +1807,113 @@ def _stage7b_plan_validation(
     return fixed_calls, err_pairs, fixed_calls
 
 
+def _stage8_orchestrate(
+    self,
+    user_text: str,
+    state: Dict[str, Any],
+) -> Tuple[str, List[ContextObject]]:
+    """
+    Top-level orchestrator: plan → execute → (maybe replan) → finalize.
+    Returns (assistant_reply, all_tool_outputs)
+    """
+
+    # ─── guarantee mandatory context objects exist ──────────────────
+    if "clar_ctx" not in state or state["clar_ctx"] is None:
+        dummy_clar = ContextObject.make_stage(
+            "intent_clarification_dummy", [], {"summary": ""}
+        )
+        dummy_clar.touch()
+        self.repo.save(dummy_clar)
+        state["clar_ctx"] = dummy_clar
+
+    if "know_ctx" not in state or state["know_ctx"] is None:
+        dummy_know = ContextObject.make_stage(
+            "external_knowledge_dummy",
+            state["clar_ctx"].references,
+            {"summary": ""}
+        )
+        dummy_know.touch()
+        self.repo.save(dummy_know)
+        state["know_ctx"] = dummy_know
+
+    # keep IDs for stamping later
+    state.setdefault(
+        "conversation_id",
+        getattr(self, "_active_conversation_id", uuid.uuid4().hex)
+    )
+    state.setdefault(
+        "user_id",
+        getattr(self, "current_user_id", "anon")
+    )
+
+    # ─── planner: clarifier + knowledge → graph ─────────────────────
+    clar_ctx = state["clar_ctx"]
+    know_ctx = state["know_ctx"]
+    tools    = state.get("tools_list", [])
+
+    plan_ctx, plan_json = self._stage7_planning_summary(
+        clar_ctx   = clar_ctx,
+        know_ctx   = know_ctx,
+        tools_list = tools,
+        user_text  = user_text,
+        state      = state,
+    )
+    state["plan_ctx"]    = plan_ctx
+    state["plan_output"] = plan_json
+
+    all_tool_ctxs: List[ContextObject] = []
+
+    # ─── execute ↔ reflect loop ─────────────────────────────────────
+    while True:
+        ready_ctxs = self._stage9_invoke_with_retries(
+            raw_calls        = [],                 # ignored in DAG mode
+            plan_output      = state["plan_output"],
+            selected_schemas = state.get("schemas", []),
+            user_text        = user_text,
+            clar_metadata    = clar_ctx.metadata,
+            state            = state,
+        )
+        all_tool_ctxs.extend(ready_ctxs)
+
+        turn = state["turn"]
+        if not getattr(turn, "pending_nodes", None):
+            break
+
+        replan_json = self._stage9b_reflection_and_replan(
+            tool_ctxs     = ready_ctxs,
+            plan_output   = state["plan_output"],
+            user_text     = user_text,
+            clar_metadata = clar_ctx.metadata,
+            state         = state,
+        )
+        if replan_json is None:                    # “OK” → keep graph
+            continue
+
+        state["plan_output_prev"] = state["plan_output"]
+        state["plan_output"]      = replan_json
+
+    # ─── final answer ───────────────────────────────────────────────
+    reply = self._stage10_assemble_and_infer(
+        user_text = user_text,
+        state     = state,
+    )
+
+    polished = self._stage10b_response_critique_and_safety(
+        draft     = reply,
+        user_text = user_text,
+        tool_ctxs = all_tool_ctxs,
+        state     = state,
+    )
+    if polished:
+        reply = polished
+
+    # ─── memory write-back ───────────────────────────────────────────
+    self._stage11_memory_writeback(final_answer=reply, tool_ctxs=all_tool_ctxs)
+
+    return reply, all_tool_ctxs
+
+
+
 def _stage8_tool_chaining(
     self,
     plan_ctx: ContextObject,
