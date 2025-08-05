@@ -1802,59 +1802,53 @@ class Assembler:
         max_image_bytes: int = 8 * 1024 * 1024,
         images: list[bytes] | None = None,
         on_token: Callable[[str], None] | None = None,
-        _is_fallback: bool = False,        # ← internal flag to avoid loops
+        _is_fallback: bool = False,
     ) -> str:
         """
-        Stream a response from Ollama with:
+        Stream a response with:
         • automatic image-inlining
-        • token-level callback for TTS / UI
-        • multiple run-away guards (token, line, pattern, multi-token, suffix, fuzzy-phrase, n-gram, erosion)
-        • Ollama-crash resilience + retry loop
-        • optional automatic fall-back to secondary model
-
-        NEW (fuzzy pattern detectors):
-        - fuzzy_phrase_guard: catches short phrases repeated many times with small drift (e.g., truncated leading char)
-        - ngram_guard_fuzzy: catches repeated n-grams of tokens with approximate matches
-        - erosion_guard: catches “left-shift” stutter where each step drops/changes 1 char (e.g., “…each form / ach form / ch form …”)
+        • token‐level callback
+        • run‐away guards (token, line, pattern, multi-token, fuzzy‐phrase, n-gram, erosion)
+        • crash resilience + retry loop
+        • optional fallback to secondary model
         """
-
-        # You should already have these in scope:
-        # from your_ollama_wrapper import chat, _OllamaError
+        import re
+        import time
+        import requests
+        from pathlib import Path
+        from collections import deque
+        from difflib import SequenceMatcher
+        # assume chat and _OllamaError are available in scope
 
         # ── tweakables ─────────────────────────────────────────────────────
         TOKEN_WINDOW               = 2000
         TOKEN_REPEAT_LIMIT         = 200
         LINE_REPEAT_LIMIT          = 20
 
-        # old “backref repeat” detector (kept, but thresholds lowered a bit)
-        PATTERN_MAX_LEN            = 200          # was 1000; shorter to catch phrase loops
-        PATTERN_REPEAT_THRESHOLD   = 8            # was 100; now triggers on ~8+ repeats
+        # backref repeat detector
+        PATTERN_MAX_LEN            = 200
+        PATTERN_REPEAT_THRESHOLD   = 8
 
-        # multi-token loop (sliding motif)
+        # multi-token loop
         SEQ_MIN, SEQ_MAX           = 2, 50
-        SEQ_REPEAT_LIMIT           = 10          # how many repeats of the motif
+        SEQ_REPEAT_LIMIT           = 10
 
-        # suffix-guard (degenerate suffix spam)
-        SUFFIX_WINDOW              = 100
-        SUFFIX_THRESHOLD           = 0.8
-        SUFFIX_PATTERN             = "Professional"
+        # fuzzy phrase repetition
+        CHAR_WINDOW                = 600
+        CHUNK_MIN, CHUNK_MAX       = 8, 48
+        PHRASE_REPEAT_LIMIT        = 6
+        FUZZY_SIM_THRESH           = 0.90
 
-        # NEW fuzzy phrase repetition over characters
-        CHAR_WINDOW                = 600          # analyze the last N chars
-        CHUNK_MIN, CHUNK_MAX       = 8, 48        # candidate phrase length (chars)
-        PHRASE_REPEAT_LIMIT        = 6            # similar phrase count to trigger
-        FUZZY_SIM_THRESH           = 0.90         # SequenceMatcher ratio
+        # fuzzy token n-gram repetition
+        NGRAM_TOKEN_WINDOW         = 120
+        NGRAM_MIN, NGRAM_MAX       = 5, 20
+        NGRAM_REPEAT_LIMIT         = 15
+        NGRAM_FUZZY_SIM_THRESH     = 0.95
 
-        # NEW fuzzy token n-gram repetition (tuned to avoid bullet-list false positives)
-        NGRAM_TOKEN_WINDOW         = 120          # was 240; smaller window reduces cross-bullet accumulation
-        NGRAM_MIN, NGRAM_MAX       = 5, 20        # was 2,8; require more substantive n-grams
-        NGRAM_REPEAT_LIMIT         = 15           # was 8; allow structured lists without tripping
-        NGRAM_FUZZY_SIM_THRESH     = 0.95         # was 0.92; tighter similarity to count as a repeat
-
-        # NEW erosion / left-shift detector
+        # erosion / left-shift detector
         EROSION_CHAR_WINDOW        = 200
         EROSION_SLICE_LEN          = 14
-        EROSION_STEPS_CHECK        = 10           # consecutive shifted slices to compare
+        EROSION_STEPS_CHECK        = 10
         EROSION_SIM_THRESH         = 0.94
         EROSION_MIN_TRIGGERS       = 6
 
@@ -1863,13 +1857,13 @@ class Assembler:
         GUARD_DELAY_SEC            = 5
         # ──────────────────────────────────────────────────────────────────
 
-        # Regex for “backref repeats” (verbatim repeated substring)
+        # regex for verbatim repeated‐pattern
         pat_regex = re.compile(
             rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
             re.DOTALL
         )
 
-        # ---------- inline images (unchanged) ----------------------------
+        # ── inline images ─────────────────────────────────────────────────
         path_pat = re.compile(
             r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\."
             r"(?:jpg|jpeg|png|bmp|gif|webp))",
@@ -1906,20 +1900,19 @@ class Assembler:
 
         def multi_token_guard(tokens: deque[str]) -> bool:
             arr = list(tokens); n = len(arr)
-            # check if the last motif of length L repeats SEQ_REPEAT_LIMIT times
             for L in range(SEQ_MIN, min(SEQ_MAX, max(SEQ_MIN, n // SEQ_REPEAT_LIMIT)) + 1):
                 seq = arr[-L:]
                 ok = True
                 for r in range(2, SEQ_REPEAT_LIMIT + 1):
-                    a = arr[-r * L : -(r-1) * L] if (-(r-1) * L) != 0 else arr[-r * L :]
-                    if a != seq:
+                    start = -r * L
+                    end = start + L
+                    if arr[start:end] != seq:
                         ok = False
                         break
                 if ok:
                     return True
             return False
 
-        # NEW: fuzzy similarity helpers (character-level)
         def _norm_chars(s: str) -> str:
             return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
@@ -1927,53 +1920,37 @@ class Assembler:
             return SequenceMatcher(None, a, b).ratio()
 
         def fuzzy_phrase_guard(full_text: str) -> bool:
-            """
-            Catch short phrase loops even with small drift (leading char dropped, tiny edits).
-            Looks only at the tail of the text (CHAR_WINDOW).
-            """
             tail = _norm_chars(full_text[-CHAR_WINDOW:])
             if len(tail) < CHUNK_MIN * PHRASE_REPEAT_LIMIT:
                 return False
-
-            # Take the last candidate phrase; scan prior segments for similar phrases
-            # We try a few lengths around the median to reduce cost.
             candidates = []
             step = max(1, (CHUNK_MAX - CHUNK_MIN) // 4)
             for L in range(CHUNK_MIN, CHUNK_MAX + 1, step):
                 if len(tail) >= L:
                     candidates.append(tail[-L:])
-
-            # For each candidate, count approximate repeats (non-overlapping backward scan)
             for cand in candidates:
                 if not cand.strip():
                     continue
-                count = 1  # include the last one
+                count = 1
                 pos = len(tail) - len(cand)
-                # Scan backward in chunks of roughly len(cand); allow ±20% drift by sliding
                 min_gap = int(len(cand) * 0.8)
                 max_gap = int(len(cand) * 1.2)
                 while pos - min_gap >= 0 and count < PHRASE_REPEAT_LIMIT + 3:
-                    found_match = False
-                    start_min = max(0, pos - max_gap)
-                    start_max = max(0, pos - min_gap)
-                    # Check a few candidate starts to allow drift/misalignment
-                    probes = (start_min, (start_min + start_max)//2, start_max)
+                    found = False
+                    probes = (max(0, pos-max_gap), (max(0, pos-max_gap)+max(0, pos-min_gap))//2, max(0, pos-min_gap))
                     for st in probes:
-                        seg = tail[st : st + len(cand)]
-                        if not seg:
-                            continue
-                        if _sim(cand, seg) >= FUZZY_SIM_THRESH:
+                        seg = tail[st:st+len(cand)]
+                        if seg and _sim(cand, seg) >= FUZZY_SIM_THRESH:
                             count += 1
                             pos = st
-                            found_match = True
+                            found = True
                             break
-                    if not found_match:
+                    if not found:
                         break
                 if count >= PHRASE_REPEAT_LIMIT:
                     return True
             return False
 
-        # NEW: fuzzy token n-gram guard
         def ngram_guard_fuzzy(tokens: deque[str]) -> bool:
             toks = list(tokens)[-NGRAM_TOKEN_WINDOW:]
             if len(toks) < NGRAM_MIN * NGRAM_REPEAT_LIMIT:
@@ -1983,60 +1960,45 @@ class Assembler:
                 if len(joined) < n * NGRAM_REPEAT_LIMIT:
                     break
                 pattern = " ".join(joined[-n:])
-                if not pattern.strip():
-                    continue
-                # Scan earlier n-grams (stride = n to bias to phrase boundaries)
                 cnt = 1
                 for i in range(len(joined) - 2*n, -1, -n):
-                    seg = " ".join(joined[i : i + n])
+                    seg = " ".join(joined[i:i+n])
                     if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
                         cnt += 1
                         if cnt >= NGRAM_REPEAT_LIMIT:
                             return True
-                # secondary scan with stride 1 to catch off-by-one drifts
                 if cnt < NGRAM_REPEAT_LIMIT:
                     cnt2 = 1
                     for i in range(len(joined) - n - 1, -1, -1):
-                        seg = " ".join(joined[i : i + n])
+                        seg = " ".join(joined[i:i+n])
                         if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
                             cnt2 += 1
                             if cnt2 >= NGRAM_REPEAT_LIMIT:
                                 return True
             return False
 
-        # NEW: erosion / left-shift guard
         def erosion_guard(full_text: str) -> bool:
-            """
-            Detects successive slices that are almost identical but 1-char shifted,
-            which presents as “…each form / ach form / ch form …” style erosion.
-            """
             tail = _norm_chars(full_text[-EROSION_CHAR_WINDOW:])
             if len(tail) < (EROSION_SLICE_LEN + EROSION_STEPS_CHECK):
                 return False
-            # Compare adjacent slices shifted by 1 character
             triggers = 0
-            # Start from the end; ensure we have enough room
             base_end = len(tail)
             for k in range(EROSION_STEPS_CHECK):
                 end_a = base_end - k
                 start_a = max(0, end_a - EROSION_SLICE_LEN)
                 end_b = end_a - 1
                 start_b = max(0, end_b - EROSION_SLICE_LEN)
-                if start_b >= end_b or start_a >= end_a:
-                    break
                 a = tail[start_a:end_a]
                 b = tail[start_b:end_b]
                 if _sim(a, b) >= EROSION_SIM_THRESH:
                     triggers += 1
                 else:
-                    # allow short gaps but stop if signal breaks too much
                     if triggers > 0:
                         break
             return triggers >= EROSION_MIN_TRIGGERS
 
         session_start = time.time()
 
-        # ── inner single-pass streamer ───────────────────────────────────
         def one_pass() -> tuple[str, bool]:
             buf_tokens = deque(maxlen=TOKEN_WINDOW)
             buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
@@ -2045,8 +2007,6 @@ class Assembler:
             first_output = None
 
             print(f"{tag} ", end="", flush=True)
-
-            # get the generator – may raise immediately
             try:
                 stream_iter = chat(model=model, messages=messages, stream=True)
             except _OllamaError as e:
@@ -2055,26 +2015,19 @@ class Assembler:
 
             try:
                 for part in stream_iter:
-                    # user abort?
                     if getattr(self, "_abort_inference", False):
                         print("\n[Interrupted] aborting generation.")
                         return "".join(chunks), False
-
-                    # session timeout
                     if time.time() - session_start > SESSION_TIMEOUT_SEC:
                         print("\n[Timeout guard] session expired → aborting pass.")
                         return "".join(chunks), True
 
                     chunk = part["message"]["content"]
-
-                    # strip nested ```json fences
                     st = chunk.strip()
                     if st.startswith("```json"):
-                        inside_json = True
-                        continue
+                        inside_json = True; continue
                     if inside_json and st.startswith("```"):
-                        inside_json = False
-                        continue
+                        inside_json = False; continue
                     if inside_json:
                         continue
 
@@ -2084,55 +2037,35 @@ class Assembler:
                     print(chunk, end="", flush=True)
                     chunks.append(chunk)
                     if on_token:
-                        try:
-                            on_token(chunk)
-                        except Exception:
-                            pass
+                        try: on_token(chunk)
+                        except: pass
 
                     for tok in chunk.split():
                         buf_tokens.append(tok)
                     for ln in chunk.splitlines():
-                        s = ln.strip()
-                        if s:
-                            buf_lines.append(s)
+                        if ln.strip():
+                            buf_lines.append(ln.strip())
 
-                    # ── guards after delay ───────────────────────────────
                     if first_output and (time.time() - first_output) > GUARD_DELAY_SEC:
-                        # 1) token-repeat guard
                         if token_guard(buf_tokens):
                             print("\n[Run-away guard] token repeat → aborting pass.")
                             return "".join(chunks), True
-                        # 2) line-repeat guard
                         if line_guard(buf_lines):
                             print("\n[Run-away guard] line repeat → aborting pass.")
                             return "".join(chunks), True
-                        # 3) multi-token sequence guard
                         if multi_token_guard(buf_tokens):
                             print("\n[Run-away guard] multi-token loop → aborting pass.")
                             return "".join(chunks), True
-                        # 4) suffix-guard (degenerate suffix spam)
-                        if len(buf_tokens) >= SUFFIX_WINDOW:
-                            count_suffix = sum(1 for t in buf_tokens if SUFFIX_PATTERN in t)
-                            if (count_suffix / len(buf_tokens)) >= SUFFIX_THRESHOLD:
-                                print(
-                                    f"\n[Suffix-runaway guard] ≥{int(SUFFIX_THRESHOLD*100)}% tokens "
-                                    f"contain “{SUFFIX_PATTERN}” → aborting pass."
-                                )
-                                return "".join(chunks), True
-                        # 5) verbatim repeated-pattern guard (backref)
                         full_now = "".join(chunks)
                         if pat_regex.search(full_now) or full_now.count("```json") > 1:
                             print("\n[Run-away guard] pattern repetition → aborting pass.")
                             return full_now, True
-                        # 6) NEW fuzzy phrase guard (character-level, tolerant to drift)
                         if fuzzy_phrase_guard(full_now):
                             print("\n[Run-away guard] fuzzy phrase repetition → aborting pass.")
                             return full_now, True
-                        # 7) NEW fuzzy n-gram guard (token-level)
                         if ngram_guard_fuzzy(buf_tokens):
                             print("\n[Run-away guard] n-gram repetition → aborting pass.")
                             return "".join(chunks), True
-                        # 8) NEW erosion / left-shift guard
                         if erosion_guard(full_now):
                             print("\n[Run-away guard] erosion (left-shift) loop → aborting pass.")
                             return full_now, True
@@ -2144,7 +2077,6 @@ class Assembler:
             print()
             return "".join(chunks), False
 
-        # ── retry loop ───────────────────────────────────────────────────
         for attempt in range(1, MAX_ATTEMPTS + 1):
             text, retry = one_pass()
             if not retry:
@@ -2152,7 +2084,6 @@ class Assembler:
             print(f"[Guard/crash] restart ({attempt}/{MAX_ATTEMPTS}) …")
             time.sleep(0.1)
 
-        # ── optional fallback to secondary model ─────────────────────────
         if (
             model == getattr(self, "primary_model", "")
             and not _is_fallback
@@ -2169,9 +2100,9 @@ class Assembler:
                 _is_fallback=True,
             )
 
-        # give up after retries / fallback
         print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
+
 
 
 
