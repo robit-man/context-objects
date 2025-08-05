@@ -3505,133 +3505,137 @@ class Tools:
         images: list[bytes] | None = None
     ) -> str:
         """
-        Call an LLM in a *fire-and-forget* fashion, enriched with optional narrative
-        context / recent retrievals.
-
-        Robust repetition guard: aborts & retries immediately on
-          • identical token >10×,
-          • any line ≥10×,
-          • any substring (20–120 chars) ≥10×,
-          • or 5-minute timeout.
+        Call an LLM in a fire-and-forget fashion with very loose repetition guards:
+          • identical token >20× (ignoring punctuation tokens)
+          • any single non-border line ≥20×
+          • any substring (20–120 chars) ≥20×
+          • abort & retry up to 3× on timeout (>5m) or guard trip
         """
         import re, json, requests, time, collections
 
-        # 1) choose model
+        # choose model
         tier_map = {
             "primary":   config["primary_model"],
             "secondary": config.get("secondary_model", config["primary_model"]),
-            "decision":  config.get("decision_model", config.get("secondary_model", config["primary_model"]))
+            "decision":  config.get(
+                "decision_model",
+                config.get("secondary_model", config["primary_model"])
+            )
         }
-        model_selected = tier_map.get((model_tier or "primary").lower(), config["primary_model"])
+        model_selected = tier_map.get((model_tier or "primary").lower(),
+                                      config["primary_model"])
 
-        # 2) assemble messages
-        messages: list[dict[str, any]] = []
+        # assemble messages
+        messages = []
         if system is not None:
-            messages.append({"role": "system", "content": system})
+            messages.append({"role":"system","content":system})
         if context is not None:
             messages.append({
-                "role": "system",
-                "content": (
+                "role":"system",
+                "content":(
                     f"### Narrative Context (last {retrieval_count} snippets) ###\n"
                     f"{context}"
                 )
             })
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role":"user","content":prompt})
 
-        # 3) embed images if any
-        images_data: list[bytes] = []
-        if images:
-            images_data = images
-        else:
-            patt = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
-            for loc in re.findall(patt, prompt, flags=re.I):
+        # embed images
+        images_data = images or []
+        if not images_data:
+            img_patt = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+            for loc in re.findall(img_patt, prompt, flags=re.I):
                 try:
-                    if loc.lower().startswith(("http://", "https://")):
-                        resp = requests.get(loc, timeout=5)
-                        resp.raise_for_status()
-                        images_data.append(resp.content)
+                    if loc.lower().startswith(("http://","https://")):
+                        r = requests.get(loc,timeout=5); r.raise_for_status()
+                        images_data.append(r.content)
                     else:
-                        with open(loc, "rb") as f:
-                            images_data.append(f.read())
-                except Exception:
-                    continue
+                        with open(loc,"rb") as f: images_data.append(f.read())
+                except:
+                    pass
         if images_data:
             messages[-1]["images"] = images_data
 
-        # 4) helpers
-        def _log(msg: str, level: str = "INFO"):
-            log_message(f"auxiliary_inference: {msg}", level)
+        # helpers & loosened thresholds
+        _punct_re   = re.compile(r'^[\W_]+$')
+        _border_re  = re.compile(r'^[\s\-\=\+\|\:\.\`~]{3,}$')
+        TOKEN_LIMIT = 20
+        LINE_LIMIT  = 20
+        SUBSTR_LIMIT= 20
+        TIMEOUT_SEC = 5*60
+        MAX_TRIES   = 3
 
-        def _substr_count(text: str, substr: str) -> int:
-            return text.count(substr)
+        def _log(msg, lvl="INFO"):
+            log_message(f"auxiliary_inference: {msg}", lvl)
 
-        # 5) retry loop
-        attempt = 0
-        while True:
-            attempt += 1
-            start_ts = time.time()
+        def _substr_count(txt, sub):
+            return txt.count(sub)
+
+        for attempt in range(1, MAX_TRIES+1):
+            _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})","PROCESS")
             content = ""
             prev_tok = None
-            exact_repeat_cnt = 0
-            line_counter = collections.Counter()
+            tok_rep  = 0
+            line_ctr = collections.Counter()
+            start_ts = time.time()
 
-            _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})", "PROCESS")
             try:
-                print("⟳ Auxiliary-LLM stream:", end="", flush=True)
-                for part in chat(
-                    model=model_selected,
-                    messages=messages,
-                    stream=True,
-                    options={"temperature": temperature},
-                ):
+                print("⟳ Auxiliary-LLM stream:",end="",flush=True)
+                for part in chat(model=model_selected,
+                                 messages=messages,
+                                 stream=True,
+                                 options={"temperature": temperature}):
                     tok = part["message"]["content"]
                     now = time.time()
 
-                    # timeout guard (5 min)
-                    if now - start_ts > 300:
-                        raise TimeoutError("stream exceeded 5-minute limit")
+                    # timeout
+                    if now - start_ts > TIMEOUT_SEC:
+                        raise TimeoutError("exceeded 5-minute limit")
 
-                    # identical-token spam
+                    # identical-token guard
                     if tok == prev_tok:
-                        exact_repeat_cnt += 1
-                        if exact_repeat_cnt > 10:
-                            raise RuntimeError("detected repeated content")
+                        tok_rep += 1
+                        if tok_rep > TOKEN_LIMIT and not _punct_re.match(tok):
+                            raise RuntimeError("repeated token spam")
                     else:
-                        exact_repeat_cnt = 0
+                        tok_rep = 0
                     prev_tok = tok
 
                     content += tok
                     print(tok, end="", flush=True)
 
-                    # line-based repetition
+                    # line-based guard
                     if "\n" in tok:
-                        for line in tok.splitlines():
-                            ln = line.strip()
-                            if ln:
-                                line_counter[ln] += 1
-                                if line_counter[ln] >= 10:
-                                    raise RuntimeError("detected repeated content")
+                        for ln in tok.splitlines():
+                            ln = ln.strip()
+                            if ln and not _border_re.match(ln):
+                                line_ctr[ln] += 1
+                                if line_ctr[ln] >= LINE_LIMIT:
+                                    raise RuntimeError("repeated line spam")
 
-                    # substring repetition (20-120 chars)
+                    # substring guard
                     if len(content) > 240:
                         tail = content[-120:]
                         for L in range(20, 121, 10):
-                            sub = tail[-L:]
-                            if _substr_count(content, sub) >= 10:
-                                raise RuntimeError("detected repeated content")
+                            sub = tail[-L:].strip()
+                            if len(sub) >= 5 and _substr_count(content, sub) >= SUBSTR_LIMIT:
+                                raise RuntimeError("repeated substring spam")
 
                 print()
-                _log("auxiliary_inference complete.", "SUCCESS")
+                _log("complete.","SUCCESS")
                 return content
 
             except (TimeoutError, RuntimeError) as e:
-                _log(f"{e}; immediate retry", "WARNING")
+                _log(f"{e}; retrying","WARNING")
                 time.sleep(1.0)
                 continue
 
             except Exception as e:
-                _log(f"error: {e}", "ERROR")
+                _log(f"fatal error: {e}","ERROR")
                 return json.dumps({"error": str(e)})
+
+        # after MAX_TRIES
+        _log(f"giving up after {MAX_TRIES} attempts","ERROR")
+        return content
 
 
 
