@@ -2740,7 +2740,7 @@ class Assembler:
             user_text=user_text,
             options=["YES","NO"],
             system_template=(
-                "Consider the complexity of the incoming user message, compared to past interactions, if it seems to be a hallucinated input, or single word unrelated to prior conversation, ignore it and replay NO.\n"
+                "Respond to whatever you deem worthy, bias towards response unless the input seems too short or irrelevant.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
