@@ -1813,67 +1813,45 @@ class Assembler:
         on_token: Callable[[str], None] | None = None,
         _is_fallback: bool = False,
     ) -> str:
-        """
-        Stream a response with:
-        • automatic image-inlining
-        • token‐level callback
-        • run‐away guards (token, line, pattern, multi-token, fuzzy‐phrase, n-gram, erosion)
-        • crash resilience + retry loop
-        • optional fallback to secondary model
-        """
-        import re
-        import time
-        import requests
+        import re, time, requests
         from pathlib import Path
         from collections import deque
         from difflib import SequenceMatcher
-        # assume chat and _OllamaError are available in scope
 
-        # ── tweakables ─────────────────────────────────────────────────────
-        TOKEN_WINDOW               = 2000          # unchanged
+        # ─── looser thresholds ────────────────────────────────────
+        TOKEN_WINDOW               = 4000
+        TOKEN_REPEAT_LIMIT         = 1200
+        LINE_REPEAT_LIMIT          = 120
+        PATTERN_MAX_LEN            = 200
+        PATTERN_REPEAT_THRESHOLD   = 24
+        SEQ_MIN, SEQ_MAX           = 2, 80
+        SEQ_REPEAT_LIMIT           = 40
+        CHAR_WINDOW                = 1200
+        CHUNK_MIN, CHUNK_MAX       = 8, 48
+        PHRASE_REPEAT_LIMIT        = 50
+        FUZZY_SIM_THRESH           = 0.985
+        NGRAM_TOKEN_WINDOW         = 300
+        NGRAM_MIN, NGRAM_MAX       = 6, 24
+        NGRAM_REPEAT_LIMIT         = 60
+        NGRAM_FUZZY_SIM_THRESH     = 0.99
+        EROSION_CHAR_WINDOW        = 400
+        EROSION_SLICE_LEN          = 14
+        EROSION_STEPS_CHECK        = 12
+        EROSION_SIM_THRESH         = 0.99
+        EROSION_MIN_TRIGGERS       = 30
+        MAX_ATTEMPTS               = 5
+        SESSION_TIMEOUT_SEC        = 15 * 60
+        GUARD_DELAY_SEC            = 12
 
-        TOKEN_REPEAT_LIMIT         = 400           # ↑ from 200
-        LINE_REPEAT_LIMIT          = 40            # ↑ from 20
+        # ─── ignore ASCII borders & punct-only tokens ─────────────
+        _border_line_re = re.compile(r'^[\s\-\=\+\|\:\.\_]{3,}$')
+        _punct_token_re = re.compile(r'^[\-\=\+\|\:\.\_\~`]+$')
+        def _is_border_line(s: str) -> bool:
+            return bool(_border_line_re.match((s or "").strip()))
+        def _is_punct_token(tok: str) -> bool:
+            return bool(_punct_token_re.match(tok or ""))
 
-        # back-ref repeat detector
-        PATTERN_MAX_LEN            = 200           # unchanged
-        PATTERN_REPEAT_THRESHOLD   = 12            # ↑ from 8
-
-        # multi-token loop detector
-        SEQ_MIN, SEQ_MAX           = 2, 50         # unchanged
-        SEQ_REPEAT_LIMIT           = 18            # ↑ from 10
-
-        # fuzzy phrase repetition
-        CHAR_WINDOW                = 600           # unchanged (scope of scan)
-        CHUNK_MIN, CHUNK_MAX       = 8, 48         # unchanged
-        PHRASE_REPEAT_LIMIT        = 12            # ↑ from 6
-        FUZZY_SIM_THRESH           = 0.93          # ↑ from 0.90 (needs closer match)
-
-        # fuzzy token n-gram repetition
-        NGRAM_TOKEN_WINDOW         = 120           # unchanged
-        NGRAM_MIN, NGRAM_MAX       = 5, 20         # unchanged
-        NGRAM_REPEAT_LIMIT         = 30            # ↑ from 15
-        NGRAM_FUZZY_SIM_THRESH     = 0.97          # ↑ from 0.95
-
-        # erosion / left-shift detector
-        EROSION_CHAR_WINDOW        = 200           # unchanged
-        EROSION_SLICE_LEN          = 14            # unchanged
-        EROSION_STEPS_CHECK        = 10            # unchanged
-        EROSION_SIM_THRESH         = 0.97          # ↑ from 0.94
-        EROSION_MIN_TRIGGERS       = 10            # ↑ from 6
-
-        MAX_ATTEMPTS               = 5             # ↑ from 3
-        SESSION_TIMEOUT_SEC        = 10 * 60       # unchanged
-        GUARD_DELAY_SEC            = 5             # unchanged
-        # ──────────────────────────────────────────────────────────────────
-
-        # regex for verbatim repeated‐pattern
-        pat_regex = re.compile(
-            rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
-            re.DOTALL
-        )
-
-        # ── inline images ─────────────────────────────────────────────────
+        # ─── prepare images inline ───────────────────────────────────
         path_pat = re.compile(
             r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\."
             r"(?:jpg|jpeg|png|bmp|gif|webp))",
@@ -1890,42 +1868,43 @@ class Assembler:
                         p = Path(loc).expanduser().resolve()
                         if p.is_file() and p.stat().st_size <= max_image_bytes:
                             imgs_data.append(p.read_bytes())
-                except Exception:
+                except:
                     pass
         if imgs_data:
             messages[-1]["images"] = imgs_data
 
-        # ── guard helpers ────────────────────────────────────────────────
+        # ─── guard helpers ───────────────────────────────────────────
         def token_guard(tokens: deque[str]) -> bool:
-            return (
-                len(tokens) >= TOKEN_REPEAT_LIMIT
-                and len(set(list(tokens)[-TOKEN_REPEAT_LIMIT:])) == 1
-            )
+            filtered = [t for t in list(tokens)[-TOKEN_REPEAT_LIMIT:] if not _is_punct_token(t)]
+            return len(filtered) >= TOKEN_REPEAT_LIMIT and len(set(filtered)) == 1
 
         def line_guard(lines: deque[str]) -> bool:
-            return (
-                len(lines) >= LINE_REPEAT_LIMIT
-                and len(set(list(lines)[-LINE_REPEAT_LIMIT:])) == 1
-            )
+            window = [ln for ln in list(lines)[-LINE_REPEAT_LIMIT:] if ln and not _is_border_line(ln)]
+            return len(window) >= LINE_REPEAT_LIMIT and len(set(window)) == 1
 
         def multi_token_guard(tokens: deque[str]) -> bool:
-            arr = list(tokens); n = len(arr)
-            for L in range(SEQ_MIN, min(SEQ_MAX, max(SEQ_MIN, n // SEQ_REPEAT_LIMIT)) + 1):
+            arr = [t for t in list(tokens) if not _is_punct_token(t)]
+            n = len(arr)
+            if n < SEQ_MIN * SEQ_REPEAT_LIMIT:
+                return False
+            upper = min(SEQ_MAX, max(SEQ_MIN, n // SEQ_REPEAT_LIMIT))
+            for L in range(SEQ_MIN, upper + 1):
                 seq = arr[-L:]
                 ok = True
                 for r in range(2, SEQ_REPEAT_LIMIT + 1):
-                    start = -r * L
-                    end = start + L
-                    if arr[start:end] != seq:
+                    if arr[-r*L:-r*L+L] != seq:
                         ok = False
                         break
                 if ok:
                     return True
             return False
 
+        pat_regex = re.compile(
+            rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
+            re.DOTALL
+        )
         def _norm_chars(s: str) -> str:
             return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
         def _sim(a: str, b: str) -> float:
             return SequenceMatcher(None, a, b).ratio()
 
@@ -1933,78 +1912,24 @@ class Assembler:
             tail = _norm_chars(full_text[-CHAR_WINDOW:])
             if len(tail) < CHUNK_MIN * PHRASE_REPEAT_LIMIT:
                 return False
-            candidates = []
-            step = max(1, (CHUNK_MAX - CHUNK_MIN) // 4)
-            for L in range(CHUNK_MIN, CHUNK_MAX + 1, step):
-                if len(tail) >= L:
-                    candidates.append(tail[-L:])
-            for cand in candidates:
-                if not cand.strip():
-                    continue
-                count = 1
-                pos = len(tail) - len(cand)
-                min_gap = int(len(cand) * 0.8)
-                max_gap = int(len(cand) * 1.2)
-                while pos - min_gap >= 0 and count < PHRASE_REPEAT_LIMIT + 3:
-                    found = False
-                    probes = (max(0, pos-max_gap), (max(0, pos-max_gap)+max(0, pos-min_gap))//2, max(0, pos-min_gap))
-                    for st in probes:
-                        seg = tail[st:st+len(cand)]
-                        if seg and _sim(cand, seg) >= FUZZY_SIM_THRESH:
-                            count += 1
-                            pos = st
-                            found = True
-                            break
-                    if not found:
-                        break
-                if count >= PHRASE_REPEAT_LIMIT:
+            step = max(1, (CHUNK_MAX - CHUNK_MIN)//4)
+            for L in range(CHUNK_MIN, CHUNK_MAX+1, step):
+                sub = tail[-L:]
+                count = sum(1 for _ in re.finditer(re.escape(sub), tail))
+                if count >= PHRASE_REPEAT_LIMIT and _sim(sub, sub) >= FUZZY_SIM_THRESH:
                     return True
-            return False
-
-        def ngram_guard_fuzzy(tokens: deque[str]) -> bool:
-            toks = list(tokens)[-NGRAM_TOKEN_WINDOW:]
-            if len(toks) < NGRAM_MIN * NGRAM_REPEAT_LIMIT:
-                return False
-            joined = [t.lower() for t in toks]
-            for n in range(NGRAM_MIN, NGRAM_MAX + 1):
-                if len(joined) < n * NGRAM_REPEAT_LIMIT:
-                    break
-                pattern = " ".join(joined[-n:])
-                cnt = 1
-                for i in range(len(joined) - 2*n, -1, -n):
-                    seg = " ".join(joined[i:i+n])
-                    if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
-                        cnt += 1
-                        if cnt >= NGRAM_REPEAT_LIMIT:
-                            return True
-                if cnt < NGRAM_REPEAT_LIMIT:
-                    cnt2 = 1
-                    for i in range(len(joined) - n - 1, -1, -1):
-                        seg = " ".join(joined[i:i+n])
-                        if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
-                            cnt2 += 1
-                            if cnt2 >= NGRAM_REPEAT_LIMIT:
-                                return True
             return False
 
         def erosion_guard(full_text: str) -> bool:
             tail = _norm_chars(full_text[-EROSION_CHAR_WINDOW:])
-            if len(tail) < (EROSION_SLICE_LEN + EROSION_STEPS_CHECK):
+            if len(tail) < EROSION_SLICE_LEN + EROSION_STEPS_CHECK:
                 return False
             triggers = 0
-            base_end = len(tail)
             for k in range(EROSION_STEPS_CHECK):
-                end_a = base_end - k
-                start_a = max(0, end_a - EROSION_SLICE_LEN)
-                end_b = end_a - 1
-                start_b = max(0, end_b - EROSION_SLICE_LEN)
-                a = tail[start_a:end_a]
-                b = tail[start_b:end_b]
+                a = tail[-(k+1)*EROSION_SLICE_LEN: -k*EROSION_SLICE_LEN or None]
+                b = tail[-(k+2)*EROSION_SLICE_LEN: -(k+1)*EROSION_SLICE_LEN]
                 if _sim(a, b) >= EROSION_SIM_THRESH:
                     triggers += 1
-                else:
-                    if triggers > 0:
-                        break
             return triggers >= EROSION_MIN_TRIGGERS
 
         session_start = time.time()
@@ -2050,34 +1975,38 @@ class Assembler:
                         try: on_token(chunk)
                         except: pass
 
+                    # queue only meaningful tokens/lines
                     for tok in chunk.split():
-                        buf_tokens.append(tok)
+                        if not _is_punct_token(tok):
+                            buf_tokens.append(tok)
                     for ln in chunk.splitlines():
-                        if ln.strip():
-                            buf_lines.append(ln.strip())
+                        ln = ln.strip()
+                        if ln and not _is_border_line(ln):
+                            buf_lines.append(ln)
 
                     if first_output and (time.time() - first_output) > GUARD_DELAY_SEC:
+                        full_now = "".join(chunks)
+                        # sanitize tables/borders out of checks
+                        lines = [l for l in full_now.splitlines() if not _is_border_line(l)]
+                        full_s = "\n".join(lines)
+
                         if token_guard(buf_tokens):
                             print("\n[Run-away guard] token repeat → aborting pass.")
-                            return "".join(chunks), True
+                            return full_now, True
                         if line_guard(buf_lines):
                             print("\n[Run-away guard] line repeat → aborting pass.")
-                            return "".join(chunks), True
+                            return full_now, True
                         if multi_token_guard(buf_tokens):
                             print("\n[Run-away guard] multi-token loop → aborting pass.")
-                            return "".join(chunks), True
-                        full_now = "".join(chunks)
-                        if pat_regex.search(full_now) or full_now.count("```json") > 1:
+                            return full_now, True
+                        if pat_regex.search(full_s) or full_s.count("```json")>1:
                             print("\n[Run-away guard] pattern repetition → aborting pass.")
                             return full_now, True
-                        if fuzzy_phrase_guard(full_now):
+                        if fuzzy_phrase_guard(full_s):
                             print("\n[Run-away guard] fuzzy phrase repetition → aborting pass.")
                             return full_now, True
-                        if ngram_guard_fuzzy(buf_tokens):
-                            print("\n[Run-away guard] n-gram repetition → aborting pass.")
-                            return "".join(chunks), True
-                        if erosion_guard(full_now):
-                            print("\n[Run-away guard] erosion (left-shift) loop → aborting pass.")
+                        if erosion_guard(full_s):
+                            print("\n[Run-away guard] erosion loop → aborting pass.")
                             return full_now, True
 
             except _OllamaError as e:
@@ -2087,23 +2016,19 @@ class Assembler:
             print()
             return "".join(chunks), False
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, MAX_ATTEMPTS+1):
             text, retry = one_pass()
             if not retry:
                 return text
             print(f"[Guard/crash] restart ({attempt}/{MAX_ATTEMPTS}) …")
             time.sleep(0.1)
 
-        if (
-            model == getattr(self, "primary_model", "")
-            and not _is_fallback
-            and getattr(self, "secondary_model", None)
-        ):
+        if model == getattr(self, "primary_model", "") and not _is_fallback and getattr(self, "secondary_model", None):
             print("[Fallback] primary model kept failing → switching to secondary.")
             return self._stream_and_capture(
                 self.secondary_model,
                 messages,
-                tag=tag + "(fallback)",
+                tag=tag+"(fallback)",
                 max_image_bytes=max_image_bytes,
                 images=images,
                 on_token=on_token,

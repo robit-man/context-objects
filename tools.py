@@ -3505,331 +3505,134 @@ class Tools:
         images: list[bytes] | None = None
     ) -> str:
         """
-        Fire-and-forget LLM call with robust streaming guards:
-        • automatic image inlining
-        • token-level streaming with all repetition detectors:
-            – single-token repeat
-            – line repeat
-            – back-ref / regex pattern repeat
-            – multi-token loop
-            – fuzzy phrase repeat
-            – fuzzy n-gram repeat
-            – erosion/left-shift loop
-        • per-attempt session timeout
-        • crash resilience + retry loop
-        • optional fallback to secondary model
+        Call an LLM in a *fire-and-forget* fashion, enriched with optional narrative
+        context / recent retrievals.
 
-        Returns the generated text, or a compact JSON error string on hard failure.
+        Robust repetition guard: aborts & retries immediately on
+          • identical token >10×,
+          • any line ≥10×,
+          • any substring (20–120 chars) ≥10×,
+          • or 5-minute timeout.
         """
-        import re, json, time, requests
-        from pathlib import Path
-        from collections import deque, Counter
-        from difflib import SequenceMatcher
+        import re, json, requests, time, collections
 
-        # ---------- model selection ----------
+        # 1) choose model
         tier_map = {
-            "primary":   config.get("primary_model"),
-            "secondary": config.get("secondary_model", config.get("primary_model")),
-            "decision":  config.get("decision_model",
-                        config.get("secondary_model", config.get("primary_model")))
+            "primary":   config["primary_model"],
+            "secondary": config.get("secondary_model", config["primary_model"]),
+            "decision":  config.get("decision_model", config.get("secondary_model", config["primary_model"]))
         }
-        model_primary   = tier_map.get((model_tier or "primary").lower(), config.get("primary_model"))
-        model_secondary = config.get("secondary_model", model_primary)
+        model_selected = tier_map.get((model_tier or "primary").lower(), config["primary_model"])
 
-        # ---------- message assembly ----------
-        messages: list[dict[str, Any]] = []
+        # 2) assemble messages
+        messages: list[dict[str, any]] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
         if context is not None:
             messages.append({
                 "role": "system",
-                "content": f"### Narrative Context (last {retrieval_count} snippets) ###\n{context}"
+                "content": (
+                    f"### Narrative Context (last {retrieval_count} snippets) ###\n"
+                    f"{context}"
+                )
             })
         messages.append({"role": "user", "content": prompt})
 
-        # ---------- image inlining (same behavior) ----------
-        max_image_bytes = 8 * 1024 * 1024
-        imgs_data: list[bytes] = images or []
-        if not imgs_data:
-            patt = re.compile(
-                r"(?P<path>(?:~|\.{1,2}|[A-Za-z]:)?[^\s\"'<>|]+\.(?:jpg|jpeg|png|bmp|gif|webp))",
-                re.IGNORECASE
-            )
-            for loc in {m.group("path") for m in patt.finditer(prompt)}:
+        # 3) embed images if any
+        images_data: list[bytes] = []
+        if images:
+            images_data = images
+        else:
+            patt = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
+            for loc in re.findall(patt, prompt, flags=re.I):
                 try:
                     if loc.lower().startswith(("http://", "https://")):
-                        r = requests.get(loc, timeout=5); r.raise_for_status()
-                        imgs_data.append(r.content)
+                        resp = requests.get(loc, timeout=5)
+                        resp.raise_for_status()
+                        images_data.append(resp.content)
                     else:
-                        p = Path(loc).expanduser().resolve()
-                        if p.is_file() and p.stat().st_size <= max_image_bytes:
-                            imgs_data.append(p.read_bytes())
+                        with open(loc, "rb") as f:
+                            images_data.append(f.read())
                 except Exception:
-                    pass
-        if imgs_data:
-            messages[-1]["images"] = imgs_data
+                    continue
+        if images_data:
+            messages[-1]["images"] = images_data
 
-        # ---------- tweakables (ported from _stream_and_capture) ----------
-        TOKEN_WINDOW               = 2000
-
-        TOKEN_REPEAT_LIMIT         = 400
-        LINE_REPEAT_LIMIT          = 40
-
-        PATTERN_MAX_LEN            = 200
-        PATTERN_REPEAT_THRESHOLD   = 12
-
-        SEQ_MIN, SEQ_MAX           = 2, 50
-        SEQ_REPEAT_LIMIT           = 18
-
-        CHAR_WINDOW                = 600
-        CHUNK_MIN, CHUNK_MAX       = 8, 48
-        PHRASE_REPEAT_LIMIT        = 12
-        FUZZY_SIM_THRESH           = 0.93
-
-        NGRAM_TOKEN_WINDOW         = 120
-        NGRAM_MIN, NGRAM_MAX       = 5, 20
-        NGRAM_REPEAT_LIMIT         = 30
-        NGRAM_FUZZY_SIM_THRESH     = 0.97
-
-        EROSION_CHAR_WINDOW        = 200
-        EROSION_SLICE_LEN          = 14
-        EROSION_STEPS_CHECK        = 10
-        EROSION_SIM_THRESH         = 0.97
-        EROSION_MIN_TRIGGERS       = 10
-
-        MAX_ATTEMPTS               = 5
-        SESSION_TIMEOUT_SEC        = 10 * 60
-        GUARD_DELAY_SEC            = 5
-
-        # ---------- helpers ----------
+        # 4) helpers
         def _log(msg: str, level: str = "INFO"):
             log_message(f"auxiliary_inference: {msg}", level)
 
-        pat_regex = re.compile(
-            rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
-            re.DOTALL
-        )
+        def _substr_count(text: str, substr: str) -> int:
+            return text.count(substr)
 
-        def _norm_chars(s: str) -> str:
-            return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
-        def _sim(a: str, b: str) -> float:
-            return SequenceMatcher(None, a, b).ratio()
-
-        def token_guard(tokens: deque[str]) -> bool:
-            return (len(tokens) >= TOKEN_REPEAT_LIMIT
-                    and len(set(list(tokens)[-TOKEN_REPEAT_LIMIT:])) == 1)
-
-        def line_guard(lines: deque[str]) -> bool:
-            return (len(lines) >= LINE_REPEAT_LIMIT
-                    and len(set(list(lines)[-LINE_REPEAT_LIMIT:])) == 1)
-
-        def multi_token_guard(tokens: deque[str]) -> bool:
-            arr = list(tokens); n = len(arr)
-            upper = min(SEQ_MAX, max(SEQ_MIN, n // SEQ_REPEAT_LIMIT))
-            for L in range(SEQ_MIN, upper + 1):
-                seq = arr[-L:]
-                ok = True
-                for r in range(2, SEQ_REPEAT_LIMIT + 1):
-                    s = -r * L; e = s + L
-                    if arr[s:e] != seq:
-                        ok = False; break
-                if ok:
-                    return True
-            return False
-
-        def fuzzy_phrase_guard(full_text: str) -> bool:
-            tail = _norm_chars(full_text[-CHAR_WINDOW:])
-            if len(tail) < CHUNK_MIN * PHRASE_REPEAT_LIMIT:
-                return False
-            step = max(1, (CHUNK_MAX - CHUNK_MIN) // 4)
-            for L in range(CHUNK_MIN, CHUNK_MAX + 1, step):
-                if len(tail) < L:
-                    continue
-                cand = tail[-L:]
-                if not cand.strip():
-                    continue
-                count = 1
-                pos = len(tail) - L
-                min_gap = int(L * 0.8)
-                max_gap = int(L * 1.2)
-                while pos - min_gap >= 0 and count < PHRASE_REPEAT_LIMIT + 3:
-                    found = False
-                    for st in (max(0, pos-max_gap),
-                            (max(0, pos-max_gap)+max(0, pos-min_gap))//2,
-                            max(0, pos-min_gap)):
-                        seg = tail[st:st+L]
-                        if seg and _sim(cand, seg) >= FUZZY_SIM_THRESH:
-                            count += 1; pos = st; found = True; break
-                    if not found:
-                        break
-                if count >= PHRASE_REPEAT_LIMIT:
-                    return True
-            return False
-
-        def ngram_guard_fuzzy(tokens: deque[str]) -> bool:
-            toks = list(tokens)[-NGRAM_TOKEN_WINDOW:]
-            if len(toks) < NGRAM_MIN * NGRAM_REPEAT_LIMIT:
-                return False
-            joined = [t.lower() for t in toks]
-            for n in range(NGRAM_MIN, NGRAM_MAX + 1):
-                if len(joined) < n * NGRAM_REPEAT_LIMIT:
-                    break
-                pattern = " ".join(joined[-n:])
-                cnt = 1
-                for i in range(len(joined) - 2*n, -1, -n):
-                    seg = " ".join(joined[i:i+n])
-                    if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
-                        cnt += 1
-                        if cnt >= NGRAM_REPEAT_LIMIT:
-                            return True
-                if cnt < NGRAM_REPEAT_LIMIT:
-                    cnt2 = 1
-                    for i in range(len(joined) - n - 1, -1, -1):
-                        seg = " ".join(joined[i:i+n])
-                        if _sim(pattern, seg) >= NGRAM_FUZZY_SIM_THRESH:
-                            cnt2 += 1
-                            if cnt2 >= NGRAM_REPEAT_LIMIT:
-                                return True
-            return False
-
-        def erosion_guard(full_text: str) -> bool:
-            tail = _norm_chars(full_text[-EROSION_CHAR_WINDOW:])
-            if len(tail) < (EROSION_SLICE_LEN + EROSION_STEPS_CHECK):
-                return False
-            triggers = 0
-            base_end = len(tail)
-            for k in range(EROSION_STEPS_CHECK):
-                end_a = base_end - k
-                start_a = max(0, end_a - EROSION_SLICE_LEN)
-                end_b = end_a - 1
-                start_b = max(0, end_b - EROSION_SLICE_LEN)
-                a = tail[start_a:end_a]
-                b = tail[start_b:end_b]
-                if _sim(a, b) >= EROSION_SIM_THRESH:
-                    triggers += 1
-                else:
-                    if triggers > 0:
-                        break
-            return triggers >= EROSION_MIN_TRIGGERS
-
-        # ---------- one streaming attempt ----------
-        def _attempt(model_name: str, tag: str) -> tuple[str, bool]:
-            from builtins import print as _print  # avoid any monkey patches
-            buf_tokens = deque(maxlen=TOKEN_WINDOW)
-            buf_lines  = deque(maxlen=LINE_REPEAT_LIMIT)
-            chunks: list[str] = []
-            inside_json = False
-            first_output = None
+        # 5) retry loop
+        attempt = 0
+        while True:
+            attempt += 1
             start_ts = time.time()
+            content = ""
+            prev_tok = None
+            exact_repeat_cnt = 0
+            line_counter = collections.Counter()
 
-            _print(f"{tag} ", end="", flush=True)
+            _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})", "PROCESS")
             try:
-                stream_iter = chat(
-                    model=model_name,
+                print("⟳ Auxiliary-LLM stream:", end="", flush=True)
+                for part in chat(
+                    model=model_selected,
                     messages=messages,
                     stream=True,
                     options={"temperature": temperature},
-                )
-            except _OllamaError as e:
-                _print(f"\n[Ollama crash before start] {e}")
-                return "", True
+                ):
+                    tok = part["message"]["content"]
+                    now = time.time()
 
-            try:
-                for part in stream_iter:
-                    # timeout guard
-                    if time.time() - start_ts > SESSION_TIMEOUT_SEC:
-                        _print("\n[Timeout guard] session expired → aborting pass.")
-                        return "".join(chunks), True
+                    # timeout guard (5 min)
+                    if now - start_ts > 300:
+                        raise TimeoutError("stream exceeded 5-minute limit")
 
-                    chunk = part["message"]["content"]
-                    st = (chunk or "").strip()
-                    # fence off code-block JSON to avoid confusing guards
-                    if st.startswith("```json"):
-                        inside_json = True; continue
-                    if inside_json and st.startswith("```"):
-                        inside_json = False; continue
-                    if inside_json:
-                        continue
+                    # identical-token spam
+                    if tok == prev_tok:
+                        exact_repeat_cnt += 1
+                        if exact_repeat_cnt > 10:
+                            raise RuntimeError("detected repeated content")
+                    else:
+                        exact_repeat_cnt = 0
+                    prev_tok = tok
 
-                    if first_output is None and chunk:
-                        first_output = time.time()
+                    content += tok
+                    print(tok, end="", flush=True)
 
-                    _print(chunk, end="", flush=True)
-                    chunks.append(chunk)
+                    # line-based repetition
+                    if "\n" in tok:
+                        for line in tok.splitlines():
+                            ln = line.strip()
+                            if ln:
+                                line_counter[ln] += 1
+                                if line_counter[ln] >= 10:
+                                    raise RuntimeError("detected repeated content")
 
-                    # update buffers
-                    for tok in (chunk.split() if chunk else []):
-                        buf_tokens.append(tok)
-                    for ln in (chunk.splitlines() if chunk else []):
-                        ln = ln.strip()
-                        if ln:
-                            buf_lines.append(ln)
+                    # substring repetition (20-120 chars)
+                    if len(content) > 240:
+                        tail = content[-120:]
+                        for L in range(20, 121, 10):
+                            sub = tail[-L:]
+                            if _substr_count(content, sub) >= 10:
+                                raise RuntimeError("detected repeated content")
 
-                    # run guards after a small grace period
-                    if first_output and (time.time() - first_output) > GUARD_DELAY_SEC:
-                        full_now = "".join(chunks)
-                        if token_guard(buf_tokens):
-                            _print("\n[Run-away guard] token repeat → aborting pass.")
-                            return full_now, True
-                        if line_guard(buf_lines):
-                            _print("\n[Run-away guard] line repeat → aborting pass.")
-                            return full_now, True
-                        if multi_token_guard(buf_tokens):
-                            _print("\n[Run-away guard] multi-token loop → aborting pass.")
-                            return full_now, True
-                        if pat_regex.search(full_now) or full_now.count("```json") > 1:
-                            _print("\n[Run-away guard] pattern repetition → aborting pass.")
-                            return full_now, True
-                        if fuzzy_phrase_guard(full_now):
-                            _print("\n[Run-away guard] fuzzy phrase repetition → aborting pass.")
-                            return full_now, True
-                        if ngram_guard_fuzzy(buf_tokens):
-                            _print("\n[Run-away guard] n-gram repetition → aborting pass.")
-                            return full_now, True
-                        if erosion_guard(full_now):
-                            _print("\n[Run-away guard] erosion (left-shift) loop → aborting pass.")
-                            return full_now, True
-
-            except _OllamaError as e:
-                _print(f"\n[Ollama crash] {e}")
-                return "".join(chunks), True
-            except Exception as e:
-                _print(f"\n[Stream error] {e}")
-                return "".join(chunks), True
-
-            _print()
-            return "".join(chunks), False
-
-        # ---------- retry loop + fallback ----------
-        attempt = 0
-        while attempt < MAX_ATTEMPTS:
-            attempt += 1
-            _log(f"attempt {attempt}/{MAX_ATTEMPTS} (model={model_primary}, temp={temperature})", "PROCESS")
-            text, retry = _attempt(model_primary, tag="⟳ Aux-LLM stream:")
-            if not retry:
+                print()
                 _log("auxiliary_inference complete.", "SUCCESS")
-                return text
-            _log("guard/crash triggered → restarting shortly…", "WARNING")
-            time.sleep(0.1)
+                return content
 
-        # fallback to secondary if configured and different
-        if model_secondary and model_secondary != model_primary:
-            _log("primary kept failing → switching to secondary model", "WARNING")
-            attempt = 0
-            while attempt < MAX_ATTEMPTS:
-                attempt += 1
-                _log(f"[fallback] attempt {attempt}/{MAX_ATTEMPTS} (model={model_secondary})", "PROCESS")
-                text, retry = _attempt(model_secondary, tag="⟳ Aux-LLM stream (fallback):")
-                if not retry:
-                    _log("auxiliary_inference complete (fallback).", "SUCCESS")
-                    return text
-                time.sleep(0.1)
+            except (TimeoutError, RuntimeError) as e:
+                _log(f"{e}; immediate retry", "WARNING")
+                time.sleep(1.0)
+                continue
 
-        # hard fail
-        err = {"error": f"aborted after {MAX_ATTEMPTS} attempts (primary{'' if model_secondary==model_primary else '+fallback'})"}
-        _log(err["error"], "ERROR")
-        return json.dumps(err)
+            except Exception as e:
+                _log(f"error: {e}", "ERROR")
+                return json.dumps({"error": str(e)})
+
 
 
         
