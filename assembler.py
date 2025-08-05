@@ -3487,9 +3487,9 @@ class Assembler:
         # ---------------------------------------------------------------------
         # Provisional answer (if TTS bridge exists)
         # ---------------------------------------------------------------------
-        _check_cancel()
-        if not state["provisional_sent"] and getattr(self, "_tts_bridge", None):
-            await _emit_provisional()
+        #_check_cancel()
+        #if not state["provisional_sent"] and getattr(self, "_tts_bridge", None):
+        #    await _emit_provisional()
 
         # ---------------------------------------------------------------------
         # FAST EXIT if no tools
