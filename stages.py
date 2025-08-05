@@ -2038,19 +2038,19 @@ def _stage9b_reflection_and_replan(
     user_text: str,
     clar_metadata: Dict[str, Any],
     state: Dict[str, Any],
-    max_tokens: int = 128_000,
+    max_tokens: int = 128000,
 ) -> Optional[str]:
     """
-    DAG-aware reflection & re-plan with *graph-stagnation* detection.
-
-    • If the plan is complete (or unchanged) → returns **None**.
-    • Otherwise returns a JSON plan (preferred {"graph": …}  – or {"tasks": …}).
-    • Persists a 'reflection_and_replan' ContextObject describing the delta.
+    DAG-aware reflection + (optional) re-planning stage.
+    Returns
+        • None   → keep existing graph
+        • "OK"   → same as None (graph already satisfied intent)
+        • <json> → new plan (normalised {'graph': {...}})
     """
-    # ---------------- std imports / helpers ----------------
     import json, re, hashlib, datetime
     from typing import Any, Dict
 
+    # ────────────────────────── helper fns ────────────────────────────
     def _clean_json_block(text: str) -> str:
         m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
         if m:
@@ -2064,193 +2064,167 @@ def _stage9b_reflection_and_replan(
         except Exception:
             return repr(obj)
 
-    def _sig(graph: Dict[str, Any]) -> str:
-        return hashlib.md5(json.dumps(graph, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
+    _sig = lambda g: hashlib.md5(
+        json.dumps(g or {}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
 
-    # -------- task→graph normaliser (same as before) --------
-    def _flatten_with_edges(task: dict, parent_id: str | None, idx: list[int], acc: list):
-        idx[0] += 1
-        nid = task.get("id") or f"n{idx[0]}"
-        acc.append(
-            {"id": nid, "tool": task.get("call"),
-             "args": task.get("tool_input", {}) or {},
-             "after": [parent_id] if parent_id else []})
-        for sub in task.get("subtasks") or []:
-            _flatten_with_edges(sub, nid, idx, acc)
+    # convert {"tasks":[...]} or bare task into {'graph':{...}}
+    def _as_graph(plan_any: Any) -> Dict[str, Any]:
+        # (same normaliser as before – omitted here for brevity)
+        from copy import deepcopy
+        def _flatten(task, parent, idx, acc):
+            idx[0] += 1
+            nid = task.get("id") or f"n{idx[0]}"
+            acc.append(
+                {"id": nid, "tool": task.get("call"), "args": task.get("tool_input", {}), "after": [parent] if parent else []}
+            )
+            for sub in task.get("subtasks", []) or []:
+                _flatten(sub, nid, idx, acc)
 
-    def _ensure_graph(raw: Any) -> Dict[str, Any]:
-        if isinstance(raw, dict) and "graph" in raw:
-            g = raw["graph"]; g.setdefault("nodes", []); g.setdefault("meta", {})
+        if isinstance(plan_any, dict) and "graph" in plan_any:
+            g = deepcopy(plan_any["graph"])
+            g.setdefault("nodes", [])
+            g.setdefault("meta", {})
             return {"graph": g}
 
-        # might be str or tasks
-        try:
-            obj = raw if isinstance(raw, dict) else json.loads(_clean_json_block(raw))
-        except Exception:
-            obj = {}
-        if "graph" in obj:
-            g = obj["graph"]; g.setdefault("nodes", []); g.setdefault("meta", {})
-            return {"graph": g}
-        tasks = obj.get("tasks", []) if isinstance(obj.get("tasks"), list) else []
-        if not tasks and "call" in obj:            # single task dict
-            tasks = [obj]
+        if isinstance(plan_any, dict) and "tasks" in plan_any:
+            nodes, counter = [], [0]
+            for t in plan_any["tasks"]:
+                _flatten(t, None, counter, nodes)
+            return {"graph": {"nodes": nodes, "meta": plan_any.get("meta", {})}}
 
-        idx = [0]; nodes = []
-        for t in tasks:
-            _flatten_with_edges(t, None, idx, nodes)
-        # chain independent tops deterministically
-        tops = [n for n in nodes if not n["after"]]
-        for i in range(1, len(tops)):
-            tops[i]["after"].append(tops[i-1]["id"])
-        return {"graph": {"nodes": nodes, "meta": obj.get("meta", {})}}
+        # bare single task
+        if isinstance(plan_any, dict) and "call" in plan_any:
+            return _as_graph({"tasks": [plan_any]})
 
-    # ---------------- current plan / tracker ----------------
+        return {"graph": {"nodes": [], "meta": {}}}
+
+    # deps-satisfied util
+    def _deps_ok(n: dict, done: set[str]) -> bool:
+        return all(d in done for d in (n.get("after") or []))
+
+    # ───────────────────── current turn / plan state ──────────────────
     turn = _ensure_turn_state(state)
-    old_norm = _ensure_graph(plan_output)
-    old_graph = old_norm["graph"]
-    old_sig   = _sig(old_graph)
 
-    tracker = next(self.repo.query(
+    cur_graph = _as_graph(json.loads(_clean_json_block(plan_output)) if plan_output else {}).get("graph")
+    cur_sig   = _sig(cur_graph)
+
+    # safe tracker lookup (works whether repo.query returns list or iterator)
+    trackers = self.repo.query(
         lambda c: c.component == "plan_tracker"
-        and (c.metadata.get("plan_id") == getattr(turn, "plan_id", None)
-             or c.semantic_label == old_sig)
-    ), None)
+        and (
+            c.metadata.get("plan_id") == getattr(turn, "plan_id", None)
+            or c.semantic_label == cur_sig
+        )
+    )
+    if isinstance(trackers, list):
+        tracker = trackers[0] if trackers else None
+    else:                                 # generator / iterator
+        tracker = next(trackers, None)
 
-    completed = set(tracker.metadata.get("completed", [])) if tracker else set(getattr(turn, "completed_nodes", set()))
-    pending   = set(tracker.metadata.get("pending_nodes", [])) if tracker else set(getattr(turn, "pending_nodes", set()))
-    errors_by = dict(tracker.metadata.get("errors_by_node", {})) if tracker else {}
+    completed = set()
+    pending   = set()
+    errs_by   = {}
 
-    id2node  = {n["id"]: n for n in old_graph.get("nodes", []) if n.get("id")}
-    deps_ok  = lambda n: all((dep in completed) for dep in (n.get("after") or []))
-    ready    = [nid for nid, n in id2node.items() if nid in pending and deps_ok(n)]
-
-    # ----- NEW: stagnation detection ----------------------------------
-    stagnated = bool(pending) and not ready
-    # mark in tracker (helpful for UI / metrics)
     if tracker:
-        tracker.metadata["stagnated"] = stagnated
-        tracker.touch(); self.repo.save(tracker)
+        completed = set(tracker.metadata.get("completed") or [])
+        pending   = set(tracker.metadata.get("pending_nodes") or [])
+        errs_by   = dict(tracker.metadata.get("errors_by_node") or {})
+    else:
+        completed = set(getattr(turn, "completed_nodes", set()) or [])
+        pending   = set(getattr(turn, "pending_nodes", set()) or [])
 
-    # ---------------- build reflection context ------------------------
-    parts = [
-        f"=== TURN id={getattr(turn, 'turn_id','')}  plan_id={getattr(turn,'plan_id','')} ===",
-        f"USER QUESTION:\n{user_text}",
-        f"CLARIFIER NOTES:\n{clar_metadata.get('notes','(none)')}",
-        f"CLARIFIER KEYWORDS:\n{', '.join(clar_metadata.get('keywords', [])) or '(none)'}",
-        "EXECUTION STATUS:",
-        _pretty({"total_nodes": len(old_graph.get('nodes', [])),
-                 "completed": sorted(completed),
-                 "pending":   sorted(pending),
-                 "ready":     sorted(ready),
-                 "errors_by_node": errors_by,
-                 "stagnated": stagnated}),
+    ready = [
+        n["id"]
+        for n in cur_graph.get("nodes") or []
+        if n["id"] in pending and _deps_ok(n, completed)
     ]
 
-    # tool outputs (short form)
-    for c in tool_ctxs:
-        nid = c.metadata.get("node_id") or "?"
-        tnm = c.metadata.get("tool_name") or "tool"
-        out = c.metadata.get("output_short") or c.metadata.get("output_full")
-        parts.append(f"TOOL OUTPUT [node={nid} tool={tnm}]:\n{_pretty(out)[:2000]}")
+    # ───────────────────── assemble reflection prompt ─────────────────
+    clar_notes = (clar_metadata or {}).get("notes", "")
+    clar_keywords = (clar_metadata or {}).get("keywords", [])
 
-    parts.append("ORIGINAL PLAN (GRAPH):\n" + _pretty(old_graph))
-    context_blob = "\n\n".join(parts)
+    parts = [
+        f"=== TURN ID ===\n{getattr(turn,'turn_id','')}",
+        f"=== USER ===\n{user_text}",
+        f"=== CLARIFIER NOTES ===\n{clar_notes or '(none)'}",
+        f"=== EXEC STATUS ===\n{_pretty(dict(total=len(cur_graph.get('nodes',[])),completed=sorted(completed),pending=sorted(pending),ready_now=sorted(ready),errors_by_node=errs_by))}",
+    ]
+    if clar_keywords:
+        parts.append("=== CLARIFIER KEYWORDS ===\n" + ", ".join(clar_keywords))
 
-    # ---------------- reflection prompt -------------------------------
-    system_msg   = self._get_prompt("reflection_prompt")
-    instruction  = (
-        "\n\nDid the current DAG fully satisfy the user’s intent?"
-        "\n• If **yes** → reply exactly: OK"
-        "\n• If **no**  → return ONLY a corrected plan as JSON (see format examples)."
-        "\n(Detect circular-dependency or ‘stagnated’ graphs and correct them.)"
+    for tc in tool_ctxs:
+        oid = tc.metadata.get("node_id")
+        tnm = tc.metadata.get("tool_name")
+        payload = tc.metadata.get("output_short") or tc.metadata.get("output_full")
+        parts.append(f"=== TOOL OUTPUT [node={oid} tool={tnm}] ===\n{_pretty(payload)[:800]}")
+
+    parts.append("=== ORIGINAL GRAPH ===\n" + _pretty(cur_graph))
+
+    prompt_user = "\n\n".join(parts) + (
+        "\n\nDid these tool outputs fully satisfy the user request?\n"
+        "• If YES, reply exactly: OK\n"
+        "• Otherwise return ONLY the corrected plan as JSON.\n"
+        "Accepted formats:\n"
+        "  {\"graph\": {\"nodes\": [...], \"meta\": {...}}}\n"
+        "  — or —\n"
+        "  {\"tasks\": [...]} (will be auto-converted)"
     )
-    resp_raw = self._stream_and_capture(
+
+    # ───────────────────── call model for reflection ──────────────────
+    sys_msg = self._get_prompt("reflection_prompt")
+    reply_raw = self._stream_and_capture(
         self.secondary_model,
-        [{"role": "system", "content": system_msg},
-         {"role": "user",   "content": context_blob + instruction}],
-        tag="[Reflection]"
+        [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt_user}],
+        tag="[Reflection]",
     ).strip()
 
-    # ---------------- quick success path ------------------------------
-    if re.fullmatch(r"(?i)(ok|okay)[.!]?", resp_raw):
-        self._persist_and_index([ContextObject.make_success(
-            description="Reflection confirmed plan satisfied intent",
-            refs=[c.context_id for c in tool_ctxs])])
+    # ───────────────— quick exits: OK / same graph —───────────────────
+    if re.fullmatch(r"(?i)(ok|okay)[.!]?", reply_raw):
         return None
 
-    # -------------- parse / normalise returned plan -------------------
     try:
-        cand = json.loads(_clean_json_block(resp_raw))
+        new_plan = json.loads(_clean_json_block(reply_raw))
     except Exception:
-        cand = None
+        # unparsable – bubble raw string upwards
+        return reply_raw
 
-    new_norm = None
-    if isinstance(cand, dict):
-        if "graph" in cand or "tasks" in cand or "call" in cand:
-            new_norm = _ensure_graph(cand)
-    # unparsable → persist & bubble raw
-    if new_norm is None:
-        self._persist_and_index([ContextObject.make_failure(
-            description="Reflection returned unparsable plan",
-            refs=[c.context_id for c in tool_ctxs])])
-        return resp_raw
-
+    new_norm = _as_graph(new_plan)
     new_graph = new_norm["graph"]
-    if _sig(new_graph) == old_sig:
-        # identical graph ⇒ treat as “OK”
-        self._persist_and_index([ContextObject.make_success(
-            description="Reflection produced identical graph",
-            refs=[c.context_id for c in tool_ctxs])])
-        return None
+    if _sig(new_graph) == cur_sig:
+        return None  # identical -> nothing to change
 
-    # ---------------- persist delta & update turn / tracker -----------
-    def _delta(g_old, g_new):
-        o_ids = {n["id"] for n in g_old.get("nodes", [])}
-        n_ids = {n["id"] for n in g_new.get("nodes", [])}
-        changed = [nid for nid in (o_ids & n_ids)
-                   if _pretty([x for x in g_old["nodes"] if x["id"] == nid][0])
-                   != _pretty([x for x in g_new["nodes"] if x["id"] == nid][0])]
-        return {"added": sorted(n_ids - o_ids),
-                "removed": sorted(o_ids - n_ids),
-                "changed": sorted(changed)}
-
-    delta = _delta(old_graph, new_graph)
-    repl_ctx = ContextObject.make_stage(
-        "reflection_and_replan",
-        [c.context_id for c in tool_ctxs],
-        {"old_graph": old_graph, "new_graph": new_graph, "delta": delta}
-    )
-    repl_ctx.summary = _pretty(delta)
-    repl_ctx.touch(); self.repo.save(repl_ctx)
-
-    # ---- refresh TurnState & tracker ---------------------------------
+    # --------------- update TurnState & tracker for new graph ----------
     new_sig = _sig(new_graph)
     turn.plan_id = f"plan_{new_sig}"
     turn.graph   = new_graph
-    new_ids      = {n["id"] for n in new_graph.get("nodes", [])}
-
-    still_done = completed & new_ids
-    turn.completed_nodes = still_done
-    turn.pending_nodes   = new_ids - still_done
+    turn.pending_nodes = {n["id"] for n in new_graph.get("nodes", [])}
+    turn.completed_nodes &= turn.pending_nodes  # keep only still-existing ones
 
     tracker_new = ContextObject.make_stage(
         "plan_tracker",
-        [repl_ctx.context_id],
-        {"plan_id": turn.plan_id,
-         "turn_id": getattr(turn, "turn_id", ""),
-         "total_nodes": len(new_ids),
-         "pending_nodes": sorted(list(turn.pending_nodes)),
-         "completed": sorted(list(still_done)),
-         "errors_by_node": {},
-         "attempts": 0,
-         "status": "in_progress",
-         "started_at": datetime.datetime.utcnow().isoformat() + "Z"}
+        [],
+        dict(
+            plan_id=turn.plan_id,
+            turn_id=turn.turn_id,
+            total_nodes=len(new_graph.get("nodes", [])),
+            pending_nodes=sorted(list(turn.pending_nodes)),
+            completed=sorted(list(turn.completed_nodes)),
+            errors_by_node={},
+            attempts=0,
+            status="in_progress",
+            started_at=datetime.datetime.utcnow().isoformat() + "Z",
+        ),
     )
     tracker_new.semantic_label = new_sig
-    tracker_new.touch(); self.repo.save(tracker_new)
+    tracker_new.stage_id = f"plan_tracker_{new_sig}"
+    tracker_new.summary = "tracker (from reflection)"
+    tracker_new.touch()
+    self.repo.save(tracker_new)
 
-    # -------------- return normalised JSON string --------------------
+    # return normalised JSON string
     return json.dumps({"graph": new_graph}, ensure_ascii=False)
+
 
 def _stage9_invoke_with_retries(
     self,
