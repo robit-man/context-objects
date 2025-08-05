@@ -354,10 +354,10 @@ DEFAULT_CFG = {
 
     # audio thresholds
     "sample_rate":         16000,
-    "rms_threshold":       0.01,
+    "rms_threshold":       0.02,
     "silence_duration":    0.5,
-    "consensus_threshold": 0.3,
-    "enable_noise_reduction": False,
+    "consensus_threshold": 0.6,
+    "enable_noise_reduction": True,
 
     # Piper release base URL & local executable name
     "piper_base_url":    "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/",
