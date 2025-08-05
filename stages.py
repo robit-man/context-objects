@@ -605,7 +605,7 @@ def _stage4_intent_clarification(
     return clar_ctx
 
 # ──────────────────────────────────────────────────────────────────
-# _stage5_external_knowledge   (upgraded)
+# _stage5_external_knowledge   (upgraded; shape-safe embeddings)
 # ──────────────────────────────────────────────────────────────────
 def _stage5_external_knowledge(
     self,
@@ -621,9 +621,9 @@ def _stage5_external_knowledge(
       • Recent tool outputs              (last 6)
       • Semantic recalls                 (saved in state["semantic"])
       • Associative holographic recall   (MemoryManager.holographic_recall)
-      • Fresh similarity hits            (engine.query, recency‑boosted)
+      • Fresh similarity hits            (engine.query, recency-boosted)
 
-    Score  =  0.55 · similarity   +   0.25 · recency_boost   +   0.20 · assoc
+    Score  =  0.55 · similarity   +   0.25 · recency_boost   +   0.20 · assoc
     (dialogue / tool snippets keep max score)
 
     Top `MAX_SNIPPETS` unique snippets are kept and persisted.
@@ -631,6 +631,7 @@ def _stage5_external_knowledge(
     import json, math, time
     from datetime import datetime, timezone
     from context import ContextObject
+    import numpy as np
 
     # ─── tunables ───────────────────────────────────────────────────
     MAX_SNIPPETS        = 12
@@ -640,6 +641,30 @@ def _stage5_external_knowledge(
     NOW_TS              = time.time()
 
     state = state or {}
+
+    # ─── embedding shape normalizers (fix row/column mismatches) ────
+    def _to_float32_1d(x) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            return x
+        # (1, D) or (D, 1) or other -> flatten to (D,)
+        return x.reshape(-1)
+
+    def _to_float32_2drow(x) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            return x.reshape(1, -1)
+        if x.ndim == 2 and x.shape[0] == 1:
+            return x
+        if x.ndim == 2 and x.shape[1] == 1:
+            return x.T
+        return x.reshape(1, -1)
+
+    def _embed_1d(text: str) -> np.ndarray:
+        return _to_float32_1d(self.embed_text(text))
+
+    def _embed_2drow(text: str) -> np.ndarray:
+        return _to_float32_2drow(self.embed_text(text))
 
     # ---------- helpers --------------------------------------------
     def _recency_boost(ctx) -> float:
@@ -653,7 +678,7 @@ def _stage5_external_knowledge(
         return 0.5 ** (age_days / HALF_LIFE_DAYS)
 
     def _label_trim(text: str, lbl: str, limit: int = 220) -> str:
-        text = text.replace("\n", " ").strip()
+        text = (text or "").replace("\n", " ").strip()
         if len(text) > limit:
             text = text[:limit].rsplit(" ", 1)[0] + " …"
         return f"({lbl}) {text}"
@@ -663,7 +688,7 @@ def _stage5_external_knowledge(
 
     # ---------- 1) recent dialogue ---------------------------------
     for c in reversed(state.get("history", [])[-MAX_PER_CATEGORY:]):
-        txt = c.summary or c.metadata.get("text", "")
+        txt = c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")
         s   = _label_trim(txt, "USER" if c.semantic_label == "user_input" else "ASSIST")
         score = 1.0
         scored.append((score, s, c))
@@ -671,10 +696,13 @@ def _stage5_external_knowledge(
 
     # ---------- 2) recent tool outputs -----------------------------
     for c in reversed(state.get("tools", [])[-MAX_PER_CATEGORY:]):
-        payload = c.metadata.get("output") or c.metadata.get("exception") or ""
+        payload = (c.metadata.get("output") if isinstance(c.metadata, dict) else None) or \
+                  (c.metadata.get("exception") if isinstance(c.metadata, dict) else "") or ""
         if not isinstance(payload, str):
-            try:    payload = json.dumps(payload, ensure_ascii=False)[:300]
-            except: payload = repr(payload)[:300]
+            try:
+                payload = json.dumps(payload, ensure_ascii=False)[:300]
+            except Exception:
+                payload = repr(payload)[:300]
         s = _label_trim(payload, f"TOOL:{c.stage_id}")
         score = 1.0
         scored.append((score, s, c))
@@ -687,50 +715,71 @@ def _stage5_external_knowledge(
             s   = _label_trim(txt, lbl)
             if s in seen_texts:
                 continue
-            sim = c.retrieval_score or 0.7
-            scored.append((sim, s, c))
-            seen_texts[s] = sim
+            sim = getattr(c, "retrieval_score", None) or (c.metadata.get("retrieval_score") if isinstance(c.metadata, dict) else None) or 0.7
+            scored.append((float(sim), s, c))
+            seen_texts[s] = float(sim)
 
     # ---------- 4) holographic associative recall ------------------
     seed_ids = [clar_ctx.context_id] + [c.context_id for c in state.get("history", [])[-2:]]
-    assoc_hits = self.memman.holographic_recall(
-        cue_ids=seed_ids,
-        cue_text=clar_ctx.summary or "",
-        hops=2,
-        top_n=MAX_PER_CATEGORY,
-        embed_fn=self.embed_text
-    )
+
+    try:
+        assoc_hits = self.memman.holographic_recall(
+            cue_ids=seed_ids,
+            cue_text=clar_ctx.summary or "",
+            hops=2,
+            top_n=MAX_PER_CATEGORY,
+            embed_fn=_embed_1d,  # <- always (D,)
+        )
+    except Exception as e:
+        # Fallback if an internal path insists on (1, D)
+        assoc_hits = self.memman.holographic_recall(
+            cue_ids=seed_ids,
+            cue_text=clar_ctx.summary or "",
+            hops=2,
+            top_n=MAX_PER_CATEGORY,
+            embed_fn=_embed_2drow,  # <- always (1, D)
+        )
+
     for h in assoc_hits:
-        txt = h.summary or h.metadata.get("content", "")
+        txt = h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")
         s   = _label_trim(txt, "HMM")
         if s in seen_texts:
             continue
-        assoc = h.retrieval_score or 0.5
+        assoc = getattr(h, "retrieval_score", None) or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else None) or 0.5
         rec   = _recency_boost(h)
-        score = 0.20 * assoc + 0.25 * rec + 0.55 * assoc  # assoc doubles as similarity proxy
+        # assoc doubles as similarity proxy here
+        score = 0.55 * float(assoc) + 0.25 * float(rec) + 0.20 * float(assoc)
         scored.append((score, s, h))
         seen_texts[s] = score
 
-    # ---------- 5) fresh similarity hits (recency‑boosted) ---------
-    kws = clar_ctx.metadata.get("keywords") or []
+    # ---------- 5) fresh similarity hits (recency-boosted) ---------
+    kws = (clar_ctx.metadata.get("keywords") if isinstance(clar_ctx.metadata, dict) else None) or []
     if not kws and clar_ctx.summary:
         kws = [clar_ctx.summary]
 
     for kw in kws:
-        for h in self.engine.query(similarity_to=kw,
-                                   stage_id="external_knowledge_query",
-                                   top_k=SIM_TOP_K):
-            txt = (h.summary or h.metadata.get("content", "")).strip()
+        try:
+            hits = self.engine.query(
+                similarity_to=kw,
+                stage_id="external_knowledge_query",
+                top_k=SIM_TOP_K,
+            )
+        except Exception:
+            # Graceful degrade: no engine results
+            hits = []
+
+        for h in hits:
+            txt = (h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")).strip()
             s   = _label_trim(txt, "FRESH")
             if s in seen_texts:
                 continue
-            sim  = h.retrieval_score or 0.0
+            sim  = getattr(h, "retrieval_score", None) or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else None) or 0.0
             rec  = _recency_boost(h)
-            score = 0.55 * sim + 0.25 * rec + 0.20 * 0.0   # no assoc for engine hits
+            score = 0.55 * float(sim) + 0.25 * float(rec) + 0.20 * 0.0
             scored.append((score, s, h))
             seen_texts[s] = score
 
-    # ---------- 6) final ranking & de‑dup --------------------------
+    # ---------- 6) final ranking & de-dup --------------------------
     scored.sort(key=lambda t: t[0], reverse=True)
     uniq_lines = []
     added = set()
@@ -753,7 +802,12 @@ def _stage5_external_knowledge(
     ext_ctx.summary = "\n".join(uniq_lines)[:1024]
     ext_ctx.touch()
     self.repo.save(ext_ctx)
-    self.memman.register_relationships(ext_ctx, self.embed_text)
+
+    # Register relationships with safe embed shapes
+    try:
+        self.memman.register_relationships(ext_ctx, _embed_1d)
+    except Exception:
+        self.memman.register_relationships(ext_ctx, _embed_2drow)
 
     # ---------- 8) debug print -------------------------------------
     self._print_stage_context(
@@ -766,6 +820,7 @@ def _stage5_external_knowledge(
         state["knowledge_snippets"] = uniq_lines
 
     return ext_ctx
+
 
 def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
     import json

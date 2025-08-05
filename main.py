@@ -376,6 +376,105 @@ DEFAULT_CFG = {
     "onnx_model_url": "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx",
 }
 
+def _run_quiet(cmd: list[str]) -> tuple[int, str]:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return 0, out.strip()
+    except subprocess.CalledProcessError as e:
+        return e.returncode, (e.output or "").strip()
+
+def ensure_ollama_running():
+    """
+    Make sure the Ollama daemon is up. Prefer system service; fall back to foreground.
+    """
+    # Quick sanity check
+    rc, _ = _run_quiet(["ollama", "list"])
+    if rc == 0:
+        return
+
+    # Try systemd service (Linux)
+    if shutil.which("systemctl"):
+        _run_quiet(["sudo", "systemctl", "daemon-reload"])
+        _run_quiet(["sudo", "systemctl", "enable", "--now", "ollama"])
+        time.sleep(1.5)
+        rc, _ = _run_quiet(["ollama", "list"])
+        if rc == 0:
+            return
+
+    # Try launchctl (macOS, official install.sh sets a launchd plist)
+    if sys.platform == "darwin" and shutil.which("launchctl"):
+        _run_quiet(["launchctl", "kickstart", "-k", "gui/$(id -u)/com.ollama.ollama"])
+        time.sleep(1.5)
+        rc, _ = _run_quiet(["ollama", "list"])
+        if rc == 0:
+            return
+
+    # Last resort: spawn a background daemon in this session
+    if shutil.which("nohup"):
+        # avoid blocking; discard output
+        subprocess.Popen(["nohup", "ollama", "serve"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None)
+        time.sleep(1.5)
+
+def install_or_upgrade_ollama():
+    """
+    Install or upgrade Ollama to latest stable for the platform.
+    Safe to run repeatedly. Requires sudo on Linux for system install.
+    """
+    log_message("Upgrading Ollama to the latest version…", "PROCESS")
+
+    if sys.platform.startswith("linux"):
+        # Official installer handles install and upgrade
+        dl_cmd = "curl -fsSL" if shutil.which("curl") else ("wget -qO-" if shutil.which("wget") else None)
+        if not dl_cmd:
+            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call(["sudo", "apt-get", "install", "-y", "curl"])
+            dl_cmd = "curl -fsSL"
+        subprocess.check_call(["sh", "-c", f"{dl_cmd} https://ollama.com/install.sh | sh"])
+        # installer usually writes/updates systemd service
+        _run_quiet(["sudo", "systemctl", "daemon-reload"])
+        _run_quiet(["sudo", "systemctl", "enable", "--now", "ollama"])
+
+    elif sys.platform == "darwin":
+        # Prefer Homebrew if present, else install.sh
+        if shutil.which("brew"):
+            subprocess.check_call(["brew", "update"])
+            # brew formula name is 'ollama'
+            subprocess.check_call(["brew", "upgrade", "ollama"])
+            subprocess.check_call(["brew", "link", "--overwrite", "ollama"])
+        else:
+            dl_cmd = "curl -fsSL" if shutil.which("curl") else ("wget -qO-" if shutil.which("wget") else None)
+            if not dl_cmd:
+                raise RuntimeError("curl or wget required to install Ollama on macOS")
+            subprocess.check_call(["sh", "-c", f"{dl_cmd} https://ollama.com/install.sh | sh"])
+
+    elif sys.platform.startswith("win"):
+        # Prefer winget; fall back to choco if available
+        if shutil.which("winget"):
+            # Silent upgrade if available; winget exits 0 even when already latest
+            subprocess.call(["winget", "install", "-e", "--id", "Ollama.Ollama", "--silent", "--accept-package-agreements", "--accept-source-agreements"])
+            subprocess.call(["winget", "upgrade", "-e", "--id", "Ollama.Ollama", "--silent", "--accept-package-agreements", "--accept-source-agreements"])
+        elif shutil.which("choco"):
+            subprocess.call(["choco", "upgrade", "-y", "ollama"])
+        else:
+            raise RuntimeError("Please install Ollama manually on Windows (winget or choco not found).")
+
+    else:
+        raise RuntimeError(f"Unsupported platform for Ollama upgrade: {sys.platform}")
+
+    # after install/upgrade, ensure the daemon is running
+    ensure_ollama_running()
+
+def is_ollama_too_old_error(exc: Exception) -> bool:
+    msg = str(exc) if exc else ""
+    # match both the HTTP status and the friendly text Ollama returns
+    needles = [
+        "requires a newer version of Ollama",
+        "412",  # HTTP 412 from API
+        "pull model manifest: 412",
+    ]
+    return any(n in msg for n in needles)
+
 # 1) Load existing config.json (or start empty)
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "r") as f:
@@ -449,6 +548,9 @@ if shutil.which("ollama") is None:
         "sh", "-c",
         f"{dl_cmd} https://ollama.com/install.sh | sh"
     ])
+
+ensure_ollama_running()
+
 # ──────────── PULL Ollama MODELS IF NEEDED ──────────────────────────────
 import ollama
 
@@ -503,7 +605,27 @@ for model_spec in (
 
     except Exception as pull_err:
         print()  # clear the bar line
-        log_message(f"Error pulling Ollama model '{model_spec}': {pull_err}", "WARNING")
+        if is_ollama_too_old_error(pull_err):
+            log_message("Ollama is too old for this model. Upgrading…", "WARNING")
+            try:
+                install_or_upgrade_ollama()
+                log_message("Retrying model pull after upgrade…", "PROCESS")
+                ensure_ollama_running()
+                for status in ollama.pull(model_spec, stream=True):
+                    comp = status.get("completed")
+                    tot  = status.get("total")
+                    bar_line = render_bar(comp, tot)
+                    sys.stdout.write(f"\r[Ollama:pull {model_spec}] {bar_line}")
+                    sys.stdout.flush()
+                print()
+                log_message(f"Successfully pulled Ollama model '{model_spec}' after upgrade.", "SUCCESS")
+                available_set.add(model_spec)
+                continue
+            except Exception as e2:
+                print()
+                log_message(f"Retry pull failed after upgrade: {e2}", "ERROR")
+        else:
+            log_message(f"Error pulling Ollama model '{model_spec}': {pull_err}", "WARNING")
 
 
 

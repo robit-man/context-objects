@@ -853,13 +853,110 @@ ContextRepository = HybridContextRepository
 class MemoryManager:
     """
     High-level service for associative recall, reinforcement, pruning,
-    and spreading-activation (“thought chains”).
+    spreading-activation (“thought chains”) and consolidation.
     """
 
-    _graph: Dict[str, Dict[str, float]] = {}   # ← NEW: shared holographic graph
+    _graph: Dict[str, Dict[str, float]] = {}
+    _graph_path: str = "context_repos/holo_graph.json"
 
     def __init__(self, repo: ContextRepository):
+        import json, os, threading
         self.repo = repo
+        self._graph_lock = threading.Lock()
+        # lazy-load persisted graph once
+        if not MemoryManager._graph and os.path.exists(self._graph_path):
+            try:
+                with open(self._graph_path, "r", encoding="utf-8") as f:
+                    MemoryManager._graph = json.load(f)
+            except Exception:
+                MemoryManager._graph = {}
+
+    def _scope_filter(self, allowed_user: str | None, allowed_conv: str | None):
+        """Restrict repo scans to a user and/or conversation when provided."""
+        def _f(c: ContextObject) -> bool:
+            uid = (c.metadata or {}).get("user_id")
+            cid = (c.metadata or {}).get("conversation_id")
+            ok_user = (allowed_user is None) or (uid == allowed_user)
+            ok_conv = (allowed_conv is None) or (cid == allowed_conv)
+            return ok_user and ok_conv
+        return _f
+
+
+    def decay_graph_edges(self, half_life_secs: float = 86_400.0, min_w: float = 1e-6) -> None:
+        """Exponential decay on holographic edges; drop tiny weights."""
+        import math, time
+        now = time.time()
+        # cache last decay time
+        if not hasattr(self, "_last_graph_decay_ts"):
+            self._last_graph_decay_ts = now
+            return
+        dt = max(now - self._last_graph_decay_ts, 0.0)
+        if dt < 60.0:   # throttle
+            return
+        factor = math.exp(-dt / float(half_life_secs))
+        with self._graph_lock:
+            for u, nbrs in list(self._graph.items()):
+                for v, w in list(nbrs.items()):
+                    w2 = w * factor
+                    if w2 <= min_w:
+                        del nbrs[v]
+                    else:
+                        nbrs[v] = w2
+                if not nbrs:
+                    del self._graph[u]
+        self._last_graph_decay_ts = now
+        self._save_graph()
+
+    def start_episode(self, title: str, meta: Dict[str, Any] | None = None) -> ContextObject:
+        from context import ContextObject
+        epi = ContextObject(
+            domain="stage",
+            component="episode",
+            semantic_label="episode",
+        )
+        epi.summary = title
+        epi.tags = ["episode"]
+        epi.metadata.update(meta or {})
+        self.repo.save(epi)
+        # remember current open episode id
+        self._current_episode_id = epi.context_id
+        return epi
+
+    def add_to_episode(self, ctx: ContextObject) -> None:
+        """Link a ctx into the open episode (if any) with strong edges."""
+        epi_id = getattr(self, "_current_episode_id", None)
+        if not epi_id:
+            return
+        self._add_edge(epi_id, ctx.context_id, 1.5)
+        self._add_edge(ctx.context_id, epi_id, 1.0)
+        self._save_graph()
+
+    def end_episode(self) -> None:
+        if hasattr(self, "_current_episode_id"):
+            delattr(self, "_current_episode_id")
+            
+    def consolidate_stm_to_ltm(self, promote_threshold: int = 3) -> None:
+        """Promote frequently-recalled items to LTM tier (and pin them)."""
+        for ctx in self.repo.query(lambda c: True):
+            cnt = (ctx.recall_stats or {}).get("count", 0)
+            if cnt >= promote_threshold and ctx.memory_tier != "LTM":
+                ctx.memory_tier = "LTM"
+                ctx.pinned = True
+                ctx.touch()
+                self.repo.save(ctx)
+
+    def _save_graph(self) -> None:
+        """Persist holographic graph to disk (best-effort)."""
+        import json, os, tempfile, shutil
+        with self._graph_lock:
+            try:
+                os.makedirs(os.path.dirname(self._graph_path), exist_ok=True)
+                tmp = self._graph_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._graph, f)
+                shutil.move(tmp, self._graph_path)
+            except Exception:
+                pass
 
     def recall(
         self,
@@ -870,42 +967,62 @@ class MemoryManager:
         weights = weights or {"assoc": 1.0, "recency": 1.0}
         now = default_clock()
 
-        # 1) one‐hop candidate scoring
+        if not seed_ids:
+            return []
+
+        # infer scope from the first seed (best-effort)
+        owner_user = owner_conv = None
+        try:
+            first = self.repo.get(seed_ids[0])
+            owner_user = (first.metadata or {}).get("user_id")
+            owner_conv = (first.metadata or {}).get("conversation_id")
+        except Exception:
+            pass
+
+        def _in_scope(cid: str) -> bool:
+            if owner_user is None and owner_conv is None:
+                return True
+            try:
+                c = self.repo.get(cid)
+                return self._scope_filter(owner_user, owner_conv)(c)
+            except Exception:
+                return False
+
+        # 1) one-hop candidate scoring (scoped)
         scores: Dict[str, float] = {}
         for sid in seed_ids:
-            seed = self.repo.get(sid)
-            for oid, strength in seed.association_strengths.items():
+            try:
+                seed = self.repo.get(sid)
+            except KeyError:
+                continue
+            for oid, strength in (seed.association_strengths or {}).items():
+                if not _in_scope(oid):
+                    continue
+                try:
+                    other = self.repo.get(oid)
+                except KeyError:
+                    continue
                 base = strength * weights["assoc"]
-                other = self.repo.get(oid)
                 last = datetime.strptime(other.last_accessed, "%Y%m%dT%H%M%SZ")
-                age = (now - last).total_seconds()
+                age  = (now - last).total_seconds()
                 base += weights["recency"] / (1.0 + age)
                 scores[oid] = scores.get(oid, 0.0) + base
 
-        # 2) pick top‐k
+        # 2) top-k, stamp, record
         top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
         results: List[ContextObject] = []
-
         for cid, score in top:
-            ctx = self.repo.get(cid)
-
-            # a) stamp retrieval_score & metadata
+            try:
+                ctx = self.repo.get(cid)
+            except KeyError:
+                continue
             ctx.retrieval_score = score
             ctx.retrieval_metadata = {"seed_ids": seed_ids}
-
-            # b) record the recall event
-            ctx.record_recall(
-                stage_id="recall",
-                coactivated_with=seed_ids,
-                retrieval_score=score
-            )
-
-            # c) save the updated object
+            ctx.record_recall(stage_id="recall", coactivated_with=seed_ids, retrieval_score=score)
             self.repo.save(ctx)
-
             results.append(ctx)
-
         return results
+
 
     def spread_activation(
         self,
@@ -990,28 +1107,33 @@ class MemoryManager:
                 self.repo.save(ctx)
 
     def reinforce(self, context_id: str, coactivated: List[str]) -> None:
-        """
-        Strengthen edges between `context_id` and every ID in `coactivated`
-        while skipping dangling references.
-        """
+        """Strengthen symmetric edges among all coactivated items + context_id."""
         try:
-            ctx = self.repo.get(context_id)
+            base = self.repo.get(context_id)
         except KeyError:
             return
 
-        valid_refs: List[str] = []
+        valid = []
         for rid in coactivated:
             try:
                 self.repo.get(rid)
-                valid_refs.append(rid)
+                valid.append(rid)
             except KeyError:
                 continue
-
-        if not valid_refs:
+        if not valid:
             return
 
-        ctx.record_recall(stage_id=None, coactivated_with=valid_refs)
-        self.repo.save(ctx)
+        all_ids = [context_id] + valid
+        # clique reinforcement
+        for i in range(len(all_ids)):
+            for j in range(i + 1, len(all_ids)):
+                a, b = all_ids[i], all_ids[j]
+                self._add_edge(a, b, 0.5)
+                self._add_edge(b, a, 0.5)
+
+        base.record_recall(stage_id="reinforce", coactivated_with=valid)
+        self.repo.save(base)
+        self._save_graph()
 
     def prune(self, ttl_hours: int) -> None:
         cutoff = default_clock() - timedelta(hours=ttl_hours)
@@ -1052,32 +1174,48 @@ class MemoryManager:
             self._add_edge(rid, cid, _HMR_REF_W)
 
         # ---------- shared tags ----------
+        MAX_TAG_NEIGHBORS = 200
         for tag in ctx.tags:
             tag_node = f"tag::{tag}"
             self._add_edge(cid, tag_node, _HMR_TAG_W)
             self._add_edge(tag_node, cid, _HMR_TAG_W)
+            # trim oversized tag neighborhoods
+            nbrs = self._graph.get(tag_node, {})
+            if len(nbrs) > MAX_TAG_NEIGHBORS:
+                # keep top by weight
+                keep = dict(sorted(nbrs.items(), key=lambda kv: kv[1], reverse=True)[:MAX_TAG_NEIGHBORS])
+                self._graph[tag_node] = keep
 
         # ---------- semantic similarity ----------
         # initialize embedding cache if missing
         if not hasattr(self, "_embed_cache"):
             self._embed_cache: Dict[str, np.ndarray] = {}
-        def _get_vec(text: str) -> np.ndarray:
-            if text not in self._embed_cache:
-                self._embed_cache[text] = embed_fn(text)
-            return self._embed_cache[text]
 
+
+        def _get_unit(text: str) -> np.ndarray:
+            vec = None
+            if text in self._embed_cache:
+                vec, _ = self._embed_cache[text]
+                return vec
+            raw = embed_fn(text)
+            v = np.asarray(raw, dtype=np.float32).reshape(-1)
+            n = float(np.linalg.norm(v) + 1e-9)
+            u = v / n
+            self._embed_cache[text] = (u, n)
+            return u
+        
         try:
-            v1 = _get_vec(ctx.summary or "")
-            # only compare to the most recent M items
-            recents = self.repo.query(lambda _: True)[-200:]
+            v1 = _get_unit(ctx.summary or "")
+            # restrict recents to same user/conversation when available
+            allowed_user = (ctx.metadata or {}).get("user_id")
+            allowed_conv = (ctx.metadata or {}).get("conversation_id")
+            recents = self.repo.query(self._scope_filter(allowed_user, allowed_conv))[-200:]
             for other in recents:
                 if other.context_id == cid or not other.summary:
                     continue
-                # skip if we've already embedded this other
                 txt = other.summary
-                v2 = _get_vec(txt)
-                sim = float(np.dot(v1, v2) /
-                            (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9))
+                v2 = _get_unit(txt)
+                sim = float(np.dot(v1, v2))  # already unit vectors
                 if sim >= _HMR_SIM_THRESH:
                     w = _HMR_SIM_W * sim
                     self._add_edge(cid, other.context_id, w)
@@ -1089,8 +1227,10 @@ class MemoryManager:
         now = ctx._ts_seconds()
         # limit scan to contexts added in the last window
         window = 600  # seconds
+        allowed_user = (ctx.metadata or {}).get("user_id")
+        allowed_conv = (ctx.metadata or {}).get("conversation_id")
         candidates = [
-            c for c in self.repo.query(lambda c: True)
+            c for c in self.repo.query(self._scope_filter(allowed_user, allowed_conv))
             if abs(now - c._ts_seconds()) <= window and c.context_id != cid
         ]
         for other in candidates:
@@ -1111,36 +1251,120 @@ class MemoryManager:
         Fuse cue_ids &/or cue_text into a single excitation vector,
         run multi-hop spreading activation over _graph, return top_n ContextObjects.
         """
+        self.decay_graph_edges()
+        self.consolidate_stm_to_ltm()
+        
         cue_ids = cue_ids or []
         activation: Dict[str, float] = collections.Counter({cid: 1.0 for cid in cue_ids})
 
-        # text cue → similarity edges once
+        # infer scope from the first cue (if available)
+        owner_user = None
+        owner_conv = None
+        if cue_ids:
+            try:
+                first = self.repo.get(cue_ids[0])
+                owner_user = (first.metadata or {}).get("user_id")
+                owner_conv = (first.metadata or {}).get("conversation_id")
+            except Exception:
+                pass
+
+        # local unit-vector helper (mirrors register_relationships)
+        def _get_unit_text(text: str) -> np.ndarray:
+            raw = embed_fn(text)
+            v = np.asarray(raw, dtype=np.float32).reshape(-1)
+            n = float(np.linalg.norm(v) + 1e-9)
+            return v / n
+
+        # text cue → similarity edges once, scoped to user/conv
         if cue_text and embed_fn:
-            qv = embed_fn(cue_text)
-            for c in self.repo.query(lambda _: True):
+            def _unit_text(text: str) -> np.ndarray:
+                v = np.asarray(embed_fn(text), dtype=np.float32).reshape(-1)
+                n = float(np.linalg.norm(v) + 1e-9)
+                return v / n
+            qv = _unit_text(cue_text)
+            for c in self.repo.query(self._scope_filter(owner_user, owner_conv)):
                 if not c.summary:
                     continue
-                vv  = embed_fn(c.summary)
-                sim = float(np.dot(qv, vv) /
-                            (np.linalg.norm(qv) * np.linalg.norm(vv) + 1e-9))
+                vv = _unit_text(c.summary)
+                sim = float(np.dot(qv, vv))  # unit vectors
                 if sim >= _HMR_SIM_THRESH:
                     activation[c.context_id] += _HMR_SIM_W * sim
 
-        # hop propagation
+        # hop propagation (optionally scoped to user/conv)
+        def _in_scope(cid: str) -> bool:
+            if owner_user is None and owner_conv is None:
+                return True
+            try:
+                c = self.repo.get(cid)
+                return self._scope_filter(owner_user, owner_conv)(c)
+            except Exception:
+                return False
+
         frontier = dict(activation)
         for _ in range(hops):
             new_frontier = collections.Counter()
             for nid, act in frontier.items():
                 for nbr, w in self._graph.get(nid, {}).items():
+                    if not _in_scope(nbr):
+                        continue
                     new_frontier[nbr] += act * w
             for k, v in new_frontier.items():
-                activation[k] += v
+                activation[k] = activation.get(k, 0.0) + v
             frontier = new_frontier
 
-        # rank & materialise
-        ranked = sorted(activation.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-        out    = []
-        for cid, score in ranked:
+        # scope filter BEFORE ranking/MMR
+        if owner_user is not None or owner_conv is not None:
+            activation = {k: v for k, v in activation.items() if _in_scope(k)}
+
+        # candidate pool for MMR (oversample for diversity)
+        cands = sorted(activation.items(), key=lambda kv: kv[1], reverse=True)[: max(top_n * 4, top_n)]
+        selected: list[tuple[str, float]] = []
+        alpha = 0.75  # relevance vs novelty
+
+        # unit-vector helper for MMR; safe when embed_fn is None
+        def _unit_from_cid(cid: str):
+            if not embed_fn:
+                return None
+            try:
+                obj = self.repo.get(cid)
+                txt = (obj.summary or "").strip()
+                if not txt:
+                    return None
+                v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
+                n = float(np.linalg.norm(v) + 1e-9)
+                return v / n
+            except Exception:
+                return None
+
+        vecs = {cid: _unit_from_cid(cid) for cid, _ in cands}
+
+        # MMR selection (single pass)
+        while cands and len(selected) < top_n:
+            best = None
+            best_score = -1e9
+            for cid, rel in cands:
+                v = vecs.get(cid)
+                if not selected or v is None:
+                    novelty = 1.0
+                else:
+                    sims = []
+                    for scid, _ in selected:
+                        sv = vecs.get(scid)
+                        if sv is None or v is None:
+                            continue
+                        sims.append(float(np.dot(v, sv)))  # unit vectors
+                    max_sim = max(sims) if sims else 0.0
+                    novelty = 1.0 - max(0.0, max_sim)
+                mmr = alpha * float(rel) + (1.0 - alpha) * novelty
+                if mmr > best_score:
+                    best_score = mmr
+                    best = (cid, rel)
+            selected.append(best)
+            cands = [(cid, r) for (cid, r) in cands if cid != best[0]]
+
+        # materialize selected set
+        out = []
+        for cid, score in selected:
             try:
                 obj = self.repo.get(cid)
                 obj.retrieval_score = score
