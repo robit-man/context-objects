@@ -1821,40 +1821,41 @@ class Assembler:
         # assume chat and _OllamaError are available in scope
 
         # ── tweakables ─────────────────────────────────────────────────────
-        TOKEN_WINDOW               = 2000
-        TOKEN_REPEAT_LIMIT         = 200
-        LINE_REPEAT_LIMIT          = 20
+        TOKEN_WINDOW               = 2000          # unchanged
 
-        # backref repeat detector
-        PATTERN_MAX_LEN            = 200
-        PATTERN_REPEAT_THRESHOLD   = 8
+        TOKEN_REPEAT_LIMIT         = 400           # ↑ from 200
+        LINE_REPEAT_LIMIT          = 40            # ↑ from 20
 
-        # multi-token loop
-        SEQ_MIN, SEQ_MAX           = 2, 50
-        SEQ_REPEAT_LIMIT           = 10
+        # back-ref repeat detector
+        PATTERN_MAX_LEN            = 200           # unchanged
+        PATTERN_REPEAT_THRESHOLD   = 12            # ↑ from 8
+
+        # multi-token loop detector
+        SEQ_MIN, SEQ_MAX           = 2, 50         # unchanged
+        SEQ_REPEAT_LIMIT           = 18            # ↑ from 10
 
         # fuzzy phrase repetition
-        CHAR_WINDOW                = 600
-        CHUNK_MIN, CHUNK_MAX       = 8, 48
-        PHRASE_REPEAT_LIMIT        = 6
-        FUZZY_SIM_THRESH           = 0.90
+        CHAR_WINDOW                = 600           # unchanged (scope of scan)
+        CHUNK_MIN, CHUNK_MAX       = 8, 48         # unchanged
+        PHRASE_REPEAT_LIMIT        = 12            # ↑ from 6
+        FUZZY_SIM_THRESH           = 0.93          # ↑ from 0.90 (needs closer match)
 
         # fuzzy token n-gram repetition
-        NGRAM_TOKEN_WINDOW         = 120
-        NGRAM_MIN, NGRAM_MAX       = 5, 20
-        NGRAM_REPEAT_LIMIT         = 15
-        NGRAM_FUZZY_SIM_THRESH     = 0.95
+        NGRAM_TOKEN_WINDOW         = 120           # unchanged
+        NGRAM_MIN, NGRAM_MAX       = 5, 20         # unchanged
+        NGRAM_REPEAT_LIMIT         = 30            # ↑ from 15
+        NGRAM_FUZZY_SIM_THRESH     = 0.97          # ↑ from 0.95
 
         # erosion / left-shift detector
-        EROSION_CHAR_WINDOW        = 200
-        EROSION_SLICE_LEN          = 14
-        EROSION_STEPS_CHECK        = 10
-        EROSION_SIM_THRESH         = 0.94
-        EROSION_MIN_TRIGGERS       = 6
+        EROSION_CHAR_WINDOW        = 200           # unchanged
+        EROSION_SLICE_LEN          = 14            # unchanged
+        EROSION_STEPS_CHECK        = 10            # unchanged
+        EROSION_SIM_THRESH         = 0.97          # ↑ from 0.94
+        EROSION_MIN_TRIGGERS       = 10            # ↑ from 6
 
-        MAX_ATTEMPTS               = 3
-        SESSION_TIMEOUT_SEC        = 10 * 60
-        GUARD_DELAY_SEC            = 5
+        MAX_ATTEMPTS               = 5             # ↑ from 3
+        SESSION_TIMEOUT_SEC        = 10 * 60       # unchanged
+        GUARD_DELAY_SEC            = 5             # unchanged
         # ──────────────────────────────────────────────────────────────────
 
         # regex for verbatim repeated‐pattern
@@ -2740,7 +2741,7 @@ class Assembler:
             user_text=user_text,
             options=["YES","NO"],
             system_template=(
-                "Respond to whatever you deem worthy, bias towards response unless the input seems too short or irrelevant.\n"
+                "Always reply YES.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",

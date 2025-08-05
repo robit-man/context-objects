@@ -1817,26 +1817,7 @@ def _stage8_orchestrate(
     Returns (assistant_reply, all_tool_outputs)
     """
 
-    # ─── guarantee mandatory context objects exist ──────────────────
-    if "clar_ctx" not in state or state["clar_ctx"] is None:
-        dummy_clar = ContextObject.make_stage(
-            "intent_clarification_dummy", [], {"summary": ""}
-        )
-        dummy_clar.touch()
-        self.repo.save(dummy_clar)
-        state["clar_ctx"] = dummy_clar
-
-    if "know_ctx" not in state or state["know_ctx"] is None:
-        dummy_know = ContextObject.make_stage(
-            "external_knowledge_dummy",
-            state["clar_ctx"].references,
-            {"summary": ""}
-        )
-        dummy_know.touch()
-        self.repo.save(dummy_know)
-        state["know_ctx"] = dummy_know
-
-    # keep IDs for stamping later
+    # ─── 0) Make sure conversation_id & user_id exist for stamping ───
     state.setdefault(
         "conversation_id",
         getattr(self, "_active_conversation_id", uuid.uuid4().hex)
@@ -1846,7 +1827,7 @@ def _stage8_orchestrate(
         getattr(self, "current_user_id", "anon")
     )
 
-    # ─── planner: clarifier + knowledge → graph ─────────────────────
+    # ─── 1) Planner: from clarifier + knowledge → graph
     clar_ctx = state["clar_ctx"]
     know_ctx = state["know_ctx"]
     tools    = state.get("tools_list", [])
@@ -1863,41 +1844,44 @@ def _stage8_orchestrate(
 
     all_tool_ctxs: List[ContextObject] = []
 
-    # ─── execute ↔ reflect loop ─────────────────────────────────────
+    # ─── 2) Execute + reflect/replan until done ───────────────────────
     while True:
-        ready_ctxs = self._stage9_invoke_with_retries(
-            raw_calls        = [],                 # ignored in DAG mode
+        # 2a) Run any ready DAG nodes
+        tcs = self._stage9_invoke_with_retries(
+            raw_calls        = [],  # ignored for DAG mode
             plan_output      = state["plan_output"],
             selected_schemas = state.get("schemas", []),
             user_text        = user_text,
             clar_metadata    = clar_ctx.metadata,
             state            = state,
         )
-        all_tool_ctxs.extend(ready_ctxs)
+        all_tool_ctxs.extend(tcs)
 
+        # done?
         turn = state["turn"]
         if not getattr(turn, "pending_nodes", None):
             break
 
-        replan_json = self._stage9b_reflection_and_replan(
-            tool_ctxs     = ready_ctxs,
-            plan_output   = state["plan_output"],
-            user_text     = user_text,
-            clar_metadata = clar_ctx.metadata,
-            state         = state,
+        # 2b) Reflection & maybe re-plan
+        replan = self._stage9b_reflection_and_replan(
+            tool_ctxs    = tcs,
+            plan_output  = state["plan_output"],
+            user_text    = user_text,
+            clar_metadata= clar_ctx.metadata,
+            state        = state,
         )
-        if replan_json is None:                    # “OK” → keep graph
+        # None means “OK” — keep the same graph
+        if replan is None:
             continue
 
+        # otherwise swap in the new plan
         state["plan_output_prev"] = state["plan_output"]
-        state["plan_output"]      = replan_json
+        state["plan_output"]      = replan
 
-    # ─── final answer ───────────────────────────────────────────────
-    reply = self._stage10_assemble_and_infer(
-        user_text = user_text,
-        state     = state,
-    )
+    # ─── 3) Final answer assembly ─────────────────────────────────────
+    reply = self._stage10_assemble_and_infer(user_text=user_text, state=state)
 
+    # ─── 4) Optional safety / polish ──────────────────────────────────
     polished = self._stage10b_response_critique_and_safety(
         draft     = reply,
         user_text = user_text,
@@ -1907,11 +1891,10 @@ def _stage8_orchestrate(
     if polished:
         reply = polished
 
-    # ─── memory write-back ───────────────────────────────────────────
+    # ─── 5) Memory write-back ─────────────────────────────────────────
     self._stage11_memory_writeback(final_answer=reply, tool_ctxs=all_tool_ctxs)
 
     return reply, all_tool_ctxs
-
 
 
 def _stage8_tool_chaining(
