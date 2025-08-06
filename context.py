@@ -708,10 +708,14 @@ class SQLiteContextRepository:
             if filter_fn(obj):
                 out.append(obj)
         return out
+# ──────────────────────────────────────────────────────────────────────────────
+# Hybrid: JSONL + SQLite (dual-write) with size-based archiving
+# ──────────────────────────────────────────────────────────────────────────────
+from pathlib import Path
+from datetime import datetime
+import logging
+import os
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Hybrid: keep recent in JSONL, archive older into SQLite
-# ──────────────────────────────────────────────────────────────────────────────
 class HybridContextRepository:
     _singleton: "HybridContextRepository" = None
 
@@ -720,6 +724,9 @@ class HybridContextRepository:
         jsonl_path: str = "context.jsonl",
         sqlite_path: str = "context.db",
         archive_max_mb: float = 10.0,   # max JSONL size in megabytes
+        *,
+        dual_write: bool = True,        # ← write every object to SQLite immediately
+        verbose: bool = True,           # ← print row deltas & archive actions
     ):
         # ─── ensure our subfolder exists ───────────────────────────────
         base_dir = Path("context_repos")
@@ -735,13 +742,27 @@ class HybridContextRepository:
         self.json_repo  = JSONLContextRepository(jsonl_full_path)
         self.sql_repo   = SQLiteContextRepository(sqlite_full_path)
         self._max_bytes = int(archive_max_mb * 1024 * 1024)
+        self._dual_write = bool(dual_write)
+        self._verbose = bool(verbose)
 
         HybridContextRepository._singleton = self  # register singleton
 
+    # ──────────────────────────────────────────────────────────────────
+    # Core ops
+    # ──────────────────────────────────────────────────────────────────
     def save(self, ctx: ContextObject) -> None:
-        # always append the new object
+        # 1) append to JSONL (source of truth for most-recent)
         self.json_repo.save(ctx)
-        # then prune by size if needed
+
+        # 2) mirror into SQLite so DB grows every save
+        if self._dual_write:
+            before = self._safe_count()
+            self.sql_repo.save(ctx)
+            after = self._safe_count()
+            if self._verbose and after is not None and before is not None:
+                print(f"[HybridRepo] SQLite rows: {before} → {after} (+{after - before})")
+
+        # 3) prune JSONL by size if needed (moves oldest non-artifacts to SQLite)
         self._archive_by_size()
 
     def get(self, cid: str) -> ContextObject:
@@ -751,7 +772,9 @@ class HybridContextRepository:
             return self.sql_repo.get(cid)
 
     def delete(self, cid: str) -> None:
+        # remove from JSONL
         self.json_repo.delete(cid)
+        # best-effort remove from SQLite
         try:
             self.sql_repo.delete(cid)
         except KeyError:
@@ -767,57 +790,111 @@ class HybridContextRepository:
                     out.append(ctx)
         return out
 
-    def _archive_by_size(self):
+    # ──────────────────────────────────────────────────────────────────
+    # Archiving
+    # ──────────────────────────────────────────────────────────────────
+    def force_archive(self) -> int:
+        """Force a single offload pass regardless of file size. Returns # rows moved."""
+        return self._archive_by_size(force=True)
+
+    def _archive_by_size(self, force: bool = False) -> int:
         path = self.json_repo.path
         try:
             size = os.path.getsize(path)
         except OSError:
-            return
-        if size <= self._max_bytes:
-            return
+            if self._verbose:
+                logging.info("[HybridRepo] archive: JSONL path missing")
+            return 0
 
-        # read all lines
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        if not force and size <= self._max_bytes:
+            return 0
 
-        # parse lines, skip non-archiveable objects
+        # Load JSONL lines
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as e:
+            logging.warning("[HybridRepo] archive: cannot read JSONL: %s", e)
+            return 0
+
+        archived = 0
         entries: list[tuple[int, datetime, ContextObject]] = []
+
         for idx, line in enumerate(lines):
             try:
                 obj = ContextObject.from_json(line)
-            except Exception:
+            except Exception as e:
+                logging.warning("[HybridRepo] archive: skip unparsable line %d: %s", idx, e)
                 continue
 
-            # <<< skip prompt & schema artifacts >>>
+            # Skip prompt & schema artifacts (keep them in JSONL)
             if obj.domain == "artifact" and obj.component in ("prompt", "schema"):
                 continue
 
-            ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
+            # Parse timestamp (YYYYmmddTHHMMSSZ); skip bad rows
+            try:
+                ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
+            except Exception as e:
+                logging.warning("[HybridRepo] archive: bad timestamp line %d: %s", idx, e)
+                continue
+
             entries.append((idx, ts, obj))
 
-        # sort oldest first
+        if not entries:
+            if self._verbose:
+                logging.info("[HybridRepo] archive: no eligible entries (jsonl=%d bytes)", size)
+            return 0
+
+        # Oldest first
         entries.sort(key=lambda x: x[1])
 
         to_remove = set()
         for idx, ts, obj in entries:
-            # archive into SQLite
-            self.sql_repo.save(obj)
-            to_remove.add(idx)
+            try:
+                self.sql_repo.save(obj)
+                archived += 1
+                to_remove.add(idx)
+            except Exception as e:
+                logging.error("[HybridRepo] archive: SQLite save failed for %s: %s", obj.context_id, e)
 
-            # estimate remaining size
-            rem = sum(
-                len(l.encode("utf-8"))
-                for i, l in enumerate(lines)
-                if i not in to_remove
-            )
-            if rem <= self._max_bytes:
-                break
+            if not force:
+                remaining_bytes = self._remaining_bytes_after_removal(lines, to_remove)
+                if remaining_bytes <= self._max_bytes:
+                    break
 
-        # rewrite JSONL without archived lines
-        with open(path, "w", encoding="utf-8") as f:
-            for i, l in enumerate(lines):
-                if i not in to_remove:
-                    f.write(l)
+        if to_remove:
+            # Rewrite JSONL without archived lines
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    for i, l in enumerate(lines):
+                        if i not in to_remove:
+                            f.write(l)
+            except OSError as e:
+                logging.error("[HybridRepo] archive: failed to rewrite JSONL: %s", e)
+
+        if self._verbose:
+            try:
+                now = os.path.getsize(path) if os.path.exists(path) else 0
+            except OSError:
+                now = -1
+            logging.info("[HybridRepo] archive: moved %d rows to SQLite; JSONL now %d bytes", archived, now)
+
+        return archived
+
+    # ──────────────────────────────────────────────────────────────────
+    # Utilities
+    # ──────────────────────────────────────────────────────────────────
+    def _safe_count(self) -> int | None:
+        try:
+            return self.sql_repo.count()  # optional convenience method
+        except Exception:
+            # Fall back: don’t block if repo lacks count()
+            return None
+
+    @staticmethod
+    def _remaining_bytes_after_removal(lines, to_remove: set[int]) -> int:
+        # Sum encoded byte lengths of lines not marked for removal
+        return sum(len(l.encode("utf-8")) for i, l in enumerate(lines) if i not in to_remove)
 
     @classmethod
     def instance(cls) -> "ContextRepository":

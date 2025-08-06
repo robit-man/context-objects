@@ -671,6 +671,7 @@ class Assembler:
             "inference_prompt",
             "Use all provided snippets and tool outputs to inform your reply, abide by internal instruction present and distill coherent and verbose responses based on contextual understanding and intention. Dont repeat this instruction in your response!"
         )
+
         # ──────────────────────────────────────────────────────────────────────
         #  PROMPT DEFAULTS  (updated for richer placeholder syntax)
         # ──────────────────────────────────────────────────────────────────────
@@ -699,6 +700,72 @@ class Assembler:
             "\n"
             "Rules:\n"
             "• Use ONLY tools from the provided *Available tools* list (names must match exactly).\n"
+            "• Keep the graph minimal: prefer 1–3 nodes; max 6; ≤ 3 runnable in parallel per layer.\n"
+            "• To reference prior-node output inside args you may write **any** of:\n"
+            "      \"[tX.output]\"                     // full output object\n"
+            "      \"[tX.output.some.path]\"           // specific sub-field via dot-path\n"
+            "      \"[ <tX>.output ]\"                // same as first (angle-brackets allowed)\n"
+            "      \"{{tX}}\"                          // shorthand = full output\n"
+            "  (Whitespace inside […] is ignored.)\n"
+            "• Do NOT invent argument keys; use exactly the keys/types from the tool’s schema.\n"
+            "• No cycles; every id in \"after\" must exist.\n"
+            "• If a single tool suffices, return a graph with one node only.\n"
+            "\n"
+            "Example (illustrative):\n"
+            "{\n"
+            "  \"graph\": {\n"
+            "    \"nodes\": [\n"
+            "      {\"id\":\"t1\",\"tool\":\"web_search\",\"args\":{\"query\":\"kayfabe definition\"},\"after\":[]},\n"
+            "      {\"id\":\"t2\",\"tool\":\"summarize\",\"args\":{\"text\":\"[t1.output]\",\"length\":\"short\"},\"after\":[\"t1\"]}\n"
+            "    ],\n"
+            "    \"meta\": {\"goal\":\"Answer the user’s question concisely\"}\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "Return **ONLY** that JSON object—no markdown fences, no commentary."
+            # ──────────────────────────────────────────────────────────────────
+        )
+
+        self.planning_prompt_select = self.cfg.get(
+            "planning_prompt_select",
+            # ── PASS 1: TOOL SELECTION ────────────────────────────────────────
+            "You are the Planner (Selection Phase).\n"
+            "Choose which tools are most appropriate to satisfy the user's request.\n"
+            "Return ONLY valid JSON of the form:\n"
+            "{ \"tools\": [\"<tool_name>\", ...] }\n"
+            "\n"
+            "Rules:\n"
+            "• Use ONLY tool names from the *Available tools* list (names must match exactly).\n"
+            "• Prefer the smallest sufficient set (often 1–3 tools).\n"
+            "• Do NOT include arguments or prose; just the list.\n"
+        )
+        
+        self.planning_prompt_fill = self.cfg.get(
+            "planning_prompt_fill",
+            # ── DAG PLANNER PROMPT (Filling Phase) ─────────────────────────────
+            "You are the Planner (Filling Phase). Output **only** valid JSON for a small task-graph (DAG).\n"
+            "Follow this schema exactly (no extra prose):\n"
+            "{\n"
+            "  \"graph\": {\n"
+            "    \"nodes\": [\n"
+            "      {\n"
+            "        \"id\": \"t1\",                 // unique id per node\n"
+            "        \"tool\": \"<tool_name>\",     // MUST match an available tool name exactly\n"
+            "        \"args\": { /* named params matching the tool schema */ },\n"
+            "        \"after\": []                  // ids of nodes that must complete before this one\n"
+            "      }\n"
+            "      // ≤ 6 nodes total; ≤ 3 runnable in any single layer\n"
+            "    ],\n"
+            "    \"meta\": {\n"
+            "      \"goal\": \"<1–2 sentence summary of the user’s request>\",\n"
+            "      \"constraints\": [ /* optional constraints */ ]\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "Rules:\n"
+            "• Use ONLY tools from the provided *Selected Tools* list (names must match exactly).\n"
+            "• Fill each node’s \"args\" using the tool’s docstring/description and its JSON schema (types/enums/ranges/defaults).\n"
             "• Keep the graph minimal: prefer 1–3 nodes; max 6; ≤ 3 runnable in parallel per layer.\n"
             "• To reference prior-node output inside args you may write **any** of:\n"
             "      \"[tX.output]\"                     // full output object\n"
@@ -893,6 +960,11 @@ class Assembler:
             # remember the actual on‑disk JSONL path for later pruning
             self.context_path = str(jsonl_file)
 
+        try:
+            sanitize_jsonl(self.repo.json_repo.path)
+        except Exception:
+            pass
+            
         tools.repo = self.repo            # for module-level tools
         tools.Tools.repo = self.repo      # for any methods on the Tools class
 
@@ -1377,6 +1449,8 @@ class Assembler:
             "assembler_prompt":        self.assembler_prompt,
             "inference_prompt":        self.inference_prompt,
             "planning_prompt":         self.planning_prompt,
+            "planning_prompt_select":  self.planning_prompt_select,
+            "planning_prompt_fill:":   self.planning_prompt_fill,
             "toolchain_prompt":        self.toolchain_prompt,
             "reflection_prompt":       self.reflection_prompt,
             "toolchain_retry_prompt":  self.toolchain_retry_prompt,
@@ -1801,7 +1875,7 @@ class Assembler:
             except Exception:
                 continue
         return out
-    
+        
     def _stream_and_capture(
         self,
         model: str,
@@ -1830,46 +1904,50 @@ class Assembler:
         # assume chat and _OllamaError are available in scope
 
         # ── tweakables ─────────────────────────────────────────────────────
-        TOKEN_WINDOW               = 2000          # unchanged
+        TOKEN_WINDOW               = 2000
 
-        TOKEN_REPEAT_LIMIT         = 400           # ↑ from 200
-        LINE_REPEAT_LIMIT          = 40            # ↑ from 20
+        TOKEN_REPEAT_LIMIT         = 400
+        LINE_REPEAT_LIMIT          = 40
 
-        # back-ref repeat detector
-        PATTERN_MAX_LEN            = 200           # unchanged
-        PATTERN_REPEAT_THRESHOLD   = 12            # ↑ from 8
+        # back-ref repeat detector (MUCH LOOSER)
+        PATTERN_MIN_LEN            = 24      # NEW: ignore tiny patterns
+        PATTERN_MAX_LEN            = 240     # ↑ allow longer repeated chunks
+        PATTERN_REPEAT_THRESHOLD   = 20      # ↑ require many repeats
 
         # multi-token loop detector
-        SEQ_MIN, SEQ_MAX           = 2, 50         # unchanged
-        SEQ_REPEAT_LIMIT           = 18            # ↑ from 10
+        SEQ_MIN, SEQ_MAX           = 2, 50
+        SEQ_REPEAT_LIMIT           = 18
 
         # fuzzy phrase repetition
-        CHAR_WINDOW                = 600           # unchanged (scope of scan)
-        CHUNK_MIN, CHUNK_MAX       = 8, 48         # unchanged
-        PHRASE_REPEAT_LIMIT        = 12            # ↑ from 6
-        FUZZY_SIM_THRESH           = 0.93          # ↑ from 0.90 (needs closer match)
+        CHAR_WINDOW                = 600
+        CHUNK_MIN, CHUNK_MAX       = 8, 48
+        PHRASE_REPEAT_LIMIT        = 12
+        FUZZY_SIM_THRESH           = 0.93
 
         # fuzzy token n-gram repetition
-        NGRAM_TOKEN_WINDOW         = 120           # unchanged
-        NGRAM_MIN, NGRAM_MAX       = 5, 20         # unchanged
-        NGRAM_REPEAT_LIMIT         = 30            # ↑ from 15
-        NGRAM_FUZZY_SIM_THRESH     = 0.97          # ↑ from 0.95
+        NGRAM_TOKEN_WINDOW         = 120
+        NGRAM_MIN, NGRAM_MAX       = 5, 20
+        NGRAM_REPEAT_LIMIT         = 30
+        NGRAM_FUZZY_SIM_THRESH     = 0.97
 
         # erosion / left-shift detector
-        EROSION_CHAR_WINDOW        = 200           # unchanged
-        EROSION_SLICE_LEN          = 14            # unchanged
-        EROSION_STEPS_CHECK        = 10            # unchanged
-        EROSION_SIM_THRESH         = 0.97          # ↑ from 0.94
-        EROSION_MIN_TRIGGERS       = 10            # ↑ from 6
+        EROSION_CHAR_WINDOW        = 200
+        EROSION_SLICE_LEN          = 14
+        EROSION_STEPS_CHECK        = 10
+        EROSION_SIM_THRESH         = 0.97
+        EROSION_MIN_TRIGGERS       = 10
 
-        MAX_ATTEMPTS               = 5             # ↑ from 3
-        SESSION_TIMEOUT_SEC        = 10 * 60       # unchanged
-        GUARD_DELAY_SEC            = 5             # unchanged
+        MAX_ATTEMPTS               = 5
+        SESSION_TIMEOUT_SEC        = 10 * 60
+        GUARD_DELAY_SEC            = 5
         # ──────────────────────────────────────────────────────────────────
 
-        # regex for verbatim repeated‐pattern
+        # regex for verbatim repeated‐pattern (MUCH LESS SENSITIVE)
+        # - requires chunk length >= PATTERN_MIN_LEN
+        # - allows optional surrounding whitespace between repeats
+        # - demands PATTERN_REPEAT_THRESHOLD occurrences
         pat_regex = re.compile(
-            rf'(.{{1,{PATTERN_MAX_LEN}}}?)(?:\1){{{PATTERN_REPEAT_THRESHOLD-1},}}',
+            rf'(.{{{PATTERN_MIN_LEN},{PATTERN_MAX_LEN}}}?)(?:\s*\1\s*){{{PATTERN_REPEAT_THRESHOLD-1},}}',
             re.DOTALL
         )
 
@@ -2066,10 +2144,16 @@ class Assembler:
                         if multi_token_guard(buf_tokens):
                             print("\n[Run-away guard] multi-token loop → aborting pass.")
                             return "".join(chunks), True
+
                         full_now = "".join(chunks)
-                        if pat_regex.search(full_now) or full_now.count("```json") > 1:
-                            print("\n[Run-away guard] pattern repetition → aborting pass.")
-                            return full_now, True
+
+                        # Only run the regex when the buffer is *long enough* to plausibly
+                        # contain that many repeats of a minimum-length pattern.
+                        if len(full_now) >= (PATTERN_MIN_LEN * PATTERN_REPEAT_THRESHOLD):
+                            if pat_regex.search(full_now) or full_now.count("```json") > 1:
+                                print("\n[Run-away guard] pattern repetition → aborting pass.")
+                                return full_now, True
+
                         if fuzzy_phrase_guard(full_now):
                             print("\n[Run-away guard] fuzzy phrase repetition → aborting pass.")
                             return full_now, True
@@ -2112,6 +2196,7 @@ class Assembler:
 
         print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
+
 
 
 

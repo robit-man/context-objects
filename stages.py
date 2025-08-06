@@ -1187,6 +1187,9 @@ def _stage7_planning_summary(
         f"Available tools:\n{tool_lines}"
     )
 
+    print("\n" + "=" * 20 + " PLANNER PROMPT " + "=" * 20)
+    print(base_system)
+    
     # ──────────────────────────────────────────────────────────────────
     # 3) Build USER message to planner
     # ──────────────────────────────────────────────────────────────────
@@ -1342,6 +1345,13 @@ def _stage7_planning_summary(
             "user_text":   user_text,
             "clar_notes":  (clar_ctx.metadata.get("notes") or clar_ctx.summary or ""),
         }
+
+        print("----------------------------------------------------")
+        print(f"\nRefining tool '{name}' with {len(missing)} missing params: {missing}")
+        print("----------------------------------------------------")
+        print(f"Prompt: {json.dumps(prompt, ensure_ascii=False, indent=2)}")
+        print("----------------------------------------------------")
+        
         out = self._stream_and_capture(
             self.secondary_model,
             [
