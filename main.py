@@ -276,9 +276,6 @@ if not os.path.exists(SETUP_MARKER):
             "python3.10-venv",
             "python3.11-venv",
             "python3.12-venv",
-            "pulseaudio-utils",
-            "portaudio19-dev",
-            "libportaudio2",
             "curl"
         ])
 

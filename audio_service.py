@@ -24,8 +24,8 @@ def _highpass(data: np.ndarray, fs: int, cutoff: float = 100.0) -> np.ndarray:
 
 
 # ─── Load Whisper models once ────────────────────────────────────────────────
-_MODEL_BASE  = whisper.load_model("base")
-_MODEL_SMALL = whisper.load_model("small")
+_MODEL_BASE  = whisper.load_model("medium")
+_MODEL_SMALL = whisper.load_model("base")
 
 
 class AudioService:
