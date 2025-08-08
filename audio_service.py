@@ -120,8 +120,8 @@ class AudioService:
             timeout = min(max(0.5, silence_duration) + 0.25*spoken_seconds, 3.0)
       • On end, transcribe the chunk (dual-model consensus) and call on_transcription().
 
-    TTS mute flag, echo cancellation via LMS or loopback monitor,
-    forced float32 dtypes, and a high-pass filter to cut rumble.
+    TTS ducking during playback to reduce feedback (attenuation + stricter VAD),
+    while keeping LMS/monitor active for continued echo adaptation.
     """
 
     def __init__(
@@ -153,6 +153,14 @@ class AudioService:
         self.stream_step         = float(self.config.get("stream_step",   0.2))
         self.delay_alpha         = float(self.config.get("delay_alpha",   0.1))
 
+        # DUCKING params (reduction during TTS playback)
+        self.ducking_enabled          = bool(self.config.get("ducking_enabled", True))
+        self.ducking_gain             = float(self.config.get("ducking_gain", 0.08))  # ≈ −22 dB
+        self.ducking_threshold_boost  = float(self.config.get("ducking_threshold_boost", 2.5))
+        self.ducking_afterglow_s      = float(self.config.get("ducking_afterglow_s", 0.25))
+        self.ducking_monitor_gate_db  = float(self.config.get("ducking_monitor_gate_db", -35.0))
+        self._last_tts_frame_ts       = 0.0  # updated via push_cancellation()
+
         # buffers & locks
         self._buffer             = np.zeros(0, dtype=np.float32)
         self._buffer_lock        = threading.Lock()
@@ -160,7 +168,7 @@ class AudioService:
         self._monitor_lock       = threading.Lock()
         self._echo_profile       = None
 
-        # TTS mute
+        # TTS suppression flag (set while TTS is talking)
         self._tts_muted          = threading.Event()
 
         # LMS echo cancellation
@@ -207,9 +215,11 @@ class AudioService:
 
     # ─── TTS controls ──────────────────────────────────────────────────────────
     def mute_tts(self):
+        """Call when TTS starts speaking."""
         self._tts_muted.set()
 
     def unmute_tts(self):
+        """Call when TTS stops speaking."""
         self._tts_muted.clear()
 
     # ─── Feed in TTS frames for echo cancellation ─────────────────────────────
@@ -217,6 +227,7 @@ class AudioService:
         if cancelled_frames is None or cancelled_frames.size == 0:
             return
         cf = cancelled_frames.astype(np.float32)
+        self._last_tts_frame_ts = time.time()
 
         # monitor buffer (for dB display)
         with self._monitor_lock:
@@ -371,8 +382,7 @@ class AudioService:
                 self._monitor_buffer = self._monitor_buffer[-maxs:]
 
     def _audio_callback(self, indata, frames, time_info, status):
-        if self._tts_muted.is_set():
-            return
+        # NOTE: we no longer drop frames during TTS; we attenuate instead.
         if status:
             self.log(f"AudioService: status {status}", "WARNING")
 
@@ -412,12 +422,34 @@ class AudioService:
                 except Exception as lms_err:
                     self.log(f"LMS process error: {lms_err}", "WARNING")
 
+        # ── DUCKING: attenuate + stricter VAD during active/just-ended TTS ────
+        tts_active = self._tts_muted.is_set()
+        # Also consider "afterglow" and actual monitor loudness
+        recent_tts = (time.time() - max(self._last_tts_frame_ts, 0.0)) <= self.ducking_afterglow_s
+        with self._monitor_lock:
+            count = int(sr * self.stream_step)
+            mblock = (self._monitor_buffer[-count:] if len(self._monitor_buffer) >= count
+                      else self._monitor_buffer)
+        monitor_db = None
+        if mblock.size:
+            mrms = float(np.sqrt(np.mean(mblock ** 2)))
+            monitor_db = 20.0 * np.log10(mrms + 1e-9)
+
+        should_duck = (
+            self.ducking_enabled
+            and (tts_active or recent_tts)
+            and (monitor_db is None or monitor_db >= self.ducking_monitor_gate_db)
+        )
+
+        if should_duck and buf.size:
+            buf *= self.ducking_gain  # attenuate mic while TTS audio is present
+
         # VAD energy
         rms = float(np.sqrt(np.mean(buf ** 2))) if buf.size else 0.0
-        if (time.time() - self._time_of_last_transcript) < 1.0:
-            thresh = self.rms_threshold * 1.2
-        else:
-            thresh = self.rms_threshold
+        # raise threshold briefly after a transcript to avoid double-firing
+        base_mult = 1.2 if (time.time() - self._time_of_last_transcript) < 1.0 else 1.0
+        duck_mult = (self.ducking_threshold_boost if should_duck else 1.0)
+        thresh = self.rms_threshold * base_mult * duck_mult
         is_speech = rms >= thresh
 
         if is_speech:
@@ -523,7 +555,7 @@ class AudioService:
             now = time.time()
             time.sleep(self.stream_step)
 
-            # TTS mute suppression display
+            # Display TTS suppression level, but DO NOT skip processing anymore.
             if self._tts_muted.is_set():
                 with self._monitor_lock:
                     count = int(sr * self.stream_step)
@@ -534,7 +566,7 @@ class AudioService:
                     rms = float(np.sqrt(np.mean(block ** 2)))
                     db  = 20.0 * np.log10(rms + 1e-9)
                     print(f"\r[TTS Suppression] ~{db:5.1f}dB", end="", flush=True)
-                continue
+                # no 'continue' ⇒ we keep live preview / countdown running
 
             # live preview while capturing
             if self._capturing:

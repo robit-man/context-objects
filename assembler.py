@@ -2987,6 +2987,9 @@ class Assembler:
             return False
                     
 
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  Decision & utility callbacks
+    # ─────────────────────────────────────────────────────────────────────────────
 
     def decision_callback(
         self,
@@ -2999,9 +3002,29 @@ class Assembler:
         record: bool = True
     ) -> str:
         """
-        Ask `self.decision_model` to choose exactly one item from `options`,
-        returning first a one-sentence justification, then on its own line the choice.
+        Ask `self.decision_model` to choose exactly one item from `options`.
+        Returns the model's full response: a one-sentence justification and,
+        on a new line, exactly one option token.
+
+        Upgrades:
+        • Strict options parsing with up to 3 attempts (guard against drift).
+        • Optional policy_manager "priors" to bias decisions (if available).
+        • Context includes a compact narrative + recent turns.
         """
+        import re
+        from context import ContextObject
+
+        options = [str(o).strip() for o in options if str(o).strip()]
+        assert options, "decision_callback: options required"
+
+        # 0) Optional priors from a policy manager
+        priors = {}
+        pm = getattr(self, "policy_manager", None)
+        if pm and hasattr(pm, "decision_priors"):
+            try:
+                priors = pm.decision_priors(user_text=user_text, options=options) or {}
+            except Exception:
+                priors = {}
 
         # 1) Build mapping & primary system prompt
         mapping    = {vn: opt for vn, opt in zip(var_names, options)}
@@ -3014,8 +3037,7 @@ class Assembler:
         # 3) Recent turns
         segs = sorted(
             [c for c in self.repo.query(
-                lambda c: c.domain=="segment"
-                          and c.semantic_label in ("user_input","assistant")
+                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
             )],
             key=lambda c:c.timestamp
         )[-history_size:]
@@ -3032,34 +3054,40 @@ class Assembler:
         else:
             context_block = "### Narrative So Far ###\n" f"{narrative}"
 
-        # 4) Second system prompt, now with justification instruction
+        # 4) Second system prompt with justification instruction + priors
+        priors_txt = ""
+        if priors:
+            pairs = ", ".join(f"{k}:{priors.get(k):.2f}" for k in options if k in priors)
+            priors_txt = f"\nUse these option priors as a *soft* bias: {pairs}"
+
         system_msg_2 = (
-            "Now, based on the above, please obey the ruleset below.  "
-            "When you answer, **first** write a **one-sentence justification** for your choice, "
+            "Now, based on the above, obey the ruleset below.\n"
+            "When you answer, **first** write a **one-sentence justification**, "
             "**then** on a **new line** write exactly one of: "
             + ", ".join(options)
             + "\n\nRuleset: "
             + system_template.format(**mapping)
+            + priors_txt
         )
 
         # 5) Debug dump
-        debug_payload = {
+        self._print_stage_context("decision_callback", {
             "narrative":      narrative,
             "recent_turns":   snippet or "(none)",
             "options":        ", ".join(options),
             "system_prompt":  system_msg,
             "ruleset_prompt": system_msg_2,
             "user_text":      user_text,
-        }
-        self._print_stage_context("decision_callback", debug_payload)
+            "priors":         priors or {},
+        })
 
         # 6) Build user message
         user_msg = f"{context_block}\n\nNEW MESSAGE:\n{user_text}"
 
-        # 7) Invoke model until we see one of the options
-        attempt    = 0
+        # 7) Invoke model up to 3 attempts until we see a standalone option token
+        attempt = 0
         prompt_user = user_msg
-        while True:
+        while attempt < 3:
             full_resp = self._stream_and_capture(
                 model=self.decision_model,
                 messages=[
@@ -3072,7 +3100,6 @@ class Assembler:
 
             # record Q&A if desired
             if record:
-                # question ctx
                 q_name = "decision_question" if attempt==0 else "decision_feedback_question"
                 q_ctx = ContextObject.make_stage(q_name, [narr_ctx.context_id], {
                     "prompt_system": system_msg,
@@ -3080,26 +3107,30 @@ class Assembler:
                 })
                 q_ctx.component="decision"; q_ctx.semantic_label="question"; q_ctx.tags.append("decision")
                 q_ctx.touch(); self.repo.save(q_ctx)
-                # answer ctx
+
                 a_name = "decision_answer" if attempt==0 else "decision_feedback_answer"
                 a_ctx = ContextObject.make_stage(a_name, [q_ctx.context_id], {"answer": full_resp})
                 a_ctx.component="decision"; a_ctx.semantic_label="answer"; a_ctx.tags.append("decision")
                 a_ctx.touch(); self.repo.save(a_ctx)
 
-            # check if one of the options appears as a standalone word
-            m = re.search(rf"\b({'|'.join(map(re.escape, options))})\b", full_resp, re.I)
+            # strict standalone token match (begin/end or newline boundaries)
+            m = re.search(rf"(?:^|\n)\s*({'|'.join(map(re.escape, options))})\s*(?:$|\n)", full_resp, re.I)
             if m:
-                # Return the entire response (justification + choice)
                 return full_resp
 
-            # else ask again
             prompt_user = (
-                "I didn’t see one of the required options in your response.\n"
+                "I didn’t see one of the required options on its own line.\n"
                 f"Previous: {full_resp}\n\n"
-                "Please answer with exactly one of: "
+                "Please answer with exactly one of, on a new line: "
                 + ", ".join(options)
             )
             attempt += 1
+
+        # Last resort: extract any option occurrence
+        m2 = re.search(rf"\b({'|'.join(map(re.escape, options))})\b", full_resp, re.I)
+        if m2:
+            return full_resp + f"\n{m2.group(1)}"
+        return full_resp
 
 
     def filter_callback(self, user_text: str) -> tuple[bool,str]:
@@ -3110,41 +3141,49 @@ class Assembler:
             user_text=user_text,
             options=["YES","NO"],
             system_template=(
-                "Always reply YES.\n"
+                "Decide whether to respond.\n"
+                "Prefer YES unless clear spam, duplicate, or empty.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
-            history_size=3,
+            history_size=4,
             var_names=["arg1","arg2"],
             record=False
         )
-        # extract the decision token on its own line or at end
+        import re
         m = re.search(r"\b(YES|NO)\b", resp, re.I)
-        decision = (m.group(1).upper() if m else "NO")
+        decision = (m.group(1).upper() if m else "YES")
         return (decision=="YES", resp)
 
 
     def tools_callback(self, user_text: str) -> tuple[bool,str]:
         """
         Returns (use_tools, full_response_with_justification)
+        Bias: use tools by default unless trivial small-talk/short answer.
         """
         resp = self.decision_callback(
             user_text=user_text,
             options=["TOOLS","NO_TOOLS"],
             system_template=(
-                "You want to always call tools unless the prompt is extremely obviously a conversationally low complexity interaction.\n"
+                "Choose whether to call tools. Prefer TOOLS unless the task is a trivial, "
+                "low-risk, short conversational reply.\n"
                 "Answer exactly {arg1} or {arg2}."
             ),
             context_type="narrative_context",
-            history_size=3,
+            history_size=4,
             var_names=["arg1","arg2"],
             record=False
         )
+        import re
         m = re.search(r"\b(TOOLS|NO_TOOLS)\b", resp, re.I)
         decision = (m.group(1).upper() if m else "TOOLS")
         return (decision=="TOOLS", resp)
 
-                
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  I/O helpers
+    # ─────────────────────────────────────────────────────────────────────────────
+
     async def _stream_and_capture_async(
         self,
         model: str,
@@ -3157,9 +3196,10 @@ class Assembler:
     ) -> str:
         """
         Async wrapper around `_stream_and_capture` that simply runs the blocking
-        function in a worker thread.  All keyword‑only args are forwarded as
+        function in a worker thread.  All keyword-only args are forwarded as
         **keywords**, preventing the positional‐argument crash.
         """
+        import asyncio
         return await asyncio.to_thread(
             self._stream_and_capture,
             model,
@@ -3170,6 +3210,7 @@ class Assembler:
             on_token=on_token,
         )
 
+
     async def _assemble_and_infer(
         self,
         user_text: str,
@@ -3179,8 +3220,8 @@ class Assembler:
         """
         Runs your sync `_stage10_assemble_and_infer(user_text, state)` safely.
         """
-        reply = await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state)
-        return (reply or "").strip()
+        return (await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state) or "").strip()
+
 
     async def _invoke_single_tool(
         self,
@@ -3200,19 +3241,16 @@ class Assembler:
             status_cb("tool_error", f"{call}: {e}")
             return None
 
+
     async def _bootstrap_for_quick_take(self, user_text: str) -> dict:
         """
-        Very light‑weight pre‑work so we can produce an empathic ack or quick
-        take *immediately*, without running the full‑blown retrieval / planning
-        stack first.
-
-        Returns a dict that can be merged straight into the master `state`
-        object used by `_handle_turn`.
+        Lightweight bootstrap to enable an *informed* quick-take without waiting
+        for the full retrieval stack. Uses integrator quick-contract and preserves
+        mandatory state keys.
         """
+        import uuid
+        from context import ContextObject
 
-        # ------------------------------------------------------------------
-        # Build the minimal state skeleton **with all mandatory keys**.
-        # ------------------------------------------------------------------
         boot_state: dict[str, Any] = {
             "errors":        [],
             "recent_ids":    [],
@@ -3221,42 +3259,23 @@ class Assembler:
             "fixed_calls":   [],
             "provisional_sent": False,
             "user_text":     user_text.strip(),
-            # 🔑 keys required by later stages:
-            "conversation_id": getattr(
-                self, "_active_conversation_id", uuid.uuid4().hex
-            ),
+            "conversation_id": getattr(self, "_active_conversation_id", uuid.uuid4().hex),
             "user_id": getattr(self, "current_user_id", "anon"),
         }
 
-        # ------------------------------------------------------------------
-        # Stage‑1 (record raw input) – we need this so the integrator
-        # can keep track of the user’s latest utterance.
-        # ------------------------------------------------------------------
+        # Stage 1 – record raw input
         try:
-            boot_state["user_ctx"] = await asyncio.to_thread(
-                self._stage1_record_input, user_text, boot_state
-            )
+            boot_state["user_ctx"] = await asyncio.to_thread(self._stage1_record_input, user_text, boot_state)
         except Exception as e:
             boot_state["errors"].append(("record_input", str(e)))
-            # fall back to a dummy context object so later code never blows up
-            dummy = ContextObject.make_stage(
-                "record_input_failed",
-                [],
-                {"summary": user_text[:120]}
-            )
-            dummy.touch()
-            self.repo.save(dummy)
+            dummy = ContextObject.make_stage("record_input_failed", [], {"summary": user_text[:120]})
+            dummy.touch(); self.repo.save(dummy)
             boot_state["user_ctx"] = dummy
 
-        # ------------------------------------------------------------------
-        # Quick integrator ingest so we can yank 1‑2 highly relevant snippets
-        # without doing the whole semantic‑recall dance.
-        # ------------------------------------------------------------------
+        # Integrator quick ingest + contract
         try:
             await asyncio.to_thread(self.integrator.ingest, [boot_state["user_ctx"]])
-            quick = await asyncio.to_thread(
-                self.integrator.contract, keep_ids=[boot_state["user_ctx"].context_id]
-            )
+            quick = await asyncio.to_thread(self.integrator.contract, keep_ids=[boot_state["user_ctx"].context_id])
             boot_state["merged"] = quick
         except Exception as e:
             boot_state["errors"].append(("integrator_quick", str(e)))
@@ -3274,22 +3293,23 @@ class Assembler:
         if evt is not None:
             evt.wait(timeout)
 
+
     def _ensure_prompts_present(self) -> None:
         """
-        If the repo is missing any of the canonical prompts (e.g., right
-        after a reload), reseed synchronously. Safe to call often.
+        Ensure canonical prompts exist in the repo (idempotent).
         """
         try:
-            have = {
-                (c.semantic_label or "").strip()
-                for c in self.repo.query(lambda c: c.component == "prompt")
-            }
+            have = {(c.semantic_label or "").strip() for c in self.repo.query(lambda c: c.component == "prompt")}
             need = set(getattr(self, "system_prompts", {}).keys())
             if need and not need.issubset(have):
                 self._seed_static_prompts()
         except Exception:
-            # don't block the turn on hygiene
             pass
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  Orchestrator (Quick-Take + Planner)
+    # ─────────────────────────────────────────────────────────────────────────────
 
     async def run_with_meta_context(
         self,
@@ -3304,91 +3324,71 @@ class Assembler:
         Two-phase orchestrator (upgraded):
 
         1) Quick-Take  – informed one-liner with *fast RAG* (semantic hits,
-                        memory recall, recent history & tool outputs),
-                        streamed via TTS and token-cadence
-        2) Planner     – full pipeline (tools, RAG, reflection, etc.); runs
-                        concurrently after quick stage initializes
+                        memory recall, recent history & tool outputs)
+        2) Planner     – full pipeline (Strategy Graph planning + tool exec);
+                        runs concurrently after quick seed
 
-        Improvements:
-        • Builds a compact, MMR-ranked context BEFORE the first token.
-        • Recency-aware scoring + diversity penalty to avoid redundant seeds.
-        • Uses dynamic prompt patches + last performance, as before.
-        • Robust against embedding shape issues.
+        If advanced components are present:
+        • self.tool_registry  – schema-grounded catalogue
+        • self.policy_manager – picks planner/executor/prompt variants
+        • self.planner_core   – multi-plan proposal (HTN/MCTS/A*)
+        • self.critic         – postcondition/schema/safety checks
+        • self.executor_core  – DAG executor w/ budgets & repair
+        The code auto-detects and downgrades to legacy stages otherwise.
         """
-        import asyncio, time, uuid, numpy as np
+        import asyncio, time, uuid, numpy as np, json, traceback
         from datetime import datetime, timezone
 
-        # ────────────────────────────────────────────────────────────────
-        # 0) Hygiene & defaults
-        # ────────────────────────────────────────────────────────────────
+        # 0) Hygiene
         await asyncio.to_thread(sanitize_jsonl, self.repo.json_repo.path)
         await asyncio.to_thread(self._await_prompts_ready, 5.0)
         await asyncio.to_thread(self._ensure_prompts_present)
         if status_cb is None:
             status_cb = lambda stage, info=None: None
 
-        # ────────────────────────────────────────────────────────────────
-        # 0.5 Narrative & last answer
-        # ────────────────────────────────────────────────────────────────
+        # Narrative & last answer
         narrative_ctx  = await asyncio.to_thread(self._load_narrative_context)
         narrative_text = narrative_ctx.summary or "(no narrative yet)"
         prev_final     = getattr(self, "_last_final", "")
 
-        # ────────────────────────────────────────────────────────────────
-        # Timestamp helper
-        # ────────────────────────────────────────────────────────────────
         def now_ts(fmt: str = "%Y-%m-%d %H:%M UTC") -> str:
             return datetime.now(timezone.utc).strftime(fmt)
 
-        # ────────────────────────────────────────────────────────────────
         # Live-TTS setup
-        # ────────────────────────────────────────────────────────────────
         bridge = _LiveTTSBridge(self.tts) if getattr(self, "tts", None) else None
         self._tts_bridge = bridge
         if bridge:
             bridge.new_turn(uuid.uuid4().hex)
 
         _spoken: list[str] = []
-
         def _speak(txt: str) -> None:
-            if not bridge:
-                return
+            if not bridge: return
             line = txt.strip()
-            if not line or line in _spoken:
-                return
-            bridge.feed(line)
-            _spoken.append(line)
-            if len(_spoken) > 12:
-                _spoken.pop(0)
+            if not line or line in _spoken: return
+            bridge.feed(line); _spoken.append(line)
+            if len(_spoken) > 12: _spoken.pop(0)
 
-        def _tok_to_sentence(tok: str, _buf: list[str] = []) -> None:
+        def _tok_to_sentence(tok: str, _buf: list[str]=[]) -> None:
             _buf.append(tok)
             if tok.endswith((".", "!", "?", "…", "\n")):
-                _speak("".join(_buf).strip())
-                _buf.clear()
+                _speak("".join(_buf).strip()); _buf.clear()
 
-        def _status_and_speak(stage: str, info: Any = None) -> None:
+        def _status_and_speak(stage: str, info: Any=None) -> None:
             status_cb(stage, info)
             if bridge and stage in getattr(self, "tts_live_stages", ()):
                 _speak(str(info))
 
-        # ────────────────────────────────────────────────────────────────
         # Cancel any in-flight planner
-        # ────────────────────────────────────────────────────────────────
         if hasattr(self, "_turn_task") and not self._turn_task.done():
-            self._turn_cancel.set()
-            self._turn_task.cancel()
+            self._turn_cancel.set(); self._turn_task.cancel()
         self._turn_cancel = asyncio.Event()
 
-        # ────────────────────────────────────────────────────────────────
-        # Decide tool usage & seed base state
-        # ────────────────────────────────────────────────────────────────
+        # Decide tool usage
         try:
             use_tools, tools_reason = await asyncio.to_thread(self.tools_callback, user_text)
         except Exception:
             use_tools, tools_reason = True, ""
-
-        state: dict[str, Any] = {
+        state: dict[str,Any] = {
             "start_ts":     time.time(),
             "use_tools":    use_tools,
             "tools_reason": tools_reason,
@@ -3398,19 +3398,20 @@ class Assembler:
             "stages_run":   set(),
         }
 
-        # ────────────────────────────────────────────────────────────────
-        # Build tool-preview hint (non-blocking)
-        # ────────────────────────────────────────────────────────────────
+        # Tool-preview hint (non-blocking)
         try:
-            schemas     = await asyncio.to_thread(self._stage6_prepare_tools)
-            tool_preview = ", ".join(t["name"] for t in schemas[:6]) if use_tools else ""
+            # Prefer tool registry if present
+            tr = getattr(self, "tool_registry", None)
+            if tr and hasattr(tr, "list"):
+                schemas = tr.list() or []
+            else:
+                schemas = await asyncio.to_thread(self._stage6_prepare_tools)
+            tool_preview = ", ".join(t["name"] for t in (schemas or [])[:6]) if use_tools else ""
         except Exception:
             schemas = []
             tool_preview = ""
 
-        # ────────────────────────────────────────────────────────────────
         # Pre-seed context for Quick-Take (stages 1–3)
-        # ────────────────────────────────────────────────────────────────
         try:
             user_ctx = await asyncio.to_thread(self._stage1_record_input, user_text, state)
             state["user_ctx"] = user_ctx
@@ -3436,23 +3437,19 @@ class Assembler:
                 "tools": [], "semantic": [], "assoc": [],
             })
 
-        # ────────────────────────────────────────────────────────────────
         # Dynamic prompt patches & last performance
-        # ────────────────────────────────────────────────────────────────
-        dyn = self.repo.query(lambda c: c.component == "policy" and "dynamic_prompt" in (c.tags or []))
+        dyn = self.repo.query(lambda c: c.component=="policy" and "dynamic_prompt" in (c.tags or []))
         dyn_text = "\n".join(
             p.metadata.get("policy", p.summary or "")
             for p in sorted(dyn, key=lambda c: c.timestamp)[-3:]
         )
-        perf = self.repo.query(lambda c: c.component == "stage_performance")
+        perf = self.repo.query(lambda c: c.component=="stage_performance")
         perf_text = ""
         if perf:
             latest = sorted(perf, key=lambda c: c.timestamp, reverse=True)[0]
             perf_text = latest.summary or ""
 
-        # ────────────────────────────────────────────────────────────────
         # Fast-RAG context builder (recency-boosted MMR)
-        # ────────────────────────────────────────────────────────────────
         def _recency_boost(ts_str: str | None, half_life_days: float = 3.0) -> float:
             try:
                 ts = datetime.fromisoformat((ts_str or "").replace("Z", "+00:00")).timestamp()
@@ -3462,7 +3459,6 @@ class Assembler:
             return 0.5 ** (age_days / half_life_days)
 
         def _mmr(items, top_k: int, lambda_rel: float = 0.65):
-            """items: list of dicts with keys {text, rel, vec}"""
             import numpy as np
             chosen, rest = [], items[:]
             while rest and len(chosen) < top_k:
@@ -3483,51 +3479,36 @@ class Assembler:
             return chosen
 
         async def _fast_context_seed() -> list[str]:
-            """
-            Build up to 6 compact snippets from:
-            • semantic engine hits (user_text)
-            • associative recall from WM
-            • recent history (last 4)
-            • recent tool outputs (last 2)
-            All scored with recency boost, reranked with MMR for diversity.
-            """
             MAX_SNIPPETS = 6
             seeds: list[dict] = []
+            import numpy as np
 
             # 1) Semantic engine hits
             engine_hits = []
             if getattr(self, "engine", None):
                 try:
                     engine_hits = await asyncio.to_thread(
-                        self.engine.query,
-                        "semantic_quick",
-                        user_text,
-                        8  # a bit more, MMR will cut down
+                        self.engine.query, "semantic_quick", user_text, 8
                     )
                 except TypeError:
-                    # backwards compat signature
                     try:
                         engine_hits = await asyncio.to_thread(
-                            self.engine.query,
-                            stage_id="semantic_quick",
-                            similarity_to=user_text,
-                            top_k=8
+                            self.engine.query, stage_id="semantic_quick",
+                            similarity_to=user_text, top_k=8
                         )
                     except Exception:
                         engine_hits = []
                 except ValueError:
-                    # embedding shape fallback sweep
                     try:
                         for c in self.repo.query(lambda c: True):
-                            emb = (c.metadata or {}).get("embedding")
+                            md = c.metadata or {}
+                            emb = md.get("embedding")
                             if emb is not None:
-                                arr = np.asarray(emb)
-                                (c.metadata or {})["embedding"] = arr.reshape(-1).tolist()
+                                import numpy as _np
+                                md["embedding"] = _np.asarray(emb).reshape(-1).tolist()
                         engine_hits = await asyncio.to_thread(
-                            self.engine.query,
-                            stage_id="semantic_quick",
-                            similarity_to=user_text,
-                            top_k=8
+                            self.engine.query, stage_id="semantic_quick",
+                            similarity_to=user_text, top_k=8
                         )
                     except Exception:
                         engine_hits = []
@@ -3540,21 +3521,18 @@ class Assembler:
                             or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else 0.0)
                             or 0.0)
                 rec = _recency_boost(getattr(h, "timestamp", None))
-                seeds.append({
-                    "src": f"SEM/{h.semantic_label or h.stage_id or 'hit'}",
-                    "text": txt[:260],
-                    "rel": 0.7 * rel + 0.3 * rec,
-                    "vec": np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                })
+                vec = None
+                try:
+                    vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
+                except Exception:
+                    vec = None
+                seeds.append({"src": f"SEM/{h.semantic_label or h.stage_id or 'hit'}", "text": txt[:260], "rel": 0.7*rel + 0.3*rec, "vec": vec})
 
-            # 2) Associative memory recall from WM (light)
+            # 2) Assoc WM spread
             wm_ids = state.get("wm_ids", [])
             if wm_ids and getattr(self, "memman", None):
                 try:
-                    act = await asyncio.to_thread(
-                        self.memman.spread_activation,
-                        wm_ids, 2, 0.6, 1.0, 0.5
-                    )
+                    act = await asyncio.to_thread(self.memman.spread_activation, wm_ids, 2, 0.6, 1.0, 0.5)
                     top_ids = sorted(act, key=act.get, reverse=True)[:5]
                     for cid in top_ids:
                         try:
@@ -3564,28 +3542,28 @@ class Assembler:
                         txt = (c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")).strip()
                         if not txt:
                             continue
-                        seeds.append({
-                            "src": "ASSOC",
-                            "text": txt[:260],
-                            "rel": 0.65,  # modest, but helpful glue
-                            "vec": np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                        })
+                        vec = None
+                        try:
+                            vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
+                        except Exception:
+                            vec = None
+                        seeds.append({"src": "ASSOC", "text": txt[:260], "rel": 0.65, "vec": vec})
                 except Exception:
                     pass
 
-            # 3) Recent history (last 4 turns)
+            # 3) Recent hist
             for c in state.get("history", [])[-4:]:
                 txt = (c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")).strip()
                 if not txt:
                     continue
-                seeds.append({
-                    "src": "HIST",
-                    "text": txt[:260],
-                    "rel": 0.75,
-                    "vec": np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                })
+                vec = None
+                try:
+                    vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
+                except Exception:
+                    vec = None
+                seeds.append({"src": "HIST", "text": txt[:260], "rel": 0.75, "vec": vec})
 
-            # 4) Recent tool outputs (last 2)
+            # 4) Last 2 tool outputs
             for c in state.get("tools", [])[-2:]:
                 payload = (c.metadata.get("output") if isinstance(c.metadata, dict) else None) or \
                         (c.metadata.get("exception") if isinstance(c.metadata, dict) else "") or ""
@@ -3595,55 +3573,42 @@ class Assembler:
                     blob = repr(payload)
                 txt = blob.strip()
                 if txt:
-                    seeds.append({
-                        "src": f"TOOL/{c.stage_id}",
-                        "text": txt[:260],
-                        "rel": 0.8,
-                        "vec": np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                    })
+                    vec = None
+                    try:
+                        vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
+                    except Exception:
+                        vec = None
+                    seeds.append({"src": f"TOOL/{c.stage_id}", "text": txt[:260], "rel": 0.8, "vec": vec})
 
-            # Dedup identical text
-            seen = set()
-            uniq = []
+            # Dedup and MMR select
+            seen = set(); uniq = []
             for s in seeds:
                 key = s["text"]
                 if key not in seen:
-                    uniq.append(s)
-                    seen.add(key)
-
-            # MMR select
+                    uniq.append(s); seen.add(key)
             ranked = _mmr(uniq, top_k=MAX_SNIPPETS, lambda_rel=0.7)
-            # Format as compact bullets with provenance tags
             return [f"[{r['src']}] {r['text']}" for r in ranked]
 
-        # ────────────────────────────────────────────────────────────────
-        # Quick-Take micro-stage
-        # ────────────────────────────────────────────────────────────────
+        # Quick-Take
         async def _quick_take() -> str:
             if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
                 return ""
-
             status_cb("quick_context_seed", {"ts": now_ts()})
             try:
                 bullets = await _fast_context_seed()
             except Exception:
                 bullets = []
-
-            # compact the bullets to stay within a small budget
             context_blob = " | ".join(bullets[:6]) if bullets else "(none)"
             status_cb("quick_context_ready", {"count": len(bullets)})
 
-            # System prompt for quick pass
             sys_txt = "\n".join([
                 "You are QuickResponder, a fast front-line assistant.",
                 dyn_text.strip(),
                 perf_text.strip(),
-                "Use the provided 'Fast Context' as soft hints. If a specific fact isn't in the context or you're not sure, be careful and say you'll verify.",
-                "Keep the reply brief and helpful (1–3 sentences max). If the user’s ask is ambiguous, include exactly one clarifying question at the end.",
+                "Use the provided 'Fast Context' as soft hints. If a fact isn't present or you're unsure, say you'll verify.",
+                "Keep it brief (1–3 sentences). If ambiguous, include exactly one clarifying question.",
                 "No JSON. No tool calls in this phase.",
             ])
-
-            # Compose user message with context
             user_blob = f"{user_text}\n\nFast Context: {context_blob}"
 
             status_cb("quick_started", {"ts": now_ts()})
@@ -3657,22 +3622,15 @@ class Assembler:
                 on_token=_tok_to_sentence
             )
             text = (reply or "").strip()
-
-            # Strip accidental JSON fences if any
             if text.startswith("{") and "}" in text:
-                try:
-                    text = text[text.index("}") + 1 :].lstrip()
-                except Exception:
-                    pass
-
+                try: text = text[text.index("}") + 1 :].lstrip()
+                except Exception: pass
             state.setdefault("early_phases", {})["quick_take"] = text
             state.setdefault("stages_run", set()).add("quick_take")
             status_cb("quick_finished", {"len": len(text)})
             return text
 
-        # ────────────────────────────────────────────────────────────────
         # Planner micro-stage (full pipeline)
-        # ────────────────────────────────────────────────────────────────
         async def _planner() -> str:
             status_cb("planner_started", {"ts": now_ts(), "tool_preview": tool_preview})
             out = await self._handle_turn(
@@ -3687,23 +3645,16 @@ class Assembler:
             status_cb("planner_finished", {"ts": now_ts()})
             return out
 
-        # ────────────────────────────────────────────────────────────────
-        # Shortcut: skip Quick-Take entirely
-        # ────────────────────────────────────────────────────────────────
+        # Skips
         if skip_quick_phases:
             final = await _planner()
             self._last_final = final
-            if bridge:
-                bridge.flush(force=True)
+            if bridge: bridge.flush(force=True)
             return final
 
-        # ────────────────────────────────────────────────────────────────
-        # Run Quick-Take, then kick off Planner in background
-        # ────────────────────────────────────────────────────────────────
+        # Quick then planner
         quick = await _quick_take()
         state.setdefault("early_phases", {})["quick_take"] = quick
-
-        # Start planner immediately after quick context is delivered
         self._turn_task = asyncio.create_task(_planner())
         try:
             final = await self._turn_task
@@ -3712,14 +3663,14 @@ class Assembler:
         finally:
             if bridge:
                 bridge.flush(force=True)
-
         self._last_final = final
         return final
 
 
     # ─────────────────────────────────────────────────────────────────────────────
-    #  _handle_turn  (DAG-ready)
+    #  End-to-end handler (Strategy Graph aware; falls back to legacy)
     # ─────────────────────────────────────────────────────────────────────────────
+
     async def _handle_turn(                  # noqa: C901
         self,
         user_text: str,
@@ -3731,33 +3682,26 @@ class Assembler:
         tool_preview: str                     = "",
     ) -> str:
         """
-        Single end-to-end reasoning / planning / tool-calling pipeline.
-        Updated to support DAG planning/validation/execution and reflection.
+        One full turn: reasoning → planning → tool exec → drafting → final.
 
-        Key updates vs. legacy:
-          • Uses DAG plan from _stage7_planning_summary (with implicit-deps + validation).
-          • Passes normalized plan to plan_validation and tool_chaining.
-          • Captures tool outputs directly from _stage9_invoke_with_retries (no repo ref filter).
-          • After reflection/replan, updates state’s plan copy (for UI / logging).
+        Upgrades:
+        • Uses Tool Registry (if available) for schemas (no hallucinated keys).
+        • Strategy Graph planner with *speculative multi-plan* (if planner_core exists).
+        • Critic/Repair loop hooks (schema checks, postconditions) if present.
+        • Falls back to your legacy Stage 6/7/8 pipeline otherwise.
         """
+        import asyncio, traceback, uuid, json, time
+        from typing import List, Dict, Any, Optional
+        from context import ContextObject
 
-        # ---------------------------------------------------------------------
-        # Sanity helper
-        # ---------------------------------------------------------------------
         def _check_cancel() -> None:
             if getattr(self, "_turn_cancel", None) and self._turn_cancel.is_set():
                 raise asyncio.CancelledError()
 
-        # ---------------------------------------------------------------------
-        # Quick exit on blank input
-        # ---------------------------------------------------------------------
         if not (user_text or "").strip():
-            status_cb("output", "")
-            return ""
+            status_cb("output", ""); return ""
 
-        # ---------------------------------------------------------------------
         # STATE BOOTSTRAP
-        # ---------------------------------------------------------------------
         state: Dict[str, Any] = {
             "user_text":        user_text,
             "errors":           [],
@@ -3770,53 +3714,12 @@ class Assembler:
             "tools_list":       tools_list if tools_list is not None else [],
             "tool_preview":     tool_preview,
         }
-        # Expose for other internals
         self._last_state = state
         state["conversation_id"]      = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
         self._active_conversation_id  = state["conversation_id"]
         state["user_id"]              = getattr(self, "current_user_id", "anon")
 
-        # ---------------------------------------------------------------------
-        # Helper → speak a provisional RAG-only answer as early as possible
-        # ---------------------------------------------------------------------
-        async def _emit_provisional() -> None:
-            if state["provisional_sent"]:
-                return
-
-            intent = state.get("clar_ctx").summary if state.get("clar_ctx") else user_text
-            snippets: List[str] = [
-                c.summary[:350] for c in state.get("merged", [])[:8] if getattr(c, "summary", None)
-            ]
-            snippet_blob = "\n".join(f"- {s}" for s in snippets[:6])
-
-            sys_fast = (
-                "You are FastResponder. Craft a *first pass* answer using ONLY the "
-                "snippets below (2–4 sentences). Tell the user you’ll refine once "
-                "tools finish if needed."
-            )
-            usr_fast = f"User: {user_text}\n\nIntent: {intent}\n\nRelevant snippets:\n{snippet_blob}"
-
-            try:
-                prov = await self._stream_and_capture_async(
-                    self.primary_model,
-                    [
-                        {"role": "system", "content": sys_fast},
-                        {"role": "user",   "content": usr_fast},
-                    ],
-                    tag="[Provisional]",
-                    on_token=on_token,                   # sentence splitter in caller
-                )
-                prov = (prov or "").strip()
-                if prov:
-                    status_cb("provisional_answer", prov)
-                    state["provisional_answer"] = prov
-                    state["provisional_sent"]   = True
-            except Exception as e:
-                state["errors"].append(("provisional_answer", str(e)))
-
-        # ---------------------------------------------------------------------
-        # Stage 0 — Should we respond at all?
-        # ---------------------------------------------------------------------
+        # Stage 0 — Should we respond?
         _check_cancel()
         try:
             should, _ = await _to_thread_safe(self.filter_callback, user_text)
@@ -3825,12 +3728,9 @@ class Assembler:
         state["should_respond"] = should
         status_cb("decision_to_respond", should)
         if not should:
-            status_cb("output", "…")
-            return ""
+            status_cb("output", "…"); return ""
 
-        # ---------------------------------------------------------------------
-        # Stage 0.5 — Decide whether tools are needed
-        # ---------------------------------------------------------------------
+        # Stage 0.5 — Tools?
         _check_cancel()
         try:
             use_tools, _ = await _to_thread_safe(self.tools_callback, user_text)
@@ -3839,10 +3739,8 @@ class Assembler:
         state["use_tools"] = use_tools
         status_cb("decide_tool_usage", use_tools)
 
-        # ---------------------------------------------------------------------
-        # Stage 1 — Record user input (first pass, if tools disabled)
-        # ---------------------------------------------------------------------
-        if not use_tools:
+        # Stage 1/2 — record + system
+        if not state.get("user_ctx"):
             _check_cancel()
             try:
                 ctx1 = await _to_thread_safe(self._stage1_record_input, user_text, state)
@@ -3851,7 +3749,7 @@ class Assembler:
             except Exception as e:
                 state["errors"].append(("record_input", str(e)))
                 status_cb("record_input_error", str(e))
-
+        if not state.get("sys_ctx"):
             _check_cancel()
             try:
                 ctx2 = await _to_thread_safe(self._stage2_load_system_prompts)
@@ -3861,36 +3759,29 @@ class Assembler:
                 state["errors"].append(("load_system_prompts", str(e)))
                 status_cb("load_system_prompts_error", str(e))
 
-        # ---------------------------------------------------------------------
-        # Stage 3 — Retrieve & merge context
-        # ---------------------------------------------------------------------
+        # Stage 3 — retrieve & merge
         _check_cancel()
         try:
             extra = await _to_thread_safe(self._get_history)
             state["recent_ids"] = [c.context_id for c in extra]
             out3 = await _to_thread_safe(
                 self._stage3_retrieve_and_merge_context,
-                user_text,
-                state.get("user_ctx"),
-                state.get("sys_ctx"),
-                extra_ctx=extra,
+                user_text, state.get("user_ctx"), state.get("sys_ctx"), extra_ctx=extra,
             )
         except Exception:
             status_cb("retrieve_error", traceback.format_exc(limit=5))
             out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
         state.update(out3)
 
-        # ingest & contract
+        # integrator contract (keeps)
         _check_cancel()
         try:
             await _to_thread_safe(self.integrator.ingest, state["merged"])
             keep: List[str] = []
-            if state.get("user_ctx"):
-                keep.append(state["user_ctx"].context_id)
+            if state.get("user_ctx"): keep.append(state["user_ctx"].context_id)
             sys_val = state.get("sys_ctx")
             sys_list = sys_val if isinstance(sys_val, list) else ([sys_val] if sys_val else [])
-            for sc in sys_list:
-                keep.append(sc.context_id)
+            for sc in sys_list: keep.append(sc.context_id)
             if sys_list:
                 await _to_thread_safe(self.integrator.ingest, sys_list)
             contracted = await _to_thread_safe(self.integrator.contract, keep_ids=keep)
@@ -3905,17 +3796,10 @@ class Assembler:
 
         status_cb("retrieve_and_merge_context", f"{len(state['merged'])} ctxs")
 
-        # ---------------------------------------------------------------------
-        # Stage 4 — Intent clarification (first pass)
-        # ---------------------------------------------------------------------
+        # Stage 4 — intent clarification
         _check_cancel()
         try:
-            clar = await _to_thread_safe(
-                self._stage4_intent_clarification,
-                user_text,
-                state,
-                on_token=on_token,
-            )
+            clar = await _to_thread_safe(self._stage4_intent_clarification, user_text, state, on_token=on_token)
             state["clar_ctx"] = clar
             status_cb("intent_clarification", clar.summary)
         except Exception as e:
@@ -3926,86 +3810,27 @@ class Assembler:
             dummy.touch(); self.repo.save(dummy)
             state["clar_ctx"] = dummy
 
-        # ---------------------------------------------------------------------
-        # Stage 5 — External knowledge (RAG) – immediately speak snippets
-        # ---------------------------------------------------------------------
+        # Stage 5 — external knowledge (RAG)
         _check_cancel()
-
-        def _pull_snippets(src) -> List[str]:
-            """Extract plaintext snippets from various payload shapes."""
-            out: List[str] = []
-            def grab(d: Dict):
-                for _k, v in d.items():
-                    if isinstance(v, str):
-                        out.append(v)
-                    elif isinstance(v, list):
-                        for item in v:
-                            if isinstance(item, str):
-                                out.append(item)
-                            elif isinstance(item, dict):
-                                for kk in ("snippet","text","content","summary","body","answer"):
-                                    if kk in item and isinstance(item[kk], str):
-                                        out.append(item[kk])
-                    elif isinstance(v, dict):
-                        grab(v)
-
-            if isinstance(src, dict):
-                grab(src)
-            else:                                  # ContextObject
-                grab(src.metadata or {})
-                if getattr(src, "summary", None):
-                    out.append(src.summary)
-
-            dedup: List[str] = []
-            seen: set[str] = set()
-            for s in out:
-                s = s.strip()
-                if s and s not in seen:
-                    dedup.append(s); seen.add(s)
-            return dedup
-
         try:
             know_raw = await _to_thread_safe(self._stage5_external_knowledge, state["clar_ctx"], state)
-
-            if isinstance(know_raw, ContextObject):
-                know_ctx = know_raw
-                snippets = _pull_snippets(know_ctx)
-            else:
-                snippets = _pull_snippets(know_raw)
-                K = ContextObject.make_stage(
-                    "external_knowledge_retrieval",
-                    state["clar_ctx"].references,
-                    know_raw,
-                )
-                K.stage_id = "external_knowledge_retrieval"
-                K.summary  = "\n".join(snippets[:8])[:2000] or "(no snippets)"
-                K.touch(); self.repo.save(K)
-                know_ctx = K
-
-            state["know_ctx"]      = know_ctx
-            state["know_snippets"] = snippets
-            status_cb("external_knowledge", " ".join(snippets)[:260] if snippets else "(no snippets)")
+            know_ctx = (
+                know_raw if isinstance(know_raw, ContextObject)
+                else ContextObject.make_stage("external_knowledge_retrieval", state["clar_ctx"].references, know_raw)
+            )
+            if not isinstance(know_raw, ContextObject):
+                know_ctx.summary = (know_ctx.summary or (json.dumps(know_raw, ensure_ascii=False)[:500] if know_raw else "")) or ""
+            know_ctx.touch(); self.repo.save(know_ctx)
+            state["know_ctx"] = know_ctx
+            status_cb("external_knowledge", know_ctx.summary[:260] if know_ctx.summary else "(ok)")
         except Exception as e:
             state["errors"].append(("external_knowledge", str(e)))
             status_cb("external_knowledge_error", str(e))
-            state["know_ctx"] = None
-            state["know_snippets"] = []
+            state["know_ctx"] = ContextObject.make_stage("external_knowledge_dummy", [], {"summary": ""})
 
-        # ---------------------------------------------------------------------
-        # Provisional answer (if TTS bridge exists)
-        # ---------------------------------------------------------------------
-        #_check_cancel()
-        #if not state["provisional_sent"] and getattr(self, "_tts_bridge", None):
-        #    await _emit_provisional()
-
-        # ---------------------------------------------------------------------
-        # FAST EXIT if no tools
-        # ---------------------------------------------------------------------
+        # FAST EXIT (no tools)
         if not state["use_tools"]:
             _check_cancel()
-
-            # Annotate with explicit budgets/window (the override would compute
-            # these anyway, but saving them helps downstream logging/telemetry).
             try:
                 budgets = self._compute_budgets(state)
                 state["final_budgets"] = budgets
@@ -4025,10 +3850,7 @@ class Assembler:
                 status_cb("memory_writeback_error", str(e))
 
             if state["errors"]:
-                patched = await _to_thread_safe(
-                    self._stage10b_response_critique_and_safety,
-                    final, user_text, [], state,
-                )
+                patched = await _to_thread_safe(self._stage10b_response_critique_and_safety, final, user_text, [], state)
                 state["draft"] = patched or final
                 status_cb("response_critique", state["draft"])
             else:
@@ -4047,192 +3869,31 @@ class Assembler:
             out = state["final"].strip()
             status_cb("output", out)
             return out
-        # ---------------------------------------------------------------------
-        # Stage 6 — prepare tool schemas
-        # ---------------------------------------------------------------------
+
+        # Stage 6 — tool schemas via Tool Registry (if available)
         _check_cancel()
         try:
-            tools_list = await _to_thread_safe(self._stage6_prepare_tools)
+            tr = getattr(self, "tool_registry", None)
+            if tr and hasattr(tr, "list"):
+                tools_list = tr.list() or []
+            else:
+                tools_list = await _to_thread_safe(self._stage6_prepare_tools)
             state["tools_list"] = tools_list
+            state["tool_preview"] = ", ".join(t["name"] for t in tools_list[:6])
             status_cb("prepare_tools", f"{len(tools_list)} tools")
         except Exception as e:
             state["errors"].append(("prepare_tools", str(e)))
             status_cb("prepare_tools_error", str(e))
-
-        # ---------------------------------------------------------------------
-        # Stage 1 & 2 again (fresh context for tool run)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            ctx1 = await _to_thread_safe(self._stage1_record_input, user_text, state)
-            state["user_ctx"] = ctx1
-            status_cb("record_input", ctx1.summary)
-        except Exception as e:
-            state["errors"].append(("record_input", str(e)))
-            status_cb("record_input_error", str(e))
-
-        _check_cancel()
-        try:
-            ctx2 = await _to_thread_safe(self._stage2_load_system_prompts)
-            state["sys_ctx"] = ctx2
-            status_cb("load_system_prompts", "(loaded)")
-        except Exception as e:
-            state["errors"].append(("load_system_prompts", str(e)))
-            status_cb("load_system_prompts_error", str(e))
-
-        # ---------------------------------------------------------------------
-        # Stage 3 again (semantic+assoc merge after new material)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        extra2 = await _to_thread_safe(self._get_history)
-        state["recent_ids"] = [c.context_id for c in extra2]
-        try:
-            out3b = await _to_thread_safe(
-                self._stage3_retrieve_and_merge_context,
-                user_text,
-                state["user_ctx"],
-                state["sys_ctx"],
-                extra_ctx=extra2,
-            )
-        except Exception:
-            status_cb("retrieve_error", traceback.format_exc(limit=5))
-            out3b = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
-        state.update(out3b)
-
-        _check_cancel()
-        try:
-            await _to_thread_safe(self.integrator.ingest, state["merged"])
-            contracted2 = await _to_thread_safe(self.integrator.contract, keep_ids=state["recent_ids"])
-            state["merged"]     = contracted2
-            state["merged_ids"] = [c.context_id for c in contracted2]
-        except Exception:
-            status_cb("integrator_error", traceback.format_exc(limit=5))
-        status_cb("retrieve_and_merge_context", f"{len(state['merged'])} ctxs")
-
-        # ---------------------------------------------------------------------
-        # Stage 4 again (clarify with fresh context)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            clar2 = await _to_thread_safe(
-                self._stage4_intent_clarification,
-                user_text,
-                state,
-                on_token=on_token,
-            )
-            state["clar_ctx"] = clar2
-            status_cb("intent_clarification", clar2.summary)
-        except Exception as e:
-            state["errors"].append(("intent_clarification", str(e)))
-            status_cb("intent_clarification_error", str(e))
-            refs2 = [state["user_ctx"].context_id]
-            dummy2 = ContextObject.make_stage("intent_clarification_failed", refs2, {"summary": ""})
-            dummy2.touch(); self.repo.save(dummy2)
-            state["clar_ctx"] = dummy2
-
-        # ---------------------------------------------------------------------
-        # Stage 5 again (speak fresh RAG snippets)
-        # ---------------------------------------------------------------------
-        _check_cancel()
-        try:
-            know2 = await _to_thread_safe(self._stage5_external_knowledge, state["clar_ctx"], state)
-
-            if isinstance(know2, ContextObject):
-                rag_payload = know2.metadata or {}
-            else:
-                rag_payload = know2 or {}
-
-            # flatten candidate text
-            candidates: List[str] = []
-            for k in ("snippets","docs","chunks","results","evidence","texts"):
-                v = rag_payload.get(k)
-                if isinstance(v, list):
-                    candidates += [str(x) for x in v]
-                elif isinstance(v, str):
-                    candidates.append(v)
-            if not candidates and isinstance(rag_payload, dict):
-                for v in rag_payload.values():
-                    if isinstance(v, str):
-                        candidates.append(v)
-                    elif isinstance(v, list):
-                        candidates += [str(x) for x in v if isinstance(x,(str,int,float))]
-
-            def _clean(t: str) -> str:
-                t = " ".join(t.split())
-                return (t[:280] + "…") if len(t) > 280 else t
-
-            seen: set[str] = set()
-            top_snips: List[str] = []
-            for s in candidates:
-                s = _clean(s)
-                if s and s not in seen:
-                    seen.add(s); top_snips.append(s)
-                if len(top_snips) >= 3:
-                    break
-
-            if not isinstance(know2, ContextObject):
-                kk = ContextObject.make_stage(
-                    "external_knowledge_retrieval",
-                    state["clar_ctx"].references,
-                    rag_payload,
-                )
-                kk.stage_id = "external_knowledge_retrieval"
-                kk.summary  = top_snips[0] if top_snips else "(no snippets)"
-                kk.touch(); self.repo.save(kk)
-                know2 = kk
-
-            state["know_ctx"] = know2
-            if top_snips:
-                for i, sn in enumerate(top_snips, 1):
-                    status_cb(f"external_knowledge_{i}", sn)
-            else:
-                status_cb("external_knowledge_0", "(no snippets)")
-        except Exception as e:
-            state["errors"].append(("external_knowledge", str(e)))
-            status_cb("external_knowledge_error", str(e))
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # Stage 6 — ensure we have an in-memory catalogue of tool-schemas
-        # ──────────────────────────────────────────────────────────────────────────
-        _check_cancel()
-        try:
-            # If another stage hasn’t already cached them, load from repo now
-            if not state.get("tools_list"):
-                state["tools_list"] = await _to_thread_safe(self._stage6_prepare_tools)
-
-            tools = state["tools_list"]
-            if not tools:
-                raise RuntimeError(
-                    "No active tool_schema rows found (component=='schema' & tag 'tool_schema')."
-                )
-
-            # Keep a short comma-separated preview for logging / UX
-            state["tool_preview"] = ", ".join(t["name"] for t in tools[:6])
-            status_cb("prepare_tools", f"{len(tools)} tools")
-        except Exception as e:
-            err_msg = f"{type(e).__name__}: {e}"
-            state.setdefault("errors", []).append(("prepare_tools", err_msg))
-            status_cb("prepare_tools_error", err_msg)
-            # Proceed without tools – downstream planner can still answer text-only
             state["tools_list"]   = []
             state["tool_preview"] = ""
 
-        # ──────────────────────────────────────────────────────────────────────────
-        # Guarantee clarifier & knowledge contexts (orchestrator prerequisites)
-        # ──────────────────────────────────────────────────────────────────────────
+        # Guarantee clarifier/knowledge presence
         _check_cancel()
         if "clar_ctx" not in state:
             try:
-                clar_ctx = await _to_thread_safe(
-                    self._stage4_intent_clarification,
-                    user_text,
-                    state,
-                    on_token=on_token,
-                )
+                clar_ctx = await _to_thread_safe(self._stage4_intent_clarification, user_text, state, on_token=on_token)
             except Exception:
-                clar_ctx = ContextObject.make_stage(
-                    "intent_clarification_failed", [], {"summary": ""}
-                )
+                clar_ctx = ContextObject.make_stage("intent_clarification_failed", [], {"summary": ""})
                 clar_ctx.touch(); self.repo.save(clar_ctx)
             state["clar_ctx"] = clar_ctx
             status_cb("intent_clarification", clar_ctx.summary or "(created)")
@@ -4240,35 +3901,110 @@ class Assembler:
         _check_cancel()
         if "know_ctx" not in state:
             try:
-                know_raw = await _to_thread_safe(
-                    self._stage5_external_knowledge, state["clar_ctx"], state
-                )
+                know_raw = await _to_thread_safe(self._stage5_external_knowledge, state["clar_ctx"], state)
                 know_ctx = (
-                    know_raw
-                    if isinstance(know_raw, ContextObject)
-                    else ContextObject.make_stage(
-                        "external_knowledge_retrieval",
-                        state["clar_ctx"].references,
-                        know_raw,
-                    )
+                    know_raw if isinstance(know_raw, ContextObject)
+                    else ContextObject.make_stage("external_knowledge_retrieval", state["clar_ctx"].references, know_raw)
                 )
                 know_ctx.touch(); self.repo.save(know_ctx)
             except Exception:
-                know_ctx = ContextObject.make_stage(
-                    "external_knowledge_dummy", [], {"summary": ""}
-                )
+                know_ctx = ContextObject.make_stage("external_knowledge_dummy", [], {"summary": ""})
                 know_ctx.touch(); self.repo.save(know_ctx)
             state["know_ctx"] = know_ctx
             status_cb("external_knowledge", know_ctx.summary or "(created)")
 
-        # ──────────────────────────────────────────────────────────────────────────
-        # Stage 8 — unified orchestration  (plan ⇒ execute ⇒ draft ⇒ final)
-        # ──────────────────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────────
+        # Strategy Graph: multi-plan propose → evaluate → execute
+        # ──────────────────────────────────────────────────────────────────
+        planner = getattr(self, "planner_core", None)
+        executor = getattr(self, "executor_core", None)
+        critic   = getattr(self, "critic", None)
+        policy   = getattr(self, "policy_manager", None)
+
+        # Context bundle for planning
+        plan_ctx = {
+            "user_text": user_text,
+            "clar": state["clar_ctx"],
+            "knowledge": state["know_ctx"],
+            "tools": state["tools_list"],
+            "history": state.get("history", []),
+            "budgets": getattr(self, "_compute_budgets", lambda s: {})(state) if hasattr(self, "_compute_budgets") else {},
+        }
+
+        def _legacy_execute() -> tuple[str, list]:
+            # Fall back to your Stage 8 orchestrate
+            reply, tool_outputs = self._stage8_orchestrate(user_text, state)
+            return reply, tool_outputs
+
+        # If we lack advanced components, use legacy execution
+        if not planner or not executor or not critic:
+            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
+            state["tool_ctxs"] = tool_outputs
+            return reply
+
+        # Otherwise: multi-plan
         _check_cancel()
-        reply, tool_outputs = await asyncio.to_thread(
-            self._stage8_orchestrate,
-            user_text,
-            state,
-        )
-        state["tool_ctxs"] = tool_outputs
-        return reply
+        try:
+            k = 3
+            if policy and hasattr(policy, "num_candidate_plans"):
+                try: k = int(policy.num_candidate_plans(context=plan_ctx)) or 3
+                except Exception: k = 3
+
+            # propose up to k candidate graphs
+            candidates = planner.propose(context=plan_ctx, k=k)
+            if not isinstance(candidates, list) or not candidates:
+                # fallback: single plan via legacy planner stage
+                reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
+                state["tool_ctxs"] = tool_outputs
+                return reply
+
+            # optional: cost model scoring
+            scored = []
+            for g in candidates:
+                try:
+                    score = policy.score_plan(g, context=plan_ctx) if policy and hasattr(policy, "score_plan") else 0.0
+                except Exception:
+                    score = 0.0
+                scored.append((score, g))
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            # Execute best-first; can early-stop on success by critic signal
+            for idx, (_, graph) in enumerate(scored, 1):
+                status_cb("plan_candidate", {"rank": idx, "nodes": len(graph.get("nodes", []))})
+                # Ensure schema checks enforced by critic (pre-flight)
+                if hasattr(critic, "preflight"):
+                    issues = critic.preflight(graph, context=plan_ctx) or []
+                    if issues:
+                        status_cb("plan_rejected", {"rank": idx, "issues": issues[:3]})
+                        continue
+
+                # Execute with budgets and repair
+                try:
+                    exec_result = executor.run(graph, context=plan_ctx, critic=critic, tool_registry=getattr(self, "tool_registry", None))
+                    # exec_result: {"reply": str, "tool_ctxs": [...], "graph": graph, "repairs": int, "issues": [...]}
+                    reply = (exec_result or {}).get("reply", "")
+                    tctxs = (exec_result or {}).get("tool_ctxs", [])
+                    issues = (exec_result or {}).get("issues", [])
+                    repairs = int((exec_result or {}).get("repairs", 0))
+                    state["tool_ctxs"] = tctxs
+                    state["plan_graph"] = graph
+                    state["plan_issues"] = issues
+                    state["plan_repairs"] = repairs
+                    if reply:
+                        status_cb("plan_success", {"rank": idx, "repairs": repairs, "issues": len(issues or [])})
+                        return reply
+                    status_cb("plan_empty_reply", {"rank": idx})
+                except Exception as e:
+                    status_cb("plan_exec_error", f"rank {idx}: {e}")
+                    continue
+
+            # If none produced a reply, fallback legacy
+            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
+            state["tool_ctxs"] = tool_outputs
+            return reply
+
+        except Exception:
+            status_cb("strategy_graph_error", traceback.format_exc(limit=8))
+            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
+            state["tool_ctxs"] = tool_outputs
+            return reply
