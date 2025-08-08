@@ -1,33 +1,114 @@
 # audio_service.py
 
-import threading
 import time
+import threading
+from difflib import SequenceMatcher
+
 import numpy as np
 import sounddevice as sd
 from sounddevice import InputStream
 from scipy.signal import resample_poly, butter, lfilter
+
+import torch
 import whisper
-from difflib import SequenceMatcher
+
 from lms import StreamingLMSFilter
 
-# ─── High-pass filter helper ─────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Process-wide Whisper cache with refcounting
+# ─────────────────────────────────────────────────────────────────────────────
+_WHISPER_LOCK = threading.Lock()
+_WHISPER_POOL: dict[tuple[str, str], object] = {}   # (model_name, device) -> model
+_WHISPER_REFS: dict[tuple[str, str], int] = {}      # refcounts
+
+
+def _device_or_auto(dev: str | None) -> str:
+    """
+    Normalize device: "cpu", "cuda", or "auto" -> resolve to cpu/cuda.
+    Default: auto (cuda if available else cpu).
+    """
+    if dev is None or dev == "" or dev == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if dev not in ("cpu", "cuda"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if dev == "cuda" and not torch.cuda.is_available():
+        return "cpu"
+    return dev
+
+
+def _get_whisper_model(name: str, device: str | None = None):
+    """
+    Return a process-global Whisper model instance for (name, device).
+    Increments a refcount; pair with _release_whisper_model on teardown.
+    """
+    dev = _device_or_auto(device)
+    key = (name, dev)
+    with _WHISPER_LOCK:
+        if key in _WHISPER_POOL:
+            _WHISPER_REFS[key] += 1
+            return _WHISPER_POOL[key]
+        model = whisper.load_model(name, device=dev)
+        _WHISPER_POOL[key] = model
+        _WHISPER_REFS[key] = 1
+        return model
+
+
+def _release_whisper_model(name: str, device: str | None = None):
+    """
+    Decrement refcount; when it hits 0, move to CPU and free VRAM.
+    Safe to call multiple times.
+    """
+    dev = _device_or_auto(device)
+    key = (name, dev)
+    with _WHISPER_LOCK:
+        if key not in _WHISPER_POOL:
+            return
+        _WHISPER_REFS[key] -= 1
+        if _WHISPER_REFS[key] > 0:
+            return
+        # Drop the model and free CUDA memory
+        try:
+            _WHISPER_POOL[key].to("cpu")
+        except Exception:
+            pass
+        try:
+            del _WHISPER_POOL[key]
+            del _WHISPER_REFS[key]
+        except Exception:
+            pass
+    # Vacate VRAM outside the lock
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def release_all_whisper_models():
+    """Force-release everything (used on hot-reload)."""
+    with _WHISPER_LOCK:
+        keys = list(_WHISPER_POOL.keys())
+    for name, dev in keys:
+        _release_whisper_model(name, dev)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DSP helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def _highpass(data: np.ndarray, fs: int, cutoff: float = 100.0) -> np.ndarray:
     """
     2nd-order Butterworth high-pass filter at `cutoff` Hz.
     Always returns float32.
     """
-    # design filter
-    b, a = butter(2, cutoff / (fs / 2), btype='high', analog=False)
-    # apply
+    b, a = butter(2, cutoff / (fs / 2), btype="high", analog=False)
     y = lfilter(b, a, data)
     return y.astype(np.float32)
 
 
-# ─── Load Whisper models once ────────────────────────────────────────────────
-_MODEL_BASE  = whisper.load_model("medium")
-_MODEL_SMALL = whisper.load_model("base")
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Audio Service
+# ─────────────────────────────────────────────────────────────────────────────
 class AudioService:
     """
     Mic + loopback capture with echo calibration.
@@ -65,12 +146,12 @@ class AudioService:
         self._denoise_fn         = denoise_fn
         self.on_transcription    = on_transcription
         self.log                 = logger
-        self.config              = cfg
+        self.config              = cfg or {}
 
         # streaming params
-        self.stream_window       = float(cfg.get("stream_window", 3.0))
-        self.stream_step         = float(cfg.get("stream_step",   0.2))
-        self.delay_alpha         = float(cfg.get("delay_alpha",   0.1))
+        self.stream_window       = float(self.config.get("stream_window", 3.0))
+        self.stream_step         = float(self.config.get("stream_step",   0.2))
+        self.delay_alpha         = float(self.config.get("delay_alpha",   0.1))
 
         # buffers & locks
         self._buffer             = np.zeros(0, dtype=np.float32)
@@ -83,9 +164,9 @@ class AudioService:
         self._tts_muted          = threading.Event()
 
         # LMS echo cancellation
-        self.enable_lms          = bool(cfg.get("enable_lms", False))
-        taps = int(cfg.get("lms_taps", 1024))
-        mu   = float(cfg.get("lms_mu", 5e-4))
+        self.enable_lms          = bool(self.config.get("enable_lms", False))
+        taps = int(self.config.get("lms_taps", 1024))
+        mu   = float(self.config.get("lms_mu", 5e-4))
         self._tts_lms           = StreamingLMSFilter(num_taps=taps, mu=mu, safe=True)
         self._lms_ref_buf       = np.zeros(0, dtype=np.float32)
         self._lms_lock          = threading.Lock()
@@ -97,10 +178,17 @@ class AudioService:
         self._monitor_stream    = None
         self._worker            = None
 
-        # Whisper
-        self.log("AudioService: loading Whisper models…", "INFO")
-        self.model_base  = _MODEL_BASE
-        self.model_small = _MODEL_SMALL
+        # ── Whisper selection (via cfg with safe defaults) ────────────────────
+        self._wm_device = _device_or_auto(self.config.get("whisper_device", "auto"))
+        self._wm_full   = str(self.config.get("whisper_full_model", "medium")).strip() or "medium"
+        self._wm_cons   = str(self.config.get("whisper_consensus_model", "base")).strip() or "base"
+
+        self.log(f"AudioService: loading Whisper models ({self._wm_full}, {self._wm_cons}) on {self._wm_device}", "INFO")
+        # For live preview, use the *consensus* (smaller) model to keep it snappy.
+        self.model_preview   = _get_whisper_model(self._wm_cons, device=self._wm_device)
+        # For final decode, use full model + consensus with the smaller one.
+        self.model_full      = _get_whisper_model(self._wm_full, device=self._wm_device)
+        self.model_consensus = _get_whisper_model(self._wm_cons, device=self._wm_device)
         self.log("AudioService: Whisper models ready.", "SUCCESS")
 
         # VAD state
@@ -112,11 +200,10 @@ class AudioService:
         self._block_dt          = 1024.0 / float(sample_rate)
 
         # live-preview text
-        self._last_live_text    = ""
+        self._last_live_text      = ""
         self._last_live_decode_ts = 0.0
-        self._live_decode_interval = float(cfg.get("live_decode_interval", 0.8))
-        self._live_window_seconds  = float(cfg.get("live_window_seconds", 2.5))
-
+        self._live_decode_interval = float(self.config.get("live_decode_interval", 0.8))
+        self._live_window_seconds  = float(self.config.get("live_window_seconds", 2.5))
 
     # ─── TTS controls ──────────────────────────────────────────────────────────
     def mute_tts(self):
@@ -124,7 +211,6 @@ class AudioService:
 
     def unmute_tts(self):
         self._tts_muted.clear()
-
 
     # ─── Feed in TTS frames for echo cancellation ─────────────────────────────
     def push_cancellation(self, cancelled_frames: np.ndarray):
@@ -147,7 +233,6 @@ class AudioService:
                 if self._lms_ref_buf.size > maxs:
                     self._lms_ref_buf = self._lms_ref_buf[-maxs:]
 
-
     # ─── Echo calibration via loopback monitor ────────────────────────────────
     def _find_monitor_device(self) -> int | None:
         default = sd.default.device
@@ -162,10 +247,10 @@ class AudioService:
         if isinstance(out_idx, int) and 0 <= out_idx < len(devs):
             hostapi = devs[out_idx]["hostapi"]
             for i, d in enumerate(devs):
-                if d["hostapi"] == hostapi and d["max_input_channels"]>0 and "monitor" in d["name"].lower():
+                if d["hostapi"] == hostapi and d["max_input_channels"] > 0 and "monitor" in d["name"].lower():
                     return i
         for i, d in enumerate(devs):
-            if d["max_input_channels"]>0 and "monitor" in d["name"].lower():
+            if d["max_input_channels"] > 0 and "monitor" in d["name"].lower():
                 return i
         return None
 
@@ -173,8 +258,8 @@ class AudioService:
         tone_dur = 1.0
         freq     = 440.0
         self.log("AudioService: calibrating echo via test tone…", "INFO")
-        t = np.linspace(0, tone_dur, int(self.sample_rate*tone_dur), False)
-        tone = (0.5*np.sin(2*np.pi*freq*t)).astype(np.float32)
+        t = np.linspace(0, tone_dur, int(self.sample_rate * tone_dur), False)
+        tone = (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
         with self._monitor_lock:
             self._monitor_buffer = np.zeros(0, dtype=np.float32)
         sd.play(tone, self.sample_rate); sd.wait()
@@ -183,7 +268,6 @@ class AudioService:
             self._echo_profile = self._monitor_buffer.copy()
         self.log(f"AudioService: captured echo profile ({len(self._echo_profile)} samples).", "INFO")
 
-
     # ─── Start / Stop ─────────────────────────────────────────────────────────
     def start(self):
         # ambient noise calibration
@@ -191,8 +275,8 @@ class AudioService:
         try:
             sd.default.samplerate = self.sample_rate
             sd.default.channels   = 1
-            amb = sd.rec(int(self.sample_rate*1.0), dtype="float32"); sd.wait()
-            ambient = float(np.sqrt(np.mean(amb**2)))
+            amb = sd.rec(int(self.sample_rate * 1.0), dtype="float32"); sd.wait()
+            ambient = float(np.sqrt(np.mean(amb ** 2)))
             self.rms_threshold = max(self.rms_threshold, ambient * 1.5)
             self.log(f"AudioService: rms_threshold={self.rms_threshold:.6f}", "INFO")
         except Exception as e:
@@ -240,7 +324,7 @@ class AudioService:
         # reset LMS
         try:
             self._tts_lms.reset()
-        except:
+        except Exception:
             pass
         with self._lms_lock:
             self._lms_ref_buf = np.zeros(0, dtype=np.float32)
@@ -249,32 +333,42 @@ class AudioService:
         self._worker = threading.Thread(target=self._stream_loop, daemon=True)
         self._worker.start()
 
-
     def stop(self):
         self.log("AudioService: stopping capture…", "INFO")
         self._stop_evt.set()
         if self._stream:
-            try: self._stream.stop(); self._stream.close()
-            except: pass
+            try:
+                self._stream.stop(); self._stream.close()
+            except Exception:
+                pass
         if self._monitor_stream:
-            try: self._monitor_stream.stop(); self._monitor_stream.close()
-            except: pass
+            try:
+                self._monitor_stream.stop(); self._monitor_stream.close()
+            except Exception:
+                pass
         if self._worker:
-            try: self._worker.join()
-            except: pass
+            try:
+                self._worker.join()
+            except Exception:
+                pass
 
+        # Release shared Whisper models so VRAM is freed when last user goes away
+        try:
+            _release_whisper_model(self._wm_full, device=self._wm_device)
+            _release_whisper_model(self._wm_cons, device=self._wm_device)
+        except Exception:
+            pass
 
     # ─── Callbacks ────────────────────────────────────────────────────────────
     def _monitor_callback(self, indata, frames, time_info, status):
         if status:
             self.log(f"AudioService(monitor): status {status}", "WARNING")
-        buf = indata[:,0].astype(np.float32)
+        buf = indata[:, 0].astype(np.float32)
         with self._monitor_lock:
             self._monitor_buffer = np.concatenate((self._monitor_buffer, buf))
             maxs = int(self.stream_window * self.sample_rate)
-            if len(self._monitor_buffer)>maxs:
+            if len(self._monitor_buffer) > maxs:
                 self._monitor_buffer = self._monitor_buffer[-maxs:]
-
 
     def _audio_callback(self, indata, frames, time_info, status):
         if self._tts_muted.is_set():
@@ -283,7 +377,7 @@ class AudioService:
             self.log(f"AudioService: status {status}", "WARNING")
 
         # raw float32
-        buf = indata[:,0].astype(np.float32)
+        buf = indata[:, 0].astype(np.float32)
 
         # optional denoise (if provided)
         sr = getattr(self._stream, "samplerate", self.sample_rate)
@@ -299,7 +393,7 @@ class AudioService:
         # subtract static echo profile
         if self._echo_profile is not None and buf.size:
             ep = self._echo_profile
-            seg = ep[-len(buf):] if len(ep)>=len(buf) else np.pad(ep, (len(buf)-len(ep),0))
+            seg = ep[-len(buf):] if len(ep) >= len(buf) else np.pad(ep, (len(buf) - len(ep), 0))
             buf = (buf - seg).astype(np.float32)
 
         # adaptive LMS echo cancellation
@@ -313,14 +407,13 @@ class AudioService:
                 ref_seg = ref[-len(buf):].astype(np.float32)
                 try:
                     _, e = self._tts_lms.process(ref_seg, buf)
-                    if e is not None and e.size==buf.size:
+                    if e is not None and e.size == buf.size:
                         buf = e.astype(np.float32)
                 except Exception as lms_err:
                     self.log(f"LMS process error: {lms_err}", "WARNING")
 
         # VAD energy
-        rms = float(np.sqrt(np.mean(buf**2))) if buf.size else 0.0
-        # optionally raise threshold right after a transcript
+        rms = float(np.sqrt(np.mean(buf ** 2))) if buf.size else 0.0
         if (time.time() - self._time_of_last_transcript) < 1.0:
             thresh = self.rms_threshold * 1.2
         else:
@@ -335,7 +428,7 @@ class AudioService:
             self._speech_run   = 0.0
 
         # start chunk after ~150 ms speech
-        if not self._capturing and is_speech and self._speech_run>=0.15:
+        if not self._capturing and is_speech and self._speech_run >= 0.15:
             self._capturing           = True
             self._chunk               = np.zeros(0, dtype=np.float32)
             self._spoken_seconds      = 0.0
@@ -352,9 +445,8 @@ class AudioService:
         with self._buffer_lock:
             self._buffer = np.concatenate((self._buffer, buf))
             maxs = int(self.stream_window * self.sample_rate)
-            if len(self._buffer)>maxs:
+            if len(self._buffer) > maxs:
                 self._buffer = self._buffer[-maxs:]
-
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -365,21 +457,22 @@ class AudioService:
         curr_t = curr.split()
         n = min(len(prev_t), len(curr_t))
         i = 0
-        while i<n and prev_t[i]==curr_t[i]:
-            i+=1
+        while i < n and prev_t[i] == curr_t[i]:
+            i += 1
         return " ".join(curr_t[i:]).strip()
 
-
-    def _transcribe_np(self, pcm: np.ndarray, full: bool=False) -> str:
+    def _transcribe_np(self, pcm: np.ndarray, full: bool = False) -> str:
         """
-        Resample→cast→Whisper.  Live preview uses base-only; full uses
-        both models + no_speech_prob and consensus filtering.
+        Resample → cast → Whisper.
+        - Live preview: uses the smaller consensus model (faster).
+        - Final: uses full model + consensus check.
         """
-        if pcm.size==0:
+        if pcm.size == 0:
             return ""
+
         # resample
         sr_in = int(self.sample_rate)
-        if sr_in!=16000:
+        if sr_in != 16000:
             try:
                 audio_16k = resample_poly(pcm, 16000, sr_in)
             except Exception as e:
@@ -387,34 +480,33 @@ class AudioService:
                 return ""
         else:
             audio_16k = pcm
-        # force float32
         audio_16k = audio_16k.astype(np.float32)
 
-        # live preview
+        # live preview → consensus model for speed
         if not full:
             try:
-                return self.model_base.transcribe(
+                return self.model_preview.transcribe(
                     audio_16k, language="en", fp16=False
                 )["text"].strip()
             except Exception as e:
-                self.log(f"Whisper base error: {e}", "ERROR")
+                self.log(f"Whisper preview error: {e}", "ERROR")
                 return ""
 
-        # full transcription
+        # full transcription → full model then consensus check
         try:
-            result = self.model_base.transcribe(audio_16k, language="en", fp16=False)
-            text   = result.get("text","").strip()
+            result = self.model_full.transcribe(audio_16k, language="en", fp16=False)
+            text   = result.get("text", "").strip()
 
             # drop no-speech
-            if result.get("no_speech_prob",0.0)>0.6 or len(text.split())<2:
+            if result.get("no_speech_prob", 0.0) > 0.6 or len(text.split()) < 2:
                 return ""
 
-            # consensus with small
-            tm = self.model_small.transcribe(audio_16k, language="en", fp16=False)["text"].strip()
+            # consensus with smaller model
+            tm = self.model_consensus.transcribe(audio_16k, language="en", fp16=False)["text"].strip()
             if tm and text:
-                ratio = SequenceMatcher(None,text,tm).ratio()
-                if ratio<self.consensus_threshold:
-                    self.log(f"Consensus fail ({ratio:.2f}<{self.consensus_threshold})","INFO")
+                ratio = SequenceMatcher(None, text, tm).ratio()
+                if ratio < self.consensus_threshold:
+                    self.log(f"Consensus fail ({ratio:.2f}<{self.consensus_threshold})", "INFO")
                     return ""
 
             return text
@@ -422,7 +514,6 @@ class AudioService:
         except Exception as e:
             self.log(f"Whisper error: {e}", "ERROR")
             return ""
-
 
     # ─── Main loop ────────────────────────────────────────────────────────────
     def _stream_loop(self):
@@ -435,13 +526,13 @@ class AudioService:
             # TTS mute suppression display
             if self._tts_muted.is_set():
                 with self._monitor_lock:
-                    count = int(sr*self.stream_step)
+                    count = int(sr * self.stream_step)
                     block = (self._monitor_buffer[-count:]
-                             if len(self._monitor_buffer)>=count
+                             if len(self._monitor_buffer) >= count
                              else self._monitor_buffer)
                 if block.size:
-                    rms = float(np.sqrt(np.mean(block**2)))
-                    db  = 20.0*np.log10(rms+1e-9)
+                    rms = float(np.sqrt(np.mean(block ** 2)))
+                    db  = 20.0 * np.log10(rms + 1e-9)
                     print(f"\r[TTS Suppression] ~{db:5.1f}dB", end="", flush=True)
                 continue
 
@@ -449,9 +540,9 @@ class AudioService:
             if self._capturing:
                 if now - self._last_live_decode_ts >= self._live_decode_interval:
                     self._last_live_decode_ts = now
-                    tail_len = int(self._live_window_seconds*self.sample_rate)
+                    tail_len = int(self._live_window_seconds * self.sample_rate)
                     tail = (self._chunk[-tail_len:]
-                            if len(self._chunk)>tail_len else self._chunk)
+                            if len(self._chunk) > tail_len else self._chunk)
                     live_text = self._transcribe_np(tail, full=False)
                     if live_text:
                         new_suffix = self._diff_new_suffix(self._last_live_text, live_text)
@@ -462,9 +553,9 @@ class AudioService:
                         self._last_live_text = live_text
 
                 # countdown since last transcript
-                dynamic_timeout = min(self.base_silence + 0.25*self._spoken_seconds, max_timeout)
+                dynamic_timeout = min(self.base_silence + 0.25 * self._spoken_seconds, max_timeout)
                 elapsed = now - self._time_of_last_transcript
-                remaining = max(0.0, min(dynamic_timeout-elapsed, max_timeout))
+                remaining = max(0.0, min(dynamic_timeout - elapsed, max_timeout))
                 print(f"\r⏱ {remaining:4.2f}s until send", end="", flush=True)
 
                 if elapsed >= dynamic_timeout:

@@ -23,6 +23,7 @@ if sys.platform.startswith("win"):
 
 import time
 import json
+import atexit
 import shutil
 import signal
 import platform
@@ -348,6 +349,10 @@ DEFAULT_CFG = {
     "primary_model":   "gemma3:4b",
     "secondary_model": "gemma3:4b",
     "decision_model":  "gemma3:1b",
+
+    "whisper_full_model": "medium",
+    "whisper_consensus_model": "base",
+    "whisper_device": "cuda",
 
     # audio thresholds
     "sample_rate":         16000,
@@ -727,17 +732,16 @@ CONFIG_FILE = "config.json"  # adjust as needed
 _audio_loop = asyncio.new_event_loop()
 
 def start_audio_pipeline():
-    # 1) Bind that loop to this thread
-    asyncio.set_event_loop(_audio_loop)
+    global audio_svc, tts_audio, asm_audio  # ← add this
 
-    # 2) Instantiate audio → TTS → assembler exactly as before:
-    audio_svc = AudioService(
+    asyncio.set_event_loop(_audio_loop)
+    audio_svc = AudioService(   # ← now the global gets the instance
         sample_rate         = config["sample_rate"],
         rms_threshold       = config["rms_threshold"],
         silence_duration    = config["silence_duration"],
         consensus_threshold = config["consensus_threshold"],
         enable_denoise      = config["enable_noise_reduction"],
-        on_transcription    = lambda text: None,   # overridden below
+        on_transcription    = lambda text: None,
         logger              = log_message,
         cfg                 = config,
         denoise_fn          = None,
@@ -928,78 +932,187 @@ threading.Thread(
     name="TelegramThread"
 ).start()
 
-# ─── 4) WATCHER FOR FILE CHANGES & GIT ────────────────────────────────────
+# ─── 4) WATCHER FOR FILE CHANGES & GIT — with graceful reload ───────────────
+
+# Single reload guard
+_RELOAD_LOCK = threading.Lock()
+_RELOAD_FLAG = False
+_LAST_RELOAD_TS = 0.0
+_RELOAD_DEBOUNCE_SEC = 0.75
+
+def _graceful_shutdown():
+    """Stop services and free GPU memory (Whisper) before reload/exit."""
+    try:
+        # Stop audio/TTS services if they exist
+        try:
+            if 'audio_svc' in globals() and audio_svc:
+                audio_svc.stop()
+        except Exception:
+            pass
+        try:
+            if 'tts_audio' in globals() and tts_audio:
+                tts_audio.stop()
+        except Exception:
+            pass
+        try:
+            if 'tts_cli' in globals() and tts_cli:
+                tts_cli.stop()
+        except Exception:
+            pass
+        try:
+            if 'tts_tele' in globals() and tts_tele:
+                tts_tele.stop()
+        except Exception:
+            pass
+
+        # Stop the dedicated audio loop if we created one
+        try:
+            if '_audio_loop' in globals() and _audio_loop and _audio_loop.is_running():
+                _audio_loop.call_soon_threadsafe(_audio_loop.stop)
+        except Exception:
+            pass
+
+        # Release Whisper VRAM across the process
+        try:
+            from audio_service import release_all_whisper_models
+            release_all_whisper_models()
+        except Exception:
+            # If import fails for any reason, just continue
+            pass
+    except Exception:
+        tb = traceback.format_exc()
+        log_message(f"Shutdown error:\n{tb}", "WARNING")
+
+
+def trigger_reload(reason: str):
+    """Idempotent reload that cleans up first, then execv's the process."""
+    global _RELOAD_FLAG, _LAST_RELOAD_TS
+    with _RELOAD_LOCK:
+        now = time.time()
+        if _RELOAD_FLAG and (now - _LAST_RELOAD_TS) < 10.0:
+            return
+        _RELOAD_FLAG = True
+        _LAST_RELOAD_TS = now
+
+    try:
+        log_message(f"Detected change ({reason}); restarting…", "INFO")
+        notify_admin(f"🔄 *Reload triggered by* `{reason}`")
+    except Exception:
+        pass
+
+    # Clean up services and free GPU memory
+    _graceful_shutdown()
+
+    # Exec new process image (won't run atexit handlers)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def _monitor_git_and_files(interval: float = 5.0):
     def _run(cmd):
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
 
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
-    def watched():
-        return {
-            os.path.join(repo_dir, f)
-            for f in os.listdir(repo_dir)
-            if f.endswith(".py") or f == CONFIG_FILE
-        }
+    def _watched_paths():
+        """Return a set of files to watch (top-level .py + CONFIG_FILE)."""
+        keep = set()
+        for f in os.listdir(repo_dir):
+            if f.endswith(".py") or f == CONFIG_FILE:
+                keep.add(os.path.join(repo_dir, f))
+        return keep
 
-    last = {p: os.path.getmtime(p) for p in watched()}
+    def _snapshot(paths):
+        snap = {}
+        for p in paths:
+            try:
+                st = os.stat(p)
+                snap[p] = (st.st_mtime, st.st_size)
+            except OSError:
+                # Missing file is a change; mark with None
+                snap[p] = None
+        return snap
+
+    paths = _watched_paths()
+    last_snap = _snapshot(paths)
 
     while True:
-        # file/config changes
-        for path, old in list(last.items()):
-            try:
-                new = os.path.getmtime(path)
-            except OSError:
-                new = None
-            if new != old:
-                log_message(f"Detected change in {os.path.basename(path)}; restarting…", "INFO")
-                notify_admin(f"🔄 *Reload triggered by* `{os.path.basename(path)}`")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-        for p in watched() - last.keys():
-            last[p] = os.path.getmtime(p)
-
-        # git updates
         try:
-            branch = _run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
-            _run(["git", "-C", repo_dir, "fetch"])
-            behind = int(_run([
-                "git", "-C", repo_dir,
-                f"rev-list", f"HEAD..origin/{branch}", "--count"
-            ]))
-            if behind > 0:
-                pull_out = _run(["git", "-C", repo_dir, "pull", "--ff-only"])
-                log_message(f"Git pull succeeded:\n{pull_out}", "SUCCESS")
-                notify_admin(f"🔄 *Git update*: `{branch}` +{behind} commits")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-        except subprocess.CalledProcessError as e:
-            err = e.output.strip()
-            log_message(f"Git watcher error: {err}", "WARNING")
-            notify_admin(f"⚠️ *Git watcher error*:\n```{err[:1500]}```")
+            # 1) File/config changes (debounced)
+            curr_paths = _watched_paths()
+            # handle new files
+            for p in curr_paths - paths:
+                last_snap[p] = None
+            # handle removed files
+            for p in paths - curr_paths:
+                last_snap.pop(p, None)
+
+            paths = curr_paths
+            curr_snap = _snapshot(paths)
+
+            changed = []
+            for p in paths:
+                if last_snap.get(p) != curr_snap.get(p):
+                    changed.append(p)
+
+            if changed:
+                # debounce: wait a beat, re-check once
+                time.sleep(_RELOAD_DEBOUNCE_SEC)
+                curr_snap2 = _snapshot(paths)
+                stable = []
+                for p in changed:
+                    if curr_snap2.get(p) == curr_snap.get(p):
+                        stable.append(p)
+                if stable:
+                    reason = ", ".join(os.path.basename(p) for p in stable[:3])
+                    trigger_reload(reason)
+                    return  # just in case
+
+            last_snap = curr_snap
+
+            # 2) Git updates
+            try:
+                branch = _run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
+                _run(["git", "-C", repo_dir, "fetch"])
+                behind = int(_run(["git", "-C", repo_dir, "rev-list", f"HEAD..origin/{branch}", "--count"]))
+                if behind > 0:
+                    pull_out = _run(["git", "-C", repo_dir, "pull", "--ff-only"])
+                    log_message(f"Git pull succeeded:\n{pull_out}", "SUCCESS")
+                    notify_admin(f"🔄 *Git update*: `{branch}` +{behind} commits")
+                    trigger_reload(f"git pull on {branch}")
+                    return
+            except subprocess.CalledProcessError as e:
+                err = (e.output or "").strip()
+                log_message(f"Git watcher error: {err}", "WARNING")
+                notify_admin(f"⚠️ *Git watcher error*:\n```{err[:1500]}```")
+            except Exception:
+                tb = traceback.format_exc()
+                log_message(f"Watcher exception (git):\n{tb}", "WARNING")
+                notify_admin(f"⚠️ *Watcher exception (git)*:\n```{tb[:1500]}```")
+
         except Exception:
             tb = traceback.format_exc()
-            log_message(f"Watcher exception:\n{tb}", "WARNING")
-            notify_admin(f"⚠️ *Watcher exception*:\n```{tb[:1500]}```")
+            log_message(f"Watcher loop exception:\n{tb}", "WARNING")
+            try:
+                notify_admin(f"⚠️ *Watcher loop exception*:\n```{tb[:1500]}```")
+            except Exception:
+                pass
 
         time.sleep(interval)
 
+
+# Start the watcher thread
 threading.Thread(
     target=_monitor_git_and_files,
+    kwargs={"interval": 5.0},
     daemon=True,
     name="GitAndFileWatcher"
 ).start()
 
-# ─── CLEANUP & WAIT ───────────────────────────────────────────────────────
-import atexit
-import signal
-import os
-import sys
 
+# ─── CLEANUP & WAIT ───────────────────────────────────────────────────────
 def _cleanup():
     log_message("Shutting down services…", "INFO")
-    try: audio_svc.stop()
-    except: pass
-    try: tts_audio.stop()
-    except: pass
+    _graceful_shutdown()
     log_message("Goodbye.", "INFO")
 
 # 1) Always run cleanup on normal exit
@@ -1011,10 +1124,10 @@ def _signal_handler(signum, frame):
     _cleanup()
     os._exit(0)   # bypass Python shutdown hooks & thread.join()
 
-signal.signal(signal.SIGINT,  _signal_handler)   # Ctrl‑C
+signal.signal(signal.SIGINT,  _signal_handler)   # Ctrl-C
 signal.signal(signal.SIGTERM, _signal_handler)   # kill, docker stop
 
-# 3) Ignore Ctrl‑Z (SIGTSTP) so you can't background it
+# 3) Ignore Ctrl-Z (SIGTSTP) so you can't background it
 if hasattr(signal, "SIGTSTP"):
     signal.signal(signal.SIGTSTP, lambda s, f: None)
 
