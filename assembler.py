@@ -30,9 +30,10 @@ from types import MethodType
 from collections import deque
 from functools import lru_cache
 from difflib import SequenceMatcher
+from rl import RLManager, RewardConfig
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 # ── Third-party ───────────────────────────────────────────────────────────────
@@ -1013,6 +1014,28 @@ class Assembler:
 
         self.memman = MemoryManager(self.repo)
 
+        # RL / bandits (tools, prompt variants, knobs)
+        self.bandit = RLManager(
+            repo=self.repo,
+            d_tool=self.cfg.get("linucb_d", 5),
+            alpha=self.cfg.get("linucb_alpha", 0.75),
+            reward_cfg=RewardConfig(
+                latency_budget_ms=self.cfg.get("latency_budget_ms", 60_000)  # 60s default
+            )
+        )
+        # per-turn prompt bookkeeping
+        self._prompt_variants_cache: dict[str, dict[str, str]] = {}
+        self._prompts_used_current: dict[str, str] = {}
+
+
+        self._task_poll_event = threading.Event()
+        self._task_bg_thread  = None
+        # start a lightweight poller (2s) to launch due tasks and keep countdown fresh
+        try:
+            self._task_start_background(poll_seconds=self.cfg.get("task_poll_seconds", 2.0))
+        except Exception:
+            pass
+
         self.embed_text = embed_text          # ← ADD THIS LINE
         
         integrator_config = {
@@ -1202,6 +1225,62 @@ class Assembler:
                 except Exception: pass
         return provisional
 
+    def _hash8(self, text: str) -> str:
+        return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
+
+    def _gather_dynamic_patches(self) -> list[str]:
+        """
+        Collect small dynamic policy snippets (created by system_prompt_refine).
+        We treat the concatenation as a *variant patch* on top of a slot’s base prompt.
+        """
+        patches = []
+        try:
+            for row in self.repo.query(lambda c: c.component == "policy" and "dynamic_prompt" in (c.tags or [])):
+                txt = (row.metadata.get("policy") or row.summary or "").strip()
+                if txt:
+                    patches.append(txt)
+        except Exception:
+            pass
+        return patches
+
+    def _build_prompt_variants(self, slot: str, base_text: str) -> dict[str, str]:
+        """
+        Build 2–3 variants for a prompt slot from (a) base, (b) base+all patches,
+        (c) an ultra-concise nudge. Keys are stable variant_ids.
+        """
+        variants: dict[str, str] = {}
+
+        # (A) baseline
+        vA = base_text.strip()
+        variants[f"{slot}:base:{self._hash8(vA)}"] = vA
+
+        # (B) baseline + dynamic patches (if any)
+        patches = self._gather_dynamic_patches()
+        if patches:
+            vB = (vA + "\n\n" + "\n".join(patches)).strip()
+            variants[f"{slot}:dyn:{self._hash8(vB)}"] = vB
+
+        # (C) a shortness/style nudge (cheap exploration)
+        vC = (vA + "\n\n" + "STYLE OVERRIDE: Prefer fewer words; tighten phrasing.").strip()
+        variants[f"{slot}:tight:{self._hash8(vC)}"] = vC
+
+        return variants
+
+    def _choose_prompt_text(self, slot: str, base_text: str) -> tuple[str, str]:
+        """
+        Return (chosen_text, variant_id) using Thompson sampling w/ canary ramping.
+        Caches the variant texts for this turn; also records self._prompts_used_current.
+        """
+        variants = self._build_prompt_variants(slot, base_text)
+        self._prompt_variants_cache.setdefault(slot, {}).update(variants)
+
+        chosen_id = self.bandit.choose_prompt_variant(slot, list(variants.keys()))
+        if chosen_id not in variants:
+            # fallback to baseline
+            chosen_id = next(iter(variants.keys()))
+        chosen_text = variants[chosen_id]
+        self._prompts_used_current[slot] = chosen_id
+        return chosen_text, chosen_id
 
     
     def _prune_jsonl_duplicates(self) -> None:
@@ -2515,6 +2594,369 @@ class Assembler:
         return ""
 
 
+    # ─── Task scheduling & countdown (repo-native, no extra files) ───────────────
+    def _task__fmt_due(self, dt: datetime) -> str:
+        """Repo-friendly UTC timestamp."""
+        from context import _fmt_ts
+        return _fmt_ts(dt.replace(tzinfo=None))
+
+    def _task__now_utc(self) -> datetime:
+        from context import default_clock
+        return default_clock()
+
+    def _task__sec_until(self, due_at_s: str) -> float:
+        """Seconds until due_at_s (repo format %Y%m%dT%H%M%SZ)."""
+        try:
+            # repo parser expects trailing Z; be lenient if missing
+            ts = due_at_s if str(due_at_s).endswith("Z") else f"{due_at_s}Z"
+            return max((datetime.strptime(ts, "%Y%m%dT%H%M%SZ") - self._task__now_utc()).total_seconds(), 0.0)
+        except Exception:
+            return 0.0
+
+    def _task__to_ctx(self, *, title: str, due_at: str, payload_text: str,
+                    conversation_id: str | None, user_id: str | None,
+                    status: str = "scheduled", **extra) -> ContextObject:
+        """Create a ContextObject (artifact/task)."""
+        from context import ContextObject
+        ctx = ContextObject(
+            domain="artifact",
+            component="task",
+            semantic_label="scheduled_task",
+        )
+        ctx.summary = f"[{status}] {title}"
+        ctx.tags = ["task", "scheduled"]
+        ctx.metadata.update({
+            "model": "scheduled_task/v1",
+            "task_id": ctx.context_id,
+            "title": title,
+            "due_at": due_at,
+            "payload_text": payload_text,
+            "status": status,
+            "created_at": self._task__fmt_due(self._task__now_utc()),
+            "remaining_seconds": self._task__sec_until(due_at),
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            **(extra or {})
+        })
+        # show a T-… hint in summary for quick scanning
+        rem = ctx.metadata.get("remaining_seconds")
+        if rem is not None:
+            ctx.summary = f"{ctx.summary}  (T-{int(rem)}s)"
+        return ctx
+
+    def _task_schedule(self, *, title: str, due_in_seconds: int | None = None,
+                    due_at_utc: str | None = None, payload_text: str,
+                    conversation_id: str | None, user_id: str | None,
+                    rrule: str | None = None, allow_update: bool = False) -> ContextObject:
+        """
+        Upsert a task. If allow_update and a very similar title exists in-scope,
+        update it instead of creating a new one (fills missing due time, etc.).
+        """
+        # Resolve due_at
+        if not due_at_utc:
+            if due_in_seconds is None:
+                raise ValueError("Provide due_in_seconds or due_at_utc")
+            due_at = self._task__now_utc() + timedelta(seconds=int(due_in_seconds))
+            due_at_utc = self._task__fmt_due(due_at)
+        else:
+            # normalize to repo format (ensure trailing Z removed since _fmt_ts adds it)
+            try:
+                # accept ISO8601-ish with/without Z; parse minimally
+                iso = due_at_utc.replace("Z", "")
+                dt = datetime.fromisoformat(iso) if "T" in iso else datetime.fromisoformat(iso + "T00:00:00")
+                due_at_utc = self._task__fmt_due(dt)
+            except Exception:
+                # fallback: keep as-is; countdown may be zero
+                pass
+
+        # Dedup/update in scope
+        existing = self._task_list(conversation_id=conversation_id, user_id=user_id)
+        keeper = None
+        if allow_update:
+            # simple fuzzy match on title
+            tnorm = (title or "").strip().lower()
+            for t in existing:
+                en = (t.metadata.get("title","") or t.summary or "").strip().lower()
+                if en and (en == tnorm or tnorm in en or en in tnorm):
+                    keeper = t
+                    break
+
+        if keeper:
+            meta = keeper.metadata or {}
+            if not meta.get("due_at"):
+                meta["due_at"] = due_at_utc
+            if not meta.get("payload_text"):
+                meta["payload_text"] = payload_text
+            meta["status"] = "scheduled"
+            meta["remaining_seconds"] = self._task__sec_until(meta["due_at"])
+            keeper.summary = f"[{meta['status']}] {title}  (T-{int(meta['remaining_seconds'])}s)"
+            keeper.metadata = meta
+            keeper.touch(); self.repo.save(keeper)
+            self.memman.register_relationships(keeper, embed_text)
+            return keeper
+
+        ctx = self._task__to_ctx(
+            title=title,
+            due_at=due_at_utc,
+            payload_text=payload_text,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            status="scheduled",
+            rrule=rrule,
+        )
+        ctx.touch(); self.repo.save(ctx)
+        self.memman.register_relationships(ctx, embed_text)
+        return ctx
+
+    def _task_list(self, *, conversation_id: str | None = None, user_id: str | None = None) -> list[ContextObject]:
+        rows = self.repo.query(lambda c:
+            c.domain=="artifact" and c.component=="task" and
+            ((conversation_id is None) or (c.metadata or {}).get("conversation_id")==conversation_id) and
+            ((user_id is None) or (c.metadata or {}).get("user_id")==user_id)
+        )
+        rows.sort(key=lambda c: (c.metadata or {}).get("due_at", c.timestamp))
+        return rows
+
+    def _task_inject_countdown_context(self, state: dict) -> list[ContextObject]:
+        """
+        Update per-task remaining_seconds and emit a 'task_countdown' stage
+        visible to planner when something is due within 1 hour.
+        """
+        from context import ContextObject
+        conv = state.get("conversation_id")
+        uid  = state.get("user_id")
+        soon: list[ContextObject] = []
+        for t in self._task_list(conversation_id=conv, user_id=uid):
+            meta = t.metadata or {}
+            if meta.get("status") != "scheduled":
+                continue
+            meta["remaining_seconds"] = self._task__sec_until(meta.get("due_at",""))
+            t.metadata = meta
+            t.summary  = f"[{meta.get('status')}] {meta.get('title','task')}  (T-{int(meta['remaining_seconds'])}s)"
+            t.touch(); self.repo.save(t)
+            if meta["remaining_seconds"] <= 3600 and meta["remaining_seconds"] > 0:
+                soon.append(t)
+
+        if not soon:
+            return []
+
+        lines = [
+            f"• { (s.metadata.get('title') or s.summary) } — T-{int(s.metadata.get('remaining_seconds',0))}s (due {s.metadata.get('due_at')})"
+            for s in sorted(soon, key=lambda x: x.metadata.get("remaining_seconds", 0))
+        ]
+        msg = "Upcoming tasks:\n" + "\n".join(lines)
+        sc = ContextObject.make_stage(
+            "task_countdown",
+            input_refs=[state.get("user_ctx", None) and state["user_ctx"].context_id or ""],
+            output={"text": msg, "items": [s.metadata for s in soon]},
+        )
+        sc.summary = msg[:250]
+        sc.metadata.update({"conversation_id": conv, "user_id": uid, "count": len(soon)})
+        sc.touch(); self.repo.save(sc)
+        self.memman.register_relationships(sc, embed_text)
+
+        state.setdefault("merged", []).append(sc)
+        state.setdefault("merged_ids", []).append(sc.context_id)
+        return [sc]
+
+    def _task__due_now(self) -> list[ContextObject]:
+        """Return all scheduled tasks whose due time has arrived (any scope)."""
+        out = []
+        for t in self._task_list():
+            meta = t.metadata or {}
+            if meta.get("status") != "scheduled":
+                continue
+            if self._task__sec_until(meta.get("due_at","")) <= 0:
+                out.append(t)
+        return out
+
+    def _launch_scheduled(self, task_ctx: ContextObject):
+        """
+        Launch a new repo-assembler session seeded with the task's payload.
+        Marks the task as completed/failed accordingly.
+        """
+        async def _go():
+            try:
+                payload = (task_ctx.metadata or {}).get("payload_text") or task_ctx.summary or ""
+                # Optional: open an “episode” for visibility
+                try:
+                    self.memman.start_episode(f"Task: {task_ctx.metadata.get('title','task')}", {
+                        "task_id": task_ctx.metadata.get("task_id"),
+                        "due_at": task_ctx.metadata.get("due_at"),
+                        "conversation_id": task_ctx.metadata.get("conversation_id"),
+                        "user_id": task_ctx.metadata.get("user_id"),
+                    })
+                except Exception:
+                    pass
+
+                await self.run_with_meta_context(
+                    payload, skip_quick_phases=True, direct_plan=True, images=None
+                )
+
+                # mark complete
+                try:
+                    fresh = self.repo.get(task_ctx.context_id)
+                    fresh.metadata["status"] = "completed"
+                    fresh.summary = f"[completed] {fresh.metadata.get('title','task')}"
+                    fresh.touch(); self.repo.save(fresh)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    fresh = self.repo.get(task_ctx.context_id)
+                    fresh.metadata["status"] = "failed"
+                    fresh.touch(); self.repo.save(fresh)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    self.memman.end_episode()
+                except Exception:
+                    pass
+        # fire-and-forget
+        try:
+            import asyncio
+            asyncio.create_task(_go())
+        except RuntimeError:
+            # no running loop → run in a thread
+            import threading
+            threading.Thread(target=lambda: asyncio.run(_go()), daemon=True).start()
+
+    def _task_tick_and_launch(self) -> int:
+        """One poll tick: refresh countdowns and launch all due tasks. Returns count launched."""
+        launched = 0
+        # refresh countdowns globally
+        for t in self._task_list():
+            meta = t.metadata or {}
+            if meta.get("status") != "scheduled":
+                continue
+            meta["remaining_seconds"] = self._task__sec_until(meta.get("due_at",""))
+            t.metadata = meta
+            t.summary  = f"[{meta.get('status')}] {meta.get('title','task')}  (T-{int(meta['remaining_seconds'])}s)"
+            t.touch(); self.repo.save(t)
+        # launch due
+        for t in self._task__due_now():
+            try:
+                t.metadata["status"] = "running"
+                t.metadata["last_run_at"] = self._task__fmt_due(self._task__now_utc())
+                t.summary = f"[running] {t.metadata.get('title','task')}"
+                t.touch(); self.repo.save(t)
+                self._launch_scheduled(t)
+                launched += 1
+            except Exception:
+                try:
+                    t.metadata["status"] = "failed"
+                    t.touch(); self.repo.save(t)
+                except Exception:
+                    pass
+        return launched
+
+    def _task_start_background(self, poll_seconds: float = 2.0):
+        """Start background poller that launches due tasks."""
+        if self._task_bg_thread and self._task_bg_thread.is_alive():
+            return
+        self._task_poll_event.clear()
+        def _run():
+            while not self._task_poll_event.is_set():
+                try:
+                    self._task_tick_and_launch()
+                except Exception:
+                    pass
+                self._task_poll_event.wait(poll_seconds)
+        self._task_bg_thread = threading.Thread(target=_run, name="TaskPoller", daemon=True)
+        self._task_bg_thread.start()
+
+    def _task_stop_background(self):
+        try:
+            if self._task_bg_thread:
+                self._task_poll_event.set()
+                self._task_bg_thread.join(timeout=1.5)
+                self._task_bg_thread = None
+        except Exception:
+            pass
+
+    def _stage_task_detect_and_schedule(self, *, user_text: str, state: dict, allow_update: bool = False) -> ContextObject | None:
+        """
+        Lightweight detector that decides whether the user's message implies a
+        future task (e.g., “remind me at 5pm …”, “run the sync tonight”).
+        If so, schedules it and returns the created/updated task ContextObject.
+        """
+        # 1) Ask the small model to produce a strict JSON object
+        sys = (
+            "You classify scheduling intents. Return ONLY JSON with keys:\n"
+            "{\n"
+            '  "should_schedule": true|false,\n'
+            '  "title": "<short title or empty>",\n'
+            '  "payload_text": "<what to run or empty>",\n'
+            '  "due_in_seconds": <integer or null>,\n'
+            '  "due_at_utc": "<YYYY-MM-DDTHH:MM:SSZ or null>"\n'
+            "}\n"
+            "Rules:\n"
+            "• If the user clearly asked for a future action/reminder/run, should_schedule=true.\n"
+            "• Prefer due_at_utc (UTC) if a specific date/time is given, else due_in_seconds.\n"
+            "• payload_text should be what the agent should execute at that time.\n"
+            "• No prose. No markdown. Return valid JSON only."
+        )
+        # Include clarifier notes if available
+        hint = ""
+        try:
+            clar = state.get("clar_ctx")
+            if clar and clar.metadata.get("notes"):
+                hint = f"\n\n[Intent notes]\n{clar.metadata.get('notes')}"
+        except Exception:
+            pass
+
+        raw = self._stream_and_capture(
+            self.decision_model,
+            [{"role":"system","content":sys},
+            {"role":"user","content":(user_text or "").strip() + hint}],
+            tag="[TaskDetect]"
+        ).strip()
+
+        # 2) Parse JSON; fallback to no-op on failure
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not data.get("should_schedule"):
+            return None
+
+        title   = (data.get("title") or "").strip() or "Scheduled task"
+        payload = (data.get("payload_text") or user_text or "").strip()
+        due_in  = data.get("due_in_seconds")
+        due_at  = data.get("due_at_utc")
+
+        # 3) Create/update the task in-scope and surface a small confirmation stage
+        tctx = self._task_schedule(
+            title=title,
+            due_in_seconds=int(due_in) if isinstance(due_in, (int, float)) else None,
+            due_at_utc=due_at if isinstance(due_at, str) and due_at else None,
+            payload_text=payload,
+            conversation_id=state.get("conversation_id"),
+            user_id=state.get("user_id"),
+            allow_update=allow_update
+        )
+
+        # short confirmation (stage)
+        try:
+            from context import ContextObject
+            conf = ContextObject.make_stage(
+                "task_scheduled",
+                [state.get("user_ctx", None) and state["user_ctx"].context_id or ""],
+                {"title": title, "due_at": tctx.metadata.get("due_at"), "payload": payload}
+            )
+            conf.summary = f"Scheduled: {title} @ {tctx.metadata.get('due_at')}"
+            conf.metadata.update({"conversation_id": state.get("conversation_id"), "user_id": state.get("user_id")})
+            conf.touch(); self.repo.save(conf)
+            self.memman.register_relationships(conf, embed_text)
+            state.setdefault("merged", []).append(conf)
+            state.setdefault("merged_ids", []).append(conf.context_id)
+        except Exception:
+            pass
+
+        return tctx
+
+
     from self_state import SelfState
 
     def _load_self_state(self) -> SelfState:
@@ -2558,138 +3000,371 @@ class Assembler:
             )
             nodes.append(node)
         return nodes
-    
-    def _generate_system_prompt(self, purpose, schema=None, variables={}):
-        system_meta = (
-            "Generate a clear and concise instruction set for an agent to perform a task.\n"
-            "First, review the purpose of the system prompt:\n"
-            f"{purpose}\n\n"
-        )
         
-        if schema is not None:
-            system_meta += (
-                "Now, based on the purpose, we have a schema which will be used to perform regex and capture outputs. Creatively inform the system prompt you are about to generate based on the expected model outputs:\n"
-                f"{schema}\n\n"
-            )
-        
-        # Inject additional variables
-        for var_name, var_value in variables.items():
-            system_meta += (
-                f"Additionally, consider the following variable: {var_name}.\n"
-                f"The value of {var_name} is: {var_value}\n\n"
-            )
-        
-        system_meta += (
-            "Generate a clear instruction set based on the above, with no additional introduction or explanation. Output only the exact system message and nothing more."
-        )
-        
-        system = self._stream_and_capture(
-            self.primary_model,
-            [{"role": "system", "content": system_meta}],
-            tag="[Refine]"
-        ).strip()
-        
-        return system
+    def _generate_system_prompt(
+        self,
+        purpose: str,
+        schema: dict | str | None = None,
+        variables: dict | None = None,
+        *,
+        label: str | None = None,
+        save: bool = True,
+        refine_with_llm: bool = False,
+    ) -> str:
+        """
+        Build a strong, deterministic system prompt from inputs.
+        - purpose:   short paragraph describing the agent's job
+        - schema:    JSON schema (dict or JSON string) describing EXPECTED OUTPUT fields
+        - variables: freeform knobs/context (e.g. audience="exec", tone="formal")
+        - label:     semantic label for saving to repo
+        - save:      persist prompt to repo as a prompt artifact
+        - refine_with_llm: optional one-pass polish using primary_model
+        """
+        import json, hashlib, textwrap
+
+        variables = variables or {}
+
+        # Parse schema if needed
+        schema_obj: dict | None = None
+        if isinstance(schema, str):
+            try:
+                schema_obj = json.loads(schema)
+            except Exception:
+                schema_obj = None
+        elif isinstance(schema, dict):
+            schema_obj = schema
+
+        def _schema_bullets(s: dict) -> list[str]:
+            bullets = []
+            if not isinstance(s, dict):
+                return bullets
+            props = (s.get("properties") or {}) if isinstance(s.get("properties"), dict) else {}
+            req   = set(s.get("required") or [])
+            for name, meta in props.items():
+                t = meta.get("type", "any")
+                desc = (meta.get("description") or "").strip()
+                oneof = meta.get("enum")
+                rng = []
+                if "minimum" in meta: rng.append(f"≥ {meta['minimum']}")
+                if "maximum" in meta: rng.append(f"≤ {meta['maximum']}")
+                extras = []
+                if oneof: extras.append(f"one of {oneof}")
+                if rng:   extras.append(", ".join(rng))
+                tail = f" ({'; '.join(extras)})" if extras else ""
+                need = "REQUIRED" if name in req else "optional"
+                bullets.append(f"- `{name}` ({t}, {need}){tail}: {desc}")
+            return bullets
+
+        # Render variables
+        var_lines = [f"- {k}: {v}" for k, v in variables.items() if v is not None]
+
+        # Render schema bullets
+        sch_lines = _schema_bullets(schema_obj) if schema_obj else []
+
+        # Build deterministic base system message
+        parts = [
+            "ROLE: You are a precise, reliable agent. Follow instructions exactly. Do not invent facts.",
+            "",
+            "OBJECTIVE:",
+            textwrap.dedent(purpose).strip(),
+            "",
+            "OUTPUT CONTRACT:",
+            ("Adhere strictly to the following field contract:" if sch_lines else "No fixed field contract was provided."),
+        ]
+        if sch_lines:
+            parts.extend(sch_lines)
+            parts += [
+                "",
+                "CONSTRAINTS:",
+                "- If a field cannot be derived, set it to null (do not guess).",
+                "- Preserve types exactly as specified.",
+                "- Do not include extra fields.",
+            ]
+        else:
+            parts += [
+                "",
+                "CONSTRAINTS:",
+                "- Keep outputs unambiguous, minimal, and directly actionable.",
+            ]
+
+        if var_lines:
+            parts += ["", "CONTEXT / KNOBS:"] + var_lines
+
+        parts += [
+            "",
+            "STYLE:",
+            "- Be concise; avoid hedging or filler.",
+            "- Prefer bullet points for multi-item guidance.",
+            "- Use active voice.",
+            "",
+            "FAILURE MODE:",
+            "- If the request is underspecified, ask 1–2 crisp clarifying questions.",
+            "- If a step is impossible, state exactly why and suggest the closest safe alternative.",
+        ]
+
+        system_text = "\n".join(parts).strip()
+
+        # Optional one-pass polish (keeps it short)
+        if refine_with_llm:
+            try:
+                prompt = (
+                    "Tighten the following system prompt without changing meaning. "
+                    "Keep all constraints and field contracts. Return only the revised text.\n\n"
+                    + system_text
+                )
+                system_text = self._stream_and_capture(
+                    self.primary_model,
+                    [{"role": "system", "content": prompt}],
+                    tag="[PromptPolish]"
+                ).strip() or system_text
+            except Exception:
+                pass
+
+        # Save to repo (idempotent-ish)
+        if save:
+            from context import ContextObject
+            # Derive a stable label if not supplied
+            h = hashlib.sha1(system_text.encode("utf-8")).hexdigest()[:10]
+            label = label or f"generated_system_prompt_{h}"
+            ctx = ContextObject.make_prompt(label=label, prompt_text=system_text, tags=["artifact","prompt","generated"])
+            ctx.touch(); self.repo.save(ctx)
+            self.memman.register_relationships(ctx, self.embed_text)
+
+        return system_text
+
 
 
     def _should_ask_confirmation(self, state: Dict[str, Any]) -> bool:
         """
-        Ask the LLM if we need to show the plan to the user before running.
-        Returns True if it replies 'yes', False otherwise.
+        Decide whether to show the plan to the user before running.
+        Heuristics → LLM fallback. Records a 'confirm_decision' stage node.
         """
+        import re, json, time
+        from context import ContextObject
 
-        calls = state.get("fixed_calls", [])
-        # build a one-line summary of the recent context
+        calls: list[str] = list(state.get("fixed_calls", []) or [])
         ctx_summ = " | ".join(
-            f"{c.stage_id or c.semantic_label}: {c.summary[:40].replace(chr(10), ' ')}"
-            for c in [
-                state.get("user_ctx"),
-                state.get("clar_ctx"),
-                state.get("know_ctx"),
-            ]
-            if c
+            f"{(c.stage_id or c.semantic_label)}: {(c.summary or '')[:80].replace(chr(10),' ')}"
+            for c in [state.get("user_ctx"), state.get("clar_ctx"), state.get("know_ctx")] if c
         )
-        prompt = {
-            "plan": calls,
-            "context_summary": ctx_summ
-        }
-        system = (
-            "You are a meta‐reasoner.  Given the plan (list of tool calls) "
-            "and a brief context summary, decide whether you need explicit user "
-            "confirmation before running the plan.  Answer only 'yes' or 'no'."
+
+        # Heuristic signals
+        risky_keywords = re.compile(
+            r"\b(delete|remove|truncate|drop|post|publish|tweet|send|email|sms|text|call|"
+            r"buy|purchase|charge|wire|transfer|subscribe|deploy|production|prod)\b",
+            re.I
         )
-        out = self._stream_and_capture(
-            self.primary_model,
-            [
-                {"role":"system",  "content": system},
-                {"role":"user",    "content": json.dumps(prompt)}
-            ],
-            tag="[ConfirmCheck]"
-        ).strip()
-        return bool(re.search(r"\byes\b", out, re.I))
-   
+        money_re = re.compile(r"\b(\$|usd|eur|gbp)\s*\d|\bamount\s*=\s*\d", re.I)
+        pii_re   = re.compile(r"\b(ssn|passport|credit\s*card|cvc|cvv)\b", re.I)
 
-    # helper: resume after user says yes/no
-    def _handle_confirmation(self, reply: str) -> str:
-        ans = reply.strip().lower()
-        # YES
-        if re.search(r"\b(yes|y|sure|go ahead)\b", ans):
-            st = self._pending_state
-            queue = self._pending_queue
-            # clear flags
-            del self._awaiting_confirmation
-            del self._pending_state
-            del self._pending_queue
-            # continue where we left off
-            return self.run_with_meta_context(st["user_text"])
-        # NO → abort or replan
-        else:
-            # clear flags
-            del self._awaiting_confirmation
-            st = self._pending_state
-            queue = self._pending_queue
-            # for simplicity, force replanning
-            return self.run_with_meta_context(st["user_text"])
-        
+        risk_score = 0
+        reasons: list[str] = []
 
-    # ────────────────────────────────────────────────────────────────────
-    # NEW: Called from telegram_input to register incoming chats
-    def register_chat(self, chat_id: int, user_text: str):
-        """Remember which Telegram chat issued this request."""
-        self._chat_contexts.add(chat_id)
+        # 1) Lots of tool calls → conservative
+        if len(calls) >= 4:
+            risk_score += 1; reasons.append("many_calls")
 
-    # ────────────────────────────────────────────────────────────────────
-    # NEW: Proactive “appiphany” ping
-    def _maybe_appiphany(self, chat_id: int):
-        """
-        If our pipeline thinks there’s a high-value insight to share,
-        ping the user in text + voice.
-        """
-        # Example condition: no errors this turn + at least one curiosity probe
-        if not getattr(self, "_last_errors", False) and getattr(self, "curiosity_used", []):
-            text = "💡 I just made an insight that might help you!"
-            # send text
-            self._telegram_bot.send_message(chat_id=chat_id, text=text)
-            # enqueue voice
-            self.tts.enqueue(text)
+        # 2) Keyword risks
+        joined = " | ".join(calls)
+        if risky_keywords.search(joined):
+            risk_score += 2; reasons.append("risky_verbs")
+        if money_re.search(joined):
+            risk_score += 2; reasons.append("money_like")
+        if pii_re.search(joined):
+            risk_score += 2; reasons.append("pii_like")
+
+        # 3) Tool schema flags (x_requires_confirmation)
+        try:
+            from tools import TOOL_SCHEMAS
+            for call in calls:
+                name = call.split("(", 1)[0].strip()
+                sch = TOOL_SCHEMAS.get(name) or {}
+                if sch.get("x_requires_confirmation") or sch.get("x_side_effects"):
+                    risk_score += 3; reasons.append(f"schema_flag:{name}")
+        except Exception:
+            pass
+
+        # 4) Suspicious HTTP verbs in args
+        if re.search(r"method\s*=\s*['\"]?(POST|DELETE|PUT)['\"]?", joined, re.I):
+            risk_score += 2; reasons.append("http_mutation")
+
+        # 5) Scheduling / automation (creating future triggers)
+        if re.search(r"(schedule|remind|cron|rrule|due_at)", joined, re.I):
+            risk_score += 1; reasons.append("scheduling")
+
+        # 6) Domain check (rough) — unknown external hostnames in calls
+        if re.search(r"https?://[^/\s]+", joined, re.I):
+            risk_score += 1; reasons.append("external_domains")
+
+        # Decide from heuristics
+        heuristic_yes = risk_score >= 3
+
+        # LLM fallback only if undecided
+        llm_yes = False
+        if not heuristic_yes:
             try:
-                ogg = self.tts.wait_for_latest_ogg(timeout=1.0)
-                with open(ogg, "rb") as vf:
-                    self._telegram_bot.send_voice(chat_id=chat_id, voice=vf)
+                prompt = {"plan": calls, "context_summary": ctx_summ}
+                system = (
+                    "Decide if explicit user confirmation is required before running this plan.\n"
+                    "Say only 'yes' or 'no'.\n"
+                    "Heuristics: ask for confirmation if actions are destructive, irreversible, spend money, "
+                    "send messages/emails, touch production, or create future automations."
+                )
+                out = self._stream_and_capture(
+                    self.primary_model,
+                    [{"role":"system","content":system},{"role":"user","content":json.dumps(prompt)}],
+                    tag="[ConfirmCheck]"
+                ).strip().lower()
+                llm_yes = bool(re.search(r"\byes\b", out))
+                if not re.search(r"\b(?:yes|no)\b", out):
+                    # default conservative if model drifted
+                    llm_yes = True
             except Exception:
-                    pass
+                # fail safe → ask
+                llm_yes = True
 
-    def dump_architecture(self):
-        
+        need = bool(heuristic_yes or llm_yes)
 
+        # Record decision
+        try:
+            node = ContextObject.make_stage(
+                "confirm_decision",
+                [state.get("user_ctx", None) and state["user_ctx"].context_id or ""],
+                {"need_confirmation": need, "risk_score": risk_score, "reasons": reasons, "calls": calls}
+            )
+            node.summary = f"confirm={need} (risk={risk_score}; reasons={','.join(reasons) or '-'})"
+            node.touch(); self.repo.save(node)
+            self.memman.register_relationships(node, self.embed_text)
+        except Exception:
+            pass
+
+        try:
+            state["asked_confirmation"] = bool(need)
+        except Exception:
+            pass
+
+        return need
+
+
+    async def _handle_confirmation_async(self, reply: str) -> str:
+        """
+        Handle user's yes/no after a confirmation prompt.
+        Continues or replans by calling run_with_meta_context(...).
+        """
+        ans = (reply or "").strip().lower()
+        yes = bool(re.search(r"\b(yes|y|sure|go ahead|ok|okay|proceed|confirm)\b", ans))
+
+        st = getattr(self, "_pending_state", None)
+        if not st or "user_text" not in st:
+            return "No pending plan to confirm."
+
+        # clear flags safely
+        for attr in ("_awaiting_confirmation","_pending_state","_pending_queue"):
+            if hasattr(self, attr):
+                try: delattr(self, attr)
+                except Exception: setattr(self, attr, None)
+
+        if yes:
+            return await self.run_with_meta_context(st["user_text"])
+        else:
+            # simple replan: nudge clarifier to note refusal
+            rej_text = st["user_text"] + "\n\n(User did NOT approve previous plan. Replan without side-effects.)"
+            return await self.run_with_meta_context(rej_text)
+
+    def _handle_confirmation(self, reply: str) -> str:
+        """
+        Sync wrapper for environments without an event loop.
+        Spawns/awaits as needed.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # schedule task and return a short ack
+            loop.create_task(self._handle_confirmation_async(reply))
+            return "Got it — continuing in the background."
+        else:
+            return asyncio.run(self._handle_confirmation_async(reply))
+
+
+    def register_chat(self, chat_id: int, user_text: str):
+        """
+        Remember the Telegram chat and bind/refresh a conversation id.
+        """
+        import time, uuid
+        self._chat_contexts.add(chat_id)
+        if not hasattr(self, "_chat_index"):
+            self._chat_index = {}  # chat_id -> {conversation_id, last_seen, last_text}
+
+        rec = self._chat_index.get(chat_id) or {}
+        rec["conversation_id"] = rec.get("conversation_id") or getattr(self, "_active_conversation_id", uuid.uuid4().hex)
+        rec["last_seen"] = int(time.time())
+        rec["last_text"] = (user_text or "")[:200]
+        self._chat_index[chat_id] = rec
+
+        # Make this the active conversation for the next turn
+        self._active_conversation_id = rec["conversation_id"]
+
+    def _maybe_appiphany(self, chat_id: int) -> bool:
+        """
+        If there's a high-value insight, ping the user in text (and voice if supported).
+        Rate-limited to once per 2 minutes.
+        """
+        import time
+        if not getattr(self, "curiosity_used", []):  # needs at least one curiosity probe
+            return False
+        if getattr(self, "_last_errors", False):
+            return False
+
+        now = time.time()
+        last = getattr(self, "_last_appiphany_at", 0.0)
+        if now - last < 120:  # 2 min cooldown
+            return False
+
+        bot = getattr(self, "_telegram_bot", None)
+        if not bot:
+            return False
+
+        text = "💡 I just found an insight that might help—want to hear it?"
+        try:
+            bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            return False
+
+        # Voice is optional; guard hard
+        try:
+            if getattr(self, "tts", None):
+                self.tts.enqueue(text)
+                ogg = None
+                try:
+                    ogg = self.tts.wait_for_latest_ogg(timeout=1.0)
+                except Exception:
+                    ogg = None
+                if ogg:
+                    with open(ogg, "rb") as vf:
+                        bot.send_voice(chat_id=chat_id, voice=vf)
+        except Exception:
+            pass
+
+        self._last_appiphany_at = now
+        return True
+
+
+    def dump_architecture(self, save: bool = True) -> str:
+        """
+        Return a JSON string with the current architecture snapshot and optionally save it.
+        """
+        import json, inspect, textwrap
         arch = {
             "stages":               self.STAGES,
             "optional_stages":      self._optional_stages,
-            "curiosity_templates":  [t.semantic_label for t in self.curiosity_templates],
+            "curiosity_templates":  [t.semantic_label for t in getattr(self, "curiosity_templates", [])],
             "rl_weights":           {"Q": self.rl.Q, "R_bar": self.rl.R_bar},
             "curiosity_weights":    {"Q": self.curiosity_rl.Q, "R_bar": self.curiosity_rl.R_bar},
-            # now output the full mapping of prompt names → text
-            "system_prompts":       self.system_prompts,
+            "system_prompts":       getattr(self, "system_prompts", {}),
             "stage_methods":        {}
         }
 
@@ -2698,10 +3373,20 @@ class Assembler:
             if fn:
                 arch["stage_methods"][s] = {
                     "signature": str(inspect.signature(fn)),
-                    "doc":       fn.__doc__,
+                    "doc": (fn.__doc__ or "").strip(),
                 }
 
-        print(json.dumps(arch, indent=2))
+        text = json.dumps(arch, indent=2)
+
+        if save:
+            from context import ContextObject
+            ctx = ContextObject.make_stage("architecture_dump", [], {"json": arch})
+            ctx.summary = "architecture_dump"
+            ctx.touch(); self.repo.save(ctx)
+            self.memman.register_relationships(ctx, self.embed_text)
+
+        print(text)
+        return text
 
 
     def _stage_curiosity_probe(self, state: Dict[str,Any]) -> List[str]:
@@ -2709,112 +3394,96 @@ class Assembler:
         Identify gaps in clarified intent, auto-mull or explicit follow-ups via RL,
         ask the LLM for answers, record Q&A as ContextObjects, return answers.
         """
-        
+        from context import ContextObject
+        import re
+
         probes: List[str] = []
         clar = state.get("clar_ctx")
         if clar is None:
             return probes
 
-        # 1) Compute cascade-activation–based recall feature
+        max_probes = int(self.cfg.get("curiosity_max_probes", 2))
+
+        # 1) Cascade activation feature (guarded)
+        activation_map: Dict[str, float] = {}
         recall_ids = state.get("recent_ids", [])
         if recall_ids:
-            activation_map = self.memman.spread_activation(
-                seed_ids=recall_ids,
-                hops=2,
-                decay=0.6,
-                assoc_weight=1.0,
-                recency_weight=0.5
-            )
-            # take mean of top-N activations
-            top_vals = sorted(activation_map.values(), reverse=True)[: len(recall_ids)]
-            rf = sum(top_vals) / len(top_vals) if top_vals else 0.0
-        else:
-            rf = 0.0
+            try:
+                activation_map = self.memman.spread_activation(
+                    seed_ids=recall_ids, hops=2, decay=0.6, assoc_weight=1.0, recency_weight=0.5
+                ) or {}
+            except Exception:
+                activation_map = {}
+        top_vals = sorted(activation_map.values(), reverse=True)[: len(recall_ids) or 1]
+        rf = (sum(top_vals) / len(top_vals)) if top_vals else 0.0
 
         # 2) Detect explicit gaps
         gaps: List[Tuple[str,str]] = []
-        if not clar.metadata.get("notes"):
-            gaps.append(("missing_notes", clar.summary[:50]))
-        plan_out = state.get("plan_output", "")
-        if "date(" in plan_out and not any(
-            kw.lower().startswith("date") for kw in clar.metadata.get("keywords", [])
-        ):
+        if not (clar.metadata or {}).get("notes"):
+            gaps.append(("missing_notes", (clar.summary or "")[:80]))
+        plan_out = state.get("plan_output", "") or ""
+        if ("date(" in plan_out) and not any((kw or "").lower().startswith("date") for kw in (clar.metadata or {}).get("keywords", [])):
             gaps.append(("missing_date", "plan mentions a date"))
 
         # 3) If no explicit gaps, auto-mull
         if not gaps:
             gaps.append(("auto_mull", "self-reflection"))
 
-        # 4) For each gap, pick a template, probe LLM, record Q&A
+        used = 0
         for gap_name, snippet in gaps:
-            # choose best template by RL probability
-            candidates = [
-                t for t in self.curiosity_templates
-                if gap_name in t.semantic_label
-            ]
-            if not candidates:
-                continue
-            picked = max(
-                candidates,
-                key=lambda t: self.curiosity_rl.probability(t.semantic_label, rf)
-            )
-            prompt = picked.metadata.get("policy", picked.summary).format(snippet=snippet)
+            if used >= max_probes:
+                break
 
-            # 4a) Record question ContextObject
-            q_ctx = ContextObject.make_stage(
-                f"curiosity_question_{gap_name}",
-                [clar.context_id],
-                {"question": prompt}
-            )
-            q_ctx.component        = "curiosity"
-            q_ctx.semantic_label   = "question"
-            q_ctx.tags.append("curiosity")
-            # annotate retrieval metrics
-            score = activation_map.get(picked.context_id, 0.0)
-            q_ctx.retrieval_score    = score
-            q_ctx.retrieval_metadata = {"template": picked.semantic_label}
-            # record reinforcement: clar -> question
+            # choose the best template by RL probability
+            candidates = [t for t in getattr(self, "curiosity_templates", []) if gap_name in (t.semantic_label or "")]
+            prompt = None
+            picked = None
+            if candidates:
+                picked = max(candidates, key=lambda t: self.curiosity_rl.probability(t.semantic_label, rf))
+                tmpl = (picked.metadata.get("policy") or picked.summary or "").strip()
+                if tmpl:
+                    prompt = tmpl.format(snippet=snippet)
+
+            # fallback generic prompt
+            if not prompt:
+                prompt = f"Clarify this gap ({gap_name}): «{snippet}». Provide one concise answer."
+
+            # 4a) record question node
+            q_ctx = ContextObject.make_stage(f"curiosity_question_{gap_name}", [clar.context_id], {"question": prompt})
+            q_ctx.component = "curiosity"; q_ctx.semantic_label = "question"; q_ctx.tags.append("curiosity")
+            score = activation_map.get(getattr(picked, "context_id", ""), 0.0) if picked else 0.0
+            q_ctx.retrieval_score = score
+            q_ctx.retrieval_metadata = {"template": getattr(picked, "semantic_label", "fallback")}
             self.memman.reinforce(clar.context_id, [q_ctx.context_id])
-            q_ctx.touch()
-            self.repo.save(q_ctx)
-            self.memman.register_relationships(q_ctx, embed_text)
+            q_ctx.touch(); self.repo.save(q_ctx)
+            self.memman.register_relationships(q_ctx, self.embed_text)
 
+            # 4b) ask model
+            try:
+                reply = self._stream_and_capture(
+                    self.primary_model,
+                    [{"role":"system","content":"Answer the follow-up question succinctly and concretely."},
+                    {"role":"user","content":prompt}],
+                    tag=f"[CuriosityAnswer_{gap_name}]"
+                ).strip()
+            except Exception:
+                reply = ""
 
-            # 4b) Ask the LLM
-            reply = self._stream_and_capture(
-                self.primary_model,
-                [
-                    {"role":"system","content":"Please answer this follow-up question:"},
-                    {"role":"user",  "content":prompt}
-                ],
-                tag=f"[CuriosityAnswer_{gap_name}]"
-            ).strip()
-
-            # 4c) Record answer ContextObject
-            a_ctx = ContextObject.make_stage(
-                f"curiosity_answer_{gap_name}",
-                [q_ctx.context_id],
-                {"answer": reply}
-            )
-            a_ctx.component        = "curiosity"
-            a_ctx.semantic_label   = "answer"
-            a_ctx.tags.append("curiosity")
-            # annotate retrieval metrics
-            a_score = activation_map.get(q_ctx.context_id, 0.0)
-            a_ctx.retrieval_score    = a_score
+            # 4c) record answer
+            a_ctx = ContextObject.make_stage(f"curiosity_answer_{gap_name}", [q_ctx.context_id], {"answer": reply})
+            a_ctx.component = "curiosity"; a_ctx.semantic_label = "answer"; a_ctx.tags.append("curiosity")
+            a_ctx.retrieval_score = activation_map.get(q_ctx.context_id, 0.0)
             a_ctx.retrieval_metadata = {"question_id": q_ctx.context_id}
-            # record reinforcement: question -> answer
             self.memman.reinforce(q_ctx.context_id, [a_ctx.context_id])
-            a_ctx.touch()
-            self.repo.save(a_ctx)
-            self.memman.register_relationships(a_ctx, embed_text)
+            a_ctx.touch(); self.repo.save(a_ctx)
+            self.memman.register_relationships(a_ctx, self.embed_text)
 
-
-            # track which template you used and collect the reply
-            state.setdefault("curiosity_used", []).append(picked.semantic_label)
+            state.setdefault("curiosity_used", []).append(getattr(picked, "semantic_label", f"fallback_{gap_name}"))
             probes.append(reply)
+            used += 1
 
         return probes
+
 
     
     def _get_prompt(self, label: str) -> str:
@@ -2837,8 +3506,16 @@ class Assembler:
                 return val
 
         # Fallback to the in-memory canonical prompt text
-        return getattr(self, "system_prompts", {}).get(label, "")
-    
+        base = getattr(self, "system_prompts", {}).get(label, "")
+
+        # NEW: route through RL prompt variants (slot == label)
+        try:
+            chosen_text, _vid = self._choose_prompt_text(label, base)
+            return chosen_text
+        except Exception:
+            return base    
+
+
     def _stage_system_prompt_refine(self, state: Dict[str, Any]) -> str | None:
         """
         RL-gated self-mutation of prompts & policies, with full visibility
@@ -3368,7 +4045,6 @@ class Assembler:
                 self._seed_static_prompts()
         except Exception:
             pass
-                
     # ─────────────────────────────────────────────────────────────────────────────
     #  Orchestrator (Quick-Take + Planner) — with direct-plan bypass
     # ─────────────────────────────────────────────────────────────────────────────
@@ -3397,6 +4073,7 @@ class Assembler:
         """
         import json, traceback, uuid, textwrap, inspect
         from datetime import datetime, timezone
+
         import numpy as np
 
         # ── status callback ───────────────────────────────────────────────
@@ -3510,7 +4187,7 @@ class Assembler:
                         pair_ids.append(i)
             return lines, pair_ids
 
-        # ── shared state bootstrap ────────────────────────────────────────
+        # ── shared state bootstrap (WITH TIME CONTEXT) ───────────────────────
         state = getattr(self, "_last_state", {}) or {}
         state["start_ts"] = state.get("start_ts") or datetime.now(timezone.utc).timestamp()
         state.setdefault("stages_run", [])
@@ -3518,42 +4195,117 @@ class Assembler:
         state.setdefault("conversation_id", getattr(self, "_active_conversation_id", uuid.uuid4().hex))
         state.setdefault("user_id", getattr(self, "current_user_id", "anon"))
 
-        # ── Stage 1: record input ────────────────────────────────────────
+        # Build time context (human + machine) and inject everywhere
+        local_now = datetime.now().astimezone()
+        utc_now   = datetime.now(timezone.utc)
+
+        human_local = local_now.strftime("%A, %B %d, %Y %I:%M %p %Z (UTC%z)")
+        human_utc   = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        # Required literal banner sentence (per your spec)
+        time_banner = (
+            f"To aid in making chronologically informed decisions, the current time is {human_local}. "
+            f"UTC now: {human_utc}. Always compute time deltas relative to this moment."
+        )
+
+        # Stash rich time fields in state for every stage to consume
+        state["system_time_prompt"]   = time_banner
+        state["now_local_human"]      = human_local
+        state["now_utc_human"]        = human_utc
+        state["now_local_iso"]        = local_now.isoformat()
+        state["now_utc_iso"]          = utc_now.isoformat().replace("+00:00", "Z")
+        state["now_epoch"]            = utc_now.timestamp()
+        try:
+            off = local_now.utcoffset() or (utc_now.utcoffset() or 0)
+            state["now_tz_offset_minutes"] = int(off.total_seconds() // 60)
+        except Exception:
+            state["now_tz_offset_minutes"] = 0
+        state["now_tz_name"]          = local_now.tzname() or "Local"
+
+        # Create a first-class ContextObject for time and persist it so merges/planner see it
+        time_ctx = None
+        try:
+            from context import ContextObject
+            time_ctx = ContextObject.make_stage(
+                "system_time",
+                [],
+                {
+                    "text": time_banner,
+                    "now_local_iso": state["now_local_iso"],
+                    "now_utc_iso": state["now_utc_iso"],
+                    "now_epoch": state["now_epoch"],
+                    "tz_name": state["now_tz_name"],
+                    "tz_offset_minutes": state["now_tz_offset_minutes"],
+                },
+            )
+            time_ctx.stage_id = "system_time"
+            time_ctx.summary = time_banner[:250]
+            time_ctx.metadata.update({
+                "conversation_id": state["conversation_id"],
+                "user_id": state["user_id"],
+            })
+            time_ctx.touch()
+            self.repo.save(time_ctx)
+        except Exception:
+            # Non-fatal: stages will still read state["system_time_prompt"]
+            time_ctx = None
+
+        # ── Stage 1: record input ────────────────────────────────────────────
         try:
             user_ctx = self._stage1_record_input(user_text, state)
             state["user_ctx"] = user_ctx
             state["user_text"] = user_text
-            status_cb("input_recorded", {"ctx_id": user_ctx.context_id})
+            status_cb("input_recorded", {"ctx_id": getattr(user_ctx, "context_id", None), "now": state["now_local_human"]})
         except Exception as e:
             status_cb("error_stage1", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 2: system prompts (policies, etc.) ─────────────────────
+        # ── Stage 2: system prompts (policies, etc.) + time injection ────────
         try:
             sys_ctxs = self._stage2_load_system_prompts()
+            # Inject time context as an extra system prompt so every downstream prompt builder sees it
+            if time_ctx:
+                try:
+                    sys_ctxs = list(sys_ctxs) if isinstance(sys_ctxs, (list, tuple)) else [sys_ctxs]
+                    sys_ctxs.append(time_ctx)
+                except Exception:
+                    pass
             state["sys_ctx"] = sys_ctxs
             state["stages_run"].append("stage2_load_system_prompts")
         except Exception as e:
             sys_ctxs = []
             status_cb("error_stage2", {"error": f"{type(e).__name__}: {e}"})
 
+        # Also expose as an explicit helper to any later stage that wants a ready-made banner
+        state["extra_system_messages"] = [state["system_time_prompt"]]
+
+        try:
+            self._task_inject_countdown_context(state)
+            # Give the model a chance to *create* a task from this message (e.g., “remind me …”)
+            self._stage_task_detect_and_schedule(user_text=user_text, state=state)
+        except Exception:
+            pass
+
         # If not direct planning, do the normal context/quick/clarifier/knowledge flow.
         do_quick = (not skip_quick_phases) and (not direct_plan)
 
-        # ── Stage 3: retrieve & merge context (skip on direct_plan) ──────
+        # ── Stage 3: retrieve & merge context (skip on direct_plan) ──────────
         if not direct_plan:
             try:
                 merged_out = self._stage3_retrieve_and_merge_context(
                     user_text=user_text,
                     user_ctx=user_ctx,
                     sys_ctx=sys_ctxs,
-                    extra_ctx=None,
+                    # Inject the system_time context directly into the merge
+                    extra_ctx=[time_ctx] if time_ctx else None,
                     recall_ids=None,
                 )
                 state.update(merged_out or {})
                 state["stages_run"].append("stage3_retrieve_and_merge_context")
                 state.setdefault("merged", state.get("merged", []))
                 state.setdefault("merged_ids", state.get("merged_ids", [c.context_id for c in state["merged"] if hasattr(c, "context_id")]))
-                status_cb("context_merged", {"merged": len(state.get("merged_ids", []))})
+                status_cb("context_merged", {
+                    "merged": len(state.get("merged_ids", [])),
+                    "now": state["now_local_human"]
+                })
             except Exception as e:
                 state.setdefault("merged", [])
                 state.setdefault("merged_ids", [])
@@ -3562,11 +4314,18 @@ class Assembler:
             # Ensure planner doesn’t crash if it expects these keys
             state.setdefault("merged", [])
             state.setdefault("merged_ids", [])
+            # Even on direct plan, force-inject the time ctx into merged so Stage 7/8 can see it
+            if time_ctx:
+                try:
+                    state["merged"].append(time_ctx)
+                    state["merged_ids"].append(time_ctx.context_id)
+                except Exception:
+                    pass
 
-        # ── Quick-Take (optional) — never when direct_plan=True ──────────
+        # ── Quick-Take (optional) — never when direct_plan=True ─────────────
         if do_quick:
             try:
-                status_cb("quick_take_begin", {})
+                status_cb("quick_take_begin", {"now": state["now_local_human"]})
                 pairs, pair_ids = _ranked_convo_context(state["conversation_id"], top_pairs=6, pool=80)
                 state["quick_take_pairs"] = pairs
                 state["quick_take_pair_ids"] = pair_ids
@@ -3579,6 +4338,8 @@ class Assembler:
                 )
                 qt_ctx = "\n".join(pairs) if pairs else "(no prior context)"
                 msgs = [
+                    # Prepend explicit time banner as a system message
+                    {"role": "system", "content": state["system_time_prompt"]},
                     {"role": "system", "content": qt_sys},
                     {"role": "system", "content": qt_guard},
                     {"role": "system", "content": "Ranked prior U↔A pairs:\n" + qt_ctx},
@@ -3594,7 +4355,11 @@ class Assembler:
                     state["provisional_sent"] = True
                     try:
                         from context import ContextObject
-                        prov = ContextObject.make_stage("quick_take", [state["user_ctx"].context_id], {"text": quick, "pairs": pairs})
+                        prov = ContextObject.make_stage(
+                            "quick_take",
+                            [state["user_ctx"].context_id],
+                            {"text": quick, "pairs": pairs, "now": state["now_local_human"]}
+                        )
                         prov.stage_id = "quick_take"; prov.summary = quick[:250]
                         prov.metadata.update({"conversation_id": state["conversation_id"], "user_id": state["user_id"]})
                         prov.touch(); self.repo.save(prov)
@@ -3606,47 +4371,167 @@ class Assembler:
             except Exception as e:
                 status_cb("quick_take_error", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 4: intent clarification (skip on direct_plan) ──────────
+        # ── Stage 4: intent clarification (skip on direct_plan) ──────────────
         clar_ctx = None
         if not direct_plan:
             try:
                 clar_ctx = self._stage4_intent_clarification(
                     user_text=user_text,
-                    state=state,
-                    on_token=None,   # never stream clarifier (prevents TTS on JSON)
+                    state=state,           # ← has time fields
+                    on_token=None,         # never stream clarifier (prevents TTS on JSON)
                 )
                 state["clar_ctx"] = clar_ctx
                 state["stages_run"].append("stage4_intent_clarification")
-                status_cb("clarified", {"topic": (clar_ctx.summary or "")[:140]})
+                status_cb("clarified", {"topic": (getattr(clar_ctx, "summary", "") or "")[:140], "now": state["now_local_human"]})
             except Exception as e:
                 clar_ctx = None
                 status_cb("error_stage4", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 5: external knowledge (skip on direct_plan) ────────────
+            # If clarifier produced better structure (keywords/notes), re-attempt scheduling
+            try:
+                if clar_ctx:
+                    self._stage_task_detect_and_schedule(
+                        user_text=(clar_ctx.metadata.get("notes") or user_text),
+                        state=state,          # ← time-aware
+                        allow_update=True,    # refine or fill missing due time/title
+                    )
+            except Exception:
+                pass
+
+        # ── Stage 5: external knowledge (skip on direct_plan) ────────────────
         know_ctx = None
         if not direct_plan:
             try:
-                know_ctx = self._stage5_external_knowledge(clar_ctx, state)
+                know_ctx = self._stage5_external_knowledge(clar_ctx, state)  # ← time-aware via state
                 state["know_ctx"] = know_ctx
                 state["stages_run"].append("stage5_external_knowledge")
-                status_cb("knowledge_built", {"snippets": len(state.get("knowledge_snippets", []))})
+                status_cb("knowledge_built", {
+                    "snippets": len(state.get("knowledge_snippets", [])),
+                    "now": state["now_local_human"]
+                })
             except Exception as e:
                 know_ctx = None
                 status_cb("error_stage5", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 5b: planning KG (tool/arg catalog) ─────────────────────
+        # ── Stage 5b: planning KG (tool/arg catalog) ─────────────────────────
         try:
             tools_list = self._stage6_prepare_tools()
             state["tools_list"] = tools_list
+            def _tool_name(obj):
+                if isinstance(obj, str):
+                    return obj
+                if isinstance(obj, dict):
+                    return obj.get("name") or obj.get("tool") or obj.get("semantic_label") or obj.get("id") or "unknown"
+                return str(obj)
+
+            def _tool_features_map(tool_names: list[str]) -> dict[str, list[float]]:
+                """
+                Build LinUCB features:
+                [affinity, success_rate, 1-arg_err, 1-norm_latency, 1.0]
+                from recent repo observations + cheap text affinity to the clarifier notes.
+                """
+                names = list(tool_names)
+                feats: dict[str, list[float]] = {}
+                # quick clarifier text for affinity
+                clar_txt = ""
+                try:
+                    clar = state.get("clar_ctx")
+                    clar_txt = ((clar and clar.metadata.get("notes")) or (state.get("user_text") or ""))[:400]
+                except Exception:
+                    pass
+
+                # vectorize once
+                try:
+                    qv = self.embed_text(clar_txt)
+                except Exception:
+                    qv = np.zeros(768)
+
+                # historical latency mins for normalization
+                latencies: dict[str, list[float]] = {n: [] for n in names}
+                succs: dict[str, list[int]] = {n: [] for n in names}
+                argerrs: dict[str, list[int]] = {n: [] for n in names}
+
+                rows = list(self.repo.query(lambda c: c.component == "tool_output"))
+                rows = rows[-500:]  # recent window
+                for r in rows:
+                    meta = r.metadata or {}
+                    tn = meta.get("tool_name") or _tool_name(meta)
+                    if tn not in latencies:
+                        continue
+                    if meta.get("exception") is None:
+                        succs[tn].append(1)
+                    else:
+                        succs[tn].append(0)
+                        if "argument" in str(meta.get("exception", "")).lower():
+                            argerrs[tn].append(1)
+                        else:
+                            argerrs[tn].append(0)
+                    if "latency_ms" in meta:
+                        latencies[tn].append(float(meta["latency_ms"]))
+
+                # global latency normalization
+                all_lats = [x for arr in latencies.values() for x in arr]
+                hi = (np.percentile(all_lats, 90) if all_lats else 1.0) or 1.0
+
+                for nm in names:
+                    # affinity: crude cosine between clar text and the tool name
+                    try:
+                        tv = self.embed_text(nm)
+                        denom = (np.linalg.norm(qv) * np.linalg.norm(tv)) or 1.0
+                        affinity = float(np.dot(qv, tv) / denom)
+                    except Exception:
+                        affinity = 0.0
+
+                    sr = (sum(succs[nm]) / max(1, len(succs[nm]))) if succs[nm] else 0.5
+                    arg_bad = (sum(argerrs[nm]) / max(1, len(argerrs[nm]))) if argerrs[nm] else 0.2
+                    lat = np.median(latencies[nm]) if latencies[nm] else hi
+                    inv_lat = 1.0 - min(1.0, float(lat) / float(hi or 1.0))
+
+                    feats[nm] = [affinity, sr, 1.0 - arg_bad, inv_lat, 1.0]
+                return feats
+
+            # compute ranked order
+            names = [_tool_name(t) for t in tools_list]
+            feats_map = _tool_features_map(names)
+            ranked_names = self.bandit.rank_tools(names, feats_map)
+
+            name_to_objs: dict[str, list] = {}
+            for t in tools_list:
+                name_to_objs.setdefault(_tool_name(t), []).append(t)
+
+            tools_list_ranked: list = []
+            for n in ranked_names:
+                tools_list_ranked.extend(name_to_objs.pop(n, []))
+
+            # keep any unknowns at the end in their original order
+            for remaining in name_to_objs.values():
+                tools_list_ranked.extend(remaining)
+
+            # persist ranked list for downstream users (state + executor)
+            state["tools_list"] = tools_list_ranked
+            self.tools_list = tools_list_ranked
+
             # Build KG from whatever we have (may be None on direct_plan — should be robust)
-            self._stage5b_build_planning_kg(clar_ctx if not direct_plan else None,
-                                            know_ctx if not direct_plan else None,
-                                            tools_list, state)
+            self._stage5b_build_planning_kg(
+                clar_ctx if not direct_plan else None,
+                know_ctx if not direct_plan else None,
+                tools_list_ranked,  # ← use ranked list
+                state                 # ← time-aware state
+            )
             state["stages_run"].append("stage5b_build_planning_kg")
         except Exception as e:
             status_cb("error_stage5b", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── DIRECT PLAN BYPASS INTO STAGE 7 ───────────────────────────────
+        # === Bandit knobs (planner/executor) — choose once per run ===
+        if hasattr(self, "bandit"):
+            idx_t, temp = self.bandit.choose_knob("planner_temperature", [0.2, 0.4, 0.6, 0.8])
+            idx_r, retries = self.bandit.choose_knob("executor_retries", [1, 2, 3])
+
+            state.setdefault("selected_knobs", {})
+            state["selected_knobs"]["planner_temperature"] = (idx_t, temp)
+            state["selected_knobs"]["executor_retries"]     = (idx_r, retries)
+
+        # ── DIRECT PLAN BYPASS INTO STAGE 7 ───────────────────────────────────
         if direct_plan:
             # Minimal planner seed; also provide pack fields so Stage 8 can read them if it prefers.
             state["planner_mode"] = "direct_from_user"
@@ -3654,21 +4539,29 @@ class Assembler:
             state.setdefault("planner_context_ids", [])
             if state.get("user_ctx") and hasattr(state["user_ctx"], "context_id"):
                 state["planner_context_ids"].append(state["user_ctx"].context_id)
+            # Ensure time context is part of planner context even on bypass
+            if time_ctx and time_ctx.context_id not in state["planner_context_ids"]:
+                state["planner_context_ids"].append(time_ctx.context_id)
+
             state["planner_context_pack"] = {
                 "seed_text": user_text,
                 "merged_ids": state.get("merged_ids", []),
                 "tools_list": state.get("tools_list", []),
                 "conversation_id": state.get("conversation_id"),
+                "system_time_prompt": state["system_time_prompt"],
+                "now_utc_iso": state["now_utc_iso"],
+                "now_local_iso": state["now_local_iso"],
+                "now_epoch": state["now_epoch"],
             }
 
             # Try explicit Stage-7 → Stage-7b, then continue; otherwise hint orchestrator.
             try:
-                status_cb("planner_direct_begin", {"mode": "direct_from_user"})
+                status_cb("planner_direct_begin", {"mode": "direct_from_user", "now": state["now_local_human"]})
 
                 if hasattr(self, "_stage7_planning_summary"):
                     plan_ctx = self._stage7_planning_summary(
                         user_text=user_text,
-                        state=state,
+                        state=state,            # ← includes time fields
                         seed_text=user_text,
                         bypass_context=True,
                     )
@@ -3689,7 +4582,7 @@ class Assembler:
                         "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                         "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                     ])
-                    status_cb("planner_direct_done", {"tools": len(tool_ctxs)})
+                    status_cb("planner_direct_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
                 else:
                     # Orchestrator-only path: set flags so _stage8_orchestrate plans straight from seed.
                     state["bypass_to_stage7"] = True
@@ -3702,16 +4595,16 @@ class Assembler:
                         "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                         "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                     ])
-                    status_cb("planner_direct_done", {"tools": len(tool_ctxs)})
+                    status_cb("planner_direct_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
 
             except Exception as e:
                 status_cb("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
                 state["final"] = (state.get("draft") or user_text or "").strip()
 
         else:
-            # ── Normal Planner+Executor pipeline via Stage 8 orchestrator ──
+            # ── Normal Planner+Executor pipeline via Stage 8 orchestrator ─────
             try:
-                status_cb("planner_begin", {})
+                status_cb("planner_begin", {"now": state["now_local_human"]})
                 final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
                 state["tool_ctxs"] = tool_ctxs
                 state["final"] = final
@@ -3721,12 +4614,12 @@ class Assembler:
                     "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                     "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                 ])
-                status_cb("planner_done", {"tools": len(tool_ctxs)})
+                status_cb("planner_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
             except Exception as e:
                 status_cb("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
                 state["final"] = (state.get("draft") or user_text or "").strip()
 
-        # ── Optional: Stage 12 performance rating ────────────────────────
+        # ── Optional: Stage 12 performance rating ────────────────────────────
         try:
             self._stage12_performance_rating(state)
         except Exception:
@@ -3735,6 +4628,52 @@ class Assembler:
         # ensure _last_state is kept up to date
         try:
             self._last_state = state
+        except Exception:
+            pass
+
+        # -------- RL: register turn & persist --------
+        try:
+            # latency
+            try:
+                start_ts = state.get("start_ts")
+                if start_ts:
+                    state["latency_ms"] = int((time.time() - start_ts) * 1000)
+            except Exception:
+                pass
+
+            # reflection status (cheap heuristic if your stage 9b doesn’t set it)
+            state.setdefault("reflection_status", "OK" if not state.get("errors") else "NEEDS_FIX")
+            state.setdefault("critic_needed", False)
+            state.setdefault("user_feedback", state.get("user_feedback", 0))  # -1/0/+1 if you collect explicit thumbs
+
+            # per-tool updates (one row per unique tool name from this run)
+            tool_updates = []
+            seen = set()
+            for t in (state.get("tool_ctxs") or []):
+                meta = t.metadata or {}
+                name = meta.get("tool_name") or meta.get("call", "").split("(")[0]
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                # quick features for *this* run (falls back to historical ranking next time)
+                succ = 1.0 if meta.get("exception") is None else 0.0
+                arg_ok = 1.0 if ("argument" not in str(meta.get("exception","")).lower()) else 0.0
+                inv_lat = 1.0
+                if "latency_ms" in meta:
+                    inv_lat = max(0.0, min(1.0, 1.0 - float(meta["latency_ms"]) / float(self.cfg.get("latency_budget_ms", 60_000) or 60_000)))
+                feats = [0.0, succ, arg_ok, inv_lat, 1.0]
+                tool_updates.append((name, feats))
+
+            selected_knobs = state.get("selected_knobs", {})
+            prompts_used = dict(getattr(self, "_prompts_used_current", {}) or {})
+
+            self.bandit.register_turn(
+                tool_updates=tool_updates,
+                selected_knobs=selected_knobs,
+                prompts_used=prompts_used,
+                state=state,
+            )
+            self.bandit.finalize_turn()
         except Exception:
             pass
 
