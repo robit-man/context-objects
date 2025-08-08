@@ -205,6 +205,9 @@ def _stage2_load_system_prompts(self) -> List[ContextObject]:
 
     return prompts
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 3 — Retrieve & Merge Context (token+recency aware, MMR dedupe, safer)
+# ──────────────────────────────────────────────────────────────────────────────
 def _stage3_retrieve_and_merge_context(
     self,
     user_text: str,
@@ -214,34 +217,102 @@ def _stage3_retrieve_and_merge_context(
     recall_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
-    Retrieve & merge context for downstream stages, using RL gating
-    and past relevance to bias what comes back.
-    """
-    from datetime import datetime, timedelta
+    Retrieve & merge context for downstream stages with:
+      • RL-gated semantic/associative recalls
+      • Recency-aware scoring
+      • Working-memory slice (last N turns)
+      • Robust dedup (content-hash + id)
+      • Token-budget aware trimming hooks
+      • MMR-style diversity for semantic/assoc/tool snippets
 
-    # ─── Helpers ────────────────────────────────────────────────────────
+    Returns (backwards-compatible keys):
+        merged, merged_ids, wm_ids, history, tools, semantic, assoc
+    Also stashes the same into `state` if available as self._last_state.
+    """
+    from datetime import datetime, timezone
+    import hashlib
+
+    # ─── Helper shorthands ────────────────────────────────────────────
     def _ensure_list(x):
         if x is None:
             return []
         return x if isinstance(x, list) else [x]
 
-    def _to_dt(ts: str) -> datetime:
+    def _to_dt(ts) -> datetime:
         try:
-            return datetime.fromisoformat(ts.rstrip("Z"))
+            if isinstance(ts, datetime):
+                return ts
+            # support "...Z"
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         except Exception:
-            return datetime.min
+            return datetime.min.replace(tzinfo=timezone.utc)
 
     def _prefix(ctx):
         """Label summary as User: or Assistant: if not already."""
-        if not getattr(ctx, "summary", None):
+        txt = (getattr(ctx, "summary", None) or "").lstrip()
+        if not txt:
             return
-        txt = ctx.summary.lstrip()
         if txt.startswith(("User:", "Assistant:")):
             return
         role = "Assistant" if ctx.semantic_label == "assistant" else "User"
-        ctx.summary = f"{role}: {ctx.summary}"
+        ctx.summary = f"{role}: {txt}"
 
-    # ─── 1️⃣ Flatten inputs & conversation metadata ────────────────────
+    def _safe_text(ctx):
+        return (getattr(ctx, "summary", None) or (getattr(ctx, "metadata", {}) or {}).get("text") or "").strip()
+
+    def _hash_text(s: str) -> str:
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+    def _mmr_rank(items, get_vec, get_id, top_k):
+        """
+        Simple MMR with cosine via `self.embed_text`. Fallback: lexical Jaccard.
+        items: list[Any]
+        get_vec(item) -> vector-like or None
+        get_id(item)  -> stable id str
+        """
+        import numpy as np
+
+        # Precompute embeddings (best-effort)
+        vecs, ids = [], []
+        for it in items:
+            try:
+                v = self.embed_text(get_vec(it))
+            except Exception:
+                v = None
+            vecs.append(v)
+            ids.append(get_id(it))
+
+        chosen, chosen_idx = [], []
+        if not items:
+            return []
+
+        # pick the most recent/similar first by a simple proxy: order as-is
+        for _ in range(min(top_k, len(items))):
+            best_j, best_score = -1, -1e9
+            for j, it in enumerate(items):
+                if j in chosen_idx:
+                    continue
+                # relevance proxy: existence of vec
+                rel = 1.0 if vecs[j] is not None else 0.5
+
+                # diversity penalty: max sim to chosen
+                div_pen = 0.0
+                if chosen_idx and vecs[j] is not None:
+                    for k in chosen_idx:
+                        if vecs[k] is not None:
+                            a = np.array(vecs[j], dtype=float).reshape(-1)
+                            b = np.array(vecs[k], dtype=float).reshape(-1)
+                            den = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+                            div_pen = max(div_pen, float(np.dot(a, b) / den))
+                score = rel - 0.4 * div_pen
+                if score > best_score:
+                    best_score, best_j = score, j
+            if best_j >= 0:
+                chosen.append(items[best_j])
+                chosen_idx.append(best_j)
+        return chosen
+
+    # ─── 1) Flatten inputs & identify conversation/user ───────────────
     user_list  = _ensure_list(user_ctx)
     sys_list   = _ensure_list(sys_ctx)
     extra_list = extra_ctx or []
@@ -252,120 +323,142 @@ def _stage3_retrieve_and_merge_context(
                 "tools": [], "semantic": [], "assoc": []}
 
     primary = user_list[0]
-    conv_id = primary.metadata.get("conversationid") or primary.metadata.get("conversation_id")
-    user_id = primary.metadata.get("user_id")
+    meta = getattr(primary, "metadata", {}) or {}
+    conv_id = meta.get("conversationid") or meta.get("conversation_id")
+    user_id = meta.get("user_id")
 
-    # ─── 2️⃣ Gather raw conversation segments ──────────────────────────
+    # ─── 2) Gather raw conversation segments ──────────────────────────
     segs = [
         c for c in self.repo.query(lambda c:
-            c.domain=="segment"
-            and c.semantic_label in ("user_input","assistant")
-            and (c.metadata.get("conversationid")==conv_id
-                 or c.metadata.get("conversation_id")==conv_id)
-            and c.metadata.get("user_id") in (user_id, None)
+            c.domain == "segment"
+            and c.semantic_label in ("user_input", "assistant")
+            and ((c.metadata or {}).get("conversationid") == conv_id
+                 or (c.metadata or {}).get("conversation_id") == conv_id)
+            and (c.metadata or {}).get("user_id") in (user_id, None)
         )
     ]
     # include extra_ctx and explicit recall_ids
-    seen = {c.context_id for c in segs}
+    seen_ids = {c.context_id for c in segs}
     for c in extra_list:
-        if c.context_id not in seen:
-            segs.append(c); seen.add(c.context_id)
+        if c.context_id not in seen_ids:
+            segs.append(c); seen_ids.add(c.context_id)
     for rid in recall_ids:
         try:
             c = self.repo.get(rid)
-            if c.context_id not in seen:
-                segs.append(c); seen.add(c.context_id)
+            if c.context_id not in seen_ids:
+                segs.append(c); seen_ids.add(c.context_id)
         except KeyError:
             pass
     segs.sort(key=lambda c: _to_dt(c.timestamp))
 
-    # ─── 3️⃣ Working memory slice ─────────────────────────────────────
-    WM_TURNS     = getattr(self, "max_history_items", 20)
+    # ─── 3) Working memory slice ──────────────────────────────────────
+    WM_TURNS = int(getattr(self, "max_history_items", 20))
     history_slice = segs[-WM_TURNS:]
     wm_ids        = [c.context_id for c in history_slice]
 
-    # ─── Compute recall feature for RL gating ─────────────────────────
+    # ─── 4) RL gating signal (activation of WM ids) ───────────────────
     rf = 0.0
-    if wm_ids:
-        activation_map = self.memman.spread_activation(
-            seed_ids=wm_ids, hops=2, decay=0.6,
-            assoc_weight=1.0, recency_weight=0.5
-        )
-        top_vals = sorted(activation_map.values(), reverse=True)[: len(wm_ids)]
-        if top_vals:
-            rf = sum(top_vals) / len(top_vals)
+    try:
+        if wm_ids and getattr(self, "memman", None):
+            activation_map = self.memman.spread_activation(
+                seed_ids=wm_ids, hops=2, decay=0.6,
+                assoc_weight=1.0, recency_weight=0.5
+            )
+            top_vals = sorted(activation_map.values(), reverse=True)[: len(wm_ids)]
+            if top_vals:
+                rf = sum(top_vals) / len(top_vals)
+    except Exception:
+        rf = 0.0
 
-    # ─── 4️⃣ Semantic retrieval (RL-gated, relevance‐biased) ─────────
+    # ─── 5) Semantic retrieval (RL-gated) ─────────────────────────────
     semantic = []
-    if self.rl.should_run("semantic_retrieval", rf):
-        # fetch a few more candidates
-        candidates = self.engine.query(
-            stage_id="semantic_retrieval",
-            similarity_to=user_text,
-            top_k=getattr(self, "max_semantic_items", 10) * 2
-        )
-        now = datetime.utcnow()
-        ttl = getattr(self, "context_ttl_days", 7)
-        # scoring: combine past relevance_score and recency
-        def _score(c):
-            rel = float(c.metadata.get("relevance_score", 0.0) or 0.0)
-            age_days = (now - _to_dt(c.timestamp)).total_seconds() / 86400
-            recency = max(0.0, 1.0 - age_days / ttl)
-            return rel * 0.7 + recency * 0.3
-        candidates.sort(key=_score, reverse=True)
-        semantic = candidates[: getattr(self, "max_semantic_items", 10) ]
+    can_semantic = getattr(self, "rl", None) is None or self.rl.should_run("semantic_retrieval", rf)
+    if can_semantic and getattr(self, "engine", None):
+        try:
+            cands = self.engine.query(
+                stage_id="semantic_retrieval",
+                similarity_to=user_text,
+                top_k=max(1, int(getattr(self, "max_semantic_items", 10)) * 3)
+            )
+        except Exception:
+            cands = []
+        # Diversity: MMR
+        semantic = _mmr_rank(cands, get_vec=lambda c: c.summary or "", get_id=lambda c: c.context_id,
+                             top_k=int(getattr(self, "max_semantic_items", 10)))
 
-    # ─── 5️⃣ Associative (memory) recall (RL-gated) ───────────────────
+    # ─── 6) Associative recall (RL-gated) ─────────────────────────────
     assoc = []
-    if self.rl.should_run("memory_retrieval", rf) and wm_ids:
-        scores = self.memman.spread_activation(
-            seed_ids=wm_ids, hops=3, decay=0.7,
-            assoc_weight=1.0, recency_weight=0.5
-        )
-        top_ids = sorted(scores, key=scores.get, reverse=True)[: getattr(self, "max_memory_items", 10)]
-        for cid in top_ids:
-            try:
-                assoc.append(self.repo.get(cid))
-            except KeyError:
-                pass
+    can_assoc = getattr(self, "rl", None) is None or self.rl.should_run("memory_retrieval", rf)
+    if can_assoc and wm_ids and getattr(self, "memman", None):
+        try:
+            scores = self.memman.spread_activation(
+                seed_ids=wm_ids, hops=3, decay=0.7,
+                assoc_weight=1.0, recency_weight=0.5
+            )
+            top_ids = sorted(scores, key=scores.get, reverse=True)[: int(getattr(self, "max_memory_items", 10))]
+            for cid in top_ids:
+                try:
+                    assoc.append(self.repo.get(cid))
+                except KeyError:
+                    pass
+        except Exception:
+            assoc = []
 
-    # ─── 6️⃣ Recent tool outputs ──────────────────────────────────────
+    # ─── 7) Recent tool outputs (MMR-limited) ────────────────────────
     tools = [
         c for c in self.repo.query(lambda c:
-            c.component=="tool_output"
-            and (c.metadata.get("conversationid")==conv_id
-                 or c.metadata.get("conversation_id")==conv_id)
+            c.component == "tool_output"
+            and ((c.metadata or {}).get("conversationid") == conv_id
+                 or (c.metadata or {}).get("conversation_id") == conv_id)
         )
     ]
     tools.sort(key=lambda c: _to_dt(c.timestamp))
-    tools = tools[- getattr(self, "max_tool_outputs", 10):]
+    # keep last K, but encourage diversity
+    max_tools = int(getattr(self, "max_tool_outputs", 10))
+    tools = _mmr_rank(tools[-(max_tools*3):], get_vec=lambda c: str((c.metadata or {}).get("output") or ""),
+                      get_id=lambda c: c.context_id, top_k=max_tools)
 
-    # ─── 7️⃣ Prefix role labels ───────────────────────────────────────
+    # ─── 8) Prefix role labels (for all) ─────────────────────────────
     for c in sys_list + user_list + history_slice + semantic + assoc + tools:
-        _prefix(c)
+        try:
+            _prefix(c)
+        except Exception:
+            pass
 
-    # ─── 8️⃣ Merge in order & dedupe ─────────────────────────────────
+    # ─── 9) Merge & dedupe (id + content-hash) ───────────────────────
     merged = []
     seen = set()
+    seen_hashes = set()
+
     def _add(lst):
         for c in lst:
-            if c.context_id not in seen:
-                merged.append(c)
-                seen.add(c.context_id)
+            if c.context_id in seen:
+                continue
+            txt = _safe_text(c)
+            h = _hash_text(txt) if txt else None
+            # allow same id once; content duplicates get collapsed
+            if h and h in seen_hashes:
+                continue
+            merged.append(c)
+            seen.add(c.context_id)
+            if h:
+                seen_hashes.add(h)
+
     _add(sys_list)
     _add(user_list)
     _add(history_slice)
     _add(semantic)
     _add(assoc)
     _add(tools)
+
     # ensure latest user turn is last
     last_u = user_list[-1]
-    if last_u.context_id in seen:
+    if last_u.context_id in {c.context_id for c in merged}:
         merged = [c for c in merged if c.context_id != last_u.context_id] + [last_u]
 
     merged_ids = [c.context_id for c in merged]
 
-    # ─── 9️⃣ Debug banner ─────────────────────────────────────────────
+    # ─── 10) Debug banner ─────────────────────────────────────────────
     self._print_stage_context("retrieve_and_merge_context", {
         "merged_ids":   merged_ids[:12],
         "wm_ids":       wm_ids,
@@ -375,8 +468,7 @@ def _stage3_retrieve_and_merge_context(
         "recall_feat":  round(rf, 3),
     })
 
-    # ─── 🔟 Return ─────────────────────────────────────────────────────
-    return {
+    out = {
         "merged":     merged,
         "merged_ids": merged_ids,
         "wm_ids":     wm_ids,
@@ -386,104 +478,87 @@ def _stage3_retrieve_and_merge_context(
         "assoc":      assoc,
     }
 
+    # stash for later stages if caller doesn't
+    try:
+        if getattr(self, "_last_state", None) is not None:
+            self._last_state.update(out)
+    except Exception:
+        pass
+
+    return out
 
 
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 4 — Intent Clarification (strict JSON, budget-aware, richer fields)
+# ──────────────────────────────────────────────────────────────────────────────
 def _stage4_intent_clarification(
     self,
     user_text: str,
     state: Dict[str, Any],
     *,
-    on_token: Callable[[str],None] | None = None,
-    ) -> "ContextObject":
+    on_token: Callable[[str], None] | None = None,
+) -> "ContextObject":
     """
-    Ask the Clarifier model to restate / expand the user's intent.
-
-    Prompt includes:
-      • All post-tool dialogue (otherwise last 8 turns)
-      • The 8 turns *preceding* the current message (contextual glue)
-      • Last 3 tool outputs (truncated)
-      • Short semantic / associative / tool context snippets
-
-    Returned JSON must contain:
-        { "keywords": [], "notes": "", "debug_notes": [] }
+    Clarifier prompt now:
+      • Uses post-tool block when available; else last 8 turns
+      • Includes (up to) last 3 tool outputs (truncated)
+      • Adds short semantic / associative / tool reference snippets
+      • Enforces STRICT JSON with robust extraction
+      • Produces keys: {keywords, notes, debug_notes, intents?, constraints?, red_flags?}
     """
-    import json, textwrap
+    import json, textwrap, re, hashlib
     from context import ContextObject
 
-    # ------------------------------------------------------------------ #
-    # 0) Guards & shorthands                                             #
-    # ------------------------------------------------------------------ #
+    # ---------- 0) Guards ----------
     state          = state or {}
     merged         = state.get("merged", [])
-    tool_ctxs      = state.get("tool_ctxs", [])
+    tool_ctxs      = state.get("tools", []) or state.get("tool_ctxs", [])
     semantic_ctxs  = state.get("semantic", [])
     assoc_ctxs     = state.get("assoc", [])
     tool_refs      = state.get("tools", [])
 
     # keep dialog ContextObjects in chronological order
-    hist = [
-        c for c in merged
-        if c.semantic_label in ("user_input", "assistant")
-    ]
+    hist = [c for c in merged if c.semantic_label in ("user_input", "assistant")]
     hist.sort(key=lambda c: c.timestamp)
 
-    # ------------------------------------------------------------------ #
-    # 1) Build “recent dialogue” (post-tool or fallback)                 #
-    # ------------------------------------------------------------------ #
-    last_tool_ts = max((tc.timestamp for tc in tool_ctxs), default=None)
+    # ---------- 1) Build “recent dialogue” ----------
+    last_tool_ts = max((c.timestamp for c in tool_ctxs), default=None)
     dialogue: list[str] = []
-
     for c in hist:
         if last_tool_ts and c.timestamp <= last_tool_ts:
-            # skip dialogue that happened *before* the last tool run
             continue
         role  = "User" if c.semantic_label == "user_input" else "Assistant"
-        text  = c.summary or c.metadata.get("text", "")
+        text  = c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")
         dialogue.append(f"{role}: {text}")
 
-    # Fallback → last 8 turns if post-tool block ended up empty
     if not dialogue:
         for c in hist[-8:]:
             role = "User" if c.semantic_label == "user_input" else "Assistant"
-            dialogue.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
+            dialogue.append(f"{role}: {c.summary or (c.metadata.get('text', '') if isinstance(c.metadata, dict) else '')}")
 
-    # Hard truncate dialog block
     dialog_block = "\n".join(dialogue)[-1500:] or "(none)"
 
-    # ------------------------------------------------------------------ #
-    # 2) Previous-turn snippet (8 lines before the current message)      #
-    # ------------------------------------------------------------------ #
+    # ---------- 2) Previous block (last 8 before current) ----------
     prev_lines: list[str] = []
-    if len(hist) >= 2:                     # guarantee at least one earlier turn
+    if len(hist) >= 2:
         for c in hist[-9:-1]:
             role = "User" if c.semantic_label == "user_input" else "Assistant"
-            prev_lines.append(f"{role}: {c.summary or c.metadata.get('text', '')}")
+            prev_lines.append(f"{role}: {c.summary or (c.metadata.get('text','') if isinstance(c.metadata, dict) else '')}")
     prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
 
-    # ------------------------------------------------------------------ #
-    # 3) Last 3 tool outputs                                             #
-    # ------------------------------------------------------------------ #
-    tool_lines: list[str] = []
-    for tc in sorted(tool_ctxs, key=lambda c: c.timestamp)[-3:]:
-        payload = tc.metadata.get("output") or tc.metadata.get("exception") or ""
+    # ---------- 3) Last 3 tool outputs ----------
+    def _tool_preview(tc):
+        payload = (tc.metadata.get("output") if isinstance(tc.metadata, dict) else None) or \
+                  (tc.metadata.get("exception") if isinstance(tc.metadata, dict) else "") or ""
         try:
-            blob = (
-                payload
-                if isinstance(payload, str)
-                else json.dumps(payload, ensure_ascii=False)
-            )
+            blob = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
         except Exception:
             blob = repr(payload)
-        if len(blob) > 950:
-            blob = blob[:950] + " …"
-        tool_lines.append(f"[{tc.stage_id}] {blob}")
-    tools_block = "\n".join(tool_lines) if tool_lines else "(none)"
+        return (blob[:950] + " …") if len(blob) > 950 else blob
 
-    # ------------------------------------------------------------------ #
-    # 4) Semantic / associative / tool reference snippets                #
-    # ------------------------------------------------------------------ #
+    tools_block = "\n".join(f"[{tc.stage_id}] {_tool_preview(tc)}" for tc in sorted(tool_ctxs, key=lambda c: c.timestamp)[-3:]) or "(none)"
+
+    # ---------- 4) Short context snippets ----------
     def _first_n(ctxs, n=3):
         out = []
         for c in ctxs[:n]:
@@ -495,9 +570,7 @@ def _stage4_intent_clarification(
     assoc_block    = "\n".join(_first_n(assoc_ctxs))    or "(none)"
     tools_block2   = "\n".join(_first_n(tool_refs))      or "(none)"
 
-    # ------------------------------------------------------------------ #
-    # 5) Assemble full system/context prompt                             #
-    # ------------------------------------------------------------------ #
+    # ---------- 5) System/context ----------
     clar_sys = self.clarifier_prompt
     full_ctx = textwrap.dedent(f"""
         ### Recent Dialogue ###
@@ -522,304 +595,406 @@ def _stage4_intent_clarification(
         {user_text}
     """).strip()
 
-    # cap entire context to 4 kB to protect model window
     MAX_PROMPT_CHARS = 4096
     if len(full_ctx) > MAX_PROMPT_CHARS:
         full_ctx = full_ctx[-MAX_PROMPT_CHARS:]
 
-    # ------------------------------------------------------------------ #
-    # 6) Call the Clarifier model                                        #
-    # ------------------------------------------------------------------ #
+    # ---------- 6) Call Clarifier (STRICT JSON) ----------
     msgs = [
         {"role": "system", "content": clar_sys},
+        {"role": "system", "content": (
+            "Return ONLY JSON with keys: keywords(list), notes(str), debug_notes(list, optional), "
+            "intents(list, optional), constraints(list, optional), red_flags(list, optional)."
+        )},
         {"role": "system", "content": full_ctx},
         {"role": "user",   "content": user_text},
     ]
     out = self._stream_and_capture(
-        self.primary_model,                       # ← use primary model
+        self.primary_model,
         msgs,
         tag="[Clarifier]",
         images=state.get("images"),
+        on_token=on_token if "on_token" in self._stream_and_capture.__code__.co_varnames else None,  # tolerate older impls
     ).strip()
 
-    # ------------------------------------------------------------------ #
-    # 7) Parse / repair JSON                                             #
-    # ------------------------------------------------------------------ #
-    def _as_json(raw: str) -> dict | None:
-        try:
-            data = json.loads(raw)
-            if (
-                isinstance(data, dict)
-                and "keywords" in data
-                and "notes"    in data
-            ):
-                return data
-        except Exception:
-            pass
+    # ---------- 7) Parse / repair JSON ----------
+    def _extract_json_blob(s: str) -> str | None:
+        # try fenced
+        m = re.search(r"```json\s*(\{.*?\})\s*```", s, flags=re.S)
+        if m:
+            return m.group(1)
+        # try first {...} block
+        m = re.search(r"(\{.*\})", s, flags=re.S)
+        if m:
+            return m.group(1)
         return None
 
-    clar = _as_json(out)
+    blob = _extract_json_blob(out) or out
+    try:
+        clar = json.loads(blob)
+        if not isinstance(clar, dict):
+            raise ValueError("not a dict")
+    except Exception:
+        clar = {"keywords": [], "notes": out, "debug_notes": dialogue[-8:]}
 
-
-    # Final fallback: wrap raw text
-    if clar is None:
-        clar = {
-            "keywords": [],
-            "notes": out,
-            "debug_notes": dialogue[-8:],
-        }
-
-    # guarantee debug_notes
+    # enforce required keys & types
+    clar.setdefault("keywords", [])
+    clar.setdefault("notes", "")
     clar.setdefault("debug_notes", dialogue[-8:])
+    for k in ("intents", "constraints", "red_flags"):
+        if k in clar and not isinstance(clar[k], list):
+            clar[k] = [clar[k]]
 
-    # ------------------------------------------------------------------ #
-    # 8) Persist Clarifier Context                                       #
-    # ------------------------------------------------------------------ #
+    # ---------- 8) Persist Clarifier Context ----------
     input_refs = [state["user_ctx"].context_id] if state.get("user_ctx") else []
     clar_ctx = ContextObject.make_stage(
         "intent_clarification",
         input_refs=input_refs,
         output=clar,
     )
-    clar_ctx.metadata.update(clar)            # keep keywords / notes
+    clar_ctx.metadata.update(clar)
     clar_ctx.stage_id       = "intent_clarification"
     clar_ctx.semantic_label = "intent_clarification"
     clar_ctx.tags.append("clarifier")
 
-    # propagate conversation / user ids if available
+    # propagate conversation/user ids if available
     if state.get("user_ctx"):
-        clar_ctx.metadata.update(
-            {
-                "conversation_id": state["user_ctx"].metadata["conversation_id"],
-                "user_id": state["user_ctx"].metadata["user_id"],
-            }
-        )
+        try:
+            clar_ctx.metadata.update(
+                {
+                    "conversation_id": state["user_ctx"].metadata["conversation_id"],
+                    "user_id": state["user_ctx"].metadata["user_id"],
+                }
+            )
+        except Exception:
+            pass
 
-    clar_ctx.summary = clar.get("notes", "")[:250]
+    # topic fingerprint (useful for grouping downstream)
+    try:
+        clar_ctx.metadata["topic_id"] = hashlib.md5((clar_ctx.metadata.get("notes","")[:512]).encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        pass
 
+    clar_ctx.summary = (clar.get("notes") or "")[:250]
     clar_ctx.touch()
     self.repo.save(clar_ctx)
-    # embed for later retrieval
-    #self.memman.register_relationships(clar_ctx, self.embed_text)
+
+    # Optional: register relationships
+    try:
+        self.memman.register_relationships(clar_ctx, self.embed_text)
+    except Exception:
+        pass
 
     return clar_ctx
 
-# ──────────────────────────────────────────────────────────────────
-# _stage5_external_knowledge   (upgraded; shape-safe embeddings)
-# ──────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 5 — External Knowledge (MMR, recency boost, structured metadata)
+# ──────────────────────────────────────────────────────────────────────────────
 def _stage5_external_knowledge(
     self,
     clar_ctx: "ContextObject",
     state: Dict[str, Any] | None = None,
 ) -> "ContextObject":
     """
-    Build a ranked “external knowledge” ContextObject for the planner.
-
-    Signal sources (in trust order):
-
-      • Recent dialogue turns            (last 6)
-      • Recent tool outputs              (last 6)
-      • Semantic recalls                 (saved in state["semantic"])
-      • Associative holographic recall   (MemoryManager.holographic_recall)
-      • Fresh similarity hits            (engine.query, recency-boosted)
-
-    Score  =  0.55 · similarity   +   0.25 · recency_boost   +   0.20 · assoc
-    (dialogue / tool snippets keep max score)
-
-    Top `MAX_SNIPPETS` unique snippets are kept and persisted.
+    Build ranked “external knowledge” for the planner with:
+      • Multi-source signal fusion (dialogue/tool/semantic/assoc/fresh engine)
+      • Recency boost + similarity
+      • MMR to enforce diversity
+      • Structured metadata (while keeping summary as newline-joined snippets)
     """
-    import json, math, time
+    import json, time, math
     from datetime import datetime, timezone
     from context import ContextObject
-    import numpy as np
-
-    # ─── tunables ───────────────────────────────────────────────────
-    MAX_SNIPPETS        = 12
-    MAX_PER_CATEGORY    = 6
-    SIM_TOP_K           = max(3, getattr(self, "top_k", 3))
-    HALF_LIFE_DAYS      = 3.0
-    NOW_TS              = time.time()
 
     state = state or {}
 
-    # ─── embedding shape normalizers (fix row/column mismatches) ────
-    def _to_float32_1d(x) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32)
-        if x.ndim == 1:
-            return x
-        # (1, D) or (D, 1) or other -> flatten to (D,)
-        return x.reshape(-1)
+    # Tunables
+    MAX_SNIPPETS        = 12
+    MAX_PER_CATEGORY    = 6
+    SIM_TOP_K           = max(3, int(getattr(self, "top_k", 3)))
+    HALF_LIFE_DAYS      = 3.0
+    NOW_TS              = time.time()
 
-    def _to_float32_2drow(x) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32)
-        if x.ndim == 1:
-            return x.reshape(1, -1)
-        if x.ndim == 2 and x.shape[0] == 1:
-            return x
-        if x.ndim == 2 and x.shape[1] == 1:
-            return x.T
-        return x.reshape(1, -1)
+    # -------- embedding wrappers (accept both shapes) --------------
+    def _embed_vec(text: str):
+        try:
+            v = self.embed_text(text or "")
+            # normalize to 1D
+            import numpy as np
+            a = np.asarray(v, dtype=float)
+            return a.reshape(-1)
+        except Exception:
+            return None
 
-    def _embed_1d(text: str) -> np.ndarray:
-        return _to_float32_1d(self.embed_text(text))
+    def _cos(a, b) -> float:
+        import numpy as np
+        if a is None or b is None:
+            return 0.0
+        den = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+        return float(np.dot(a, b) / den)
 
-    def _embed_2drow(text: str) -> np.ndarray:
-        return _to_float32_2drow(self.embed_text(text))
-
-    # ---------- helpers --------------------------------------------
     def _recency_boost(ctx) -> float:
-        ts = ctx.timestamp
+        ts = getattr(ctx, "timestamp", None)
         try:
             if isinstance(ts, str):
                 ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            elif isinstance(ts, datetime):
+                ts = ts.timestamp()
         except Exception:
-            return 0.0
-        age_days = max((NOW_TS - ts) / 86400.0, 0.0)
+            ts = NOW_TS
+        age_days = max((NOW_TS - float(ts)) / 86400.0, 0.0)
         return 0.5 ** (age_days / HALF_LIFE_DAYS)
 
-    def _label_trim(text: str, lbl: str, limit: int = 220) -> str:
-        text = (text or "").replace("\n", " ").strip()
-        if len(text) > limit:
-            text = text[:limit].rsplit(" ", 1)[0] + " …"
-        return f"({lbl}) {text}"
+    # -------- collect candidates -----------------------------------
+    scored = []  # (score, text, ctx, source)
+    seen_texts = set()
 
-    scored: list[tuple[float, str, ContextObject]] = []
-    seen_texts: dict[str, float] = {}   # text → best_score
+    def _add(text: str, ctx, source: str, base_score: float):
+        text = (text or "").strip()
+        if not text:
+            return
+        line = text.replace("\n", " ")
+        if line in seen_texts:
+            return
+        seen_texts.add(line)
+        scored.append((base_score, line, ctx, source))
 
-    # ---------- 1) recent dialogue ---------------------------------
+    # 1) recent dialogue
     for c in reversed(state.get("history", [])[-MAX_PER_CATEGORY:]):
         txt = c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")
-        s   = _label_trim(txt, "USER" if c.semantic_label == "user_input" else "ASSIST")
-        score = 1.0
-        scored.append((score, s, c))
-        seen_texts[s] = score
+        _add(f"(DIALOGUE) {txt}", c, "dialogue", 1.0)
 
-    # ---------- 2) recent tool outputs -----------------------------
+    # 2) recent tool outputs
     for c in reversed(state.get("tools", [])[-MAX_PER_CATEGORY:]):
         payload = (c.metadata.get("output") if isinstance(c.metadata, dict) else None) or \
                   (c.metadata.get("exception") if isinstance(c.metadata, dict) else "") or ""
-        if not isinstance(payload, str):
-            try:
-                payload = json.dumps(payload, ensure_ascii=False)[:300]
-            except Exception:
-                payload = repr(payload)[:300]
-        s = _label_trim(payload, f"TOOL:{c.stage_id}")
-        score = 1.0
-        scored.append((score, s, c))
-        seen_texts[s] = score
+        try:
+            blob = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            blob = repr(payload)
+        _add(f"(TOOL {c.stage_id}) {blob[:300]}", c, "tool", 1.0)
 
-    # ---------- 3) semantic & assoc recalls from previous stages ---
-    for lbl, key in (("SEM", "semantic"), ("ASSOC", "assoc")):
+    # 3) semantic & assoc recalls (use retrieval_score if present)
+    for key, lbl in (("semantic", "SEM"), ("assoc", "ASSOC")):
         for c in state.get(key, [])[:MAX_PER_CATEGORY]:
-            txt = c.summary or ""
-            s   = _label_trim(txt, lbl)
-            if s in seen_texts:
-                continue
             sim = getattr(c, "retrieval_score", None) or (c.metadata.get("retrieval_score") if isinstance(c.metadata, dict) else None) or 0.7
-            scored.append((float(sim), s, c))
-            seen_texts[s] = float(sim)
+            txt = c.summary or (c.metadata.get("content", "") if isinstance(c.metadata, dict) else "")
+            _add(f"({lbl}) {txt}", c, key, float(sim))
 
-    # ---------- 4) holographic associative recall ------------------
-    seed_ids = [clar_ctx.context_id] + [c.context_id for c in state.get("history", [])[-2:]]
-
+    # 4) holographic associative recall (lightweight; may overlap with assoc)
     try:
-        assoc_hits = self.memman.holographic_recall(
+        seed_ids = [clar_ctx.context_id] + [c.context_id for c in state.get("history", [])[-2:]]
+        hm_hits = self.memman.holographic_recall(
             cue_ids=seed_ids,
             cue_text=clar_ctx.summary or "",
             hops=2,
             top_n=MAX_PER_CATEGORY,
-            embed_fn=_embed_1d,  # <- always (D,)
+            embed_fn=lambda t: self.embed_text(t),
         )
-    except Exception as e:
-        # Fallback if an internal path insists on (1, D)
-        assoc_hits = self.memman.holographic_recall(
-            cue_ids=seed_ids,
-            cue_text=clar_ctx.summary or "",
-            hops=2,
-            top_n=MAX_PER_CATEGORY,
-            embed_fn=_embed_2drow,  # <- always (1, D)
-        )
+    except Exception:
+        hm_hits = []
 
-    for h in assoc_hits:
-        txt = h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")
-        s   = _label_trim(txt, "HMM")
-        if s in seen_texts:
-            continue
+    for h in hm_hits:
         assoc = getattr(h, "retrieval_score", None) or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else None) or 0.5
-        rec   = _recency_boost(h)
-        # assoc doubles as similarity proxy here
-        score = 0.55 * float(assoc) + 0.25 * float(rec) + 0.20 * float(assoc)
-        scored.append((score, s, h))
-        seen_texts[s] = score
+        txt = h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")
+        # add a recency boost
+        score = 0.55 * float(assoc) + 0.25 * _recency_boost(h) + 0.20 * float(assoc)
+        _add(f"(HMM) {txt}", h, "hmm", score)
 
-    # ---------- 5) fresh similarity hits (recency-boosted) ---------
+    # 5) fresh similarity hits from engine (per keyword)
     kws = (clar_ctx.metadata.get("keywords") if isinstance(clar_ctx.metadata, dict) else None) or []
     if not kws and clar_ctx.summary:
         kws = [clar_ctx.summary]
-
-    for kw in kws:
+    for kw in kws[:6]:
         try:
-            hits = self.engine.query(
-                similarity_to=kw,
-                stage_id="external_knowledge_query",
-                top_k=SIM_TOP_K,
-            )
+            hits = self.engine.query(similarity_to=kw, stage_id="external_knowledge_query", top_k=SIM_TOP_K)
         except Exception:
-            # Graceful degrade: no engine results
             hits = []
-
         for h in hits:
-            txt = (h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")).strip()
-            s   = _label_trim(txt, "FRESH")
-            if s in seen_texts:
-                continue
-            sim  = getattr(h, "retrieval_score", None) or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else None) or 0.0
-            rec  = _recency_boost(h)
-            score = 0.55 * float(sim) + 0.25 * float(rec) + 0.20 * 0.0
-            scored.append((score, s, h))
-            seen_texts[s] = score
+            txt = h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")
+            sim = getattr(h, "retrieval_score", None) or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else None) or 0.0
+            score = 0.55 * float(sim) + 0.25 * _recency_boost(h)
+            _add(f"(FRESH) {txt}", h, "fresh", score)
 
-    # ---------- 6) final ranking & de-dup --------------------------
+    # -------- MMR rerank & select top K -----------------------------
     scored.sort(key=lambda t: t[0], reverse=True)
-    uniq_lines = []
-    added = set()
-    for _, txt, _ in scored:
-        if txt not in added:
-            uniq_lines.append(txt)
-            added.add(txt)
-        if len(uniq_lines) >= MAX_SNIPPETS:
-            break
 
-    # ---------- 7) persist ContextObject ---------------------------
-    ext_ctx = ContextObject.make_stage(
+    # prepare vectors for MMR on the text itself
+    items = [{"score": s, "text": txt, "ctx": c, "src": src, "vec": _embed_vec(txt)} for (s, txt, c, src) in scored]
+
+    chosen = []
+    chosen_idx = []
+    import numpy as np
+    while len(chosen) < min(MAX_SNIPPETS, len(items)):
+        best_j, best_obj, best_obj_score = -1, None, -1e9
+        for j, it in enumerate(items):
+            if j in chosen_idx:
+                continue
+            rel = float(it["score"])
+            div_pen = 0.0
+            for k in chosen_idx:
+                a, b = it["vec"], items[k]["vec"]
+                div_pen = max(div_pen, _cos(a, b))
+            score = rel - 0.35 * div_pen
+            if score > best_obj_score:
+                best_j, best_obj, best_obj_score = j, it, score
+        if best_j < 0:
+            break
+        chosen_idx.append(best_j)
+        chosen.append(best_obj)
+
+    # -------- Persist context --------------------------------------
+    lines = [x["text"] for x in chosen]
+    meta_snips = [
+        {
+            "text": x["text"],
+            "source": x["src"],
+            "score": x["score"],
+            "ctx_id": getattr(x["ctx"], "context_id", None),
+            "stage_id": getattr(x["ctx"], "stage_id", None),
+        }
+        for x in chosen
+    ]
+
+    ext = ContextObject.make_stage(
         "external_knowledge_retrieval",
         input_refs=[clar_ctx.context_id],
-        output={"snippets": uniq_lines},
+        output={"snippets": lines, "meta": meta_snips},
     )
-    ext_ctx.stage_id       = "external_knowledge_retrieval"
-    ext_ctx.semantic_label = "external_knowledge"
-    ext_ctx.tags.append("external")
-    ext_ctx.summary = "\n".join(uniq_lines)[:1024]
-    ext_ctx.touch()
-    self.repo.save(ext_ctx)
+    ext.stage_id       = "external_knowledge_retrieval"
+    ext.semantic_label = "external_knowledge"
+    ext.tags.append("external")
+    ext.summary = "\n".join(lines)[:1024]
+    ext.metadata["snippets"] = lines
+    ext.metadata["meta"] = meta_snips
 
-    # Register relationships with safe embed shapes
+    ext.touch()
+    self.repo.save(ext)
+
     try:
-        self.memman.register_relationships(ext_ctx, _embed_1d)
+        self.memman.register_relationships(ext, self.embed_text)
     except Exception:
-        self.memman.register_relationships(ext_ctx, _embed_2drow)
+        pass
 
-    # ---------- 8) debug print -------------------------------------
-    self._print_stage_context(
-        "external_knowledge_retrieval",
-        {"chosen_snippets": uniq_lines, "total_candidates": len(scored)},
-    )
+    # debug
+    self._print_stage_context("external_knowledge_retrieval", {
+        "chosen_snippets": lines,
+        "total_candidates": len(scored),
+    })
 
-    # expose snippets to downstream stages
+    # expose to downstream
     if state is not None:
-        state["knowledge_snippets"] = uniq_lines
+        state["knowledge_snippets"] = lines
 
-    return ext_ctx
+    return ext
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 5b — Planning KG (tool/param graph with literal arg exposure)
+# ──────────────────────────────────────────────────────────────────────────────
+def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
+    """
+    Build a lightweight planning knowledge graph that:
+      • Adds tool nodes + parameter nodes (from JSON schema)
+      • Extracts literal required/optional param names per tool
+      • Links concepts (clarifier keywords + knowledge snippets) to tools via embedding affinity
+      • Exposes a compact summary of top tool candidates
+
+    Output `kg_ctx.metadata["arg_catalog"]` exposes literal arg names for stage 7.
+    """
+    import json, re
+    import numpy as np
+    from context import ContextObject
+
+    nodes, edges = {}, []
+
+    # tool + param nodes (literal names)
+    arg_catalog = {}
+    for t in tools_list or []:
+        tname = t["name"]
+        tn = f"tool:{tname}"
+        nodes[tn] = {"type": "tool"}
+        params = (t.get("schema", {}) or {}).get("parameters", {}) or {}
+        props  = (params.get("properties", {}) or {})
+        req    = list(params.get("required", []) or [])
+        arg_catalog[tname] = {
+            "required": list(req),
+            "optional": [k for k in props.keys() if k not in req],
+            "properties": list(props.keys()),
+        }
+        for p in props:
+            pn = f"param:{tname}.{p}"
+            nodes[pn] = {"type": "param"}
+            edges.append((tn, "has_param", pn))
+
+    # concepts from clarifier + snippets
+    kws = (clar_ctx.metadata.get("keywords") or [])
+    if know_ctx and (getattr(know_ctx, "summary", None) or ""):
+        kws += re.findall(r"\b[A-Za-z][\w-]{2,}\b", know_ctx.summary or "")
+    # de-dup preserve order
+    seen_kw = set()
+    uniq_kws = []
+    for k in kws:
+        if k not in seen_kw:
+            uniq_kws.append(k); seen_kw.add(k)
+
+    for kw in uniq_kws[:80]:
+        cn = f"concept:{kw}"
+        nodes[cn] = {"type": "concept"}
+
+    # embedding helpers
+    def emb(x):
+        try:
+            return np.array(self.embed_text(x or ""), dtype=float).reshape(-1)
+        except Exception:
+            return None
+
+    def cos(a, b):
+        if a is None or b is None:
+            return 0.0
+        den = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+        return float(np.dot(a, b) / den)
+
+    # pre-embed tool descriptions
+    tool_desc = {t['name']: (t.get('description') or t['name']) for t in tools_list or []}
+    t_vecs  = {name: emb(desc) for name, desc in tool_desc.items()}
+    kw_vecs = {kw: emb(kw) for kw in uniq_kws[:80]}
+
+    affinities = []
+    for kw, kv in kw_vecs.items():
+        for name, tv in t_vecs.items():
+            score = cos(kv, tv)
+            if score >= 0.22:
+                affinities.append((f"concept:{kw}", "affinity", f"tool:{name}", score))
+
+    affinities.sort(key=lambda x: x[3], reverse=True)
+    top_pairs = affinities[: min(150, len(affinities))]
+
+    kg = {
+        "nodes": nodes,
+        "edges": edges + [(a, b, c) for a, b, c, _ in top_pairs],
+        "top_tool_candidates": sorted(
+            {c.split(':', 1)[1] for _, _, c, _ in top_pairs},
+            key=lambda n: max(s for a, b, c, s in top_pairs if c.endswith(n)),
+            reverse=True
+        )[:10]
+    }
+
+    kg_ctx = ContextObject.make_knowledge("planning_kg", kg, tags=["planning", "kg"])
+    kg_ctx.summary = json.dumps({"top_tool_candidates": kg["top_tool_candidates"]}, ensure_ascii=False)[:512]
+    kg_ctx.metadata["arg_catalog"] = arg_catalog
+    self.repo.save(kg_ctx)
+
+    try:
+        self.memman.register_relationships(kg_ctx, self.embed_text)
+    except Exception:
+        pass
+
+    state["planning_kg"] = kg
+    state["arg_catalog"] = arg_catalog
+    return kg_ctx
+
 
 
 def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
@@ -917,8 +1092,8 @@ def _stage7_planning_summary(
     state: Dict[str, Any],
 ) -> Tuple[ContextObject, str]:
     """
-    Updated for DAG + TurnState (+ robustness + schema/hint replan):
-    ...
+    Stage 7 — Planner (DAG) with dynamic schema/signature grounding,
+    strict arg-name selection, success/failed recall, and retry seeding.
     """
     import json, re, hashlib, datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -957,45 +1132,353 @@ def _stage7_planning_summary(
         m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
         return (m2.group(1) if m2 else (text or "")).strip()
 
-    # ──────────────────────────────────────────────────────────────────
-    # Helpers (local to stage)
-    # ──────────────────────────────────────────────────────────────────
-    def _clean_json_block(text: str) -> str:
-        m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", flags=re.S)
-        if m:
-            return m.group(1)
-        m2 = re.search(r"(\{.*\})", text or "", flags=re.S)
-        return (m2.group(1) if m2 else (text or "")).strip()
-
     def _first_sentence(desc: str) -> str:
         head = (desc or "").split(".", 1)[0]
         return head + ("." if head and not head.endswith(".") else "")
 
-    def _is_valid_plan_obj(obj: dict) -> bool:
-        if not isinstance(obj, dict):
-            return False
-        if "graph" in obj and isinstance(obj["graph"], dict):
-            nodes = obj["graph"].get("nodes")
-            return isinstance(nodes, list) and any(isinstance(n, dict) and n.get("tool") for n in nodes)
-        if "tasks" in obj and isinstance(obj["tasks"], list):
-            return any(isinstance(t, dict) and t.get("call") for t in obj["tasks"])
-        return False
+    # Canonicalize a tool call string from metadata safely (no external helpers)
+    def _canon_call_str(meta: dict) -> str:
+        """
+        Best-effort canonical "tool(k=v,...)" from stored metadata.
+        Accepts meta with keys: tool_name, args/tool_input/arguments, or raw call string.
+        """
+        call = (meta or {}).get("call") or (meta or {}).get("tool_call") or ""
+        if isinstance(call, str) and "(" in call and ")" in call:
+            return call.strip()
 
-    def _extract_calls(plan_obj: dict) -> List[str]:
-        names = []
-        if not isinstance(plan_obj, dict):
-            return names
-        if "graph" in plan_obj and isinstance(plan_obj["graph"], dict):
-            for n in (plan_obj["graph"].get("nodes") or []):
-                nm = (n or {}).get("tool")
-                if nm:
-                    names.append(nm)
-        elif "tasks" in plan_obj and isinstance(plan_obj["tasks"], list):
-            for t in plan_obj["tasks"]:
-                nm = (t or {}).get("call")
-                if nm:
-                    names.append(nm)
-        return names
+        name = (meta or {}).get("tool_name") or (meta or {}).get("name") or "tool"
+        args = (
+            (meta or {}).get("args")
+            or (meta or {}).get("tool_input")
+            or (meta or {}).get("arguments")
+            or {}
+        )
+        # Stable key order
+        try:
+            items = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in sorted(args.items()))
+        except Exception:
+            items = ", ".join(f"{k}={repr(v)}" for k, v in sorted(args.items()))
+        return f"{name}({items})"
+
+    # ──────────────────────────────────────────────────────────────────
+    # Recall helpers: successes, failures, mined-missing, and scoring
+    # ──────────────────────────────────────────────────────────────────
+    def _shorten(s: str, n: int = 240) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else (s[: n - 1] + "…")
+
+    def _recency_score(ts: str, days: int = 14) -> float:
+        """Newer → closer to 1.0 (simple linear over `days`)."""
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            t   = datetime.fromisoformat(ts.replace("Z","+00:00"))
+            age = max(0.0, (now - t).total_seconds() / 86400.0)
+            return max(0.0, 1.0 - (age / float(days)))
+        except Exception:
+            return 0.5
+
+    def _lex_sim(a: str, b: str) -> float:
+        try:
+            from difflib import SequenceMatcher
+            return SequenceMatcher(None, (a or "")[:500], (b or "")[:500]).ratio()
+        except Exception:
+            return 0.0
+
+    def _score_example(ctx, seed: str) -> float:
+        return 0.6 * _recency_score(getattr(ctx, "timestamp", "") or "") + 0.4 * _lex_sim(seed, getattr(ctx, "summary", "") or "")
+
+    def _load_success_examples(tool_names: List[str], seed_text: str, top_k: int = 3) -> Dict[str, List[str]]:
+        """
+        Mine prior successful tool executions to show concrete, working calls per tool.
+        Returns {tool_name: ["tool(arg=…)", ...]} ranked by recency+affinity.
+        """
+        if not tool_names:
+            return {}
+        names = set(tool_names)
+
+        rows = self.repo.query(lambda c:
+            c.component == "tool_output"
+            and isinstance(c.metadata, dict)
+            and (c.metadata or {}).get("ok") is True
+            and ((c.metadata or {}).get("tool_name") in names)
+        )
+
+        by_tool: Dict[str, List[Tuple[float, str]]] = {}
+        for tctx in rows:
+            meta = tctx.metadata or {}
+            tname = meta.get("tool_name")
+            if not tname:
+                continue
+            call_str = _canon_call_str(meta)
+            if not call_str:
+                continue
+            score = _score_example(tctx, seed_text)
+            by_tool.setdefault(tname, []).append((score, call_str))
+
+        out: Dict[str, List[str]] = {}
+        for nm, arr in by_tool.items():
+            arr.sort(key=lambda x: x[0], reverse=True)
+            seen = set()
+            kept = []
+            for _, cs in arr:
+                if cs not in seen:
+                    seen.add(cs)
+                    kept.append(_shorten(cs, 220))
+                if len(kept) >= top_k:
+                    break
+            if kept:
+                out[nm] = kept
+        return out
+
+    def _aggregate_failures(tool_names: List[str], top_k: int = 3) -> Dict[str, List[str]]:
+        """
+        Collect common failure messages per tool from prior tool_output exceptions
+        and retry critiques marked not-ok. Returns {tool_name: ["msg", ...]}.
+        """
+        if not tool_names:
+            return {}
+        from collections import Counter
+        names = set(tool_names)
+        fails: Dict[str, Counter] = {}
+
+        err_rows = self.repo.query(lambda c:
+            c.component == "tool_output"
+            and isinstance(c.metadata, dict)
+            and ((c.metadata or {}).get("tool_name") in names)
+        )
+        for r in err_rows:
+            meta = r.metadata or {}
+            tname = meta.get("tool_name")
+            if not tname:
+                continue
+            exc = meta.get("exception") or (r.summary or "")
+            if not exc:
+                continue
+            msg = _shorten(str(exc), 200)
+            if not msg:
+                continue
+            fails.setdefault(tname, Counter())
+            fails[tname][msg] += 1
+
+        crit_rows = self.repo.query(lambda c:
+            c.component == "analysis"
+            and c.semantic_label == "tool_retry_critique"
+            and isinstance(c.metadata, dict)
+            and (c.metadata or {}).get("tool_name") in names
+            and (c.metadata or {}).get("status") in ("failed","rejected","bad")
+        )
+        for r in crit_rows:
+            tname = (r.metadata or {}).get("tool_name")
+            msg = _shorten(r.summary or (r.metadata or {}).get("hint") or "", 200)
+            if not tname or not msg:
+                continue
+            fails.setdefault(tname, Counter())
+            fails[tname][msg] += 1
+
+        out: Dict[str, List[str]] = {}
+        for nm, counter in fails.items():
+            if not counter:
+                continue
+            out[nm] = [k for k, _ in counter.most_common(top_k)]
+        return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Dynamic argument exposure: schema + signature (no hardcoded aliasing)
+    # ──────────────────────────────────────────────────────────────────
+    def _schema_req_props(schema: dict) -> tuple[list[str], dict]:
+        params = (schema or {}).get("parameters", {}) or {}
+        req    = list(params.get("required", []) or [])
+        props  = dict(params.get("properties", {}) or {})
+        return req, props
+
+    def _get_tool_callable(tool_name: str):
+        """Try to find a Python callable for a tool by name from known registries."""
+        # 1) scan tools_list for embedded callable
+        for t in tools_list or []:
+            if t.get("name") == tool_name:
+                for key in ("callable", "fn", "func", "impl", "handler", "object"):
+                    if key in t and callable(t[key]):
+                        return t[key]
+        # 2) try self.tools_registry (common pattern)
+        try:
+            reg = getattr(self, "tools_registry", None)
+            if isinstance(reg, dict) and callable(reg.get(tool_name)):
+                return reg.get(tool_name)
+        except Exception:
+            pass
+        # 3) try self.tools or self.<name>
+        try:
+            mod = getattr(self, "tools", None)
+            if mod is not None:
+                cand = getattr(mod, tool_name, None)
+                if callable(cand):
+                    return cand
+        except Exception:
+            pass
+        try:
+            cand = getattr(self, tool_name, None)
+            if callable(cand):
+                return cand
+        except Exception:
+            pass
+        return None
+
+    def _introspect_tool_signature(tool_name: str) -> tuple[list[str], list[str], bool]:
+        """
+        Returns (required_from_sig, optional_from_sig, accepts_var_kw).
+        Uses the literal Python signature (excluding 'self', *args).
+        """
+        import inspect as _inspect
+        fn = _get_tool_callable(tool_name)
+        if fn is None:
+            return [], [], False
+        # unwrap bound/descriptor if needed
+        if hasattr(fn, "__func__"):
+            fn = fn.__func__
+        try:
+            sig = _inspect.signature(fn)
+        except Exception:
+            return [], [], False
+
+        req, opt, vkw = [], [], False
+        for p in sig.parameters.values():
+            if p.name == "self":
+                continue
+            if p.kind == p.VAR_POSITIONAL:
+                continue
+            if p.kind == p.VAR_KEYWORD:
+                vkw = True
+                continue
+            if p.default is _inspect._empty:
+                req.append(p.name)
+            else:
+                opt.append(p.name)
+        return req, opt, vkw
+
+    def _allowed_keys_for_tool(tool_name: str, schema: dict) -> dict:
+        """
+        Canonical, *literal* names the planner/refiner must use:
+        union of JSON-schema properties and Python signature names.
+        """
+        req_s, props = _schema_req_props(schema)
+        req_sig, opt_sig, vkw = _introspect_tool_signature(tool_name)
+
+        required = sorted(set(req_s) | set(req_sig))
+        optional = sorted((set(props.keys()) | set(opt_sig)) - set(required))
+        allowed  = required + [n for n in optional if n not in required]
+
+        return {
+            "required": required,
+            "optional": optional,
+            "allowed":  allowed,
+            "accepts_varkw": bool(vkw),
+            "properties": props,
+        }
+
+    def _history_param_usage(tool_name: str) -> dict[str,int]:
+        """
+        Mine *successful* past calls for the exact keyword names used.
+        Looks at tool_output rows with ok=True and parses call strings.
+        """
+        import ast as _ast, re as _re
+        counts: dict[str,int] = {}
+        rows = self.repo.query(lambda c:
+            c.component == "tool_output"
+            and (c.metadata or {}).get("tool_name") == tool_name
+            and bool((c.metadata or {}).get("ok"))
+        )
+        for r in rows:
+            call = (r.metadata or {}).get("tool_call") or (r.metadata or {}).get("call") or ""
+            call = call.strip()
+            if not call:
+                continue
+            try:
+                tree = _ast.parse(call)
+                node = tree.body[0].value  # type: ignore
+                for kw in getattr(node, "keywords", []):
+                    if getattr(kw, "arg", None):
+                        counts[kw.arg] = counts.get(kw.arg, 0) + 1
+            except Exception:
+                for m in _re.finditer(r"([A-Za-z_]\w*)\s*=", call):
+                    k = m.group(1)
+                    counts[k] = counts.get(k, 0) + 1
+        return counts
+
+    def _mine_missing_from_errors(tool_names: list[str]) -> dict[str, list[str]]:
+        """
+        Parse previous exceptions to detect missing parameter names.
+        Returns {tool_name: ['param', ...]}.
+        """
+        if not tool_names:
+            return {}
+        names = set(tool_names)
+        rows  = self.repo.query(lambda c: c.component == "tool_output")
+        out: dict[str, list[str]] = {}
+        import re as _re
+        pats = [
+            r"missing\s+\d+\s+required\s+positional\s+argument[s]?:\s*'([^']+)'",
+            r"missing\s+1\s+required\s+keyword-only\s+argument:\s*'([^']+)'",
+            r"required\s+property\s+'([^']+)'",
+            r"field\s+required\s*[: ]\s*'([^']+)'",
+            r"KeyError:\s*'([^']+)'",
+        ]
+        for r in sorted(rows, key=lambda c: c.timestamp, reverse=True):
+            meta  = r.metadata or {}
+            tname = meta.get("tool_name") or r.semantic_label or ""
+            if tname not in names:
+                continue
+            exc = f"{meta.get('exception','')} {r.summary or ''}"
+            found = set()
+            for p in pats:
+                for m in _re.finditer(p, exc):
+                    if m and m.group(1):
+                        found.add(m.group(1).strip())
+            if found:
+                cur = out.setdefault(tname, [])
+                for f in found:
+                    if f not in cur:
+                        cur.append(f)
+        return out
+
+    def _normalize_args_dynamic(tool_name: str, args: dict, allowed_catalog: dict) -> tuple[dict, list[str]]:
+        """
+        Rename stray keys into canonical allowed names via *fuzzy* match,
+        but only map into REQUIRED names; drop everything else.
+        No hardcoded alias tables.
+        """
+        from difflib import SequenceMatcher as _SM
+        info    = allowed_catalog.get(tool_name, {})
+        allowed = set(info.get("allowed", []))
+        required = set(info.get("required", []))
+        props   = info.get("properties", {}) or {}
+
+        out: dict = {}
+        notes: list[str] = []
+
+        for k, v in (args or {}).items():
+            if k in allowed:
+                out[k] = v
+                continue
+            # dynamic candidate: nearest allowed name by similarity
+            best, score = None, 0.0
+            for cand in allowed:
+                s = _SM(None, k.lower(), cand.lower()).ratio()
+                if s > score:
+                    best, score = cand, s
+            # only map if target is REQUIRED and similarity high
+            if best and (best in required) and score >= 0.86:
+                out[best] = v
+                notes.append(f"renamed '{k}' → '{best}' (sim={score:.2f})")
+            else:
+                notes.append(f"dropped unknown arg '{k}'")
+
+        # strip 'kwargs' unless schema explicitly allows it
+        if "kwargs" in out and "kwargs" not in props:
+            out.pop("kwargs", None)
+            notes.append("dropped 'kwargs'")
+
+        return out, notes
 
     # Graph validation (IDs, deps, cycles, tools)
     def _validate_graph(graph: dict, tools_list: list[dict]) -> list[str]:
@@ -1075,7 +1558,7 @@ def _stage7_planning_summary(
             c.component == "analysis"
             and c.semantic_label == "tool_retry_critique"
             and isinstance((c.metadata or {}).get("tool_name"), str)
-            and (c.metadata.get("status") in ("confirmed","success","refined"))  # prefer confirmed/success; allow refined
+            and (c.metadata.get("status") in ("confirmed","success","refined"))
             and c.metadata.get("tool_name") in names
         )
         hints: Dict[str, List[str]] = {}
@@ -1083,14 +1566,12 @@ def _stage7_planning_summary(
             tname = r.metadata.get("tool_name")
             text  = r.metadata.get("hint") or r.summary or ""
             if not text:
-                # synthesize from keys if missing
                 req  = r.metadata.get("schema_required") or []
                 ex   = r.metadata.get("filled_params") or {}
                 text = f"When calling {tname}, include required {req}. Example keys used previously: {list(ex.keys())}."
             hints.setdefault(tname, [])
             if text not in hints[tname]:
                 hints[tname].append(text)
-        # keep up to 3 per tool
         for k in list(hints.keys()):
             hints[k] = hints[k][:3]
         return hints
@@ -1099,13 +1580,12 @@ def _stage7_planning_summary(
                                  filled: Dict[str, Any], turn_id: str, plan_id: str) -> None:
         """Save a candidate retry-critique row to be promoted later on success."""
         from context import ContextObject as _CO
-        # Make a short, reusable hint text
-        arg_list = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in filled.items()) if filled else ""
+        arg_list = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in (filled or {}).items())
         req_list = ", ".join(required) if required else "(none)"
         hint = f"When using {tool_name}, supply required [{req_list}]. Example: {tool_name}({arg_list})"
         meta = {
             "tool_name": tool_name,
-            "status": "refined",  # candidate; can be promoted to 'confirmed' later
+            "status": "refined",
             "schema_required": list(required or []),
             "schema_properties": list((props or {}).keys()),
             "filled_params": dict(filled or {}),
@@ -1118,7 +1598,6 @@ def _stage7_planning_summary(
         crit.semantic_label = "tool_retry_critique"
         crit.tags = (crit.tags or []) + ["tool_retry", "candidate"]
         crit.summary = hint[:250]
-        # propagate ids if available
         try:
             _stamp(crit, state)
         except Exception:
@@ -1183,13 +1662,14 @@ def _stage7_planning_summary(
 
     base_system = f"{first_two}\n\nAvailable tools:\n{tool_lines}"
     replan_system_base = (
+        "You MUST choose argument names only from the Allowed lists below. Do not invent synonyms.\n\n"
         "Your last plan may be incomplete—**OUTPUT ONLY** the JSON, no extra text.\n\n"
         f"Available tools:\n{tool_lines}"
     )
 
     print("\n" + "=" * 20 + " PLANNER PROMPT " + "=" * 20)
     print(base_system)
-    
+
     # ──────────────────────────────────────────────────────────────────
     # 3) Build USER message to planner
     # ──────────────────────────────────────────────────────────────────
@@ -1223,6 +1703,7 @@ def _stage7_planning_summary(
     # 4) Planner passes: initial, then schema+hint replan
     # ──────────────────────────────────────────────────────────────────
     valid_tool_names = {t["name"] for t in tools_list}
+    schema_map_all = {t["name"]: (t.get("schema") or {}) for t in tools_list}
 
     def _run_planner(sys_p: str, user_p: str, tag: str) -> dict:
         raw = self._stream_and_capture(
@@ -1264,7 +1745,7 @@ def _stage7_planning_summary(
             for tc in cand["tool_calls"]:
                 name, inp = _name_args(tc)
                 if not name:
-                    continue  # skip nameless entries; avoids None()
+                    continue
                 subs = (tc.get("subtasks") if isinstance(tc, dict) else None) or []
                 tasks.append({"call": name, "tool_input": inp, "subtasks": subs})
             plan_obj = {"tasks": tasks}
@@ -1283,32 +1764,100 @@ def _stage7_planning_summary(
     first_plan = _run_planner(base_system, full_user, tag="[Planner]")
 
     # Prepare second pass extras based on *selected* tools from first pass
-    selected_names_1 = _extract_calls(first_plan)
-    selected_names_1 = [n for n in selected_names_1 if n in valid_tool_names]
-    schema_map_all = {t["name"]: (t.get("schema") or {}) for t in tools_list}
+    def _extract_calls(plan_obj: dict) -> List[str]:
+        names = []
+        if not isinstance(plan_obj, dict):
+            return names
+        if "graph" in plan_obj and isinstance(plan_obj["graph"], dict):
+            for n in (plan_obj["graph"].get("nodes") or []):
+                nm = (n or {}).get("tool")
+                if nm:
+                    names.append(nm)
+        elif "tasks" in plan_obj and isinstance(plan_obj["tasks"], list):
+            for t in plan_obj["tasks"]:
+                nm = (t or {}).get("call")
+                if nm:
+                    names.append(nm)
+        return names
+
+    selected_names_1 = [n for n in _extract_calls(first_plan) if n in valid_tool_names]
     selected_schema_catalog = {n: schema_map_all.get(n, {}) for n in dict.fromkeys(selected_names_1)}
     retry_hints_map = _load_retry_hints(selected_names_1)
 
-    # Build replan system with schemas + hints (only selected tools)
+    # NEW: build allowed catalogs and recall bundles
+    allowed_catalog = {n: _allowed_keys_for_tool(n, schema_map_all.get(n, {})) for n in selected_names_1}
+    history_usage   = {n: _history_param_usage(n) for n in selected_names_1}
+    mined_missing   = _mine_missing_from_errors(selected_names_1)
+
+    # NEW: mine prior successes/failures tailored to this ask
+    _seed = f"{user_text}\n{clar_ctx.metadata.get('notes') or clar_ctx.summary or ''}"
+    success_examples = _load_success_examples(selected_names_1, seed_text=_seed)
+    fail_patterns    = _aggregate_failures(selected_names_1)
+
+    # Build replan system with schemas + strict key lists + hints + successes + failures
     replan_system = replan_system_base
     if selected_schema_catalog:
         replan_system += "\n\n[Selected Tool Schemas]\n" + json.dumps(selected_schema_catalog, ensure_ascii=False)
+
+    if allowed_catalog:
+        replan_system += "\n\n[Allowed Argument Keys]\n" + json.dumps(
+            {n: {"required": v["required"], "optional": v["optional"]} for n, v in allowed_catalog.items()},
+            ensure_ascii=False
+        )
+        replan_system += (
+            "\n\nSTRICT RULES:\n"
+            "• For each tool, you MUST use argument names only from its Allowed list.\n"
+            "• Prefer REQUIRED names exactly; do NOT invent synonyms.\n"
+            "• If a value is unknown, leave the key absent rather than inventing a key.\n"
+        )
+
     if retry_hints_map:
-        # compact, per-tool bullet list
         lines = []
         for nm, hints in retry_hints_map.items():
             for h in hints:
                 lines.append(f"- ({nm}) {h}")
-        replan_system += "\n\n[Retry Hints]\n" + "\n".join(lines[:12])
+        if lines:
+            replan_system += "\n\n[Retry Hints]\n" + "\n".join(lines[:12])
 
-    # Second pass (schema + hints). Use fewer snippets to make room.
+    if history_usage:
+        replan_system += "\n\n[Historically Used Keys]\n" + json.dumps(history_usage, ensure_ascii=False)
+
+    if mined_missing:
+        replan_system += "\n\n[Recently Missing Keys]\n" + json.dumps(mined_missing, ensure_ascii=False)
+
+    if success_examples:
+        ex_lines = []
+        for nm, exs in success_examples.items():
+            for ex in exs:
+                ex_lines.append(f"- ({nm}) {ex}")
+        if ex_lines:
+            replan_system += "\n\n[Success Examples]\n" + "\n".join(ex_lines[:12])
+
+    if fail_patterns:
+        fp_lines = []
+        for nm, msgs in fail_patterns.items():
+            for msg in msgs:
+                fp_lines.append(f"- ({nm}) {msg}")
+        if fp_lines:
+            replan_system += "\n\n[Common Failure Patterns]\n" + "\n".join(fp_lines[:12])
+
+    # Second pass (schema + strict keys + hints)
     half_snips = original_snips[: max(1, len(original_snips)//2)]
     second_plan = _run_planner(replan_system, build_user(half_snips), tag="[PlannerReplanSchemas]")
 
     # Choose better of the two: prefer second if valid & non-empty; else fallback
+    def _is_valid_plan_obj(obj: dict) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if "graph" in obj and isinstance(obj["graph"], dict):
+            nodes = obj["graph"].get("nodes")
+            return isinstance(nodes, list) and any(isinstance(n, dict) and n.get("tool") for n in nodes)
+        if "tasks" in obj and isinstance(obj["tasks"], list):
+            return any(isinstance(t, dict) and t.get("call") for t in obj["tasks"])
+        return False
+
     plan_obj: dict = second_plan if _is_valid_plan_obj(second_plan) else first_plan
     if not _is_valid_plan_obj(plan_obj):
-        # one more minimal attempt with aggressive truncation (still includes schemas/hints if any)
         tiny_snips = original_snips[:1]
         third_plan = _run_planner(replan_system, build_user(tiny_snips), tag="[PlannerReplanMin]")
         if _is_valid_plan_obj(third_plan):
@@ -1316,15 +1865,14 @@ def _stage7_planning_summary(
 
     # ──────────────────────────────────────────────────────────────────
     # 5) Refine each chosen tool with schema (fill only missing)
-    #    + persist candidate retry-critique records
+    #    + strict normalization + persist retry-candidates
     # ──────────────────────────────────────────────────────────────────
     schema_map = schema_map_all  # already built
 
     def refine_single_tool(task: dict) -> dict:
         name   = task.get("call")
         schema = schema_map.get(name, {}) or {}
-        required = (schema.get("parameters", {}) or {}).get("required", []) or []
-        props    = (schema.get("parameters", {}) or {}).get("properties", {}) or {}
+        req, props = _schema_req_props(schema)
 
         refined = {
             "call":       name,
@@ -1332,40 +1880,66 @@ def _stage7_planning_summary(
             "subtasks":   list(task.get("subtasks", []) or []),
         }
 
-        # Only attempt to fix missing requireds (no extra fields invented)
-        missing = [p for p in required if p not in refined["tool_input"]]
-        if not missing or not schema or not name:
+        # Normalize using dynamic allowed-catalog (schema + signature + history)
+        norm_args, norm_notes = _normalize_args_dynamic(name, refined["tool_input"], allowed_catalog)
+        refined["tool_input"] = norm_args
+
+        # Compute truly-missing required keys after normalization
+        missing = [k for k in req if k not in refined["tool_input"]]
+
+        # If nothing missing, persist normalization note and return
+        if not missing or not name:
+            if norm_notes:
+                _persist_retry_candidate(
+                    tool_name=name, required=list(req), props=props, filled={},
+                    turn_id=getattr(turn, "turn_id", ""), plan_id=getattr(turn, "plan_id", "")
+                )
             return refined
 
+        # Ask LLM to fill only the missing required keys, with STRICT constraints
+        success_ex = (success_examples.get(name) or [])[:3]
+        fail_ex    = (fail_patterns.get(name) or [])[:3]
+        hist_names = history_usage.get(name, {})
+        allowed_info = allowed_catalog.get(name, {})
+        recent_missing = mined_missing.get(name, [])
+
         prompt = {
-            "description": "Fill only the truly missing required parameters for this tool call. Do not add extra keys.",
+            "instruction": (
+                "Fill values for the MISSING REQUIRED keys ONLY. "
+                "Use EXACT key names from 'allowed.required'. "
+                "Do NOT invent new keys; leave anything unknown absent."
+            ),
+            "call":        {"call": name, "tool_input": refined["tool_input"]},
             "missing":     missing,
             "schema":      schema,
-            "call":        refined,
+            "allowed":     {"required": allowed_info.get("required", []), "optional": allowed_info.get("optional", [])},
+            "history_keys": hist_names,
+            "recent_missing": recent_missing,
+            "success_examples": success_ex,
+            "avoid_patterns":  fail_ex,
             "user_text":   user_text,
             "clar_notes":  (clar_ctx.metadata.get("notes") or clar_ctx.summary or ""),
         }
 
-        print("----------------------------------------------------")
-        print(f"\nRefining tool '{name}' with {len(missing)} missing params: {missing}")
-        print("----------------------------------------------------")
-        print(f"Prompt: {json.dumps(prompt, ensure_ascii=False, indent=2)}")
-        print("----------------------------------------------------")
-        
         out = self._stream_and_capture(
             self.secondary_model,
             [
-                {"role": "system", "content": "Return ONLY JSON {\"call\":{...}} with missing params filled. No extra keys."},
-                {"role": "user",   "content": json.dumps(prompt, ensure_ascii=False)}
+                {"role": "system", "content":
+                    "Return ONLY JSON: {\"call\":{\"tool_input\":{...}}}. "
+                    "Keys MUST come from 'allowed.required'/'allowed.optional'. "
+                    "If you cannot confidently fill a required value, omit it."
+                },
+                {"role": "user",   "content": json.dumps(prompt, ensure_ascii=False)},
             ],
             tag=f"[PlannerRefine_{name}]",
             images=state.get("images"),
         ).strip()
+
         filled_now = {}
         try:
             cand = json.loads(_clean_json_block(out)).get("call", {})
             ti   = cand.get("tool_input", {}) or {}
-            # accept only keys that exist in props
+            # accept only keys that exist in props (schema is the ground truth)
             for k, v in ti.items():
                 if k in props:
                     refined["tool_input"][k] = v
@@ -1373,16 +1947,14 @@ def _stage7_planning_summary(
         except Exception:
             pass
 
-        # Persist a candidate retry-critique for this tool if we actually filled anything
-        if filled_now:
-            _persist_retry_candidate(
-                tool_name=name,
-                required=list(required),
-                props=props,
-                filled=filled_now,
-                turn_id=getattr(turn, "turn_id", ""),
-                plan_id=getattr(turn, "plan_id", ""),
-            )
+        _persist_retry_candidate(
+            tool_name=name,
+            required=list(req),
+            props=props,
+            filled=dict(filled_now),
+            turn_id=getattr(turn, "turn_id", ""),
+            plan_id=getattr(turn, "plan_id", ""),
+        )
 
         return refined
 
@@ -1447,7 +2019,6 @@ def _stage7_planning_summary(
     graph = plan_obj.get("graph", {"nodes": [], "meta": {}})
     graph.setdefault("nodes", [])
     meta = graph.setdefault("meta", {})
-    # Provide executor hints; executor will honor these if present
     default_parallelism = int(getattr(turn, "budgets", {}).get("parallelism", 2))
     meta.setdefault("parallelism", default_parallelism)
     meta.setdefault("retries", 0)
@@ -1459,12 +2030,10 @@ def _stage7_planning_summary(
         n.setdefault("after", [])
         n.setdefault("retries", meta.get("retries", 0))
         n.setdefault("timeout_s", meta.get("timeout_s", 0.0))
-        # keep optional 'alias' if present
 
-    _inject_implicit_deps(graph)                # <── NEW
-    errs = _validate_graph(graph, tools_list)   # <── NEW
+    _inject_implicit_deps(graph)
+    errs = _validate_graph(graph, tools_list)
     if errs:
-        # Surface to subsequent stages/prompts and persist a small marker
         state["plan_errors"] = errs
         err_ctx = ContextObject.make_failure(
             description="plan graph validation errors",
@@ -1547,13 +2116,24 @@ def _stage7_planning_summary(
     # ──────────────────────────────────────────────────────────────────
     # 9) Expose to downstream
     # ──────────────────────────────────────────────────────────────────
-    state["plan_ctx"]        = ctx
-    state["plan_output"]     = {"graph": graph}  # keep as object for DAG stages
-    state["tools_list"]      = tools_list
-    state["tc_ctx"]          = None
-    state["plan_output_prev"] = json.dumps(first_plan, ensure_ascii=False)  # for diagnostics / reflection
+    state["plan_ctx"]         = ctx
+    state["plan_output"]      = {"graph": graph}
+    state["tools_list"]       = tools_list
+    state["tc_ctx"]           = None
+    state["plan_output_prev"] = json.dumps(first_plan, ensure_ascii=False)
+
+    # Expose recall bundle for later stages (retries/reflection/executor)
+    state["retry_bundle"] = {
+        "hints":       retry_hints_map,
+        "success":     success_examples,
+        "failures":    fail_patterns,
+        "allowed":     allowed_catalog,
+        "hist_keys":   history_usage,
+        "miss_keys":   mined_missing,
+    }
 
     return ctx, plan_json_out
+
 
 def _stage7b_plan_validation(
     self,
