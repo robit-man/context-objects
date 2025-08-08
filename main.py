@@ -352,7 +352,7 @@ DEFAULT_CFG = {
 
     "whisper_full_model": "medium",
     "whisper_consensus_model": "base",
-    "whisper_device": "cuda",
+    "whisper_device": "auto",
 
     # audio thresholds
     "sample_rate":         16000,
@@ -377,6 +377,27 @@ DEFAULT_CFG = {
     "onnx_json_url":  "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json",
     "onnx_model_url": "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx",
 }
+
+try:
+    import torch
+    dev = config.get("whisper_device", "auto")
+    if dev not in ("auto", "cpu", "cuda"):
+        dev = "auto"
+    if dev == "cuda" and not torch.cuda.is_available():
+        log_message("whisper_device=cuda requested but CUDA not available; using cpu.", "WARNING")
+        dev = "cpu"
+    if dev == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    config["whisper_device"] = dev
+
+    # Defaults if missing/empty
+    if not str(config.get("whisper_full_model", "")).strip():
+        config["whisper_full_model"] = "medium"
+    if not str(config.get("whisper_consensus_model", "")).strip():
+        config["whisper_consensus_model"] = "base"
+except Exception:
+    pass
+
 
 def _run_quiet(cmd: list[str]) -> tuple[int, str]:
     try:
