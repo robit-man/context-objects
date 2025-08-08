@@ -614,7 +614,7 @@ def _stage4_intent_clarification(
         msgs,
         tag="[Clarifier]",
         images=state.get("images"),
-        on_token=on_token if "on_token" in self._stream_and_capture.__code__.co_varnames else None,  # tolerate older impls
+        on_token=None,
     ).strip()
 
     # ---------- 7) Parse / repair JSON ----------

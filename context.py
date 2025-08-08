@@ -1,4 +1,4 @@
-# context.py
+# context.py  — core context model + repositories
 
 import os
 import uuid
@@ -7,25 +7,48 @@ import logging
 import sqlite3
 import threading
 import contextlib
-import numpy as np
+import collections
 from pathlib import Path
-import json, collections
 from threading import Lock
 from json import JSONDecodeError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional
 
+import numpy as np
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-platform file locking for JSONL (Windows lock optional to avoid flakiness)
+# ──────────────────────────────────────────────────────────────────────────────
 if os.name == "nt":
-    @contextlib.contextmanager
-    def _locked(f, exclusive: bool):
-        """
-        No-op file lock on Windows. We rely on the in-process threading.Lock
-        to serialize JSONL writes, and avoid msvcrt.locking permission errors.
-        """
-        yield f
-else:                              # POSIX ─ use fcntl
-    import fcntl
+    try:
+        import msvcrt  # noqa: F401
+
+        @contextlib.contextmanager
+        def _locked(f, exclusive: bool):
+            """
+            Best-effort Windows lock. Disabled by default due to common AV/permission
+            conflicts. Enable by setting CTX_ENABLE_WIN_LOCK=1.
+            """
+            if not os.environ.get("CTX_ENABLE_WIN_LOCK"):
+                yield f
+                return
+            # msvcrt.locking requires a byte range; we lock 1 byte at start.
+            mode = msvcrt.LK_NBLCK if exclusive else msvcrt.LK_NBRLCK
+            try:
+                msvcrt.locking(f.fileno(), mode, 1)
+                yield f
+            finally:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+    except Exception:
+        @contextlib.contextmanager
+        def _locked(f, exclusive: bool):
+            yield f
+else:  # POSIX ─ use fcntl
+    import fcntl  # type: ignore
 
     @contextlib.contextmanager
     def _locked(f, exclusive: bool):
@@ -36,12 +59,57 @@ else:                              # POSIX ─ use fcntl
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-# ─ Utility: default clock ────────────────────────────────────────────────────────
+
+# ─ Utilities ──────────────────────────────────────────────────────────────────
+_TS_FMT = "%Y%m%dT%H%M%SZ"
+
+
+
+_TS_FMT      = "%Y%m%dT%H%M%SZ"
+_TS_FMT_NOZ  = "%Y%m%dT%H%M%S"
+
 def default_clock() -> datetime:
-    return datetime.utcnow()
+    # always UTC-aware
+    return datetime.now(timezone.utc)
+
+def _fmt_ts(dt: datetime | None = None) -> str:
+    # normalize to UTC and emit canonical Z-suffixed form
+    dt = dt or default_clock()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime(_TS_FMT)
+
+def _parse_ts(ts: str) -> datetime:
+    # tolerant reader: accept with-Z and without-Z, plus ISO-ish fallbacks
+    s = (ts or "").strip()
+    if not s:
+        return default_clock()
+    try:
+        return datetime.strptime(s, _TS_FMT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(s, _TS_FMT_NOZ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    # last-ditch fallbacks for ISO-like strings
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    # If truly malformed, surface the error
+    raise ValueError(f"Unsupported timestamp format: {ts!r}")
 
 
-# ─ MemoryTrace ───────────────────────────────────────────────────────────────────
+# ─ MemoryTrace ─────────────────────────────────────────────────────────────────
 @dataclass
 class MemoryTrace:
     """
@@ -50,31 +118,31 @@ class MemoryTrace:
     """
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     stage_id: Optional[str] = None
-    timestamp: str = field(default_factory=lambda: default_clock().strftime("%Y%m%dT%H%M%SZ"))
+    timestamp: str = field(default_factory=lambda: _fmt_ts(default_clock()))
     coactivated_with: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-# ─ ContextObject ────────────────────────────────────────────────────────────────
+# ─ ContextObject ───────────────────────────────────────────────────────────────
 @dataclass
 class ContextObject:
     """
     A universal, schema-versioned context object for chaining, retrieval,
     and self-improvement in an agent pipeline.
-    Now domain-agnostic: holds segments, stages, or arbitrary artifacts
-    (tool code, schemas, prompts, policies, plain knowledge).
+    Domain-agnostic: holds segments, stages, or arbitrary artifacts
+    (tool code, schemas, prompts, policies, knowledge).
     """
 
-    # ─ Required (no default) ────────────────────────────────────────────────────
-    domain: str           # e.g. "segment", "stage", or "artifact"
-    component: str        # e.g. "tool_code", "schema", "prompt", "policy", "knowledge"
+    # ─ Required ─
+    domain: str           # "segment" | "stage" | "artifact"
+    component: str        # "tool_code" | "schema" | "prompt" | "policy" | "knowledge" | ...
     semantic_label: str   # e.g. "select_tools", "user_prompt", "db_schema"
 
-    # ─ Defaults & Optionals ─────────────────────────────────────────────────────
+    # ─ Defaults & Optionals ─
     schema_version: int = field(init=False, default=1)
     context_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     version: Optional[str] = None
-    timestamp: str = field(default_factory=lambda: default_clock().strftime("%Y%m%dT%H%M%SZ"))
+    timestamp: str = field(default_factory=lambda: _fmt_ts(default_clock()))
 
     # Core references
     segment_ids: List[str] = field(default_factory=list)
@@ -90,7 +158,7 @@ class ContextObject:
     embedding: Optional[List[float]] = None
     retrieval_score: Optional[float] = None      # static similarity score
 
-    # ─ Reinforcement-Learning signals (NEW) ──────────────────────────
+    # Reinforcement-Learning signals
     value_estimate: Optional[float]  = None      # Q-value / critic estimate
     outcome_reward: Optional[float]  = None      # immediate scalar reward
     advantage:      Optional[float]  = None      # reward − baseline
@@ -118,11 +186,15 @@ class ContextObject:
     batch_id: Optional[str]     = None
     dirty: bool                 = True
 
+    # ─ Internals (not dataclass fields) ─ set in __post_init__
+    # _lock: threading.Lock
+    # _logger: logging.Logger
+
+    # ─ Helpers ─
     def _ts_seconds(self) -> float:
         """Return timestamp (or last_accessed) in epoch seconds."""
         ts = self.last_accessed or self.timestamp
-        return datetime.strptime(ts.rstrip("Z"), "%Y%m%dT%H%M%S").timestamp()
-
+        return _parse_ts(ts).timestamp()
 
     def __post_init__(self):
         # create the lock here (not a dataclass field)
@@ -138,7 +210,7 @@ class ContextObject:
 
         # Normalize timestamp if needed
         if isinstance(self.timestamp, datetime):
-            self.timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ")
+            self.timestamp = _fmt_ts(self.timestamp)
 
         # Initialize last_accessed
         if not self.last_accessed:
@@ -146,24 +218,20 @@ class ContextObject:
 
         # Default memory tier by domain
         tier_map = {"segment": "STM", "stage": "LTM", "artifact": "WM"}
-        self.memory_tier = tier_map.get(self.domain, "WM")
+        self.memory_tier = self.memory_tier or tier_map.get(self.domain, "WM")
 
         # Setup logger
         self._logger = logging.getLogger(__name__)
 
     def __getstate__(self):
-        """
-        Exclude non-picklable items (like threading.Lock) during pickling.
-        """
+        """Exclude non-picklable items during pickling."""
         state = self.__dict__.copy()
         state.pop("_lock", None)
         state.pop("_logger", None)
         return state
 
     def __setstate__(self, state):
-        """
-        Restore state and recreate lock and logger after unpickling.
-        """
+        """Restore state and recreate lock and logger after unpickling."""
         self.__dict__.update(state)
         self._lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
@@ -171,16 +239,16 @@ class ContextObject:
     def __repr__(self):
         return f"<ContextObject {self.domain}/{self.component}/{self.semantic_label}@{self.timestamp}>"
 
-    # ─ Core Helpers ────────────────────────────────────────────────
+    # ─ Core Helpers ─
     def touch(self):
         """Mark accessed just now."""
-        self.last_accessed = default_clock().strftime("%Y%m%dT%H%M%SZ")
+        self.last_accessed = _fmt_ts(default_clock())
         self.dirty = True
 
     def set_expiration(self, ttl_seconds: int):
         """Expire after TTL seconds."""
         exp = default_clock() + timedelta(seconds=ttl_seconds)
-        self.expires_at = exp.strftime("%Y%m%dT%H%M%SZ")
+        self.expires_at = _fmt_ts(exp)
         self.dirty = True
 
     def compute_embedding(
@@ -195,15 +263,21 @@ class ContextObject:
         """
         if not self.summary:
             return
-        fn = default_embedder
-        if component_embedder and self.component in component_embedder:
-            fn = component_embedder[self.component]
-        self.embedding = fn(self.summary)
-        self.dirty = True
+        try:
+            fn = component_embedder.get(self.component) if component_embedder else None
+            fn = fn or default_embedder
+            self.embedding = fn(self.summary)
+            self.dirty = True
+        except Exception as e:
+            self._logger.warning("compute_embedding failed: %s", e)
 
     def log_context(self, level=logging.INFO):
         """Emit full context JSON to logs."""
-        self._logger.log(level, json.dumps(self.to_dict()))
+        try:
+            self._logger.log(level, json.dumps(self.to_dict(), ensure_ascii=False))
+        except Exception:
+            # Fallback to repr if unserializable
+            self._logger.log(level, repr(self))
 
     def record_recall(
         self,
@@ -225,7 +299,7 @@ class ContextObject:
 
             # update recall stats
             stats = self.recall_stats
-            stats["count"] += 1
+            stats["count"] = int(stats.get("count", 0)) + 1
             stats["last_recalled"] = mt.timestamp
 
             # simplistic firing_rate
@@ -238,15 +312,14 @@ class ContextObject:
             # mark accessed
             self.touch()
 
-    # ─ Serialization ──────────────────────────────────────────────
+    # ─ Serialization ─
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["memory_traces"] = [asdict(mt) for mt in self.memory_traces]
         return data
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
-
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
     def make_performance(
@@ -260,14 +333,13 @@ class ContextObject:
         the scalar `reward` and any extra metrics.
         """
         obj = cls(domain="stage",
-                component="stage_performance",
-                semantic_label="stage_performance")
+                  component="stage_performance",
+                  semantic_label="stage_performance")
         obj.outcome_reward = reward
         obj.metadata.update(metrics or {})
-        obj.references = stage_ids
+        obj.references = list(stage_ids or [])
         obj.tags = ["performance"]
         return obj
-
 
     @classmethod
     def make_narrative(
@@ -281,7 +353,7 @@ class ContextObject:
         If the most-recent narrative row already has an identical summary,
         reuse it instead of creating a duplicate.
         """
-        repo: ContextRepository = ContextRepository.instance()  # singleton accessor
+        repo: "ContextRepository" = ContextRepository.instance()  # singleton accessor
 
         # latest narrative row, if any
         rows = repo.query(lambda c: c.component == "narrative")
@@ -310,25 +382,24 @@ class ContextObject:
         obj.tags = tags or ["narrative"]
         return obj
 
-    
     @classmethod
-    def make_success(cls, description: str, refs: List[str] = None) -> "ContextObject":
+    def make_success(cls, description: str, refs: Optional[List[str]] = None) -> "ContextObject":
         """Log that an action or plan succeeded."""
         obj = cls(domain="stage", component="success", semantic_label="success")
         obj.summary = description
-        obj.references = refs or []
+        obj.references = list(refs or [])
         obj.tags = ["success"]
         return obj
 
     @classmethod
-    def make_failure(cls, description: str, refs: List[str] = None) -> "ContextObject":
+    def make_failure(cls, description: str, refs: Optional[List[str]] = None) -> "ContextObject":
         """Log that an action or plan failed."""
         obj = cls(domain="stage", component="failure", semantic_label="failure")
         obj.summary = description
-        obj.references = refs or []
+        obj.references = list(refs or [])
         obj.tags = ["failure"]
         return obj
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ContextObject":
         mts = [MemoryTrace(**mt) for mt in data.get("memory_traces", [])]
@@ -337,40 +408,44 @@ class ContextObject:
             component=data["component"],
             semantic_label=data["semantic_label"],
             version=data.get("version"),
-            timestamp=data.get("timestamp", default_clock().strftime("%Y%m%dT%H%M%SZ"))
+            timestamp=data.get("timestamp", _fmt_ts(default_clock())),
         )
         # Overwrite defaults with saved values
         obj.context_id             = data.get("context_id", obj.context_id)
-        obj.segment_ids            = data.get("segment_ids", [])
+        obj.segment_ids            = list(data.get("segment_ids", []))
         obj.stage_id               = data.get("stage_id")
-        obj.references             = data.get("references", [])
-        obj.children               = data.get("children", [])
+        obj.references             = list(data.get("references", []))
+        obj.children               = list(data.get("children", []))
         obj.summary                = data.get("summary")
-        obj.tags                   = data.get("tags", [])
+        obj.tags                   = list(data.get("tags", []))
         obj.embedding              = data.get("embedding")
         obj.retrieval_score        = data.get("retrieval_score")
-        obj.retrieval_metadata     = data.get("retrieval_metadata", {})
-        obj.provenance             = data.get("provenance", {})
+        obj.retrieval_metadata     = dict(data.get("retrieval_metadata", {}))
+        obj.provenance             = dict(data.get("provenance", {}))
         obj.graph_node_id          = data.get("graph_node_id")
         obj.memory_tier            = data.get("memory_tier", obj.memory_tier)
         obj.memory_traces          = mts
-        obj.association_strengths  = data.get("association_strengths", {})
-        obj.recall_stats           = data.get("recall_stats", {"count": 0, "last_recalled": None})
+        obj.association_strengths  = dict(data.get("association_strengths", {}))
+        obj.recall_stats           = dict(data.get("recall_stats", {"count": 0, "last_recalled": None}))
         obj.firing_rate            = data.get("firing_rate")
-        obj.metadata               = data.get("metadata", {})
-        obj.pinned                 = data.get("pinned", False)
+        obj.metadata               = dict(data.get("metadata", {}))
+        obj.pinned                 = bool(data.get("pinned", False))
         obj.last_accessed          = data.get("last_accessed", obj.last_accessed)
         obj.expires_at             = data.get("expires_at")
-        obj.acl                    = data.get("acl", {})
+        obj.acl                    = dict(data.get("acl", {}))
         obj.batch_id               = data.get("batch_id")
-        obj.dirty                  = data.get("dirty", True)
+        obj.dirty                  = bool(data.get("dirty", True))
+        # RL fields (previously omitted in some versions)
+        obj.value_estimate         = data.get("value_estimate")
+        obj.outcome_reward         = data.get("outcome_reward")
+        obj.advantage              = data.get("advantage")
         return obj
 
     @staticmethod
     def from_json(s: str) -> "ContextObject":
         return ContextObject.from_dict(json.loads(s))
 
-    # ─ Factory Methods ───────────────────────────────────────────
+    # ─ Factory Methods ─
     @classmethod
     def make_segment(
         cls,
@@ -380,7 +455,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="segment", component="segment", semantic_label=semantic_label)
-        obj.segment_ids = content_refs
+        obj.segment_ids = list(content_refs or [])
         obj.tags = tags or ["segment"]
         obj.metadata.update(metadata)
         return obj
@@ -394,7 +469,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="stage", component=stage_name, semantic_label=stage_name)
-        obj.references = input_refs
+        obj.references = list(input_refs or [])
         obj.tags = [stage_name]
         obj.metadata.update(metadata)
         obj.metadata["output"] = output
@@ -409,7 +484,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="artifact", component="tool_code", semantic_label=label)
-        obj.summary = code[:120] + "…" if len(code) > 120 else code
+        obj.summary = (code[:120] + "…") if len(code) > 120 else code
         obj.tags = tags or ["code"]
         obj.metadata.update(metadata)
         obj.metadata["code"] = code
@@ -424,7 +499,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="artifact", component="schema", semantic_label=label)
-        obj.summary = schema_def[:120] + "…" if len(schema_def) > 120 else schema_def
+        obj.summary = (schema_def[:120] + "…") if len(schema_def) > 120 else schema_def
         obj.tags = tags or ["schema"]
         obj.metadata.update(metadata)
         obj.metadata["schema"] = schema_def
@@ -439,7 +514,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="artifact", component="prompt", semantic_label=label)
-        obj.summary = prompt_text[:120] + "…" if len(prompt_text) > 120 else prompt_text
+        obj.summary = (prompt_text[:120] + "…") if len(prompt_text) > 120 else prompt_text
         obj.tags = tags or ["prompt"]
         obj.metadata.update(metadata)
         obj.metadata["prompt"] = prompt_text
@@ -454,7 +529,7 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="artifact", component="policy", semantic_label=label)
-        obj.summary = policy_text[:120] + "…" if len(policy_text) > 120 else policy_text
+        obj.summary = (policy_text[:120] + "…") if len(policy_text) > 120 else policy_text
         obj.tags = tags or ["policy"]
         obj.metadata.update(metadata)
         obj.metadata["policy"] = policy_text
@@ -469,14 +544,17 @@ class ContextObject:
         **metadata
     ) -> "ContextObject":
         obj = cls(domain="artifact", component="knowledge", semantic_label=label)
-        obj.summary = content[:120] + "…" if len(content) > 120 else content
+        obj.summary = (content[:120] + "…") if len(content) > 120 else content
         obj.tags = tags or ["knowledge"]
         obj.metadata.update(metadata)
         obj.metadata["content"] = content
         return obj
 
 
-def sanitize_jsonl(path: str):
+# ──────────────────────────────────────────────────────────────────────────────
+# JSONL maintenance
+# ──────────────────────────────────────────────────────────────────────────────
+def sanitize_jsonl(path: str) -> None:
     """
     Reads 'path' under shared lock, drops any corrupted JSON lines,
     logs them into 'path.corrupt', and—only if invalid lines are found—
@@ -486,8 +564,8 @@ def sanitize_jsonl(path: str):
         return
 
     corrupt_path = path + ".corrupt"
-    good_lines = []
-    bad_entries = []
+    good_lines: List[str] = []
+    bad_entries: List[tuple[int, str]] = []
 
     # 1) Read & classify under shared lock
     with open(path, "r+", encoding="utf-8") as f, _locked(f, exclusive=False):
@@ -496,7 +574,7 @@ def sanitize_jsonl(path: str):
                 json.loads(line)
                 good_lines.append(line)
             except JSONDecodeError as e:
-                logging.warning(f"sanitize_jsonl: dropping invalid JSON at line {idx} in {path}: {e}")
+                logging.warning("sanitize_jsonl: dropping invalid JSON at line %d in %s: %s", idx, path, e)
                 bad_entries.append((idx, line.rstrip("\n")))
 
         # 2) If no bad entries, leave file as-is
@@ -505,8 +583,9 @@ def sanitize_jsonl(path: str):
 
         # 3) Log all bad lines
         with open(corrupt_path, "a", encoding="utf-8") as cf:
+            now = datetime.utcnow().isoformat()
             for idx, text in bad_entries:
-                cf.write(f"{datetime.utcnow().isoformat()} LINE {idx}: {text}\n")
+                cf.write(f"{now} LINE {idx}: {text}\n")
 
         # 4) Rewrite only when there were bad lines
         f.seek(0)
@@ -515,9 +594,12 @@ def sanitize_jsonl(path: str):
         f.flush()
         os.fsync(f.fileno())
 
-        
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Repositories
+# ──────────────────────────────────────────────────────────────────────────────
 class JSONLContextRepository:
-    _singleton = None
+    _singleton: "JSONLContextRepository" = None
 
     def __init__(self, path: str):
         # 0) Repair any pre‐existing corruption
@@ -548,9 +630,7 @@ class JSONLContextRepository:
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError as e:
-                        logging.warning(
-                            f"JSONLContextRepository.get: parse error on line {lineno}: {e}"
-                        )
+                        logging.warning("JSONLContextRepository.get: parse error on line %d: %s", lineno, e)
                         if not tried_sanitize:
                             sanitize_jsonl(self.path)
                             tried_sanitize = True
@@ -570,9 +650,7 @@ class JSONLContextRepository:
         raise KeyError(f"Context {context_id} not found")
 
     def save(self, ctx: ContextObject) -> None:
-        """
-        Append a dirty context object to JSONL under exclusive lock.
-        """
+        """Append a dirty context object to JSONL under exclusive lock."""
         if not ctx.dirty:
             return
         with self._lock:
@@ -589,31 +667,29 @@ class JSONLContextRepository:
         # First ensure file is clean
         sanitize_jsonl(self.path)
 
-        kept = []
+        kept: List[Dict[str, Any]] = []
         with self._lock:
             with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
                 for lineno, line in enumerate(f, start=1):
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
-                        logging.warning(
-                            f"JSONLContextRepository.delete: skipping bad line {lineno}"
-                        )
+                        logging.warning("JSONLContextRepository.delete: skipping bad line %d", lineno)
                         continue
                     if data.get("context_id") != context_id:
                         kept.append(data)
                 f.seek(0)
                 f.truncate()
                 for entry in kept:
-                    f.write(json.dumps(entry) + "\n")
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
 
-    def query(self, filter_fn) -> list[ContextObject]:
+    def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
         """
         Iterate all contexts, skipping any bad lines; attempt one repair pass if needed.
         """
-        results = []
+        results: List[ContextObject] = []
         tried_sanitize = False
 
         while True:
@@ -623,9 +699,7 @@ class JSONLContextRepository:
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError as e:
-                        logging.warning(
-                            f"JSONLContextRepository.query: parse error on line {lineno}: {e}"
-                        )
+                        logging.warning("JSONLContextRepository.query: parse error on line %d: %s", lineno, e)
                         if not tried_sanitize:
                             sanitize_jsonl(self.path)
                             tried_sanitize = True
@@ -650,16 +724,18 @@ class JSONLContextRepository:
         if cls._singleton is None:
             raise RuntimeError("ContextRepository not initialised")
         return cls._singleton
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SQLite-backed archive for long-term storage
 # ──────────────────────────────────────────────────────────────────────────────
 class SQLiteContextRepository:
-    def __init__(self, db_path="context.db"):
+    def __init__(self, db_path: str = "context.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = Lock()
         self._init_schema()
 
-    def _init_schema(self):
+    def _init_schema(self) -> None:
         c = self.conn.cursor()
         c.execute("""
           CREATE TABLE IF NOT EXISTS contexts (
@@ -672,9 +748,9 @@ class SQLiteContextRepository:
         c.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON contexts(last_accessed)")
         self.conn.commit()
 
-    def save(self, ctx):
+    def save(self, ctx: ContextObject) -> None:
         blob = ctx.to_json()
-        now  = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        now  = _fmt_ts(default_clock())
         with self._lock:
             self.conn.execute("""
               INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
@@ -686,36 +762,36 @@ class SQLiteContextRepository:
             self.conn.commit()
         ctx.dirty = False
 
-    def get(self, cid):
+    def get(self, cid: str) -> ContextObject:
         cur = self.conn.cursor()
         cur.execute("SELECT json_blob FROM contexts WHERE context_id=?", (cid,))
         row = cur.fetchone()
         if not row:
             raise KeyError(cid)
-        from context import ContextObject
         return ContextObject.from_json(row[0])
 
-    def delete(self, cid):
+    def delete(self, cid: str) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM contexts WHERE context_id=?", (cid,))
             self.conn.commit()
 
-    def query(self, filter_fn):
-        from context import ContextObject
-        out = []
+    def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
+        out: List[ContextObject] = []
         for (blob,) in self.conn.execute("SELECT json_blob FROM contexts"):
             obj = ContextObject.from_json(blob)
             if filter_fn(obj):
                 out.append(obj)
         return out
+
+    def count(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM contexts")
+        return cur.fetchone()[0]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Hybrid: JSONL + SQLite (dual-write) with size-based archiving
 # ──────────────────────────────────────────────────────────────────────────────
-from pathlib import Path
-from datetime import datetime
-import logging
-import os
-
 class HybridContextRepository:
     _singleton: "HybridContextRepository" = None
 
@@ -725,8 +801,8 @@ class HybridContextRepository:
         sqlite_path: str = "context.db",
         archive_max_mb: float = 10.0,   # max JSONL size in megabytes
         *,
-        dual_write: bool = True,        # ← write every object to SQLite immediately
-        verbose: bool = True,           # ← print row deltas & archive actions
+        dual_write: bool = True,        # write every object to SQLite immediately
+        verbose: bool = True,           # print row deltas & archive actions
     ):
         # ─── ensure our subfolder exists ───────────────────────────────
         base_dir = Path("context_repos")
@@ -780,9 +856,9 @@ class HybridContextRepository:
         except KeyError:
             pass
 
-    def query(self, filter_fn):
-        seen = set()
-        out  = []
+    def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
+        seen: set[str] = set()
+        out: List[ContextObject] = []
         for repo in (self.json_repo, self.sql_repo):
             for ctx in repo.query(filter_fn):
                 if ctx.context_id not in seen:
@@ -809,6 +885,9 @@ class HybridContextRepository:
         if not force and size <= self._max_bytes:
             return 0
 
+        # Ensure JSONL is clean before archiving
+        sanitize_jsonl(path)
+
         # Load JSONL lines
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -818,7 +897,7 @@ class HybridContextRepository:
             return 0
 
         archived = 0
-        entries: list[tuple[int, datetime, ContextObject]] = []
+        entries: List[tuple[int, datetime, ContextObject]] = []
 
         for idx, line in enumerate(lines):
             try:
@@ -831,9 +910,9 @@ class HybridContextRepository:
             if obj.domain == "artifact" and obj.component in ("prompt", "schema"):
                 continue
 
-            # Parse timestamp (YYYYmmddTHHMMSSZ); skip bad rows
+            # Parse timestamp; skip bad rows
             try:
-                ts = datetime.strptime(obj.timestamp, "%Y%m%dT%H%M%SZ")
+                ts = _parse_ts(obj.timestamp)
             except Exception as e:
                 logging.warning("[HybridRepo] archive: bad timestamp line %d: %s", idx, e)
                 continue
@@ -848,8 +927,8 @@ class HybridContextRepository:
         # Oldest first
         entries.sort(key=lambda x: x[1])
 
-        to_remove = set()
-        for idx, ts, obj in entries:
+        to_remove: set[int] = set()
+        for idx, _ts, obj in entries:
             try:
                 self.sql_repo.save(obj)
                 archived += 1
@@ -884,15 +963,14 @@ class HybridContextRepository:
     # ──────────────────────────────────────────────────────────────────
     # Utilities
     # ──────────────────────────────────────────────────────────────────
-    def _safe_count(self) -> int | None:
+    def _safe_count(self) -> Optional[int]:
         try:
             return self.sql_repo.count()  # optional convenience method
         except Exception:
-            # Fall back: don’t block if repo lacks count()
             return None
 
     @staticmethod
-    def _remaining_bytes_after_removal(lines, to_remove: set[int]) -> int:
+    def _remaining_bytes_after_removal(lines: List[str], to_remove: set[int]) -> int:
         # Sum encoded byte lengths of lines not marked for removal
         return sum(len(l.encode("utf-8")) for i, l in enumerate(lines) if i not in to_remove)
 
@@ -907,6 +985,7 @@ class HybridContextRepository:
         return cls._singleton
 
 
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║            H O L O G R A P H I C   M E M O R Y               ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -915,14 +994,7 @@ _HMR_SIM_THRESH   = 0.35        # cosine similarity edge cut-off
 _HMR_TAG_W        = 0.6         # weight on shared-tag edges
 _HMR_REF_W        = 1.0         # explicit reference edge weight
 _HMR_SIM_W        = 0.4         # multiplier on sim edges
-_HMR_DECAY_SECS   = 60 * 60 * 24   # temporal proximity half-life
-
-
-def _ts_seconds(self) -> float:
-    """Return timestamp (or last_accessed) in epoch seconds."""
-    ts = self.last_accessed or self.timestamp
-    return datetime.strptime(ts.rstrip("Z"), "%Y%m%dT%H%M%S").timestamp()
-
+_HMR_DECAY_SECS   = 60 * 60 * 24   # temporal proximity half-life (seconds)
 
 ContextRepository = HybridContextRepository
 
@@ -948,6 +1020,21 @@ class MemoryManager:
             except Exception:
                 MemoryManager._graph = {}
 
+    # ──────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _half_life_factor(delta_seconds: float, half_life_seconds: float) -> float:
+        """Return multiplicative decay factor using true half-life math."""
+        if half_life_seconds <= 0:
+            return 0.0
+        # 0.5 ** (dt / half_life)
+        return 0.5 ** (max(delta_seconds, 0.0) / float(half_life_seconds))
+
+    @staticmethod
+    def _parse_ts(ts: str) -> datetime:
+        return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
+
     def _scope_filter(self, allowed_user: str | None, allowed_conv: str | None):
         """Restrict repo scans to a user and/or conversation when provided."""
         def _f(c: ContextObject) -> bool:
@@ -958,10 +1045,12 @@ class MemoryManager:
             return ok_user and ok_conv
         return _f
 
-
+    # ──────────────────────────────────────────────────────────────
+    # Graph maintenance
+    # ──────────────────────────────────────────────────────────────
     def decay_graph_edges(self, half_life_secs: float = 86_400.0, min_w: float = 1e-6) -> None:
         """Exponential decay on holographic edges; drop tiny weights."""
-        import math, time
+        import time
         now = time.time()
         # cache last decay time
         if not hasattr(self, "_last_graph_decay_ts"):
@@ -970,7 +1059,7 @@ class MemoryManager:
         dt = max(now - self._last_graph_decay_ts, 0.0)
         if dt < 60.0:   # throttle
             return
-        factor = math.exp(-dt / float(half_life_secs))
+        factor = self._half_life_factor(dt, half_life_secs)
         with self._graph_lock:
             for u, nbrs in list(self._graph.items()):
                 for v, w in list(nbrs.items()):
@@ -1011,7 +1100,7 @@ class MemoryManager:
     def end_episode(self) -> None:
         if hasattr(self, "_current_episode_id"):
             delattr(self, "_current_episode_id")
-            
+
     def consolidate_stm_to_ltm(self, promote_threshold: int = 3) -> None:
         """Promote frequently-recalled items to LTM tier (and pin them)."""
         for ctx in self.repo.query(lambda c: True):
@@ -1035,6 +1124,128 @@ class MemoryManager:
             except Exception:
                 pass
 
+    def vector_search(
+        self,
+        cue_text: str,
+        top_k: int = 10,
+        *,
+        allowed_user: str | None = None,
+        allowed_conv: str | None = None,
+        embed_fn: Callable[[str], np.ndarray],
+        reembed: bool = False,
+        use_hybrid_rank: bool = True,
+    ) -> list[ContextObject]:
+        """
+        Pure vector search (optionally hybridized with recency + assoc).
+        - Persists embeddings lazily on each ContextObject.
+        - Scopes to user/conv if provided.
+        """
+        if not cue_text:
+            return []
+
+        # Build query vector (unit)
+        q = np.asarray(embed_fn(cue_text), dtype=np.float32).reshape(-1)
+        q /= (np.linalg.norm(q) + 1e-9)
+
+        # Candidate pool: in-scope only
+        filt = self._scope_filter(allowed_user, allowed_conv)
+        cands = self.repo.query(filt)
+
+        now = default_clock()
+
+        def _get_unit_embed(c: ContextObject) -> np.ndarray | None:
+            # prefer persisted
+            if not reembed and c.embedding:
+                v = np.asarray(c.embedding, dtype=np.float32).reshape(-1)
+            else:
+                txt = (c.summary or "").strip()
+                if not txt:
+                    return None
+                v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
+                # persist for future use
+                c.embedding = v.tolist()
+                c.touch()
+                self.repo.save(c)
+            n = float(np.linalg.norm(v) + 1e-9)
+            return v / n
+
+        rows = []
+        for c in cands:
+            u = _get_unit_embed(c)
+            if u is None:
+                continue
+            sim = float(np.dot(q, u))  # cosine (unit vectors)
+            # Optional hybrid re-rank
+            if use_hybrid_rank:
+                # Recency term
+                last = _parse_ts(c.last_accessed or c.timestamp)
+                age = (now - last).total_seconds()
+                rec = 1.0 / (1.0 + age)
+                # Assoc prior: how connected is this node (degree/strength)
+                assoc = sum((c.association_strengths or {}).values())
+                # Normalize assoc lightly
+                assoc = np.log1p(assoc)
+                score = 0.55 * sim + 0.25 * rec + 0.20 * assoc
+            else:
+                score = sim
+            rows.append((c, score, sim))
+
+        # rank
+        rows.sort(key=lambda t: t[1], reverse=True)
+        pool = rows[: max(top_k * 4, top_k)]
+
+        # MMR (reuse your alpha)
+        alpha = 0.75
+        selected: list[tuple[ContextObject, float]] = []
+        vec_cache: dict[str, np.ndarray] = {}
+
+        def _vec(c: ContextObject) -> np.ndarray | None:
+            v = vec_cache.get(c.context_id)
+            if v is not None:
+                return v
+            emb = np.asarray(c.embedding, dtype=np.float32).reshape(-1) if c.embedding else None
+            if emb is None or emb.size == 0:
+                return None
+            u = emb / (np.linalg.norm(emb) + 1e-9)
+            vec_cache[c.context_id] = u
+            return u
+
+        cands = pool[:]
+        while cands and len(selected) < top_k:
+            best = None
+            best_score = -1e9
+            for c, score, sim in cands:
+                if not selected:
+                    mmr = score
+                else:
+                    v = _vec(c)
+                    if v is None:
+                        novelty = 1.0
+                    else:
+                        sims = []
+                        for cs, _s in selected:
+                            sv = _vec(cs)
+                            if sv is not None:
+                                sims.append(float(np.dot(v, sv)))
+                        novelty = 1.0 - max(sims) if sims else 1.0
+                    mmr = alpha * score + (1.0 - alpha) * novelty
+                if mmr > best_score:
+                    best_score = mmr
+                    best = (c, score)
+            selected.append(best)
+            cands = [(c, s, sim) for (c, s, sim) in cands if c.context_id != best[0].context_id]
+
+        # finalize
+        out: list[ContextObject] = []
+        for c, score in selected:
+            c.retrieval_score = float(score)
+            out.append(c)
+        return out
+
+
+    # ──────────────────────────────────────────────────────────────
+    # Lightweight recall (one hop via association_strengths)
+    # ──────────────────────────────────────────────────────────────
     def recall(
         self,
         seed_ids: List[str],
@@ -1080,7 +1291,7 @@ class MemoryManager:
                 except KeyError:
                     continue
                 base = strength * weights["assoc"]
-                last = datetime.strptime(other.last_accessed, "%Y%m%dT%H%M%SZ")
+                last = self._parse_ts(other.last_accessed)
                 age  = (now - last).total_seconds()
                 base += weights["recency"] / (1.0 + age)
                 scores[oid] = scores.get(oid, 0.0) + base
@@ -1100,7 +1311,9 @@ class MemoryManager:
             results.append(ctx)
         return results
 
-
+    # ──────────────────────────────────────────────────────────────
+    # Multi-hop activation over association_strengths
+    # ──────────────────────────────────────────────────────────────
     def spread_activation(
         self,
         seed_ids: List[str],
@@ -1119,7 +1332,6 @@ class MemoryManager:
         Returns a map {context_id: activation_score}.
         """
         now = default_clock()
-        # Initialize activations
         activation: Dict[str, float] = {cid: 1.0 for cid in seed_ids}
 
         for hop in range(1, hops + 1):
@@ -1133,14 +1345,14 @@ class MemoryManager:
                     inc = act * strength * assoc_weight * (decay ** (hop - 1))
                     new_act[neigh] = new_act.get(neigh, 0.0) + inc
             # Merge new activations
-            for cid, inc in new_act.items():
-                activation[cid] = activation.get(cid, 0.0) + inc
+            for cid2, inc in new_act.items():
+                activation[cid2] = activation.get(cid2, 0.0) + inc
 
         # Recency bonus
         for cid in list(activation.keys()):
             try:
                 ctx = self.repo.get(cid)
-                last = datetime.strptime(ctx.last_accessed, "%Y%m%dT%H%M%SZ")
+                last = self._parse_ts(ctx.last_accessed)
                 age = (now - last).total_seconds()
                 activation[cid] += recency_weight / (1.0 + age)
             except Exception:
@@ -1148,6 +1360,9 @@ class MemoryManager:
 
         return activation
 
+    # ──────────────────────────────────────────────────────────────
+    # Decay association strengths in objects + promotion to LTM
+    # ──────────────────────────────────────────────────────────────
     def decay_and_promote(
         self,
         half_life: float = 86_400.0,     # seconds in a day
@@ -1162,7 +1377,7 @@ class MemoryManager:
             except KeyError:
                 continue
 
-            last_ts = datetime.strptime(ctx.last_accessed, "%Y%m%dT%H%M%SZ")
+            last_ts = self._parse_ts(ctx.last_accessed)
             delta = (now - last_ts).total_seconds()
 
             new_strengths: Dict[str, float] = {}
@@ -1171,18 +1386,21 @@ class MemoryManager:
                     self.repo.get(oid)
                 except KeyError:
                     continue
-                decayed = strength * math.exp(-delta / half_life)
+                decayed = strength * self._half_life_factor(delta, half_life)
                 if decayed > 1e-6:
                     new_strengths[oid] = decayed
 
             should_promote = ctx.recall_stats.get("count", 0) >= promote_threshold
-            if new_strengths != ctx.association_strengths or (should_promote and ctx.memory_tier!="LTM"):
+            if new_strengths != ctx.association_strengths or (should_promote and ctx.memory_tier != "LTM"):
                 ctx.association_strengths = new_strengths
                 if should_promote:
                     ctx.memory_tier = "LTM"
                 ctx.touch()
                 self.repo.save(ctx)
 
+    # ──────────────────────────────────────────────────────────────
+    # Reinforcement (clique strengthening among coactivated)
+    # ──────────────────────────────────────────────────────────────
     def reinforce(self, context_id: str, coactivated: List[str]) -> None:
         """Strengthen symmetric edges among all coactivated items + context_id."""
         try:
@@ -1212,29 +1430,38 @@ class MemoryManager:
         self.repo.save(base)
         self._save_graph()
 
+    # ──────────────────────────────────────────────────────────────
+    # Prune stale, unpinned contexts
+    # ──────────────────────────────────────────────────────────────
     def prune(self, ttl_hours: int) -> None:
         cutoff = default_clock() - timedelta(hours=ttl_hours)
         def stale(c: ContextObject) -> bool:
-            la = datetime.strptime(c.last_accessed, "%Y%m%dT%H%M%SZ")
+            la = self._parse_ts(c.last_accessed)
             return la < cutoff and not c.pinned
         for ctx in self.repo.query(stale):
             self.repo.delete(ctx.context_id)
 
+    # ──────────────────────────────────────────────────────────────
+    # Edge ops (thread-safe)
+    # ──────────────────────────────────────────────────────────────
     def _add_edge(self, src: str, dst: str, w: float) -> None:
-        if src == dst:
+        if src == dst or w == 0.0:
             return
-        self._graph.setdefault(src, {})
-        self._graph[src][dst] = self._graph[src].get(dst, 0.0) + w
+        with self._graph_lock:
+            self._graph.setdefault(src, {})
+            self._graph[src][dst] = self._graph[src].get(dst, 0.0) + w
 
     # ------------- 1️⃣  register_relationships ----------------------
-    def register_relationships(self,
-                               ctx: ContextObject,
-                               embed_fn: Callable[[str], np.ndarray]) -> None:
+    def register_relationships(
+        self,
+        ctx: ContextObject,
+        embed_fn: Callable[[str], np.ndarray],
+    ) -> None:
         """
         Call once after saving a new/updated ContextObject.
         • Skips re-registering relationships for the same ctx.
         • Uses an in-memory cache for embeddings.
-        • Limits similarity scans to the last N items.
+        • Limits similarity scans to the last N items (scoped).
         """
         import math
         # Keep track of which contexts we've already processed
@@ -1257,80 +1484,91 @@ class MemoryManager:
             self._add_edge(cid, tag_node, _HMR_TAG_W)
             self._add_edge(tag_node, cid, _HMR_TAG_W)
             # trim oversized tag neighborhoods
-            nbrs = self._graph.get(tag_node, {})
-            if len(nbrs) > MAX_TAG_NEIGHBORS:
-                # keep top by weight
-                keep = dict(sorted(nbrs.items(), key=lambda kv: kv[1], reverse=True)[:MAX_TAG_NEIGHBORS])
-                self._graph[tag_node] = keep
+            with self._graph_lock:
+                nbrs = self._graph.get(tag_node, {})
+                if len(nbrs) > MAX_TAG_NEIGHBORS:
+                    keep = dict(sorted(nbrs.items(), key=lambda kv: kv[1], reverse=True)[:MAX_TAG_NEIGHBORS])
+                    self._graph[tag_node] = keep
 
         # ---------- semantic similarity ----------
         # initialize embedding cache if missing
         if not hasattr(self, "_embed_cache"):
-            self._embed_cache: Dict[str, np.ndarray] = {}
+            # cache stores (unit_vector, original_norm)
+            self._embed_cache: Dict[str, tuple[np.ndarray, float]] = {}
 
-
-        def _get_unit(text: str) -> np.ndarray:
-            vec = None
+        def _unit(text: str) -> np.ndarray:
             if text in self._embed_cache:
-                vec, _ = self._embed_cache[text]
-                return vec
+                u, _ = self._embed_cache[text]
+                return u
             raw = embed_fn(text)
             v = np.asarray(raw, dtype=np.float32).reshape(-1)
             n = float(np.linalg.norm(v) + 1e-9)
             u = v / n
             self._embed_cache[text] = (u, n)
             return u
-        
+
         try:
-            v1 = _get_unit(ctx.summary or "")
-            # restrict recents to same user/conversation when available
-            allowed_user = (ctx.metadata or {}).get("user_id")
-            allowed_conv = (ctx.metadata or {}).get("conversation_id")
-            recents = self.repo.query(self._scope_filter(allowed_user, allowed_conv))[-200:]
-            for other in recents:
-                if other.context_id == cid or not other.summary:
-                    continue
-                txt = other.summary
-                v2 = _get_unit(txt)
-                sim = float(np.dot(v1, v2))  # already unit vectors
-                if sim >= _HMR_SIM_THRESH:
-                    w = _HMR_SIM_W * sim
-                    self._add_edge(cid, other.context_id, w)
-                    self._add_edge(other.context_id, cid, w)
+            base_text = (ctx.summary or "").strip()
+            if base_text:
+                v1 = _unit(base_text)
+                # restrict recents to same user/conversation when available
+                allowed_user = (ctx.metadata or {}).get("user_id")
+                allowed_conv = (ctx.metadata or {}).get("conversation_id")
+                # Stable recency ordering (by last_accessed then timestamp)
+                recents_all = self.repo.query(self._scope_filter(allowed_user, allowed_conv))
+                recents_sorted = sorted(
+                    recents_all,
+                    key=lambda c: (c.last_accessed or c.timestamp),
+                )[-200:]
+                for other in recents_sorted:
+                    if other.context_id == cid:
+                        continue
+                    txt = (other.summary or "").strip()
+                    if not txt:
+                        continue
+                    v2 = _unit(txt)
+                    sim = float(np.dot(v1, v2))  # already unit vectors
+                    if sim >= _HMR_SIM_THRESH:
+                        w = _HMR_SIM_W * sim
+                        self._add_edge(cid, other.context_id, w)
+                        self._add_edge(other.context_id, cid, w)
         except Exception:
             pass
 
         # ---------- temporal proximity (<10 min) ----------
-        now = ctx._ts_seconds()
-        # limit scan to contexts added in the last window
+        now_sec = ctx._ts_seconds()
         window = 600  # seconds
         allowed_user = (ctx.metadata or {}).get("user_id")
         allowed_conv = (ctx.metadata or {}).get("conversation_id")
         candidates = [
             c for c in self.repo.query(self._scope_filter(allowed_user, allowed_conv))
-            if abs(now - c._ts_seconds()) <= window and c.context_id != cid
+            if abs(now_sec - c._ts_seconds()) <= window and c.context_id != cid
         ]
         for other in candidates:
-            age = abs(now - other._ts_seconds())
-            w = math.exp(-age / _HMR_DECAY_SECS)
+            age = abs(now_sec - other._ts_seconds())
+            w = self._half_life_factor(age, _HMR_DECAY_SECS)
             self._add_edge(cid, other.context_id, w)
             self._add_edge(other.context_id, cid, w)
 
+        # Persist graph after all mutations
+        self._save_graph()
+
     # ------------- 2️⃣  holographic_recall --------------------------
-    def holographic_recall(self,
-                        cue_ids: List[str] | None = None,
-                        cue_text: str | None = None,
-                        hops: int = 2,
-                        top_n: int = 10,
-                        embed_fn: Callable[[str], np.ndarray] | None = None
-                        ) -> List[ContextObject]:
+    def holographic_recall(
+        self,
+        cue_ids: List[str] | None = None,
+        cue_text: str | None = None,
+        hops: int = 2,
+        top_n: int = 10,
+        embed_fn: Callable[[str], np.ndarray] | None = None
+    ) -> List[ContextObject]:
         """
         Fuse cue_ids &/or cue_text into a single excitation vector,
         run multi-hop spreading activation over _graph, return top_n ContextObjects.
         """
         self.decay_graph_edges()
         self.consolidate_stm_to_ltm()
-        
+
         cue_ids = cue_ids or []
         activation: Dict[str, float] = collections.Counter({cid: 1.0 for cid in cue_ids})
 
@@ -1345,24 +1583,17 @@ class MemoryManager:
             except Exception:
                 pass
 
-        # local unit-vector helper (mirrors register_relationships)
-        def _get_unit_text(text: str) -> np.ndarray:
-            raw = embed_fn(text)
-            v = np.asarray(raw, dtype=np.float32).reshape(-1)
-            n = float(np.linalg.norm(v) + 1e-9)
-            return v / n
-
         # text cue → similarity edges once, scoped to user/conv
         if cue_text and embed_fn:
-            def _unit_text(text: str) -> np.ndarray:
+            def _unit(text: str) -> np.ndarray:
                 v = np.asarray(embed_fn(text), dtype=np.float32).reshape(-1)
                 n = float(np.linalg.norm(v) + 1e-9)
                 return v / n
-            qv = _unit_text(cue_text)
+            qv = _unit(cue_text)
             for c in self.repo.query(self._scope_filter(owner_user, owner_conv)):
                 if not c.summary:
                     continue
-                vv = _unit_text(c.summary)
+                vv = _unit(c.summary)
                 sim = float(np.dot(qv, vv))  # unit vectors
                 if sim >= _HMR_SIM_THRESH:
                     activation[c.context_id] += _HMR_SIM_W * sim
@@ -1377,11 +1608,15 @@ class MemoryManager:
             except Exception:
                 return False
 
+        # Snapshot graph under lock to avoid concurrent modification during traversal
+        with self._graph_lock:
+            graph_snapshot = {k: dict(v) for k, v in self._graph.items()}
+
         frontier = dict(activation)
         for _ in range(hops):
             new_frontier = collections.Counter()
             for nid, act in frontier.items():
-                for nbr, w in self._graph.get(nid, {}).items():
+                for nbr, w in graph_snapshot.get(nid, {}).items():
                     if not _in_scope(nbr):
                         continue
                     new_frontier[nbr] += act * w
@@ -1449,7 +1684,6 @@ class MemoryManager:
             except KeyError:
                 continue
         return out
-
 
 
 # ─ Graph Interface Layer ───────────────────────────────────────────────────────
