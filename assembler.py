@@ -2473,7 +2473,28 @@ class Assembler:
         return ""
 
 
+    from self_state import SelfState
 
+    def _load_self_state(self) -> SelfState:
+        rows = sorted(self.repo.query(lambda c: c.component=="self_state"), key=lambda c: c.timestamp, reverse=True)
+        if rows:
+            try:
+                return SelfState(rows[0].metadata.get("data", {}))
+            except Exception:
+                pass
+        return SelfState()
+
+    def _save_self_state(self, ss: SelfState):
+        from context import ContextObject
+        ctx = ContextObject.make_stage("self_state", [], {"data": ss.data})
+        ctx.stage_id = "self_state"; ctx.summary = "self_state update"
+        ctx.touch(); self.repo.save(ctx)
+
+    # convenience
+    def param(self, key, default):
+        ss = getattr(self, "_self_state", None) or self._load_self_state()
+        self._self_state = ss
+        return ss.param(key, default)
 
 
 
@@ -3617,6 +3638,14 @@ class Assembler:
         state["conversation_id"] = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
         self._active_conversation_id = state["conversation_id"]
         state["user_id"] = getattr(self, "current_user_id", "anon")
+        
+        try:
+            self._self_state = getattr(self, "_self_state", None) or self._load_self_state()
+            state["self_state"] = self._self_state
+            # expose a few knobs into state for downstream
+            state["policies"] = self._self_state.policies
+        except Exception:
+            pass
 
         # Decision gates (non-fatal)
         try:

@@ -993,54 +993,6 @@ def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
     return kg_ctx
 
 
-def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
-    import json
-    nodes, edges = {}, []
-    # tool + param nodes
-    for t in tools_list:
-        tn = f"tool:{t['name']}"; nodes[tn] = {"type":"tool"}
-        props = (t.get("schema",{}).get("parameters",{}).get("properties",{}) or {})
-        for p in props:
-            pn = f"param:{t['name']}.{p}"; nodes[pn] = {"type":"param"}
-            edges.append((tn, "has_param", pn))
-    # concepts from clarifier + snippets
-    kws = (clar_ctx.metadata.get("keywords") or []) + re.findall(r"\b[A-Za-z][\w-]{2,}\b", know_ctx.summary or "")
-    kws = list(dict.fromkeys(kws))[:50]
-    for kw in kws:
-        cn = f"concept:{kw}"; nodes[cn] = {"type":"concept"}
-
-    # simple affinity: embedding cosine between kw and tool/param descriptions
-    def emb(x): return self.embed_text(x or "")
-    tool_desc = {t['name']: (t['description'] or "") for t in tools_list}
-    kw_vecs = {kw: emb(kw) for kw in kws}
-    t_vecs  = {name: emb(desc) for name,desc in tool_desc.items()}
-    def cos(a,b): 
-        import numpy as np
-        a=np.array(a); b=np.array(b)
-        den = (np.linalg.norm(a)*np.linalg.norm(b)) or 1.0
-        return float(np.dot(a,b)/den)
-    affinities = []
-    for kw in kws:
-        for name in tool_desc:
-            score = cos(kw_vecs[kw], t_vecs[name])
-            if score >= 0.25:
-                affinities.append((f"concept:{kw}", "affinity", f"tool:{name}", score))
-    affinities.sort(key=lambda x: x[3], reverse=True)
-    top_pairs = affinities[: min(100, len(affinities))]
-
-    kg = {"nodes": nodes, "edges": edges + [(a,b,c) for a,b,c,_ in top_pairs],
-          "top_tool_candidates": sorted(
-              {c.split(':',1)[1] for _,_,c,_ in top_pairs}, key=lambda n: max(s for a,b,c,s in top_pairs if c.endswith(n)), reverse=True)[:10]
-    }
-
-    kg_ctx = ContextObject.make_knowledge("planning_kg", kg, tags=["planning","kg"])
-    kg_ctx.summary = json.dumps({"top_tool_candidates": kg["top_tool_candidates"]}, ensure_ascii=False)
-    self.repo.save(kg_ctx)
-    self.memman.register_relationships(kg_ctx, self.embed_text)
-    state["planning_kg"] = kg
-    return kg_ctx
-
-
 def _stage6_prepare_tools(self) -> list[dict]:
     """
     Return a list of tool specs for planning:
