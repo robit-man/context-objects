@@ -890,9 +890,6 @@ def _stage5_external_knowledge(
     return ext
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Stage 5b — Planning KG (tool/param graph with literal arg exposure)
-# ──────────────────────────────────────────────────────────────────────────────
 def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
     """
     Build a lightweight planning knowledge graph that:
@@ -994,7 +991,6 @@ def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
     state["planning_kg"] = kg
     state["arg_catalog"] = arg_catalog
     return kg_ctx
-
 
 
 def _stage5b_build_planning_kg(self, clar_ctx, know_ctx, tools_list, state):
@@ -2489,30 +2485,429 @@ def _stage7b_plan_validation(
     return fixed_calls, err_pairs, fixed_calls
 
 
+# ================================
+#  High-Observability Orchestrator (additive)
+# ================================
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+import json, os, re, uuid, hashlib
+from context import ContextObject
+
+# ---------- Standard artifact envelope ----------
+
+@dataclass
+class Artifact:
+    kind: str                 # "text" | "list" | "json" | "table" | "file" | "blob" | "none"
+    data: Any
+    mime: str = ""
+    uri: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "data": self.data,
+            "mime": self.mime,
+            "uri": self.uri,
+            "meta": self.meta,
+        }
+
+def _coerce_artifact(val: Any, *, default_kind: str = "json") -> Artifact:
+    if val is None:
+        return Artifact("none", None)
+    if isinstance(val, Artifact):
+        return val
+    if isinstance(val, str):
+        # If it smells like a path that exists, call it a file
+        if os.path.exists(val) and (os.path.isfile(val) or os.path.isdir(val)):
+            return Artifact("file", {"path": val}, uri=val, mime="", meta={"exists": True})
+        return Artifact("text", val, mime="text/plain; charset=utf-8")
+    if isinstance(val, (list, tuple)):
+        return Artifact("list", list(val), mime="application/json")
+    if isinstance(val, dict):
+        return Artifact("json", val, mime="application/json")
+    if isinstance(val, (bytes, bytearray)):
+        return Artifact("blob", f"<{len(val)} bytes>", mime="application/octet-stream")
+    # Fallback: repr
+    return Artifact(default_kind, json.loads(json.dumps(val, default=str)), mime="application/json")
+
+# ---------- Lightweight ArtifactBus for node-to-node passing ----------
+
+class ArtifactBus:
+    def __init__(self) -> None:
+        self._store: Dict[str, Artifact] = {}
+
+    def put(self, key: str, art: Artifact) -> None:
+        self._store[key] = art
+
+    def get(self, key: str, path: Optional[str] = None) -> Any:
+        art = self._store.get(key)
+        if not art:
+            return None
+        if not path:
+            return art.data
+        # simple dotted-attr / dict path
+        cur = art.data
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
+# ---------- Orchestration events (observability) ----------
+
+def _emit_event(self, kind: str, data: Dict[str, Any]) -> None:
+    """
+    Persist a lightweight orchestration event row.
+    """
+    try:
+        evt = ContextObject.make_stage("orchestration_event", [], {"event": kind, "data": data})
+        evt.stage_id = f"evt_{kind}"
+        evt.summary = f"{kind}: {str(data)[:220]}"
+        # inherit conv/user if we have it
+        try:
+            evt.metadata["conversation_id"] = data.get("conversation_id") or getattr(self, "_active_conversation_id", None)
+            evt.metadata["user_id"] = data.get("user_id") or getattr(self, "current_user_id", None)
+        except Exception:
+            pass
+        evt.touch()
+        self.repo.save(evt)
+    except Exception:
+        pass
+
+# ---------- Strategy templates / expander for abstract 'action:*' nodes ----------
+
+class StrategyTemplates:
+    """
+    Expands abstract nodes like:
+       {"id":"task1","tool":"action:web.research","args":{"query":"...", "folder":"./out","filename":"notes.md"}}
+    into a concrete DAG using existing tools discovered from schemas.
+
+    It dynamically resolves tool names from your active tool schemas, preferring
+    the first match among candidate name lists.
+    """
+    WEB_SEARCH_CANDIDATES   = ["web_search", "search_web", "internet_search", "bing_search", "ddg_search", "duckduckgo_search", "search"]
+    REFINE_LIST_CANDIDATES  = ["refine_list", "summarize_list", "list_summarize", "summarize_text", "llm_summarize", "extract_top"]
+    FILE_WRITE_CANDIDATES   = ["write_file", "file_write", "save_text", "fs_write", "persist_text", "save_file"]
+
+    def __init__(self, host) -> None:
+        self.host = host
+
+    def _resolve_tool(self, tools_list: List[Dict[str, Any]], candidates: List[str]) -> Optional[str]:
+        names = {t["name"]: t for t in tools_list or []}
+        # direct match first
+        for c in candidates:
+            if c in names:
+                return c
+        # relaxed contains / fuzzy
+        lowered = {k.lower(): k for k in names.keys()}
+        for c in candidates:
+            if c.lower() in lowered:
+                return lowered[c.lower()]
+        # fallback: substring scan
+        for k in names.keys():
+            if any(c.lower() in k.lower() for c in candidates):
+                return k
+        return None
+
+    @staticmethod
+    def _pick_key(props: Dict[str, Any], *candidates: str, default: Optional[str] = None) -> Optional[str]:
+        pset = set(props.keys())
+        for c in candidates:
+            if c in pset:
+                return c
+        # relaxed fallbacks
+        for c in candidates:
+            for p in pset:
+                if p.lower() == c.lower():
+                    return p
+        return default
+
+    def expand_node(self, node: Dict[str, Any], tools_list: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        tool = (node.get("tool") or "").strip()
+        if not tool.startswith("action:"):
+            return None
+
+        action = tool.split(":", 1)[1]
+        base_id = node["id"]
+        args    = node.get("args", {}) or {}
+
+        # Resolve concrete tools
+        web_t   = self._resolve_tool(tools_list, self.WEB_SEARCH_CANDIDATES)
+        ref_t   = self._resolve_tool(tools_list, self.REFINE_LIST_CANDIDATES)
+        file_t  = self._resolve_tool(tools_list, self.FILE_WRITE_CANDIDATES)
+
+        if action == "web.research" and web_t and ref_t and file_t:
+            # Pull schemas to adapt arg names to what your tools expect
+            schema_map = {t["name"]: (t.get("schema") or {}) for t in tools_list}
+            web_props  = (schema_map.get(web_t, {}).get("parameters", {}) or {}).get("properties", {}) or {}
+            ref_props  = (schema_map.get(ref_t, {}).get("parameters", {}) or {}).get("properties", {}) or {}
+            file_props = (schema_map.get(file_t, {}).get("parameters", {}) or {}).get("properties", {}) or {}
+
+            # Pick canonical keys per tool
+            web_query_key  = self._pick_key(web_props, "query", "q", "search", default="query")
+            web_k_key      = self._pick_key(web_props, "top_k", "k", "limit", "n", default="top_k")
+
+            ref_in_key     = self._pick_key(ref_props, "items", "results", "texts", "input", "text", default="items")
+            ref_goal_key   = self._pick_key(ref_props, "goal", "instruction", "prompt", default="goal")
+
+            file_path_key  = self._pick_key(file_props, "path", "filepath", "file_path", default="path")
+            file_text_key  = self._pick_key(file_props, "text", "content", "data", default="text")
+
+            # Build the micro-DAG
+            n1 = {
+                "id": f"{base_id}.search",
+                "tool": web_t,
+                "args": {
+                    web_query_key: args.get("query") or args.get("q") or "",
+                    web_k_key: int(args.get("top_k", args.get("k", 10))),
+                },
+                "after": list(node.get("after", []) or []),
+            }
+            n2 = {
+                "id": f"{base_id}.refine",
+                "tool": ref_t,
+                "args": {
+                    ref_in_key: f"[{n1['id']}.output]",  # pass raw list/results forward
+                    ref_goal_key: args.get("goal") or "Condense, deduplicate, and produce a clean bullet list with links.",
+                },
+                "after": [n1["id"]],
+            }
+            target_folder = args.get("folder") or args.get("dir") or "./out"
+            target_name   = args.get("filename") or "notes.md"
+            target_path   = os.path.join(target_folder, target_name)
+            n3 = {
+                "id": f"{base_id}.persist",
+                "tool": file_t,
+                "args": {
+                    file_path_key: target_path,
+                    file_text_key: f"[{n2['id']}.output]",
+                },
+                "after": [n2["id"]],
+            }
+            return [n1, n2, n3]
+
+        # Unknown action or missing tools -> leave as-is (no expansion)
+        return None
+
+def _stage7c_expand_strategy_graph(self, graph: Dict[str, Any], tools_list: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Walk a graph produced by the planner and expand any abstract 'action:*' nodes
+    into concrete tool nodes using StrategyTemplates. Maintains dependencies.
+    """
+    tmpl = StrategyTemplates(self)
+    nodes: List[Dict[str, Any]] = list(graph.get("nodes", []))
+    if not nodes:
+        return graph
+
+    id_to_idx = {n["id"]: i for i, n in enumerate(nodes) if n.get("id")}
+    expanded: List[Dict[str, Any]] = []
+    replaced: Dict[str, str] = {}  # original_id -> last_subnode_id
+
+    for n in nodes:
+        out = tmpl.expand_node(n, tools_list)
+        if not out:
+            expanded.append(n)
+            continue
+        # Remember last subnode to reroute downstream deps
+        last = out[-1]["id"]
+        replaced[n["id"]] = last
+        expanded.extend(out)
+
+    # If nothing expanded, return original
+    if not replaced:
+        return {**graph, "nodes": nodes}
+
+    # Reroute any 'after' edges that pointed at originals -> last subnode of expansion
+    for n in expanded:
+        af = n.get("after", []) or []
+        new_after = []
+        for dep in af:
+            new_after.append(replaced.get(dep, dep))
+        n["after"] = list(dict.fromkeys(new_after))  # de-dupe preserve order
+
+    out_graph = {**graph, "nodes": expanded}
+    # Persist an event row for observability
+    try:
+        _emit_event(self, "plan_expanded", {
+            "replaced": replaced,
+            "total_nodes": len(nodes),
+            "expanded_nodes": sum(1 for _ in replaced),
+        })
+    except Exception:
+        pass
+    return out_graph
+
+# ---------- Critic / Planner / Executor adapters (plug into existing pipeline) ----------
+
+class HighObsCritic:
+    def __init__(self, host) -> None:
+        self.host = host
+
+    def preflight(self, graph: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
+        """
+        Validate the graph against tool availability + required params.
+        Reuses your Stage 7b validator for consistency.
+        """
+        try:
+            # Make a lightweight plan_ctx to satisfy stage signature
+            dummy_plan_ctx = ContextObject.make_stage("preflight_plan_ctx", [], {"graph": graph})
+            fixed, errs, _ = self.host._stage7b_plan_validation(
+                plan_ctx=dummy_plan_ctx,
+                plan_output={"graph": graph},
+                tools_list=context.get("tools", []),
+                state=self.host._last_state or {}
+            )
+            return [f"{nid}: {msg}" for (nid, msg) in errs]
+        except Exception as e:
+            return [f"preflight_error: {e}"]
+
+    def postcheck(self, tool_ctxs: List["ContextObject"], graph: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
+        """
+        Optional postconditions: if a persist node exists, ensure it succeeded, etc.
+        """
+        issues: List[str] = []
+        tmap = {c.metadata.get("node_id"): c for c in tool_ctxs if isinstance(c.metadata, dict)}
+        for n in graph.get("nodes", []):
+            if not n.get("id"):
+                continue
+            if ".persist" in n["id"]:
+                tc = tmap.get(n["id"])
+                if not tc or (tc.metadata.get("exception") is not None):
+                    issues.append(f"persist_failed:{n['id']}")
+        return issues
+
+class HighObsPlannerCore:
+    """
+    Uses your existing Stage 7 planner, then runs expansion templates.
+    """
+    def __init__(self, host) -> None:
+        self.host = host
+
+    def propose(self, context: Dict[str, Any], k: int = 1) -> List[Dict[str, Any]]:
+        state = self.host._last_state or {}
+        clar  = context.get("clar")
+        know  = context.get("knowledge")
+        tools = context.get("tools") or []
+        user_text = context.get("user_text", "")
+
+        # Run your Stage 7 planner (returns ctx + JSON string)
+        plan_ctx, plan_json = self.host._stage7_planning_summary(
+            clar_ctx=clar, know_ctx=know, tools_list=tools, user_text=user_text, state=state
+        )
+        try:
+            obj = json.loads(plan_json)
+        except Exception:
+            obj = {"graph": (context.get("graph") or {"nodes": [], "meta": {}})}
+
+        # Expand abstract actions into concrete tool nodes
+        graph0 = obj.get("graph") or {"nodes": [], "meta": {}}
+        graph1 = _stage7c_expand_strategy_graph(self.host, graph0, tools, state)
+
+        _emit_event(self.host, "plan_proposed", {
+            "nodes": len(graph1.get("nodes", [])),
+            "from_expansion": True,
+        })
+
+        # We return one best plan; if more are requested, duplicate (score/policy can refine later)
+        return [graph1] + [graph1 for _ in range(max(0, (k or 1) - 1))]
+
+class HighObsExecutorCore:
+    """
+    Wraps your Stage 9 DAG executor, emits events, and assembles a reply via your Stage 10.
+    """
+    def __init__(self, host) -> None:
+        self.host = host
+
+    def run(self, graph: Dict[str, Any], context: Dict[str, Any], critic: Optional[HighObsCritic] = None, tool_registry=None) -> Dict[str, Any]:
+        state = self.host._last_state or {}
+        user_text = context.get("user_text", "")
+        clar      = context.get("clar") or {}
+        issues_pre = critic.preflight(graph, context) if critic else []
+        if issues_pre:
+            _emit_event(self.host, "preflight_issues", {"count": len(issues_pre), "examples": issues_pre[:3]})
+
+        plan_json = json.dumps({"graph": graph}, ensure_ascii=False)
+        # Execute
+        tool_ctxs = self.host._stage9_invoke_with_retries(
+            raw_calls=[],
+            plan_output=plan_json,
+            selected_schemas=[],
+            user_text=user_text,
+            clar_metadata=getattr(clar, "metadata", {}) if clar else {},
+            state=state,
+        )
+        _emit_event(self.host, "execution_finished", {"tool_ctxs": len(tool_ctxs)})
+
+        # Postcheck
+        issues_post = critic.postcheck(tool_ctxs, graph, context) if critic else []
+        if issues_post:
+            _emit_event(self.host, "postcheck_issues", {"count": len(issues_post), "examples": issues_post[:3]})
+
+        # Build reply with your Stage 10/10b polish if available
+        reply = self.host._stage10_assemble_and_infer(user_text=user_text, state=state)
+        try:
+            polished = self.host._stage10b_response_critique_and_safety(
+                draft=reply, user_text=user_text, tool_ctxs=tool_ctxs, state=state
+            )
+            reply = polished or reply
+        except Exception:
+            pass
+
+        # Memory writeback
+        try:
+            self.host._stage11_memory_writeback(final_answer=reply, tool_ctxs=tool_ctxs)
+        except Exception:
+            pass
+
+        return {
+            "reply": reply,
+            "tool_ctxs": tool_ctxs,
+            "graph": graph,
+            "repairs": 0,
+            "issues": issues_pre + issues_post,
+        }
+
+# ---------- Auto-instantiation helper (call once during assembler boot) ----------
+
+def _ensure_orchestrator_attached(self) -> None:
+    """
+    Attach planner_core / executor_core / critic if missing.
+    Safe to call repeatedly.
+    """
+    if not getattr(self, "planner_core", None):
+        self.planner_core = HighObsPlannerCore(self)
+    if not getattr(self, "executor_core", None):
+        self.executor_core = HighObsExecutorCore(self)
+    if not getattr(self, "critic", None):
+        self.critic = HighObsCritic(self)
+
+
+
 def _stage8_orchestrate(
     self,
     user_text: str,
     state: Dict[str, Any],
-) -> Tuple[str, List[ContextObject]]:
+) -> Tuple[str, List["ContextObject"]]:
     """
-    Top-level orchestrator: plan → execute → (maybe replan) → finalize.
-    Returns (assistant_reply, all_tool_outputs)
+    Top-level orchestrator: plan → validate → chain → execute (DAG) → reflect/replan → finalize.
+
+    This **upgrades** existing Stage 8 to:
+      • Always generate a DAG via Stage 7 (planner)
+      • Validate/repair via Stage 7b (schema-aware)
+      • Summarize calls + collect schema ctxs via Stage 8 (tool chaining)
+      • Execute with Stage 9 (DAG executor), reflecting with Stage 9b
+      • Finalize with Stage 10/10b and write-back with Stage 11
     """
+    # Ensure IDs for stamping
+    state.setdefault("conversation_id", getattr(self, "_active_conversation_id", uuid.uuid4().hex))
+    state.setdefault("user_id", getattr(self, "current_user_id", "anon"))
 
-    # ─── 0) Make sure conversation_id & user_id exist for stamping ───
-    state.setdefault(
-        "conversation_id",
-        getattr(self, "_active_conversation_id", uuid.uuid4().hex)
-    )
-    state.setdefault(
-        "user_id",
-        getattr(self, "current_user_id", "anon")
-    )
-
-    # ─── 1) Planner: from clarifier + knowledge → graph
+    # ─── 1) Planner → DAG ───────────────────────────────────────────
     clar_ctx = state["clar_ctx"]
     know_ctx = state["know_ctx"]
-    tools    = state.get("tools_list", [])
+    tools    = state.get("tools_list", []) or []
 
     plan_ctx, plan_json = self._stage7_planning_summary(
         clar_ctx   = clar_ctx,
@@ -2524,11 +2919,36 @@ def _stage8_orchestrate(
     state["plan_ctx"]    = plan_ctx
     state["plan_output"] = plan_json
 
-    all_tool_ctxs: List[ContextObject] = []
+    # ─── 2) Validate/repair + tool-chaining (for schema refs) ───────
+    try:
+        _fixed_calls, _errors, _again = self._stage7b_plan_validation(
+            plan_ctx      = plan_ctx,
+            plan_output   = state["plan_output"],
+            tools_list    = tools,
+            state         = state,
+        )
+        state["fixed_calls"] = _fixed_calls
+    except Exception:
+        pass
 
-    # ─── 2) Execute + reflect/replan until done ───────────────────────
+    try:
+        tc_ctx, calls, selected_schemas = self._stage8_tool_chaining(
+            plan_ctx    = plan_ctx,
+            plan_output = state["plan_output"],
+            tools_list  = tools,
+            state       = state,
+        )
+        state["tc_ctx"]  = tc_ctx
+        state["schemas"] = selected_schemas
+        _ = self._stage8_5_user_confirmation(calls, user_text)  # auto-approve; keeps legacy semantics
+    except Exception:
+        state["schemas"] = state.get("schemas", [])
+
+    # ─── 3) Execute DAG → reflect/replan until done ─────────────────
+    all_tool_ctxs: List["ContextObject"] = []
+
     while True:
-        # 2a) Run any ready DAG nodes
+        # 3a) Execute ready nodes
         tcs = self._stage9_invoke_with_retries(
             raw_calls        = [],  # ignored for DAG mode
             plan_output      = state["plan_output"],
@@ -2544,26 +2964,23 @@ def _stage8_orchestrate(
         if not getattr(turn, "pending_nodes", None):
             break
 
-        # 2b) Reflection & maybe re-plan
+        # 3b) Reflection (optional replan)
         replan = self._stage9b_reflection_and_replan(
-            tool_ctxs    = tcs,
-            plan_output  = state["plan_output"],
-            user_text    = user_text,
-            clar_metadata= clar_ctx.metadata,
-            state        = state,
+            tool_ctxs     = tcs,
+            plan_output   = state["plan_output"],
+            user_text     = user_text,
+            clar_metadata = clar_ctx.metadata,
+            state         = state,
         )
-        # None means “OK” — keep the same graph
-        if replan is None:
+        if replan is None:      # OK/no changes
             continue
 
-        # otherwise swap in the new plan
+        # swap in new plan JSON (normalized)
         state["plan_output_prev"] = state["plan_output"]
         state["plan_output"]      = replan
 
-    # ─── 3) Final answer assembly ─────────────────────────────────────
+    # ─── 4) Final answer assembly & polish ───────────────────────────
     reply = self._stage10_assemble_and_infer(user_text=user_text, state=state)
-
-    # ─── 4) Optional safety / polish ──────────────────────────────────
     polished = self._stage10b_response_critique_and_safety(
         draft     = reply,
         user_text = user_text,
@@ -2573,7 +2990,7 @@ def _stage8_orchestrate(
     if polished:
         reply = polished
 
-    # ─── 5) Memory write-back ─────────────────────────────────────────
+    # ─── 5) Memory write-back ────────────────────────────────────────
     self._stage11_memory_writeback(final_answer=reply, tool_ctxs=all_tool_ctxs)
 
     return reply, all_tool_ctxs
@@ -2704,8 +3121,8 @@ def _stage8_5_user_confirmation(
 
 def _stage9b_reflection_and_replan(
     self,
-    tool_ctxs: List[ContextObject],
-    plan_output: str,
+    tool_ctxs: List["ContextObject"],
+    plan_output: Any,  # may be str or dict
     user_text: str,
     clar_metadata: Dict[str, Any],
     state: Dict[str, Any],
@@ -2722,12 +3139,24 @@ def _stage9b_reflection_and_replan(
     from typing import Any, Dict
 
     # ────────────────────────── helper fns ────────────────────────────
-    def _clean_json_block(text: str) -> str:
-        m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S)
+    def _clean_json_block(text: Any) -> str:
+        """Accept str or dict and return a JSON text to load from."""
+        if isinstance(text, (dict, list)):
+            try:
+                return json.dumps(text, ensure_ascii=False)
+            except Exception:
+                return "{}"
+        s = text or ""
+        if not isinstance(s, str):
+            try:
+                s = str(s)
+            except Exception:
+                s = ""
+        m = re.search(r"```json\s*(\{.*?\})\s*```", s, flags=re.S)
         if m:
             return m.group(1)
-        m2 = re.search(r"(\{.*\})", text, flags=re.S)
-        return (m2.group(1) if m2 else (text or "")).strip()
+        m2 = re.search(r"(\{.*\})", s, flags=re.S)
+        return (m2.group(1) if m2 else s).strip()
 
     def _pretty(obj: Any) -> str:
         try:
@@ -2741,30 +3170,48 @@ def _stage9b_reflection_and_replan(
 
     # convert {"tasks":[...]} or bare task into {'graph':{...}}
     def _as_graph(plan_any: Any) -> Dict[str, Any]:
-        # (same normaliser as before – omitted here for brevity)
         from copy import deepcopy
+
         def _flatten(task, parent, idx, acc):
             idx[0] += 1
             nid = task.get("id") or f"n{idx[0]}"
             acc.append(
-                {"id": nid, "tool": task.get("call"), "args": task.get("tool_input", {}), "after": [parent] if parent else []}
+                {
+                    "id": nid,
+                    "tool": task.get("call"),
+                    "args": task.get("tool_input", {}) or {},
+                    "after": [parent] if parent else [],
+                }
             )
             for sub in task.get("subtasks", []) or []:
                 _flatten(sub, nid, idx, acc)
 
+        # Already a graph dict
         if isinstance(plan_any, dict) and "graph" in plan_any:
             g = deepcopy(plan_any["graph"])
             g.setdefault("nodes", [])
             g.setdefault("meta", {})
+            for n in g["nodes"]:
+                n.setdefault("args", {})
+                n.setdefault("after", [])
             return {"graph": g}
 
+        # Plan as dict with tasks
         if isinstance(plan_any, dict) and "tasks" in plan_any:
             nodes, counter = [], [0]
-            for t in plan_any["tasks"]:
+            for t in plan_any["tasks"] or []:
                 _flatten(t, None, counter, nodes)
-            return {"graph": {"nodes": nodes, "meta": plan_any.get("meta", {})}}
+            return {"graph": {"nodes": nodes, "meta": plan_any.get("meta", {}) or {}}}
 
-        # bare single task
+        # If it’s text, try to parse
+        if isinstance(plan_any, str) and plan_any.strip():
+            try:
+                obj = json.loads(_clean_json_block(plan_any))
+                return _as_graph(obj)
+            except Exception:
+                pass
+
+        # Bare single task dict
         if isinstance(plan_any, dict) and "call" in plan_any:
             return _as_graph({"tasks": [plan_any]})
 
@@ -2777,10 +3224,21 @@ def _stage9b_reflection_and_replan(
     # ───────────────────── current turn / plan state ──────────────────
     turn = _ensure_turn_state(state)
 
-    cur_graph = _as_graph(json.loads(_clean_json_block(plan_output)) if plan_output else {}).get("graph")
+    # Robustly normalize incoming plan_output (dict or str) → graph
+    try:
+        if isinstance(plan_output, dict):
+            plan_obj_in = plan_output
+        elif isinstance(plan_output, str):
+            plan_obj_in = json.loads(_clean_json_block(plan_output)) if plan_output.strip() else {}
+        else:
+            plan_obj_in = {}
+    except Exception:
+        plan_obj_in = {}
+
+    cur_graph = _as_graph(plan_obj_in).get("graph")
     cur_sig   = _sig(cur_graph)
 
-    # safe tracker lookup (works whether repo.query returns list or iterator)
+    # safe tracker lookup (works for list or iterator)
     trackers = self.repo.query(
         lambda c: c.component == "plan_tracker"
         and (
@@ -2788,10 +3246,10 @@ def _stage9b_reflection_and_replan(
             or c.semantic_label == cur_sig
         )
     )
-    if isinstance(trackers, list):
-        tracker = trackers[0] if trackers else None
-    else:                                 # generator / iterator
-        tracker = next(trackers, None)
+    try:
+        tracker = trackers[0] if isinstance(trackers, list) else next(iter(trackers))
+    except Exception:
+        tracker = None
 
     completed = set()
     pending   = set()
@@ -2825,9 +3283,9 @@ def _stage9b_reflection_and_replan(
         parts.append("=== CLARIFIER KEYWORDS ===\n" + ", ".join(clar_keywords))
 
     for tc in tool_ctxs:
-        oid = tc.metadata.get("node_id")
-        tnm = tc.metadata.get("tool_name")
-        payload = tc.metadata.get("output_short") or tc.metadata.get("output_full")
+        oid = (tc.metadata or {}).get("node_id")
+        tnm = (tc.metadata or {}).get("tool_name")
+        payload = (tc.metadata or {}).get("output_short") or (tc.metadata or {}).get("output_full") or (tc.metadata or {})
         parts.append(f"=== TOOL OUTPUT [node={oid} tool={tnm}] ===\n{_pretty(payload)[:800]}")
 
     parts.append("=== ORIGINAL GRAPH ===\n" + _pretty(cur_graph))
@@ -2848,19 +3306,23 @@ def _stage9b_reflection_and_replan(
         self.secondary_model,
         [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt_user}],
         tag="[Reflection]",
-    ).strip()
+    )
 
     # ───────────────— quick exits: OK / same graph —───────────────────
-    if re.fullmatch(r"(?i)(ok|okay)[.!]?", reply_raw):
+    if isinstance(reply_raw, str) and re.fullmatch(r"(?i)(ok|okay)[.!]?", reply_raw.strip()):
         return None
 
-    try:
-        new_plan = json.loads(_clean_json_block(reply_raw))
-    except Exception:
-        # unparsable – bubble raw string upwards
-        return reply_raw
+    # If model returned dict already, great; otherwise parse text
+    if isinstance(reply_raw, dict):
+        new_plan = reply_raw
+    else:
+        try:
+            new_plan = json.loads(_clean_json_block(reply_raw or ""))
+        except Exception:
+            # unparsable – bubble raw string upwards (executor/upper layer decides)
+            return reply_raw if isinstance(reply_raw, str) else None
 
-    new_norm = _as_graph(new_plan)
+    new_norm  = _as_graph(new_plan)
     new_graph = new_norm["graph"]
     if _sig(new_graph) == cur_sig:
         return None  # identical -> nothing to change
@@ -2895,6 +3357,7 @@ def _stage9b_reflection_and_replan(
 
     # return normalised JSON string
     return json.dumps({"graph": new_graph}, ensure_ascii=False)
+
 
 
 def _stage9_invoke_with_retries(
@@ -3377,21 +3840,33 @@ def _stage10b_response_critique_and_safety(
 ) -> str:
     import json, difflib, pprint
 
+    # Helper: robust stringify for any object (dicts, lists, etc.)
+    def _to_str(obj) -> str:
+        if isinstance(obj, str):
+            return obj
+        try:
+            return json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception:
+            try:
+                return pprint.pformat(obj, compact=True)
+            except Exception:
+                return str(obj)
+
     if not draft:
         return draft
 
     # ─── 1) Build blocks ───────────────────────────────────────────
-    # Use only the original user_text here:
-    user_block  = "[Latest user question]\n" + user_text
-    draft_block = "[Draft response]\n"       + draft
+    user_block  = "[Latest user question]\n" + (user_text or "")
+    draft_block = "[Draft response]\n"       + _to_str(draft)
 
     # Merge snippets as before
     merged = state.get("merged", [])
     merged_texts = "\n\n".join(f"[{c.stage_id}] {c.summary}" for c in merged) or "(none)"
     merged_block = "[Merged context snippets]\n" + merged_texts
 
-    # Plan block
-    plan_txt = state.get("plan_output", "(no plan)")
+    # Plan block (fix: handle dict or str safely)
+    plan_any  = state.get("plan_output", "(no plan)")
+    plan_txt  = _to_str(plan_any)
     plan_block = "[Plan executed]\n" + plan_txt
 
     # ─── 2) Immediate tool‐outputs only ────────────────────────────
@@ -3406,7 +3881,7 @@ def _stage10b_response_critique_and_safety(
         else:
             try:
                 frag = json.dumps(raw, indent=2, ensure_ascii=False)
-            except:
+            except Exception:
                 frag = pprint.pformat(raw, compact=True)
         outputs.append(f"[{tc.stage_id}]\n{frag}")
     tools_block = "[Tool outputs]\n" + "\n\n".join(outputs) if outputs else ""
@@ -3449,11 +3924,12 @@ def _stage10b_response_critique_and_safety(
         images=state.get("images"),
     ).strip()
 
-    if polished == draft.strip():
+    if polished == (draft.strip() if isinstance(draft, str) else _to_str(draft).strip()):
         return polished
 
     # ─── 5) diff & dynamic_patch (unchanged) ────────────────────────
-    diff = difflib.unified_diff(draft.splitlines(), polished.splitlines(), lineterm="", n=1)
+    orig_lines = draft.splitlines() if isinstance(draft, str) else _to_str(draft).splitlines()
+    diff = difflib.unified_diff(orig_lines, polished.splitlines(), lineterm="", n=1)
     diff_summary = "; ".join(ln for ln in diff if ln.startswith(("+ ", "- "))) or "(format refined)"
 
     rows = sorted(
@@ -3481,7 +3957,6 @@ def _stage10b_response_critique_and_safety(
     self._persist_and_index([critique_ctx])
 
     return polished
-
 
 
 

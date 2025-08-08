@@ -3306,9 +3306,8 @@ class Assembler:
         except Exception:
             pass
 
-
     # ─────────────────────────────────────────────────────────────────────────────
-    #  Orchestrator (Quick-Take + Planner)
+    #  Orchestrator (Quick-Take + Planner) — with semantic cosine on convo pairs
     # ─────────────────────────────────────────────────────────────────────────────
 
     async def run_with_meta_context(
@@ -3321,354 +3320,253 @@ class Assembler:
         skip_quick_phases: bool = False,
     ) -> str:
         """
-        Two-phase orchestrator (upgraded):
+        Two-phase orchestrator (upgraded, non-destructive):
 
-        1) Quick-Take  – informed one-liner with *fast RAG* (semantic hits,
-                        memory recall, recent history & tool outputs)
-        2) Planner     – full pipeline (Strategy Graph planning + tool exec);
-                        runs concurrently after quick seed
-
-        If advanced components are present:
-        • self.tool_registry  – schema-grounded catalogue
-        • self.policy_manager – picks planner/executor/prompt variants
-        • self.planner_core   – multi-plan proposal (HTN/MCTS/A*)
-        • self.critic         – postcondition/schema/safety checks
-        • self.executor_core  – DAG executor w/ budgets & repair
-        The code auto-detects and downgrades to legacy stages otherwise.
+        1) Quick-Take  – fast one-liner with *ranked, interleaved* recent turns:
+                        (user_input ↔ assistant/final_inference) via cosine(sim(user_text, pair)) + recency
+        2) Planner     – full pipeline via upgraded stages:
+                        5b(KG) → 7(planner) → 7b(validate) → 8(chain)
+                        → 9(DAG exec) → 9b(reflect/replan) → 10/10b(finalize) → 11(memory)
         """
-        import asyncio, time, uuid, numpy as np, json, traceback
-        from datetime import datetime, timezone
+        import asyncio, json, traceback, uuid
 
-        # 0) Hygiene
-        await asyncio.to_thread(sanitize_jsonl, self.repo.json_repo.path)
-        await asyncio.to_thread(self._await_prompts_ready, 5.0)
-        await asyncio.to_thread(self._ensure_prompts_present)
         if status_cb is None:
-            status_cb = lambda stage, info=None: None
+            status_cb = lambda *_a, **_k: None
 
-        # Narrative & last answer
-        narrative_ctx  = await asyncio.to_thread(self._load_narrative_context)
-        narrative_text = narrative_ctx.summary or "(no narrative yet)"
-        prev_final     = getattr(self, "_last_final", "")
+        def _looks_like_json(s: str) -> bool:
+            s = (s or "").strip()
+            if not s:
+                return False
+            if s[0] in "{[":
+                return True
+            # crude heuristic to catch big JSON-ish payloads
+            return (s.count("{") + s.count("}") + s.count("[") + s.count("]")) >= 4
 
-        def now_ts(fmt: str = "%Y-%m-%d %H:%M UTC") -> str:
-            return datetime.now(timezone.utc).strftime(fmt)
-
-        # Live-TTS setup
-        bridge = _LiveTTSBridge(self.tts) if getattr(self, "tts", None) else None
-        self._tts_bridge = bridge
-        if bridge:
-            bridge.new_turn(uuid.uuid4().hex)
-
-        _spoken: list[str] = []
-        def _speak(txt: str) -> None:
-            if not bridge: return
-            line = txt.strip()
-            if not line or line in _spoken: return
-            bridge.feed(line); _spoken.append(line)
-            if len(_spoken) > 12: _spoken.pop(0)
-
-        def _tok_to_sentence(tok: str, _buf: list[str]=[]) -> None:
-            _buf.append(tok)
-            if tok.endswith((".", "!", "?", "…", "\n")):
-                _speak("".join(_buf).strip()); _buf.clear()
-
-        def _status_and_speak(stage: str, info: Any=None) -> None:
-            status_cb(stage, info)
-            if bridge and stage in getattr(self, "tts_live_stages", ()):
-                _speak(str(info))
-
-        # Cancel any in-flight planner
-        if hasattr(self, "_turn_task") and not self._turn_task.done():
-            self._turn_cancel.set(); self._turn_task.cancel()
-        self._turn_cancel = asyncio.Event()
-
-        # Decide tool usage
+        # Attach high-observability pieces if present (no-op if already set)
         try:
-            use_tools, tools_reason = await asyncio.to_thread(self.tools_callback, user_text)
+            if hasattr(self, "_ensure_orchestrator_attached"):
+                self._ensure_orchestrator_attached()
         except Exception:
-            use_tools, tools_reason = True, ""
-        state: dict[str,Any] = {
-            "start_ts":     time.time(),
-            "use_tools":    use_tools,
-            "tools_reason": tools_reason,
-            "skip_quick":   skip_quick_phases,
-            "prev_final":   prev_final,
-            "early_phases": {},
-            "stages_run":   set(),
-        }
+            pass
 
-        # Tool-preview hint (non-blocking)
-        try:
-            # Prefer tool registry if present
-            tr = getattr(self, "tool_registry", None)
-            if tr and hasattr(tr, "list"):
-                schemas = tr.list() or []
-            else:
-                schemas = await asyncio.to_thread(self._stage6_prepare_tools)
-            tool_preview = ", ".join(t["name"] for t in (schemas or [])[:6]) if use_tools else ""
-        except Exception:
-            schemas = []
-            tool_preview = ""
-
-        # Pre-seed context for Quick-Take (stages 1–3)
-        try:
-            user_ctx = await asyncio.to_thread(self._stage1_record_input, user_text, state)
-            state["user_ctx"] = user_ctx
-        except Exception:
-            user_ctx = None
-
-        try:
-            sys_ctx = await asyncio.to_thread(self._stage2_load_system_prompts)
-            state["sys_ctx"] = sys_ctx
-        except Exception:
-            sys_ctx = None
-
-        try:
-            out3 = await asyncio.to_thread(
-                self._stage3_retrieve_and_merge_context,
-                user_text, user_ctx, sys_ctx, None, None
-            )
-            state.update(out3)
-        except Exception:
-            state.update({
-                "merged": [], "merged_ids": [],
-                "wm_ids": [], "history": [],
-                "tools": [], "semantic": [], "assoc": [],
-            })
-
-        # Dynamic prompt patches & last performance
-        dyn = self.repo.query(lambda c: c.component=="policy" and "dynamic_prompt" in (c.tags or []))
-        dyn_text = "\n".join(
-            p.metadata.get("policy", p.summary or "")
-            for p in sorted(dyn, key=lambda c: c.timestamp)[-3:]
-        )
-        perf = self.repo.query(lambda c: c.component=="stage_performance")
-        perf_text = ""
-        if perf:
-            latest = sorted(perf, key=lambda c: c.timestamp, reverse=True)[0]
-            perf_text = latest.summary or ""
-
-        # Fast-RAG context builder (recency-boosted MMR)
-        def _recency_boost(ts_str: str | None, half_life_days: float = 3.0) -> float:
-            try:
-                ts = datetime.fromisoformat((ts_str or "").replace("Z", "+00:00")).timestamp()
-            except Exception:
-                return 0.0
-            age_days = max((time.time() - ts) / 86400.0, 0.0)
-            return 0.5 ** (age_days / half_life_days)
-
-        def _mmr(items, top_k: int, lambda_rel: float = 0.65):
+        # ---------- helper: ranked interleaved context (U↔A / final_inference) ----------
+        def _ranked_convo_context(conv_id: str, top_pairs: int = 5, pool: int = 80) -> list[str]:
+            """
+            Build interleaved (U→A) pairs from recent rows and rank by:
+                score = 0.72 * cosine(emb(user_text), emb(pair_text)) + 0.28 * recency_boost
+            We treat both 'assistant' segments and 'final_inference' stage outputs as A-sides.
+            Returns compact lines like: "U: … || A: …"
+            """
             import numpy as np
-            chosen, rest = [], items[:]
-            while rest and len(chosen) < top_k:
-                best, best_score = None, -1e9
-                for cand in rest:
-                    rel = float(cand.get("rel", 0.0))
-                    div = 0.0
-                    if chosen and cand.get("vec") is not None:
-                        for ch in chosen:
-                            a, b = np.asarray(cand["vec"]), np.asarray(ch["vec"])
-                            den = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
-                            div = max(div, float(np.dot(a, b) / den))
-                    score = lambda_rel * rel - (1 - lambda_rel) * div
-                    if score > best_score:
-                        best, best_score = cand, score
-                chosen.append(best)
-                rest.remove(best)
-            return chosen
+            from datetime import datetime, timezone
 
-        async def _fast_context_seed() -> list[str]:
-            MAX_SNIPPETS = 6
-            seeds: list[dict] = []
-            import numpy as np
-
-            # 1) Semantic engine hits
-            engine_hits = []
-            if getattr(self, "engine", None):
+            def _to_dt(ts):
                 try:
-                    engine_hits = await asyncio.to_thread(
-                        self.engine.query, "semantic_quick", user_text, 8
-                    )
-                except TypeError:
-                    try:
-                        engine_hits = await asyncio.to_thread(
-                            self.engine.query, stage_id="semantic_quick",
-                            similarity_to=user_text, top_k=8
-                        )
-                    except Exception:
-                        engine_hits = []
-                except ValueError:
-                    try:
-                        for c in self.repo.query(lambda c: True):
-                            md = c.metadata or {}
-                            emb = md.get("embedding")
-                            if emb is not None:
-                                import numpy as _np
-                                md["embedding"] = _np.asarray(emb).reshape(-1).tolist()
-                        engine_hits = await asyncio.to_thread(
-                            self.engine.query, stage_id="semantic_quick",
-                            similarity_to=user_text, top_k=8
-                        )
-                    except Exception:
-                        engine_hits = []
-
-            for h in engine_hits:
-                txt = (h.summary or (h.metadata.get("content", "") if isinstance(h.metadata, dict) else "")).strip()
-                if not txt:
-                    continue
-                rel = float(getattr(h, "retrieval_score", None)
-                            or (h.metadata.get("retrieval_score") if isinstance(h.metadata, dict) else 0.0)
-                            or 0.0)
-                rec = _recency_boost(getattr(h, "timestamp", None))
-                vec = None
-                try:
-                    vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
+                    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
                 except Exception:
-                    vec = None
-                seeds.append({"src": f"SEM/{h.semantic_label or h.stage_id or 'hit'}", "text": txt[:260], "rel": 0.7*rel + 0.3*rec, "vec": vec})
+                    return datetime.min.replace(tzinfo=timezone.utc)
 
-            # 2) Assoc WM spread
-            wm_ids = state.get("wm_ids", [])
-            if wm_ids and getattr(self, "memman", None):
+            # 1) Fetch recent dialog segments (user/assistant)
+            segs = [
+                c for c in self.repo.query(lambda c:
+                    (
+                        c.domain == "segment"
+                        and c.semantic_label in ("user_input", "assistant")
+                        and (
+                            (c.metadata or {}).get("conversation_id") == conv_id
+                            or (c.metadata or {}).get("conversationid") == conv_id
+                        )
+                    )
+                    or (
+                        # 2) Pull 'final_inference' stage rows and treat as assistant replies
+                        c.domain == "stage"
+                        and c.semantic_label == "final_inference"
+                        and (
+                            (c.metadata or {}).get("conversation_id") == conv_id
+                            or (c.metadata or {}).get("conversationid") == conv_id
+                        )
+                    )
+                )
+            ]
+            if not segs:
+                return []
+
+            # Normalize “assistant-ish” role for final_inference rows
+            for c in segs:
+                if c.domain == "stage" and c.semantic_label == "final_inference":
+                    c._as_role = "assistant"  # temporary tag for pairing
+
+            segs.sort(key=lambda c: _to_dt(getattr(c, "timestamp", "")))
+            segs = segs[-pool:]
+
+            # Precompute user vector once
+            try:
+                import numpy as _np
+                uvec = _np.asarray(self.embed_text(user_text), dtype=float).reshape(-1)
+            except Exception:
+                uvec = None
+
+            pairs = []
+            for i, c in enumerate(segs):
+                role = ("assistant" if getattr(c, "_as_role", None) == "assistant" else c.semantic_label)
+                if role != "user_input":
+                    continue
+
+                u_txt = (c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")).strip()
+                if not u_txt:
+                    continue
+
+                # A-side candidate: next assistant OR final_inference
+                a_txt = ""
+                if i + 1 < len(segs):
+                    nxt = segs[i + 1]
+                    nxt_role = ("assistant" if getattr(nxt, "_as_role", None) == "assistant" else nxt.semantic_label)
+                    if nxt_role == "assistant":
+                        a_txt = (nxt.summary or (nxt.metadata.get("text", "") if isinstance(nxt.metadata, dict) else "")).strip()
+
+                u_comp = u_txt.replace("\n", " ")
+                a_comp = a_txt.replace("\n", " ") if a_txt else ""
+                pair_text = (u_comp + " " + a_comp).strip()
+
+                # Pair vector
                 try:
-                    act = await asyncio.to_thread(self.memman.spread_activation, wm_ids, 2, 0.6, 1.0, 0.5)
-                    top_ids = sorted(act, key=act.get, reverse=True)[:5]
-                    for cid in top_ids:
-                        try:
-                            c = self.repo.get(cid)
-                        except KeyError:
-                            continue
-                        txt = (c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")).strip()
-                        if not txt:
-                            continue
-                        vec = None
-                        try:
-                            vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                        except Exception:
-                            vec = None
-                        seeds.append({"src": "ASSOC", "text": txt[:260], "rel": 0.65, "vec": vec})
+                    import numpy as _np
+                    pvec = _np.asarray(self.embed_text(pair_text or u_comp), dtype=float).reshape(-1)
+                except Exception:
+                    pvec = None
+
+                # cosine
+                cos = 0.0
+                if uvec is not None and pvec is not None:
+                    import numpy as _np
+                    den = (float(_np.linalg.norm(uvec)) * float(_np.linalg.norm(pvec))) or 1.0
+                    cos = float(_np.dot(uvec, pvec) / den)
+
+                # recency boost (3-day half-life)
+                ts = _to_dt(getattr(c, "timestamp", ""))
+                age_days = max(((datetime.now(timezone.utc) - ts).total_seconds()) / 86400.0, 0.0)
+                rec = 0.5 ** (age_days / 3.0)
+
+                score = 0.72 * cos + 0.28 * rec
+                if a_comp:
+                    score += 0.03  # small reward for a complete exchange
+
+                pairs.append({"score": score, "u": u_comp[:240], "a": a_comp[:240]})
+
+            if not pairs:
+                return []
+
+            pairs.sort(key=lambda x: x["score"], reverse=True)
+            out = []
+            for p in pairs[:top_pairs]:
+                out.append(f"U: {p['u']} || A: {p['a']}" if p["a"] else f"U: {p['u']}")
+            return out
+
+        async def _quick_take_once() -> str:
+            """Very small, resilient quick reply; never blocks planning."""
+            try:
+                # ✅ Minimal state so Stage 1 won't KeyError
+                q_state = {
+                    "conversation_id": getattr(self, "_active_conversation_id", uuid.uuid4().hex),
+                    "user_id": getattr(self, "current_user_id", "anon"),
+                }
+                self._active_conversation_id = q_state["conversation_id"]
+
+                # Stages 1–3: populate repo context as usual
+                user_ctx = await asyncio.to_thread(self._stage1_record_input, user_text, q_state)
+                sys_ctx  = await asyncio.to_thread(self._stage2_load_system_prompts)
+                merged   = await asyncio.to_thread(
+                    self._stage3_retrieve_and_merge_context, user_text, user_ctx, sys_ctx, None, None
+                )
+
+                # Build ranked, interleaved convo context
+                conv_id = q_state["conversation_id"]
+                interleaved = _ranked_convo_context(conv_id, top_pairs=5, pool=80)
+
+                # Tiny extras: last tool output + one semantic hit (keep small)
+                tool_snip = ""
+                if (merged.get("tools") or []):
+                    c = (merged["tools"])[-1]
+                    payload = (c.metadata or {}).get("output") or c.summary or ""
+                    try:
+                        payload = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+                    except Exception:
+                        payload = str(payload)
+                    tool_snip = payload.replace("\n", " ")[:220]
+
+                sem_snip = ""
+                if (merged.get("semantic") or []):
+                    c = (merged["semantic"])[0]
+                    sem_snip = (c.summary or "").replace("\n"," ")[:220]
+
+                # Compose Fast Context
+                parts = []
+                if interleaved:
+                    parts.append(" || ".join(interleaved))
+                if sem_snip:
+                    parts.append(f"SEM: {sem_snip}")
+                if tool_snip:
+                    parts.append(f"TOOL: {tool_snip}")
+                fast_ctx = " | ".join(parts) if parts else "(none)"
+
+                sys_txt = (
+                    "You are QuickResponder. Give a brief, helpful reply (1–3 sentences). "
+                    "Use the 'Fast Context' as soft hints; if a fact is uncertain, say you'll verify during planning. "
+                    "If ambiguous, include exactly one clarifying question. "
+                    "Do NOT return JSON or code."
+                )
+                msgs = [
+                    {"role": "system", "content": sys_txt},
+                    {"role": "user",   "content": f"{user_text}\n\nFast Context:\n{fast_ctx}"},
+                ]
+
+                # Be permissive about _stream_and_capture() signature
+                sc_kwargs = {"tag": "[Quick-Take]", "images": images}
+                try:
+                    if "on_token" in getattr(self._stream_and_capture, "__code__", None).co_varnames:
+                        sc_kwargs["on_token"] = on_token  # streaming to UI is fine; TTS is gated by event keys below
                 except Exception:
                     pass
 
-            # 3) Recent hist
-            for c in state.get("history", [])[-4:]:
-                txt = (c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")).strip()
-                if not txt:
-                    continue
-                vec = None
-                try:
-                    vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                except Exception:
-                    vec = None
-                seeds.append({"src": "HIST", "text": txt[:260], "rel": 0.75, "vec": vec})
-
-            # 4) Last 2 tool outputs
-            for c in state.get("tools", [])[-2:]:
-                payload = (c.metadata.get("output") if isinstance(c.metadata, dict) else None) or \
-                        (c.metadata.get("exception") if isinstance(c.metadata, dict) else "") or ""
-                try:
-                    blob = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-                except Exception:
-                    blob = repr(payload)
-                txt = blob.strip()
-                if txt:
-                    vec = None
-                    try:
-                        vec = np.asarray(self.embed_text(txt)) if getattr(self, "embed_text", None) else None
-                    except Exception:
-                        vec = None
-                    seeds.append({"src": f"TOOL/{c.stage_id}", "text": txt[:260], "rel": 0.8, "vec": vec})
-
-            # Dedup and MMR select
-            seen = set(); uniq = []
-            for s in seeds:
-                key = s["text"]
-                if key not in seen:
-                    uniq.append(s); seen.add(key)
-            ranked = _mmr(uniq, top_k=MAX_SNIPPETS, lambda_rel=0.7)
-            return [f"[{r['src']}] {r['text']}" for r in ranked]
-
-        # Quick-Take
-        async def _quick_take() -> str:
-            if state.get("skip_quick") or "quick_take" in state.get("stages_run", set()):
-                return ""
-            status_cb("quick_context_seed", {"ts": now_ts()})
-            try:
-                bullets = await _fast_context_seed()
+                quick = await asyncio.to_thread(self._stream_and_capture, self.primary_model, msgs, **sc_kwargs)
+                quick = (quick or "").strip()
+                if _looks_like_json(quick):
+                    quick = ""  # never speak JSON-y provisional
+                if quick:
+                    # Normal log event
+                    status_cb("quick_take", quick[:300])
+                    # **Speakable** event (configure your TTS to only speak this key)
+                    status_cb("quick_output", quick[:300])
+                return quick
             except Exception:
-                bullets = []
-            context_blob = " | ".join(bullets[:6]) if bullets else "(none)"
-            status_cb("quick_context_ready", {"count": len(bullets)})
+                status_cb("quick_take_error", traceback.format_exc(limit=5))
+                return ""
 
-            sys_txt = "\n".join([
-                "You are QuickResponder, a fast front-line assistant.",
-                dyn_text.strip(),
-                perf_text.strip(),
-                "Use the provided 'Fast Context' as soft hints. If a fact isn't present or you're unsure, say you'll verify.",
-                "Keep it brief (1–3 sentences). If ambiguous, include exactly one clarifying question.",
-                "No JSON. No tool calls in this phase.",
-            ])
-            user_blob = f"{user_text}\n\nFast Context: {context_blob}"
+        provisional = ""
+        if not skip_quick_phases:
+            provisional = await _quick_take_once()
 
-            status_cb("quick_started", {"ts": now_ts()})
-            reply = await self._stream_and_capture_async(
-                self.primary_model,
-                [
-                    {"role": "system", "content": sys_txt},
-                    {"role": "user",   "content": user_blob}
-                ],
-                tag="[Quick-Take]",
-                on_token=_tok_to_sentence
-            )
-            text = (reply or "").strip()
-            if text.startswith("{") and "}" in text:
-                try: text = text[text.index("}") + 1 :].lstrip()
-                except Exception: pass
-            state.setdefault("early_phases", {})["quick_take"] = text
-            state.setdefault("stages_run", set()).add("quick_take")
-            status_cb("quick_finished", {"len": len(text)})
-            return text
+        # Full planner path (delegates to upgraded _handle_turn you already have)
+        final = await self._handle_turn(
+            user_text=user_text,
+            status_cb=status_cb,
+            images=images or [],
+            on_token=on_token,
+            early_phases={"quick_take": provisional} if provisional else {},
+            tools_list=None,
+            tool_preview="",
+        )
 
-        # Planner micro-stage (full pipeline)
-        async def _planner() -> str:
-            status_cb("planner_started", {"ts": now_ts(), "tool_preview": tool_preview})
-            out = await self._handle_turn(
-                user_text,
-                _status_and_speak,
-                images or [],
-                on_token,
-                early_phases=state["early_phases"],
-                tools_list=schemas,
-                tool_preview=tool_preview,
-            )
-            status_cb("planner_finished", {"ts": now_ts()})
-            return out
+        # **Speakable** final event – your TTS layer should only speak this key
+        if isinstance(final, str) and final.strip() and not _looks_like_json(final):
+            status_cb("final_output", final.strip())
 
-        # Skips
-        if skip_quick_phases:
-            final = await _planner()
-            self._last_final = final
-            if bridge: bridge.flush(force=True)
-            return final
-
-        # Quick then planner
-        quick = await _quick_take()
-        state.setdefault("early_phases", {})["quick_take"] = quick
-        self._turn_task = asyncio.create_task(_planner())
-        try:
-            final = await self._turn_task
-        except asyncio.CancelledError:
-            final = ""
-        finally:
-            if bridge:
-                bridge.flush(force=True)
-        self._last_final = final
         return final
 
 
+
     # ─────────────────────────────────────────────────────────────────────────────
-    #  End-to-end handler (Strategy Graph aware; falls back to legacy)
+    #  End-to-end handler (Strategy Graph aware; upgraded stages path)
     # ─────────────────────────────────────────────────────────────────────────────
 
     async def _handle_turn(                  # noqa: C901
@@ -3678,333 +3576,179 @@ class Assembler:
         images: List[str],
         on_token: Optional[Callable[[str], None]],
         early_phases: Optional[dict[str,str]] = None,
-        tools_list: Optional[list[dict]]      = None,
-        tool_preview: str                     = "",
+        tools_list: Optional[List[Dict[str, Any]]] = None,
+        tool_preview: str = "",
     ) -> str:
         """
-        One full turn: reasoning → planning → tool exec → drafting → final.
-
-        Upgrades:
-        • Uses Tool Registry (if available) for schemas (no hallucinated keys).
-        • Strategy Graph planner with *speculative multi-plan* (if planner_core exists).
-        • Critic/Repair loop hooks (schema checks, postconditions) if present.
-        • Falls back to your legacy Stage 6/7/8 pipeline otherwise.
+        One full turn: retrieve → clarify → RAG → (5b KG) → (7 plan) → (7b validate/repair)
+        → (8 chain) → (9 DAG exec) → (9b reflect/replan) → (10/10b finalize) → (11 memory).
         """
-        import asyncio, traceback, uuid, json, time
-        from typing import List, Dict, Any, Optional
+        import asyncio, json, time, traceback, uuid
+        from typing import Any, Dict, List, Optional
         from context import ContextObject
 
-        def _check_cancel() -> None:
-            if getattr(self, "_turn_cancel", None) and self._turn_cancel.is_set():
-                raise asyncio.CancelledError()
+        async def _to_thread(func, *a, **k):
+            return await asyncio.to_thread(func, *a, **k)
 
-        if not (user_text or "").strip():
-            status_cb("output", ""); return ""
+        def _looks_like_json(s: str) -> bool:
+            s = (s or "").strip()
+            return bool(s and s[0] in "{[" and (":" in s or "]" in s or "}" in s))
 
-        # STATE BOOTSTRAP
+        # Ensure high-observability cores if available (safe no-op)
+        try:
+            if hasattr(self, "_ensure_orchestrator_attached"):
+                self._ensure_orchestrator_attached()
+        except Exception:
+            pass
+
+        # ── State bootstrap
         state: Dict[str, Any] = {
             "user_text":        user_text,
-            "errors":           [],
-            "tool_ctxs":        [],
-            "recent_ids":       [],
             "images":           images,
             "fixed_calls":      [],
-            "provisional_sent": False,
+            "tool_ctxs":        [],
+            "stages_run":       set(),
             "early_phases":     early_phases or {},
-            "tools_list":       tools_list if tools_list is not None else [],
-            "tool_preview":     tool_preview,
+            "tools_list":       tools_list or [],
+            "tool_preview":     tool_preview or "",
+            "start_ts":         time.time(),
         }
         self._last_state = state
-        state["conversation_id"]      = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
-        self._active_conversation_id  = state["conversation_id"]
-        state["user_id"]              = getattr(self, "current_user_id", "anon")
+        state["conversation_id"] = getattr(self, "_active_conversation_id", uuid.uuid4().hex)
+        self._active_conversation_id = state["conversation_id"]
+        state["user_id"] = getattr(self, "current_user_id", "anon")
 
-        # Stage 0 — Should we respond?
-        _check_cancel()
+        # Decision gates (non-fatal)
         try:
-            should, _ = await _to_thread_safe(self.filter_callback, user_text)
+            state["should_respond"] = bool(await _to_thread(self.filter_callback, user_text))
         except Exception:
-            should = True
-        state["should_respond"] = should
-        status_cb("decision_to_respond", should)
-        if not should:
-            status_cb("output", "…"); return ""
+            state["should_respond"] = True
+        status_cb("decision_to_respond", state["should_respond"])
+        if not state["should_respond"]:
+            return ""
 
-        # Stage 0.5 — Tools?
-        _check_cancel()
         try:
-            use_tools, _ = await _to_thread_safe(self.tools_callback, user_text)
+            state["use_tools"] = bool(await _to_thread(self.tools_callback, user_text))
         except Exception:
-            use_tools = True
-        state["use_tools"] = use_tools
-        status_cb("decide_tool_usage", use_tools)
+            state["use_tools"] = True
+        status_cb("decide_tool_usage", state["use_tools"])
 
-        # Stage 1/2 — record + system
-        if not state.get("user_ctx"):
-            _check_cancel()
-            try:
-                ctx1 = await _to_thread_safe(self._stage1_record_input, user_text, state)
-                state["user_ctx"] = ctx1
-                status_cb("record_input", ctx1.summary)
-            except Exception as e:
-                state["errors"].append(("record_input", str(e)))
-                status_cb("record_input_error", str(e))
-        if not state.get("sys_ctx"):
-            _check_cancel()
-            try:
-                ctx2 = await _to_thread_safe(self._stage2_load_system_prompts)
-                state["sys_ctx"] = ctx2
-                status_cb("load_system_prompts", "(loaded)")
-            except Exception as e:
-                state["errors"].append(("load_system_prompts", str(e)))
-                status_cb("load_system_prompts_error", str(e))
-
-        # Stage 3 — retrieve & merge
-        _check_cancel()
+        # Stage 1/2
         try:
-            extra = await _to_thread_safe(self._get_history)
-            state["recent_ids"] = [c.context_id for c in extra]
-            out3 = await _to_thread_safe(
+            state["user_ctx"] = await _to_thread(self._stage1_record_input, user_text, state)
+            status_cb("record_input", state["user_ctx"].summary)
+        except Exception as e:
+            status_cb("record_input_error", str(e))
+
+        try:
+            state["sys_ctx"] = await _to_thread(self._stage2_load_system_prompts)
+            status_cb("load_system_prompts", "(loaded)")
+        except Exception as e:
+            status_cb("load_system_prompts_error", str(e))
+
+        # Stage 3
+        try:
+            out3 = await _to_thread(
                 self._stage3_retrieve_and_merge_context,
-                user_text, state.get("user_ctx"), state.get("sys_ctx"), extra_ctx=extra,
+                user_text,
+                state.get("user_ctx"),
+                state.get("sys_ctx"),
+                None,
+                None,
             )
+            state.update(out3)
+            status_cb("retrieve_and_merge_context", f"{len(state.get('merged', []))} ctxs")
         except Exception:
             status_cb("retrieve_error", traceback.format_exc(limit=5))
-            out3 = {"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []}
-        state.update(out3)
+            state.update({"merged": [], "history": [], "tools": [], "semantic": [], "assoc": []})
 
-        # integrator contract (keeps)
-        _check_cancel()
+        # Integrator hygiene (ingest + contract small window)
         try:
-            await _to_thread_safe(self.integrator.ingest, state["merged"])
-            keep: List[str] = []
-            if state.get("user_ctx"): keep.append(state["user_ctx"].context_id)
+            await _to_thread(self.integrator.ingest, state.get("merged", []))
+            keep_ids: List[str] = []
+            if state.get("user_ctx"):
+                keep_ids.append(state["user_ctx"].context_id)
             sys_val = state.get("sys_ctx")
             sys_list = sys_val if isinstance(sys_val, list) else ([sys_val] if sys_val else [])
-            for sc in sys_list: keep.append(sc.context_id)
+            for sc in sys_list:
+                keep_ids.append(sc.context_id)
             if sys_list:
-                await _to_thread_safe(self.integrator.ingest, sys_list)
-            contracted = await _to_thread_safe(self.integrator.contract, keep_ids=keep)
-            state["merged"]     = contracted
-            state["merged_ids"] = [c.context_id for c in contracted]
-            state["wm_ids"]     = [c.context_id for c in contracted[-20:]]
-            hist = [c for c in contracted if c.semantic_label in ("user_input", "assistant")]
-            hist.sort(key=lambda c: c.timestamp)
-            state["history"] = hist[-8:]
+                await _to_thread(self.integrator.ingest, sys_list)
+            compact = await _to_thread(self.integrator.contract, keep_ids=keep_ids)
+            state["merged"] = compact
+            state["merged_ids"] = [c.context_id for c in compact]
         except Exception:
-            status_cb("integrator_error", traceback.format_exc(limit=5))
+            pass
 
-        status_cb("retrieve_and_merge_context", f"{len(state['merged'])} ctxs")
-
-        # Stage 4 — intent clarification
-        _check_cancel()
+        # Stage 4
         try:
-            clar = await _to_thread_safe(self._stage4_intent_clarification, user_text, state, on_token=on_token)
+            clar = await _to_thread(self._stage4_intent_clarification, user_text, state, on_token=on_token)
             state["clar_ctx"] = clar
             status_cb("intent_clarification", clar.summary)
         except Exception as e:
-            state["errors"].append(("intent_clarification", str(e)))
             status_cb("intent_clarification_error", str(e))
-            refs = [state.get("user_ctx").context_id] if state.get("user_ctx") else []
-            dummy = ContextObject.make_stage("intent_clarification_failed", refs, {"summary": ""})
+            dummy = ContextObject.make_stage("intent_clarification_failed", [], {"summary": ""})
             dummy.touch(); self.repo.save(dummy)
             state["clar_ctx"] = dummy
 
-        # Stage 5 — external knowledge (RAG)
-        _check_cancel()
+        # Stage 5
         try:
-            know_raw = await _to_thread_safe(self._stage5_external_knowledge, state["clar_ctx"], state)
-            know_ctx = (
-                know_raw if isinstance(know_raw, ContextObject)
-                else ContextObject.make_stage("external_knowledge_retrieval", state["clar_ctx"].references, know_raw)
-            )
-            if not isinstance(know_raw, ContextObject):
-                know_ctx.summary = (know_ctx.summary or (json.dumps(know_raw, ensure_ascii=False)[:500] if know_raw else "")) or ""
-            know_ctx.touch(); self.repo.save(know_ctx)
+            know_ctx = await _to_thread(self._stage5_external_knowledge, state["clar_ctx"], state)
             state["know_ctx"] = know_ctx
-            status_cb("external_knowledge", know_ctx.summary[:260] if know_ctx.summary else "(ok)")
+            status_cb("external_knowledge", (know_ctx.summary or "")[:240] if getattr(know_ctx, "summary", None) else "(ok)")
         except Exception as e:
-            state["errors"].append(("external_knowledge", str(e)))
             status_cb("external_knowledge_error", str(e))
             state["know_ctx"] = ContextObject.make_stage("external_knowledge_dummy", [], {"summary": ""})
 
-        # FAST EXIT (no tools)
-        if not state["use_tools"]:
-            _check_cancel()
+        # No-tools path
+        if not state.get("use_tools", True):
+            final = await _to_thread(self._stage10_assemble_and_infer, user_text, state)
             try:
-                budgets = self._compute_budgets(state)
-                state["final_budgets"] = budgets
-                state["final_window"]  = self._curate_final_window(state, budgets)
-                state["final_system_prompt"] = self._compose_dynamic_system_prompt(state, budgets)
+                polished = await _to_thread(self._stage10b_response_critique_and_safety, final, user_text, [], state)
+                final = polished or final
+            except Exception:
+                pass
+            try:
+                await _to_thread(self._stage11_memory_writeback, final, [])
+            except Exception:
+                pass
+            status_cb("output", final if not _looks_like_json(final) else "[response ready]")
+            return (final or "").strip()
+
+        # Stage 6
+        try:
+            if not state["tools_list"]:
+                state["tools_list"] = await _to_thread(self._stage6_prepare_tools)
+            state["tool_preview"] = ", ".join(t["name"] for t in state["tools_list"][:6])
+            status_cb("prepare_tools", f"{len(state['tools_list'])} tools")
+        except Exception as e:
+            status_cb("prepare_tools_error", str(e))
+            state["tools_list"] = []
+
+        # Stage 5b
+        try:
+            kg_ctx = await _to_thread(self._stage5b_build_planning_kg, state["clar_ctx"], state["know_ctx"], state["tools_list"], state)
+            state["kg_ctx"] = kg_ctx
+            status_cb("planning_kg", "ok")
+        except Exception as e:
+            status_cb("planning_kg_error", str(e))
+
+        # Stage 8 orchestrate (7 → 7b → 8 → 9 → 9b loop → 10/10b → 11)
+        try:
+            reply, tool_outputs = await asyncio.to_thread(self._stage8_orchestrate, user_text, state)
+            state["tool_ctxs"] = tool_outputs
+        except Exception:
+            status_cb("orchestrate_error", traceback.format_exc(limit=5))
+            reply = await _to_thread(self._stage10_assemble_and_infer, user_text, state)
+            try:
+                polished = await _to_thread(self._stage10b_response_critique_and_safety, reply, user_text, [], state)
+                reply = polished or reply
+            except Exception:
+                pass
+            try:
+                await _to_thread(self._stage11_memory_writeback, reply, [])
             except Exception:
                 pass
 
-            final = await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state)
-            state["final"] = final
-            status_cb("assemble_and_infer", final)
-            try:
-                await _to_thread_safe(self._stage11_memory_writeback, final, [])
-                status_cb("memory_writeback", "(queued)")
-            except Exception as e:
-                state["errors"].append(("memory_writeback", str(e)))
-                status_cb("memory_writeback_error", str(e))
-
-            if state["errors"]:
-                patched = await _to_thread_safe(self._stage10b_response_critique_and_safety, final, user_text, [], state)
-                state["draft"] = patched or final
-                status_cb("response_critique", state["draft"])
-            else:
-                state["draft"] = final
-
-            final2 = await _to_thread_safe(self._stage10_assemble_and_infer, user_text, state)
-            state["final"] = final2
-            status_cb("final_inference", final2)
-            try:
-                await _to_thread_safe(self._stage11_memory_writeback, final2, [])
-                status_cb("memory_writeback", "(queued)")
-            except Exception as e:
-                state["errors"].append(("memory_writeback", str(e)))
-                status_cb("memory_writeback_error", str(e))
-
-            out = state["final"].strip()
-            status_cb("output", out)
-            return out
-
-        # Stage 6 — tool schemas via Tool Registry (if available)
-        _check_cancel()
-        try:
-            tr = getattr(self, "tool_registry", None)
-            if tr and hasattr(tr, "list"):
-                tools_list = tr.list() or []
-            else:
-                tools_list = await _to_thread_safe(self._stage6_prepare_tools)
-            state["tools_list"] = tools_list
-            state["tool_preview"] = ", ".join(t["name"] for t in tools_list[:6])
-            status_cb("prepare_tools", f"{len(tools_list)} tools")
-        except Exception as e:
-            state["errors"].append(("prepare_tools", str(e)))
-            status_cb("prepare_tools_error", str(e))
-            state["tools_list"]   = []
-            state["tool_preview"] = ""
-
-        # Guarantee clarifier/knowledge presence
-        _check_cancel()
-        if "clar_ctx" not in state:
-            try:
-                clar_ctx = await _to_thread_safe(self._stage4_intent_clarification, user_text, state, on_token=on_token)
-            except Exception:
-                clar_ctx = ContextObject.make_stage("intent_clarification_failed", [], {"summary": ""})
-                clar_ctx.touch(); self.repo.save(clar_ctx)
-            state["clar_ctx"] = clar_ctx
-            status_cb("intent_clarification", clar_ctx.summary or "(created)")
-
-        _check_cancel()
-        if "know_ctx" not in state:
-            try:
-                know_raw = await _to_thread_safe(self._stage5_external_knowledge, state["clar_ctx"], state)
-                know_ctx = (
-                    know_raw if isinstance(know_raw, ContextObject)
-                    else ContextObject.make_stage("external_knowledge_retrieval", state["clar_ctx"].references, know_raw)
-                )
-                know_ctx.touch(); self.repo.save(know_ctx)
-            except Exception:
-                know_ctx = ContextObject.make_stage("external_knowledge_dummy", [], {"summary": ""})
-                know_ctx.touch(); self.repo.save(know_ctx)
-            state["know_ctx"] = know_ctx
-            status_cb("external_knowledge", know_ctx.summary or "(created)")
-
-        # ──────────────────────────────────────────────────────────────────
-        # Strategy Graph: multi-plan propose → evaluate → execute
-        # ──────────────────────────────────────────────────────────────────
-        planner = getattr(self, "planner_core", None)
-        executor = getattr(self, "executor_core", None)
-        critic   = getattr(self, "critic", None)
-        policy   = getattr(self, "policy_manager", None)
-
-        # Context bundle for planning
-        plan_ctx = {
-            "user_text": user_text,
-            "clar": state["clar_ctx"],
-            "knowledge": state["know_ctx"],
-            "tools": state["tools_list"],
-            "history": state.get("history", []),
-            "budgets": getattr(self, "_compute_budgets", lambda s: {})(state) if hasattr(self, "_compute_budgets") else {},
-        }
-
-        def _legacy_execute() -> tuple[str, list]:
-            # Fall back to your Stage 8 orchestrate
-            reply, tool_outputs = self._stage8_orchestrate(user_text, state)
-            return reply, tool_outputs
-
-        # If we lack advanced components, use legacy execution
-        if not planner or not executor or not critic:
-            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
-            state["tool_ctxs"] = tool_outputs
-            return reply
-
-        # Otherwise: multi-plan
-        _check_cancel()
-        try:
-            k = 3
-            if policy and hasattr(policy, "num_candidate_plans"):
-                try: k = int(policy.num_candidate_plans(context=plan_ctx)) or 3
-                except Exception: k = 3
-
-            # propose up to k candidate graphs
-            candidates = planner.propose(context=plan_ctx, k=k)
-            if not isinstance(candidates, list) or not candidates:
-                # fallback: single plan via legacy planner stage
-                reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
-                state["tool_ctxs"] = tool_outputs
-                return reply
-
-            # optional: cost model scoring
-            scored = []
-            for g in candidates:
-                try:
-                    score = policy.score_plan(g, context=plan_ctx) if policy and hasattr(policy, "score_plan") else 0.0
-                except Exception:
-                    score = 0.0
-                scored.append((score, g))
-            scored.sort(key=lambda x: x[0], reverse=True)
-
-            # Execute best-first; can early-stop on success by critic signal
-            for idx, (_, graph) in enumerate(scored, 1):
-                status_cb("plan_candidate", {"rank": idx, "nodes": len(graph.get("nodes", []))})
-                # Ensure schema checks enforced by critic (pre-flight)
-                if hasattr(critic, "preflight"):
-                    issues = critic.preflight(graph, context=plan_ctx) or []
-                    if issues:
-                        status_cb("plan_rejected", {"rank": idx, "issues": issues[:3]})
-                        continue
-
-                # Execute with budgets and repair
-                try:
-                    exec_result = executor.run(graph, context=plan_ctx, critic=critic, tool_registry=getattr(self, "tool_registry", None))
-                    # exec_result: {"reply": str, "tool_ctxs": [...], "graph": graph, "repairs": int, "issues": [...]}
-                    reply = (exec_result or {}).get("reply", "")
-                    tctxs = (exec_result or {}).get("tool_ctxs", [])
-                    issues = (exec_result or {}).get("issues", [])
-                    repairs = int((exec_result or {}).get("repairs", 0))
-                    state["tool_ctxs"] = tctxs
-                    state["plan_graph"] = graph
-                    state["plan_issues"] = issues
-                    state["plan_repairs"] = repairs
-                    if reply:
-                        status_cb("plan_success", {"rank": idx, "repairs": repairs, "issues": len(issues or [])})
-                        return reply
-                    status_cb("plan_empty_reply", {"rank": idx})
-                except Exception as e:
-                    status_cb("plan_exec_error", f"rank {idx}: {e}")
-                    continue
-
-            # If none produced a reply, fallback legacy
-            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
-            state["tool_ctxs"] = tool_outputs
-            return reply
-
-        except Exception:
-            status_cb("strategy_graph_error", traceback.format_exc(limit=8))
-            reply, tool_outputs = await asyncio.to_thread(_legacy_execute)
-            state["tool_ctxs"] = tool_outputs
-            return reply
+        status_cb("output", reply if not _looks_like_json(reply) else "[response ready]")
+        return (reply or "").strip()
