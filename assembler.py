@@ -4376,13 +4376,14 @@ class Assembler:
             # resolve Tools class
             _Tools = None
             try:
-                _Tools = Tools  # already imported in module scope?
+                _Tools = Tools  # already imported?
             except NameError:
                 try:
                     from tools import Tools as _Tools  # best effort
                 except Exception:
                     _Tools = None
             if _Tools is None:
+                status_cb("quick_take_info", {"note": "Tools.context_query unavailable"})
                 return [], []
 
             def _to_dt(ts):
@@ -4393,27 +4394,23 @@ class Assembler:
 
             # knobs
             window = window or self.cfg.get("quick_take_window", "72 hours")
-            top_k_each = max(pool, top_pairs * 6)
+            top_k_each = max(pool * 2, top_pairs * 8)
 
-            # scope by conversation tag if available (falls back if empty)
-            tag_filter = None
             cid = state.get("conversation_id")
-            if cid:
-                tag_filter = [cid]
 
             def _q(**kw):
                 return _Tools.context_query(assembler=self, **kw)
 
-            # Pull final_inference (Assistant)
+            # Pull final_inference (Assistant) — NOTE: component must be 'stage'
             def _pull_infers(use_tags: bool):
                 return _q(
                     window=window,
                     domain=["stage"],
-                    component=["final_inference"],
+                    component=["stage"],                 # ← FIXED
                     semantic_label=["final_inference"],
                     similarity_to=state.get("user_text") or "",
                     top_k=top_k_each,
-                    tags=(tag_filter if use_tags else None),
+                    tags=([cid] if (use_tags and cid) else None),
                 )
 
             # Pull user_input (User)
@@ -4425,28 +4422,64 @@ class Assembler:
                     semantic_label=["user_input"],
                     similarity_to=state.get("user_text") or "",
                     top_k=top_k_each,
-                    tags=(tag_filter if use_tags else None),
+                    tags=([cid] if (use_tags and cid) else None),
                 )
 
-            # try with tags first, then retry without tags if nothing comes back
+            def _filter_by_conv(results_json: str) -> list[dict]:
+                """Filter by conversation_id found in repo metadata (since tags may be absent)."""
+                try:
+                    data = json.loads(results_json or "{}").get("results", [])
+                except Exception:
+                    data = []
+                if not data:
+                    return []
+
+                # If no cid, just return as-is
+                if not cid:
+                    return data
+
+                out = []
+                for r in data:
+                    try:
+                        co = self.repo.get(r.get("context_id"))
+                        md = (getattr(co, "metadata", None) or {})
+                        rcid = md.get("conversation_id") or md.get("conversationid")
+                        if not rcid:
+                            # allow if result is extremely recent & relevant even without cid
+                            out.append(r)
+                        elif rcid == cid:
+                            out.append(r)
+                    except Exception:
+                        # if we can't load, keep it (don't over-filter)
+                        out.append(r)
+                return out
+
+            # try with tags (if any), else without; then metadata filter to the active conversation
             try:
-                j_infers = json.loads(_pull_infers(use_tags=True))
-                j_users  = json.loads(_pull_user_inputs(use_tags=True))
-                infers = j_infers.get("results", [])
-                users  = j_users.get("results", [])
-                if not infers or not users:
-                    j_infers = json.loads(_pull_infers(use_tags=False))
-                    j_users  = json.loads(_pull_user_inputs(use_tags=False))
-                    infers = j_infers.get("results", [])
-                    users  = j_users.get("results", [])
+                j_infers = _filter_by_conv(_pull_infers(use_tags=True))
+                j_users  = _filter_by_conv(_pull_user_inputs(use_tags=True))
+                if not j_infers or not j_users:
+                    j_infers = _filter_by_conv(_pull_infers(use_tags=False))
+                    j_users  = _filter_by_conv(_pull_user_inputs(use_tags=False))
             except Exception:
+                j_infers, j_users = [], []
+
+            # absolute fallback: if still empty, pull by pure recency (no sim) and filter locally
+            if not j_infers or not j_users:
+                try:
+                    j_infers = _filter_by_conv(_q(window=window, domain=["stage"], component=["stage"],
+                                                semantic_label=["final_inference"], top_k=top_k_each))
+                    j_users  = _filter_by_conv(_q(window=window, domain=["segment"], component=["segment"],
+                                                semantic_label=["user_input"], top_k=top_k_each))
+                except Exception:
+                    j_infers, j_users = [], []
+
+            if not j_infers or not j_users:
+                status_cb("quick_take_info", {"note": "No recent U/A history found for pairing"})
                 return [], []
 
-            if not infers or not users:
-                return [], []
-
-            users_sorted  = sorted(users,  key=lambda r: _to_dt(r.get("timestamp")))
-            infers_sorted = sorted(infers, key=lambda r: _to_dt(r.get("timestamp")))
+            users_sorted  = sorted(j_users,  key=lambda r: _to_dt(r.get("timestamp")))
+            infers_sorted = sorted(j_infers, key=lambda r: _to_dt(r.get("timestamp")))
 
             # pair: for each User, pick the next FinalInference at/after the user timestamp,
             # else fall back to the nearest prior inference.
