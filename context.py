@@ -747,6 +747,16 @@ class SQLiteContextRepository:
         c.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON contexts(last_accessed)")
         self.conn.commit()
 
+    def save_sync(self, ctx: ContextObject) -> None:
+        self._save_many_tx([ctx])
+
+    def flush(self, timeout: float = 2.0) -> None:
+        if not self._async:
+            return
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout and not self._q.empty():
+            time.sleep(0.01)
+            
     def _writer_loop(self):
         BATCH_MAX = 500
         COMMIT_MS = 300
@@ -1139,18 +1149,24 @@ class HybridContextRepository:
     # Core ops
     # ──────────────────────────────────────────────────────────────────
     def save(self, ctx: ContextObject) -> None:
-        # 1) append to JSONL (source of truth for most-recent)
+        # 1) append to JSONL
         self.json_repo.save(ctx)
 
-        # 2) mirror into SQLite so DB grows every save
+        # 2) mirror to SQLite (async)
         if self._dual_write:
-            before = self._safe_count()
             self.sql_repo.save(ctx)
-            after = self._safe_count()
-            if self._verbose and after is not None and before is not None:
-                print(f"[HybridRepo] SQLite rows: {before} → {after} (+{after - before})")
 
-        # 3) prune JSONL by size if needed (moves oldest non-artifacts to SQLite)
+        # 🔇 Remove the per-save COUNT(*) print — it races with async writes and spams logs.
+        # If you want visibility, throttle it and don't expect a delta after async enqueue.
+        if self._verbose:
+            now = time.monotonic()
+            if now - getattr(self, "_last_count_log_ts", 0.0) > 2.0:
+                setattr(self, "_last_count_log_ts", now)
+                rc = self._safe_count()
+                if rc is not None:
+                    print(f"[HybridRepo] SQLite rows ≈ {rc}")
+
+        # 3) archive JSONL by size
         self._archive_by_size()
 
     def get(self, cid: str) -> ContextObject:
