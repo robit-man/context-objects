@@ -689,6 +689,10 @@ class Assembler:
         self.top_k           = self.cfg.get("top_k",            top_k)
         self.hist_k          = self.cfg.get("history_turns",    5)
 
+        self._task_poll_event  = threading.Event()   # existing
+        self._task_wake_event  = threading.Event()   # ← NEW: kick to recalc sleep
+        self._task_lock_file   = None                # ← NEW: poller singleton lock handle
+
         # — system & stage prompts —
         self.clarifier_prompt = self.cfg.get(
             "clarifier_prompt",
@@ -1182,6 +1186,79 @@ class Assembler:
     _CACHE_LOCK = threading.Lock()
     _ZERO = np.zeros(768, dtype=float)
 
+
+    def _task__soonest_due_seconds(self) -> float:
+        """Return seconds until the soonest scheduled task (∞ if none)."""
+        best = float("inf")
+        for t in self._task_list():
+            m = t.metadata or {}
+            if m.get("status") != "scheduled":
+                continue
+            s = self._task__sec_until(m.get("due_at", ""))
+            if s < best:
+                best = s
+        return best
+
+    def _task__kick(self):
+        """Wake the poller to recompute its sleep immediately."""
+        try:
+            self._task_wake_event.set()
+        except Exception:
+            pass
+
+    def _task__acquire_singleton_lock(self) -> bool:
+        """
+        Best-effort cross-process lock so only one poller runs.
+        Others skip starting the background thread.
+        """
+        try:
+            lock_path = os.path.join(os.path.dirname(self.context_path) or ".", ".task_poller.lock")
+            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+            fh = open(lock_path, "a+b")
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    self._task_lock_file = fh
+                    return True
+                except OSError:
+                    fh.close()
+                    return False
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._task_lock_file = fh
+                    return True
+                except BlockingIOError:
+                    fh.close()
+                    return False
+        except Exception:
+            return True  # fail-open: better to have a poller than none
+
+    def _task__release_singleton_lock(self):
+        try:
+            fh = getattr(self, "_task_lock_file", None)
+            if not fh:
+                return
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    fh.seek(0); msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                finally:
+                    fh.close()
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+            self._task_lock_file = None
+        except Exception:
+            pass
+
+
+
     async def _emit_provisional(
         self,
         user_text: str,
@@ -1500,7 +1577,7 @@ class Assembler:
             finally:
                 # prune does canonicalization of schema strings too
                 self._prune_jsonl_duplicates()
-
+                
 
     def _seed_static_prompts(self) -> None:
         """
@@ -1640,8 +1717,6 @@ class Assembler:
 
         # mark that we’ve done this once
         self._static_prompts_seeded = True
-
-
 
 
 
@@ -2593,6 +2668,41 @@ class Assembler:
         print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
 
+    # ─── Task scheduling & countdown (repo-native, no extra files) ───────────────
+
+    def _task__reschedule_from_rrule(self, task_ctx) -> bool:
+        """
+        If task_ctx has an RFC 5545 RRULE, compute the next occurrence and
+        update the task in-place: due_at, status=scheduled, remaining_seconds, summary.
+        Returns True if it rescheduled, False otherwise.
+        """
+        try:
+            rrule_str = (task_ctx.metadata or {}).get("rrule")
+            if not rrule_str:
+                return False
+
+            from dateutil.rrule import rrulestr  # pip install python-dateutil
+            # Base the rule on the last due_at; fall back to now if missing
+            last_due = (task_ctx.metadata or {}).get("due_at") or self._task__fmt_due(self._task__now_utc())
+            dtstart = datetime.fromisoformat(str(last_due).replace("Z", ""))
+
+            rule = rrulestr(rrule_str, dtstart=dtstart)
+            nxt = rule.after(self._task__now_utc(), inc=False)
+            if not nxt:
+                return False
+
+            task_ctx.metadata["due_at"] = self._task__fmt_due(nxt)
+            task_ctx.metadata["status"] = "scheduled"
+            task_ctx.metadata["remaining_seconds"] = self._task__sec_until(task_ctx.metadata["due_at"])
+            title = task_ctx.metadata.get("title", "Scheduled task")
+            task_ctx.summary = f"[scheduled] {title}  (T-{int(task_ctx.metadata['remaining_seconds'])}s)"
+
+            task_ctx.touch(); self.repo.save(task_ctx)
+            self.memman.register_relationships(task_ctx, embed_text)
+            return True
+        except Exception:
+            return False
+
 
     # ─── Task scheduling & countdown (repo-native, no extra files) ───────────────
     def _task__fmt_due(self, dt: datetime) -> str:
@@ -2644,6 +2754,8 @@ class Assembler:
             ctx.summary = f"{ctx.summary}  (T-{int(rem)}s)"
         return ctx
 
+
+
     def _task_schedule(self, *, title: str, due_in_seconds: int | None = None,
                     due_at_utc: str | None = None, payload_text: str,
                     conversation_id: str | None, user_id: str | None,
@@ -2651,50 +2763,78 @@ class Assembler:
         """
         Upsert a task. If allow_update and a very similar title exists in-scope,
         update it instead of creating a new one (fills missing due time, etc.).
+
+        Also: after creating/updating a task, we 'kick' the background poller so it
+        recalculates sleep and can start near the exact due time.
         """
-        # Resolve due_at
+        # --- Resolve/normalize due_at in repo format ---
         if not due_at_utc:
             if due_in_seconds is None:
                 raise ValueError("Provide due_in_seconds or due_at_utc")
-            due_at = self._task__now_utc() + timedelta(seconds=int(due_in_seconds))
+            try:
+                # clamp negatives to 'now'
+                secs = max(0, int(due_in_seconds))
+            except Exception:
+                secs = 0
+            due_at = self._task__now_utc() + timedelta(seconds=secs)
             due_at_utc = self._task__fmt_due(due_at)
         else:
             # normalize to repo format (ensure trailing Z removed since _fmt_ts adds it)
             try:
-                # accept ISO8601-ish with/without Z; parse minimally
-                iso = due_at_utc.replace("Z", "")
+                iso = str(due_at_utc).replace("Z", "")
                 dt = datetime.fromisoformat(iso) if "T" in iso else datetime.fromisoformat(iso + "T00:00:00")
                 due_at_utc = self._task__fmt_due(dt)
             except Exception:
                 # fallback: keep as-is; countdown may be zero
                 pass
 
-        # Dedup/update in scope
+        # --- Dedup/update in-scope (conversation_id + user_id) ---
         existing = self._task_list(conversation_id=conversation_id, user_id=user_id)
         keeper = None
         if allow_update:
             # simple fuzzy match on title
             tnorm = (title or "").strip().lower()
             for t in existing:
-                en = (t.metadata.get("title","") or t.summary or "").strip().lower()
+                en = (t.metadata.get("title", "") or t.summary or "").strip().lower()
                 if en and (en == tnorm or tnorm in en or en in tnorm):
                     keeper = t
                     break
 
         if keeper:
             meta = keeper.metadata or {}
-            if not meta.get("due_at"):
+            # Fill missing fields only (preserve original semantics)
+            if not meta.get("due_at") and due_at_utc:
                 meta["due_at"] = due_at_utc
             if not meta.get("payload_text"):
                 meta["payload_text"] = payload_text
+            # Add rrule if newly supplied
+            if rrule and not meta.get("rrule"):
+                meta["rrule"] = rrule
+            # Ensure scope metadata is present
+            if conversation_id and not meta.get("conversation_id"):
+                meta["conversation_id"] = conversation_id
+            if user_id and not meta.get("user_id"):
+                meta["user_id"] = user_id
+            # Standard scheduling fields
+            meta["title"] = title or meta.get("title", "Scheduled task")
             meta["status"] = "scheduled"
-            meta["remaining_seconds"] = self._task__sec_until(meta["due_at"])
-            keeper.summary = f"[{meta['status']}] {title}  (T-{int(meta['remaining_seconds'])}s)"
+            if meta.get("due_at"):
+                meta["remaining_seconds"] = self._task__sec_until(meta["due_at"])
+            else:
+                meta["remaining_seconds"] = 0
+            keeper.summary = f"[{meta['status']}] {meta['title']}  (T-{int(meta['remaining_seconds'])}s)"
             keeper.metadata = meta
             keeper.touch(); self.repo.save(keeper)
             self.memman.register_relationships(keeper, embed_text)
+
+            # Wake poller to re-schedule sleep immediately
+            try:
+                self._task__kick()
+            except Exception:
+                pass
             return keeper
 
+        # --- Create a brand-new task ---
         ctx = self._task__to_ctx(
             title=title,
             due_at=due_at_utc,
@@ -2706,7 +2846,15 @@ class Assembler:
         )
         ctx.touch(); self.repo.save(ctx)
         self.memman.register_relationships(ctx, embed_text)
+
+        # Wake poller so it aligns sleep with this new due time
+        try:
+            self._task__kick()
+        except Exception:
+            pass
+
         return ctx
+
 
     def _task_list(self, *, conversation_id: str | None = None, user_id: str | None = None) -> list[ContextObject]:
         rows = self.repo.query(lambda c:
@@ -2773,54 +2921,119 @@ class Assembler:
     def _launch_scheduled(self, task_ctx: ContextObject):
         """
         Launch a new repo-assembler session seeded with the task's payload.
-        Marks the task as completed/failed accordingly.
+
+        Transitions:
+        scheduled -> running (set by _task_tick_and_launch) -> completed
+        OR, if metadata.rrule is present -> rescheduled to next due_at
+        On exception -> failed
+
+        Side effects:
+        - Updates last_run_at, last_completed_at / last_failed_at
+        - Increments runs_count / failures_count
+        - Calls _task__reschedule_from_rrule on success for recurring tasks
+        - Calls _task__kick() after (re)scheduling to self-start soon-due items
         """
         async def _go():
+            # Re-fetch the latest copy to avoid stale metadata
             try:
-                payload = (task_ctx.metadata or {}).get("payload_text") or task_ctx.summary or ""
-                # Optional: open an “episode” for visibility
-                try:
-                    self.memman.start_episode(f"Task: {task_ctx.metadata.get('title','task')}", {
-                        "task_id": task_ctx.metadata.get("task_id"),
-                        "due_at": task_ctx.metadata.get("due_at"),
-                        "conversation_id": task_ctx.metadata.get("conversation_id"),
-                        "user_id": task_ctx.metadata.get("user_id"),
-                    })
-                except Exception:
-                    pass
+                t = self.repo.get(task_ctx.context_id)
+            except Exception:
+                t = task_ctx
 
+            meta = t.metadata or {}
+
+            # Idempotency guard: only proceed if task is currently 'running'
+            if meta.get("status") != "running":
+                return
+
+            # Mark this attempt
+            meta["last_run_at"] = self._task__fmt_due(self._task__now_utc())
+            meta["runs_count"] = int(meta.get("runs_count", 0)) + 1
+            t.metadata = meta
+            t.touch(); self.repo.save(t)
+
+            # Prepare payload
+            payload = meta.get("payload_text") or t.summary or ""
+
+            # Open episode (best-effort)
+            try:
+                self.memman.start_episode(
+                    f"Task: {meta.get('title','task')}",
+                    {
+                        "task_id": meta.get("task_id"),
+                        "due_at": meta.get("due_at"),
+                        "conversation_id": meta.get("conversation_id"),
+                        "user_id": meta.get("user_id"),
+                    }
+                )
+            except Exception:
+                pass
+
+            try:
+                # Run the task workload
                 await self.run_with_meta_context(
                     payload, skip_quick_phases=True, direct_plan=True, images=None
                 )
 
-                # mark complete
+                # Success path
                 try:
-                    fresh = self.repo.get(task_ctx.context_id)
-                    fresh.metadata["status"] = "completed"
-                    fresh.summary = f"[completed] {fresh.metadata.get('title','task')}"
-                    fresh.touch(); self.repo.save(fresh)
+                    fresh = self.repo.get(t.context_id)
                 except Exception:
-                    pass
+                    fresh = t
+                fmeta = fresh.metadata or {}
+                fmeta["last_completed_at"] = self._task__fmt_due(self._task__now_utc())
+
+                # If recurring, try to roll forward; else mark completed
+                if fmeta.get("rrule"):
+                    ok = False
+                    try:
+                        ok = self._task__reschedule_from_rrule(fresh)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        fmeta["status"] = "completed"
+                        fresh.summary = f"[completed] {fmeta.get('title','task')}"
+                        fresh.metadata = fmeta
+                        fresh.touch(); self.repo.save(fresh)
+                    # Nudge the poller so newly-rescheduled near-due tasks launch promptly
+                    try:
+                        self._task__kick()
+                    except Exception:
+                        pass
+                else:
+                    fmeta["status"] = "completed"
+                    fresh.summary = f"[completed] {fmeta.get('title','task')}"
+                    fresh.metadata = fmeta
+                    fresh.touch(); self.repo.save(fresh)
+
             except Exception:
+                # Failure path
                 try:
-                    fresh = self.repo.get(task_ctx.context_id)
-                    fresh.metadata["status"] = "failed"
-                    fresh.touch(); self.repo.save(fresh)
+                    fresh = self.repo.get(t.context_id)
                 except Exception:
-                    pass
+                    fresh = t
+                fmeta = fresh.metadata or {}
+                fmeta["status"] = "failed"
+                fmeta["last_failed_at"] = self._task__fmt_due(self._task__now_utc())
+                fmeta["failures_count"] = int(fmeta.get("failures_count", 0)) + 1
+                fresh.metadata = fmeta
+                fresh.summary = f"[failed] {fmeta.get('title','task')}"
+                fresh.touch(); self.repo.save(fresh)
             finally:
                 try:
                     self.memman.end_episode()
                 except Exception:
                     pass
+
         # fire-and-forget
         try:
             import asyncio
             asyncio.create_task(_go())
         except RuntimeError:
             # no running loop → run in a thread
-            import threading
-            threading.Thread(target=lambda: asyncio.run(_go()), daemon=True).start()
+            import threading, asyncio as _asyncio
+            threading.Thread(target=lambda: _asyncio.run(_go()), daemon=True).start()
+
 
     def _task_tick_and_launch(self) -> int:
         """One poll tick: refresh countdowns and launch all due tasks. Returns count launched."""
@@ -2852,28 +3065,87 @@ class Assembler:
         return launched
 
     def _task_start_background(self, poll_seconds: float = 2.0):
-        """Start background poller that launches due tasks."""
+        """Start background poller that launches due tasks with adaptive sleeping."""
+        # Singleton guard across processes
+        if not self._task__acquire_singleton_lock():
+            # another process owns the poller
+            return
+
         if self._task_bg_thread and self._task_bg_thread.is_alive():
             return
+
         self._task_poll_event.clear()
+        self._task_wake_event.clear()
+
+        # Tunables: how early to wake and max idle when nothing is coming soon
+        start_early_s   = float(self.cfg.get("task_start_early_s", 0.75))   # start up to 0.75s early
+        idle_cap_s      = float(self.cfg.get("task_idle_cap_seconds", 60.0))# max sleep if no tasks due soon
+        hard_min_sleep  = 0.10                                              # don't busy spin
+
         def _run():
+            # 1) Immediate catch-up on boot
+            try:
+                self._task_tick_and_launch()
+            except Exception:
+                pass
+
+            # 2) Loop with adaptive sleep or wake kicks
             while not self._task_poll_event.is_set():
                 try:
+                    # Launch any tasks that just became due
                     self._task_tick_and_launch()
                 except Exception:
                     pass
-                self._task_poll_event.wait(poll_seconds)
+
+                # Compute how long to sleep until the next due time
+                try:
+                    soonest = self._task__soonest_due_seconds()
+                except Exception:
+                    soonest = float("inf")
+
+                if soonest == float("inf"):
+                    timeout = idle_cap_s
+                else:
+                    # Wake a bit early so launch jitter is <~1s
+                    timeout = max(hard_min_sleep, soonest - start_early_s)
+                    # Don't sleep *too* long even if the next due is far away
+                    timeout = min(timeout, idle_cap_s)
+
+                # Wait for either a kick (new task scheduled) or the timeout
+                kicked = self._task_wake_event.wait(timeout)
+                if kicked:
+                    # Clear and loop immediately to recompute timing
+                    try:
+                        self._task_wake_event.clear()
+                    except Exception:
+                        pass
+
+            # loop ending → releasing singleton lock
+            try:
+                self._task__release_singleton_lock()
+            except Exception:
+                pass
+
         self._task_bg_thread = threading.Thread(target=_run, name="TaskPoller", daemon=True)
         self._task_bg_thread.start()
+
+
 
     def _task_stop_background(self):
         try:
             if self._task_bg_thread:
                 self._task_poll_event.set()
+                # also wake immediately so the thread can exit now, not after timeout
+                try: self._task_wake_event.set()
+                except Exception: pass
                 self._task_bg_thread.join(timeout=1.5)
                 self._task_bg_thread = None
-        except Exception:
-            pass
+        finally:
+            try:
+                self._task__release_singleton_lock()
+            except Exception:
+                pass
+
 
     def _stage_task_detect_and_schedule(self, *, user_text: str, state: dict, allow_update: bool = False) -> ContextObject | None:
         """
@@ -4045,6 +4317,8 @@ class Assembler:
                 self._seed_static_prompts()
         except Exception:
             pass
+
+
     # ─────────────────────────────────────────────────────────────────────────────
     #  Orchestrator (Quick-Take + Planner) — with direct-plan bypass
     # ─────────────────────────────────────────────────────────────────────────────
@@ -4056,7 +4330,7 @@ class Assembler:
         images: List[str] | None = None,
         on_token: Callable[[str], None] | None = None,
         skip_quick_phases: bool = False,
-        direct_plan: bool = False,  # ← NEW: bypasses QT/clarifier/etc. and feeds user_text into Stage 7
+        direct_plan: bool = False,  # bypasses QT/clarifier/etc. and feeds user_text into Stage 7
     ) -> str:
         """
         Two-phase orchestrator (non-destructive). Supports a direct Stage-7 bypass:
@@ -4071,9 +4345,8 @@ class Assembler:
         • Seed planner directly with raw user_text (state['planner_seed_text'])
         • Attempt explicit Stage-7 calls if available; else hint _stage8_orchestrate via state flags
         """
-        import json, traceback, uuid, textwrap, inspect
+        import json, traceback, uuid, textwrap, inspect, time
         from datetime import datetime, timezone
-
         import numpy as np
 
         # ── status callback ───────────────────────────────────────────────
@@ -4087,85 +4360,136 @@ class Assembler:
         except Exception:
             pass
 
-        # ---------- helper: ranked interleaved context (U↔A / final_inference) ----------
-        def _ranked_convo_context(conv_id: str, top_pairs: int = 5, pool: int = 80) -> tuple[list[str], list[str]]:
+        # ---------- helper: ranked interleaved context via Tools.context_query ----------
+        def _ranked_pairs_via_tools(
+            state: dict,
+            *,
+            top_pairs: int = 5,
+            pool: int = 80,
+            window: str | None = None,   # e.g. "72 hours"
+        ) -> tuple[list[str], list[str]]:
+            """
+            Use Tools.context_query to fetch recent user_input segments and final_inference stages,
+            interleave them into U→A pairs, then rank by cosine(sim(user_text, pair)) with a small
+            recency boost. Returns (display_lines, flattened_pair_ids).
+            """
+            # resolve Tools class
+            _Tools = None
+            try:
+                _Tools = Tools  # already imported in module scope?
+            except NameError:
+                try:
+                    from tools import Tools as _Tools  # best effort
+                except Exception:
+                    _Tools = None
+            if _Tools is None:
+                return [], []
+
             def _to_dt(ts):
                 try:
                     return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
                 except Exception:
                     return datetime.min.replace(tzinfo=timezone.utc)
 
-            segs = [
-                c for c in self.repo.query(
-                    lambda c:
-                        c.domain == "segment"
-                        and c.semantic_label in ("user_input", "assistant")
-                        and (
-                            (c.metadata or {}).get("conversation_id") == conv_id
-                            or (c.metadata or {}).get("conversationid") == conv_id
-                        )
-                )
-            ]
-            fins = [
-                c for c in self.repo.query(
-                    lambda c:
-                        c.component == "stage"
-                        and c.semantic_label == "final_inference"
-                        and (
-                            (c.metadata or {}).get("conversation_id") == conv_id
-                            or (c.metadata or {}).get("conversationid") == conv_id
-                        )
-                )
-            ]
-            for r in fins:
-                ghost = type("GhostSeg", (), {})()
-                ghost.domain = "segment"
-                ghost.semantic_label = "assistant"
-                ghost.summary = (getattr(r, "summary", None) or (getattr(r, "metadata", {}) or {}).get("text") or "")
-                ghost.timestamp = getattr(r, "timestamp", None)
-                ghost.metadata = getattr(r, "metadata", {}) or {}
-                ghost.context_id = getattr(r, "context_id", uuid.uuid4().hex)
-                segs.append(ghost)
+            # knobs
+            window = window or self.cfg.get("quick_take_window", "72 hours")
+            top_k_each = max(pool, top_pairs * 6)
 
-            segs.sort(key=lambda c: _to_dt(getattr(c, "timestamp", "")))
-            seen = set()
-            chron = []
-            for c in segs[-(pool * 3):]:
-                role = "User" if c.semantic_label == "user_input" else "Assistant"
-                txt = (c.summary or "").strip()
-                key = (role, txt[:160], getattr(c, "timestamp", ""))
-                if key in seen:
-                    continue
-                seen.add(key)
-                chron.append((role, txt, _to_dt(getattr(c, "timestamp", "")), getattr(c, "context_id", None)))
+            # scope by conversation tag if available (falls back if empty)
+            tag_filter = None
+            cid = state.get("conversation_id")
+            if cid:
+                tag_filter = [cid]
 
+            def _q(**kw):
+                return _Tools.context_query(assembler=self, **kw)
+
+            # Pull final_inference (Assistant)
+            def _pull_infers(use_tags: bool):
+                return _q(
+                    window=window,
+                    domain=["stage"],
+                    component=["final_inference"],
+                    semantic_label=["final_inference"],
+                    similarity_to=state.get("user_text") or "",
+                    top_k=top_k_each,
+                    tags=(tag_filter if use_tags else None),
+                )
+
+            # Pull user_input (User)
+            def _pull_user_inputs(use_tags: bool):
+                return _q(
+                    window=window,
+                    domain=["segment"],
+                    component=["segment"],
+                    semantic_label=["user_input"],
+                    similarity_to=state.get("user_text") or "",
+                    top_k=top_k_each,
+                    tags=(tag_filter if use_tags else None),
+                )
+
+            # try with tags first, then retry without tags if nothing comes back
+            try:
+                j_infers = json.loads(_pull_infers(use_tags=True))
+                j_users  = json.loads(_pull_user_inputs(use_tags=True))
+                infers = j_infers.get("results", [])
+                users  = j_users.get("results", [])
+                if not infers or not users:
+                    j_infers = json.loads(_pull_infers(use_tags=False))
+                    j_users  = json.loads(_pull_user_inputs(use_tags=False))
+                    infers = j_infers.get("results", [])
+                    users  = j_users.get("results", [])
+            except Exception:
+                return [], []
+
+            if not infers or not users:
+                return [], []
+
+            users_sorted  = sorted(users,  key=lambda r: _to_dt(r.get("timestamp")))
+            infers_sorted = sorted(infers, key=lambda r: _to_dt(r.get("timestamp")))
+
+            # pair: for each User, pick the next FinalInference at/after the user timestamp,
+            # else fall back to the nearest prior inference.
             pairs = []
-            pending_u = None
-            for role, txt, ts, cid in chron:
-                if role == "User":
-                    pending_u = (txt, ts, cid)
-                elif role == "Assistant" and pending_u:
-                    pairs.append((pending_u[0], txt, pending_u[1], ts, pending_u[2], cid))
-                    pending_u = None
+            j = 0
+            for u in users_sorted[-(pool * 3):]:
+                uts = _to_dt(u.get("timestamp"))
+                while j < len(infers_sorted) and _to_dt(infers_sorted[j].get("timestamp")) < uts:
+                    j += 1
+                a = infers_sorted[j] if j < len(infers_sorted) else (infers_sorted[-1] if infers_sorted else None)
+                if not a:
+                    continue
+                u_txt = (u.get("summary") or "").strip()
+                a_txt = (a.get("summary") or "").strip()
+                if not u_txt and not a_txt:
+                    continue
+                pairs.append((
+                    u_txt, a_txt,
+                    uts, _to_dt(a.get("timestamp")),
+                    u.get("context_id"), a.get("context_id")
+                ))
 
+            if not pairs:
+                return [], []
+
+            # score: cosine(sim(user_text, "U\nA")) + recency boost
             def _embed(t: str) -> np.ndarray | None:
                 try:
                     v = self.embed_text(t or "")
-                    a = np.asarray(v, dtype=float).reshape(-1)
-                    return a
+                    return np.asarray(v, dtype=float).reshape(-1)
                 except Exception:
                     return None
 
-            uvec = _embed(user_text)
+            uvec = _embed(state.get("user_text") or "")
             now = datetime.now(timezone.utc)
 
-            def _recency_boost(ts: datetime) -> float:
+            def _recency_boost(ts):
                 age_days = max((now - ts).total_seconds() / 86400.0, 0.0)
                 return 0.5 ** (age_days / 3.0)
 
             scored = []
-            for u, a, uts, ats, ucid, acid in pairs[-pool:]:
-                pair_text = f"{u}\n{a}"
+            for u_txt, a_txt, uts, ats, ucid, acid in pairs:
+                pair_text = f"{u_txt}\n{a_txt}"
                 pvec = _embed(pair_text)
                 if uvec is None or pvec is None:
                     cos = 0.0
@@ -4174,17 +4498,14 @@ class Assembler:
                     cos = float(np.dot(uvec, pvec) / den)
                 rec = _recency_boost(max(uts, ats))
                 score = 0.72 * cos + 0.28 * rec
-                u_short = textwrap.shorten(u.strip().replace("\n", " "), width=180, placeholder="…")
-                a_short = textwrap.shorten((a or "(no reply)").strip().replace("\n", " "), width=180, placeholder="…")
+
+                u_short = textwrap.shorten(u_txt.replace("\n", " "), width=180, placeholder="…")
+                a_short = textwrap.shorten(a_txt.replace("\n", " "), width=180, placeholder="…")
                 scored.append((score, f"U: {u_short} || A: {a_short}", (ucid, acid)))
 
             scored.sort(key=lambda t: t[0], reverse=True)
-            lines = [s for _, s, _ids in scored[:top_pairs]]
-            pair_ids = []
-            for _, _, ids in scored[:top_pairs]:
-                for i in ids:
-                    if i:
-                        pair_ids.append(i)
+            lines = [s for _, s, _ in scored[:top_pairs]]
+            pair_ids = [i for _, _, ids in scored[:top_pairs] for i in ids if i]
             return lines, pair_ids
 
         # ── shared state bootstrap (WITH TIME CONTEXT) ───────────────────────
@@ -4201,7 +4522,6 @@ class Assembler:
 
         human_local = local_now.strftime("%A, %B %d, %Y %I:%M %p %Z (UTC%z)")
         human_utc   = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
-        # Required literal banner sentence (per your spec)
         time_banner = (
             f"To aid in making chronologically informed decisions, the current time is {human_local}. "
             f"UTC now: {human_utc}. Always compute time deltas relative to this moment."
@@ -4246,8 +4566,7 @@ class Assembler:
             time_ctx.touch()
             self.repo.save(time_ctx)
         except Exception:
-            # Non-fatal: stages will still read state["system_time_prompt"]
-            time_ctx = None
+            time_ctx = None  # non-fatal
 
         # ── Stage 1: record input ────────────────────────────────────────────
         try:
@@ -4261,7 +4580,6 @@ class Assembler:
         # ── Stage 2: system prompts (policies, etc.) + time injection ────────
         try:
             sys_ctxs = self._stage2_load_system_prompts()
-            # Inject time context as an extra system prompt so every downstream prompt builder sees it
             if time_ctx:
                 try:
                     sys_ctxs = list(sys_ctxs) if isinstance(sys_ctxs, (list, tuple)) else [sys_ctxs]
@@ -4274,17 +4592,14 @@ class Assembler:
             sys_ctxs = []
             status_cb("error_stage2", {"error": f"{type(e).__name__}: {e}"})
 
-        # Also expose as an explicit helper to any later stage that wants a ready-made banner
         state["extra_system_messages"] = [state["system_time_prompt"]]
 
         try:
             self._task_inject_countdown_context(state)
-            # Give the model a chance to *create* a task from this message (e.g., “remind me …”)
             self._stage_task_detect_and_schedule(user_text=user_text, state=state)
         except Exception:
             pass
 
-        # If not direct planning, do the normal context/quick/clarifier/knowledge flow.
         do_quick = (not skip_quick_phases) and (not direct_plan)
 
         # ── Stage 3: retrieve & merge context (skip on direct_plan) ──────────
@@ -4294,7 +4609,6 @@ class Assembler:
                     user_text=user_text,
                     user_ctx=user_ctx,
                     sys_ctx=sys_ctxs,
-                    # Inject the system_time context directly into the merge
                     extra_ctx=[time_ctx] if time_ctx else None,
                     recall_ids=None,
                 )
@@ -4302,19 +4616,14 @@ class Assembler:
                 state["stages_run"].append("stage3_retrieve_and_merge_context")
                 state.setdefault("merged", state.get("merged", []))
                 state.setdefault("merged_ids", state.get("merged_ids", [c.context_id for c in state["merged"] if hasattr(c, "context_id")]))
-                status_cb("context_merged", {
-                    "merged": len(state.get("merged_ids", [])),
-                    "now": state["now_local_human"]
-                })
+                status_cb("context_merged", {"merged": len(state.get("merged_ids", [])), "now": state["now_local_human"]})
             except Exception as e:
                 state.setdefault("merged", [])
                 state.setdefault("merged_ids", [])
                 status_cb("error_stage3", {"error": f"{type(e).__name__}: {e}"})
         else:
-            # Ensure planner doesn’t crash if it expects these keys
             state.setdefault("merged", [])
             state.setdefault("merged_ids", [])
-            # Even on direct plan, force-inject the time ctx into merged so Stage 7/8 can see it
             if time_ctx:
                 try:
                     state["merged"].append(time_ctx)
@@ -4326,7 +4635,12 @@ class Assembler:
         if do_quick:
             try:
                 status_cb("quick_take_begin", {"now": state["now_local_human"]})
-                pairs, pair_ids = _ranked_convo_context(state["conversation_id"], top_pairs=6, pool=80)
+                pairs, pair_ids = _ranked_pairs_via_tools(
+                    state,
+                    top_pairs=6,
+                    pool=80,
+                    window=self.cfg.get("quick_take_window", "72 hours"),
+                )
                 state["quick_take_pairs"] = pairs
                 state["quick_take_pair_ids"] = pair_ids
 
@@ -4338,7 +4652,6 @@ class Assembler:
                 )
                 qt_ctx = "\n".join(pairs) if pairs else "(no prior context)"
                 msgs = [
-                    # Prepend explicit time banner as a system message
                     {"role": "system", "content": state["system_time_prompt"]},
                     {"role": "system", "content": qt_sys},
                     {"role": "system", "content": qt_guard},
@@ -4377,8 +4690,8 @@ class Assembler:
             try:
                 clar_ctx = self._stage4_intent_clarification(
                     user_text=user_text,
-                    state=state,           # ← has time fields
-                    on_token=None,         # never stream clarifier (prevents TTS on JSON)
+                    state=state,
+                    on_token=None,  # never stream clarifier (prevents TTS on JSON)
                 )
                 state["clar_ctx"] = clar_ctx
                 state["stages_run"].append("stage4_intent_clarification")
@@ -4387,13 +4700,13 @@ class Assembler:
                 clar_ctx = None
                 status_cb("error_stage4", {"error": f"{type(e).__name__}: {e}"})
 
-            # If clarifier produced better structure (keywords/notes), re-attempt scheduling
+            # Re-attempt scheduling with better structure if we have it
             try:
                 if clar_ctx:
                     self._stage_task_detect_and_schedule(
                         user_text=(clar_ctx.metadata.get("notes") or user_text),
-                        state=state,          # ← time-aware
-                        allow_update=True,    # refine or fill missing due time/title
+                        state=state,
+                        allow_update=True,
                     )
             except Exception:
                 pass
@@ -4402,13 +4715,10 @@ class Assembler:
         know_ctx = None
         if not direct_plan:
             try:
-                know_ctx = self._stage5_external_knowledge(clar_ctx, state)  # ← time-aware via state
+                know_ctx = self._stage5_external_knowledge(clar_ctx, state)
                 state["know_ctx"] = know_ctx
                 state["stages_run"].append("stage5_external_knowledge")
-                status_cb("knowledge_built", {
-                    "snippets": len(state.get("knowledge_snippets", [])),
-                    "now": state["now_local_human"]
-                })
+                status_cb("knowledge_built", {"snippets": len(state.get("knowledge_snippets", [])), "now": state["now_local_human"]})
             except Exception as e:
                 know_ctx = None
                 status_cb("error_stage5", {"error": f"{type(e).__name__}: {e}"})
@@ -4417,6 +4727,7 @@ class Assembler:
         try:
             tools_list = self._stage6_prepare_tools()
             state["tools_list"] = tools_list
+
             def _tool_name(obj):
                 if isinstance(obj, str):
                     return obj
@@ -4432,7 +4743,6 @@ class Assembler:
                 """
                 names = list(tool_names)
                 feats: dict[str, list[float]] = {}
-                # quick clarifier text for affinity
                 clar_txt = ""
                 try:
                     clar = state.get("clar_ctx")
@@ -4490,10 +4800,13 @@ class Assembler:
                     feats[nm] = [affinity, sr, 1.0 - arg_bad, inv_lat, 1.0]
                 return feats
 
-            # compute ranked order
+            # compute ranked order (fallback to identity if bandit missing)
             names = [_tool_name(t) for t in tools_list]
             feats_map = _tool_features_map(names)
-            ranked_names = self.bandit.rank_tools(names, feats_map)
+            try:
+                ranked_names = self.bandit.rank_tools(names, feats_map)
+            except Exception:
+                ranked_names = names
 
             name_to_objs: dict[str, list] = {}
             for t in tools_list:
@@ -4502,21 +4815,17 @@ class Assembler:
             tools_list_ranked: list = []
             for n in ranked_names:
                 tools_list_ranked.extend(name_to_objs.pop(n, []))
-
-            # keep any unknowns at the end in their original order
             for remaining in name_to_objs.values():
                 tools_list_ranked.extend(remaining)
 
-            # persist ranked list for downstream users (state + executor)
             state["tools_list"] = tools_list_ranked
             self.tools_list = tools_list_ranked
 
-            # Build KG from whatever we have (may be None on direct_plan — should be robust)
             self._stage5b_build_planning_kg(
                 clar_ctx if not direct_plan else None,
                 know_ctx if not direct_plan else None,
-                tools_list_ranked,  # ← use ranked list
-                state                 # ← time-aware state
+                tools_list_ranked,
+                state
             )
             state["stages_run"].append("stage5b_build_planning_kg")
         except Exception as e:
@@ -4533,13 +4842,11 @@ class Assembler:
 
         # ── DIRECT PLAN BYPASS INTO STAGE 7 ───────────────────────────────────
         if direct_plan:
-            # Minimal planner seed; also provide pack fields so Stage 8 can read them if it prefers.
             state["planner_mode"] = "direct_from_user"
             state["planner_seed_text"] = user_text
             state.setdefault("planner_context_ids", [])
             if state.get("user_ctx") and hasattr(state["user_ctx"], "context_id"):
                 state["planner_context_ids"].append(state["user_ctx"].context_id)
-            # Ensure time context is part of planner context even on bypass
             if time_ctx and time_ctx.context_id not in state["planner_context_ids"]:
                 state["planner_context_ids"].append(time_ctx.context_id)
 
@@ -4554,14 +4861,13 @@ class Assembler:
                 "now_epoch": state["now_epoch"],
             }
 
-            # Try explicit Stage-7 → Stage-7b, then continue; otherwise hint orchestrator.
             try:
                 status_cb("planner_direct_begin", {"mode": "direct_from_user", "now": state["now_local_human"]})
 
                 if hasattr(self, "_stage7_planning_summary"):
                     plan_ctx = self._stage7_planning_summary(
                         user_text=user_text,
-                        state=state,            # ← includes time fields
+                        state=state,
                         seed_text=user_text,
                         bypass_context=True,
                     )
@@ -4573,7 +4879,6 @@ class Assembler:
                         state["plan_validation_ctx"] = val_ctx
                         state["stages_run"].append("stage7b_plan_validation")
 
-                    # Continue into the usual chain/exec via Stage 8 (it should reuse plan_ctx if supported)
                     final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
                     state["tool_ctxs"] = tool_ctxs
                     state["final"] = final
@@ -4584,7 +4889,6 @@ class Assembler:
                     ])
                     status_cb("planner_direct_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
                 else:
-                    # Orchestrator-only path: set flags so _stage8_orchestrate plans straight from seed.
                     state["bypass_to_stage7"] = True
                     final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
                     state["tool_ctxs"] = tool_ctxs
@@ -4641,12 +4945,12 @@ class Assembler:
             except Exception:
                 pass
 
-            # reflection status (cheap heuristic if your stage 9b doesn’t set it)
+            # reflection status
             state.setdefault("reflection_status", "OK" if not state.get("errors") else "NEEDS_FIX")
             state.setdefault("critic_needed", False)
             state.setdefault("user_feedback", state.get("user_feedback", 0))  # -1/0/+1 if you collect explicit thumbs
 
-            # per-tool updates (one row per unique tool name from this run)
+            # per-tool updates
             tool_updates = []
             seen = set()
             for t in (state.get("tool_ctxs") or []):
@@ -4655,7 +4959,6 @@ class Assembler:
                 if not name or name in seen:
                     continue
                 seen.add(name)
-                # quick features for *this* run (falls back to historical ranking next time)
                 succ = 1.0 if meta.get("exception") is None else 0.0
                 arg_ok = 1.0 if ("argument" not in str(meta.get("exception","")).lower()) else 0.0
                 inv_lat = 1.0

@@ -594,36 +594,27 @@ def sanitize_jsonl(path: str) -> None:
         f.flush()
         os.fsync(f.fileno())
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Repositories  (FAST: async batched SQLite + hysteresis bulk archiver)
+# ──────────────────────────────────────────────────────────────────────────────
+import queue
+import time
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Repositories
-# ──────────────────────────────────────────────────────────────────────────────
 class JSONLContextRepository:
     _singleton: "JSONLContextRepository" = None
 
     def __init__(self, path: str):
-        # 0) Repair any pre‐existing corruption
         sanitize_jsonl(path)
-
-        # 1) Ensure directory exists
         dirpath = os.path.dirname(path) or "."
         os.makedirs(dirpath, exist_ok=True)
-
-        # 2) Initialize file and lock
         self.path = path
         self._lock = threading.Lock()
-        open(self.path, "a").close()  # create file if missing
-
-        # 3) Register singleton
+        # ensure file exists
+        open(self.path, "a").close()
         JSONLContextRepository._singleton = self
 
     def get(self, context_id: str) -> ContextObject:
-        """
-        Look up a single context; if a JSON error is encountered,
-        attempt one repair pass then retry.
-        """
         tried_sanitize = False
-
         while True:
             with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
                 for lineno, line in enumerate(f, start=1):
@@ -634,39 +625,32 @@ class JSONLContextRepository:
                         if not tried_sanitize:
                             sanitize_jsonl(self.path)
                             tried_sanitize = True
-                            break  # abort this read, retry after repair
+                            break
                         else:
-                            continue  # skip this line on second pass
+                            continue
                     if data.get("context_id") == context_id:
                         return ContextObject.from_dict(data)
                 else:
-                    # finished file without finding ID
                     break
-
-            # if we repaired once already, don't loop again
             if tried_sanitize:
                 break
-
         raise KeyError(f"Context {context_id} not found")
 
     def save(self, ctx: ContextObject) -> None:
-        """Append a dirty context object to JSONL under exclusive lock."""
+        """Append a dirty context object to JSONL. Line-buffered, no fsync by default."""
         if not ctx.dirty:
             return
         with self._lock:
-            with open(self.path, "a", encoding="utf-8") as f, _locked(f, exclusive=True):
+            # line buffered IO; avoid fsync on every write unless explicitly requested
+            with open(self.path, "a", encoding="utf-8", buffering=1) as f, _locked(f, exclusive=True):
                 f.write(ctx.to_json() + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+                if os.getenv("CTX_STRICT_FSYNC", "0").lower() in ("1", "true", "yes"):
+                    f.flush()
+                    os.fsync(f.fileno())
             ctx.dirty = False
 
     def delete(self, context_id: str) -> None:
-        """
-        Remove all entries matching context_id, skipping any corrupted lines.
-        """
-        # First ensure file is clean
         sanitize_jsonl(self.path)
-
         kept: List[Dict[str, Any]] = []
         with self._lock:
             with open(self.path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
@@ -682,16 +666,13 @@ class JSONLContextRepository:
                 f.truncate()
                 for entry in kept:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+                if os.getenv("CTX_STRICT_FSYNC", "0").lower() in ("1", "true", "yes"):
+                    f.flush()
+                    os.fsync(f.fileno())
 
     def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
-        """
-        Iterate all contexts, skipping any bad lines; attempt one repair pass if needed.
-        """
         results: List[ContextObject] = []
         tried_sanitize = False
-
         while True:
             with open(self.path, "r", encoding="utf-8") as f, _locked(f, exclusive=False):
                 bad_line = False
@@ -704,19 +685,15 @@ class JSONLContextRepository:
                             sanitize_jsonl(self.path)
                             tried_sanitize = True
                             bad_line = True
-                            break  # restart after repair
+                            break
                         else:
                             continue
                     ctx = ContextObject.from_dict(data)
                     if filter_fn(ctx):
                         results.append(ctx)
-
                 if bad_line:
-                    # we repaired; retry the query on clean file
                     continue
-                # no bad line or already sanitized
                 break
-
         return results
 
     @classmethod
@@ -726,14 +703,36 @@ class JSONLContextRepository:
         return cls._singleton
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SQLite-backed archive for long-term storage
-# ──────────────────────────────────────────────────────────────────────────────
 class SQLiteContextRepository:
-    def __init__(self, db_path: str = "context.db"):
+    """
+    Single-writer async pipeline to SQLite using WAL, generous busy_timeout, and batched commits.
+    """
+    def __init__(self, db_path: str = "context.db",
+                 *, async_writes: bool = True,
+                 busy_timeout_ms: int | None = None):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._lock = Lock()
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms or int(os.getenv('CTX_SQL_BUSY_TIMEOUT_MS','15000')))};")
+        self.conn.execute("PRAGMA wal_autocheckpoint=2000;")
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
+        self.conn.execute("PRAGMA mmap_size=268435456;")
+        self.conn.execute("PRAGMA cache_size=-40000;")          # ~40 MB
+        self.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+        self.conn.execute("PRAGMA max_page_count=1048576;")      # ≈4GB with 4KB pages
+        self.conn.execute("PRAGMA journal_size_limit=52428800;") # 50 MB WAL cap
         self._init_schema()
+        self._lock = Lock()
+
+        self._async = bool(async_writes)
+        self._q: "queue.Queue[ContextObject | list[ContextObject] | None]" = queue.Queue(maxsize=10000)
+        self._writer_thread = None
+        self._last_maint = time.monotonic()
+        self._log_t0 = time.monotonic()
+        self._last_row_count_print = 0
+        if self._async:
+            self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name="SQLiteWriter")
+            self._writer_thread.start()
 
     def _init_schema(self) -> None:
         c = self.conn.cursor()
@@ -748,19 +747,112 @@ class SQLiteContextRepository:
         c.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON contexts(last_accessed)")
         self.conn.commit()
 
+    def _writer_loop(self):
+        BATCH_MAX = 500
+        COMMIT_MS = 300
+        while True:
+            batch: list[ContextObject] = []
+            try:
+                item = self._q.get(timeout=0.5)
+            except queue.Empty:
+                item = None
+
+            if item is None:
+                # periodic maintenance
+                now = time.monotonic()
+                if now - self._last_maint > 20:
+                    try:
+                        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        self.conn.execute("PRAGMA incremental_vacuum(4000);")
+                        self.conn.commit()
+                    except Exception:
+                        pass
+                    self._last_maint = now
+                continue
+
+            if isinstance(item, list):
+                batch.extend(item)
+            else:
+                batch.append(item)
+
+            t_start = time.monotonic()
+            # drain quickly to fill batch or until COMMIT_MS elapsed
+            while len(batch) < BATCH_MAX and (time.monotonic() - t_start) * 1000 < COMMIT_MS:
+                try:
+                    nxt = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    break
+                if isinstance(nxt, list):
+                    batch.extend(nxt)
+                else:
+                    batch.append(nxt)
+
+            if batch:
+                self._save_many_tx(batch)
+
+    def _save_many_tx(self, ctxs: list[ContextObject]) -> None:
+        rows = []
+        now = _fmt_ts(default_clock())
+        for c in ctxs:
+            rows.append((c.context_id, c.timestamp, now, c.to_json()))
+            c.dirty = False
+        try:
+            with self._lock:
+                self.conn.executemany(
+                    """
+                    INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(context_id) DO UPDATE SET
+                      json_blob     = excluded.json_blob,
+                      last_accessed = excluded.last_accessed
+                    """,
+                    rows
+                )
+                self.conn.commit()
+        except sqlite3.Error as e:
+            logging.error("SQLite batch save failed: %s", e)
+
+        # throttled row count print (optional; keeps your log calm)
+        try:
+            nowt = time.monotonic()
+            if nowt - self._log_t0 > 2.0:
+                self._log_t0 = nowt
+                # cheap count (no lock storm)
+                cur = self.conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM contexts")
+                rc = cur.fetchone()[0]
+                if abs(rc - self._last_row_count_print) >= 50:
+                    print(f"[HybridRepo] SQLite rows: {self._last_row_count_print} → {rc} (+{rc - self._last_row_count_print})")
+                    self._last_row_count_print = rc
+        except Exception:
+            pass
+
+    # Public API
     def save(self, ctx: ContextObject) -> None:
-        blob = ctx.to_json()
-        now  = _fmt_ts(default_clock())
-        with self._lock:
-            self.conn.execute("""
-              INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
-              VALUES(?,?,?,?)
-              ON CONFLICT(context_id) DO UPDATE SET
-                json_blob     = excluded.json_blob,
-                last_accessed = excluded.last_accessed
-            """, (ctx.context_id, ctx.timestamp, now, blob))
-            self.conn.commit()
+        if self._async:
+            try:
+                self._q.put_nowait(ctx)
+            except queue.Full:
+                # emergency: fallback to sync
+                self._save_many_tx([ctx])
+        else:
+            self._save_many_tx([ctx])
+
         ctx.dirty = False
+
+    def enqueue_many(self, ctxs: list[ContextObject]) -> None:
+        """Push many items to the writer queue (used by archiver)."""
+        if not ctxs:
+            return
+        if self._async:
+            try:
+                self._q.put_nowait(ctxs)
+            except queue.Full:
+                self._save_many_tx(ctxs)
+        else:
+            self._save_many_tx(ctxs)
 
     def get(self, cid: str) -> ContextObject:
         cur = self.conn.cursor()
@@ -787,6 +879,226 @@ class SQLiteContextRepository:
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM contexts")
         return cur.fetchone()[0]
+
+
+class HybridContextRepository:
+    _singleton: "HybridContextRepository" = None
+
+    def __init__(
+        self,
+        jsonl_path: str = "context.jsonl",
+        sqlite_path: str = "context.db",
+        archive_max_mb: float = 10.0,   # JSONL size cap before archiving
+        *,
+        dual_write: bool = True,        # mirror each save directly to SQLite
+        verbose: bool = True,
+    ):
+        base_dir = Path("context_repos")
+        base_dir.mkdir(exist_ok=True)
+        jsonl_full_path  = str(base_dir / Path(jsonl_path).name)
+        sqlite_full_path = str(base_dir / Path(sqlite_path).name)
+
+        # env overrides
+        env_dual = os.getenv("CTX_DUAL_WRITE")
+        if env_dual is not None:
+            dual_write = env_dual.lower() not in ("0", "false", "no")
+        archive_max_mb = float(os.getenv("CTX_JSONL_MAX_MB", archive_max_mb))
+
+        self.json_repo  = JSONLContextRepository(jsonl_full_path)
+        self.sql_repo   = SQLiteContextRepository(sqlite_full_path, async_writes=True)
+        self._max_bytes = int(archive_max_mb * 1024 * 1024)
+        self._dual_write = bool(dual_write)
+        self._verbose = bool(verbose)
+
+        # archiver knobs (hysteresis)
+        self._hi = float(os.getenv("CTX_ARCHIVE_HI", "1.15"))   # trigger when > 115% of cap
+        self._lo = float(os.getenv("CTX_ARCHIVE_LO", "0.70"))   # reduce to 70% of cap
+        self._arch_evt = threading.Event()
+        self._arch_lock = threading.Lock()
+        self._arch_thread = threading.Thread(target=self._archiver_loop, daemon=True, name="JSONLArchiver")
+        self._arch_thread.start()
+
+        # log throttling
+        self._last_count_log_ts = 0.0
+        self._last_count = None
+
+        HybridContextRepository._singleton = self
+
+    # ──────────────────────────────────────────────────────────────────
+    # Core ops
+    # ──────────────────────────────────────────────────────────────────
+    def save(self, ctx: ContextObject) -> None:
+        # JSONL append (cheap)
+        self.json_repo.save(ctx)
+
+        # optional mirror to SQLite
+        if self._dual_write:
+            self.sql_repo.save(ctx)
+
+        # schedule archiving only when beyond HI watermark (avoid per-save work)
+        try:
+            size = os.path.getsize(self.json_repo.path)
+            if size > int(self._max_bytes * self._hi):
+                self._arch_evt.set()
+        except OSError:
+            pass
+
+    def get(self, cid: str) -> ContextObject:
+        try:
+            return self.json_repo.get(cid)
+        except KeyError:
+            return self.sql_repo.get(cid)
+
+    def delete(self, cid: str) -> None:
+        self.json_repo.delete(cid)
+        try:
+            self.sql_repo.delete(cid)
+        except KeyError:
+            pass
+
+    def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
+        seen: set[str] = set()
+        out: List[ContextObject] = []
+        for repo in (self.json_repo, self.sql_repo):
+            for ctx in repo.query(filter_fn):
+                if ctx.context_id not in seen:
+                    seen.add(ctx.context_id)
+                    out.append(ctx)
+        return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Archiver (bulk offload with hysteresis)
+    # ──────────────────────────────────────────────────────────────────
+    def _archiver_loop(self):
+        while True:
+            self._arch_evt.wait()
+            self._arch_evt.clear()
+            # only one archiver pass at a time
+            if not self._arch_lock.acquire(blocking=False):
+                continue
+            try:
+                # keep offloading until we are under LO watermark
+                while True:
+                    moved = self._archive_bulk_pass()
+                    if moved <= 0:
+                        break
+                    try:
+                        now_size = os.path.getsize(self.json_repo.path)
+                    except OSError:
+                        break
+                    if now_size <= int(self._max_bytes * self._lo):
+                        break
+            finally:
+                self._arch_lock.release()
+
+    def _archive_bulk_pass(self) -> int:
+        path = self.json_repo.path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return 0
+
+        if size <= int(self._max_bytes * self._hi):
+            return 0
+
+        sanitize_jsonl(path)
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as e:
+            logging.warning("[HybridRepo] archiver: cannot read JSONL: %s", e)
+            return 0
+
+        entries: list[tuple[int, datetime, ContextObject]] = []
+        for idx, line in enumerate(lines):
+            try:
+                obj = ContextObject.from_json(line)
+            except Exception:
+                continue
+            # keep prompt/schema artifacts hot in JSONL
+            if obj.domain == "artifact" and obj.component in ("prompt", "schema"):
+                continue
+            try:
+                ts = _parse_ts(obj.timestamp)
+            except Exception:
+                continue
+            entries.append((idx, ts, obj))
+
+        if not entries:
+            return 0
+
+        # Oldest first, move a big chunk
+        entries.sort(key=lambda x: x[1])
+        target_bytes = int(self._max_bytes * self._lo)
+        to_remove: set[int] = set()
+        moved_objs: list[ContextObject] = []
+        moved_bytes = 0
+
+        # Move at least 10% of current lines to avoid thrash
+        min_move = max(100, int(0.10 * len(entries)))
+        i = 0
+        remaining_bytes = sum(len(l.encode("utf-8")) for l in lines)
+
+        while i < len(entries) and (remaining_bytes - moved_bytes) > target_bytes or len(to_remove) < min_move:
+            idx, _ts, obj = entries[i]
+            to_remove.add(idx)
+            moved_objs.append(obj)
+            moved_bytes += len(lines[idx].encode("utf-8"))
+            i += 1
+
+        # Ship to SQLite (if dual_write==False this is the first time; else it's harmless upsert)
+        try:
+            self.sql_repo.enqueue_many(moved_objs)
+        except Exception as e:
+            logging.error("[HybridRepo] archiver: enqueue_many failed: %s", e)
+
+        # Rewrite JSONL without those lines (atomic in-place)
+        try:
+            with self.json_repo._lock:
+                with open(path, "r+", encoding="utf-8") as f, _locked(f, exclusive=True):
+                    f.seek(0)
+                    f.truncate()
+                    for j, l in enumerate(lines):
+                        if j not in to_remove:
+                            f.write(l)
+                    if os.getenv("CTX_STRICT_FSYNC", "0").lower() in ("1", "true", "yes"):
+                        f.flush()
+                        os.fsync(f.fileno())
+        except OSError as e:
+            logging.error("[HybridRepo] archiver: rewrite failed: %s", e)
+            return 0
+
+        moved = len(to_remove)
+        if self._verbose:
+            try:
+                now = os.path.getsize(path)
+            except OSError:
+                now = -1
+            logging.info("[HybridRepo] archive: moved %d rows to SQLite; JSONL now %d bytes", moved, now)
+        return moved
+
+    # utilities
+    def force_archive(self) -> int:
+        """Force an immediate bulk pass (use sparingly)."""
+        return self._archive_bulk_pass()
+
+    def _safe_count(self) -> Optional[int]:
+        try:
+            return self.sql_repo.count()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _remaining_bytes_after_removal(lines: List[str], to_remove: set[int]) -> int:
+        return sum(len(l.encode("utf-8")) for i, l in enumerate(lines) if i not in to_remove)
+
+    @classmethod
+    def instance(cls) -> "ContextRepository":
+        if cls._singleton is None:
+            raise RuntimeError("ContextRepository has not been initialised yet")
+        return cls._singleton
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
