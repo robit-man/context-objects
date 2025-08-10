@@ -768,35 +768,62 @@ class JSONLContextRepository:
 
 class SQLiteContextRepository:
     """
-    Single-writer async pipeline to SQLite using WAL, generous busy_timeout, and batched commits.
+    Single-writer async pipeline to SQLite using WAL, generous busy_timeout,
+    batched commits, and robust retry against 'database is locked'.
     """
     def __init__(self, db_path: str = "context.db",
                  *, async_writes: bool = True,
-                 busy_timeout_ms: int | None = None):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+                 busy_timeout_ms: int | None = None,
+                 ipc_lock: bool | None = None):
+        import sqlite3, os, threading, time
+
+        # Connection with long timeout (complements PRAGMA busy_timeout)
+        connect_timeout_s = float(os.getenv("CTX_SQL_CONNECT_TIMEOUT_S", "60"))
+        self.conn = sqlite3.connect(
+            db_path,
+            check_same_thread=False,
+            timeout=connect_timeout_s,
+            isolation_level=None,  # autocommit; we'll manage BEGIN/COMMIT
+        )
+
+        # WAL + performance pragmas
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms or int(os.getenv('CTX_SQL_BUSY_TIMEOUT_MS','15000')))};")
+        self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms or int(os.getenv('CTX_SQL_BUSY_TIMEOUT_MS','60000')))};")
         self.conn.execute("PRAGMA wal_autocheckpoint=2000;")
         self.conn.execute("PRAGMA temp_store=MEMORY;")
         self.conn.execute("PRAGMA mmap_size=268435456;")
-        self.conn.execute("PRAGMA cache_size=-40000;")          # ~40 MB
+        self.conn.execute("PRAGMA cache_size=-40000;")
         self.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
-        self.conn.execute("PRAGMA max_page_count=1048576;")      # ≈4GB with 4KB pages
-        self.conn.execute("PRAGMA journal_size_limit=52428800;") # 50 MB WAL cap
+        self.conn.execute("PRAGMA max_page_count=1048576;")
+        self.conn.execute("PRAGMA journal_size_limit=52428800;")
         self._init_schema()
         self._lock = Lock()
 
+        # Optional inter-process write lock (POSIX only). Toggle via CTX_SQL_IPC_LOCK=1
+        env_ipc = os.getenv("CTX_SQL_IPC_LOCK")
+        self._ipc_lock_enabled = (ipc_lock if ipc_lock is not None else (env_ipc and env_ipc.lower() in ("1","true","yes")))
+        self._lockfile_fd = None
+        self._lockfile_path = f"{db_path}.wlock"
+        if self._ipc_lock_enabled and os.name != "nt":
+            try:
+                self._lockfile_fd = os.open(self._lockfile_path, os.O_CREAT | os.O_RDWR, 0o644)
+            except Exception:
+                self._ipc_lock_enabled = False  # graceful disable if fs doesn't allow
+
+        # Async writer
+        import queue
         self._async = bool(async_writes)
         self._q: "queue.Queue[ContextObject | list[ContextObject] | None]" = queue.Queue(maxsize=10000)
         self._writer_thread = None
         self._last_maint = time.monotonic()
-        self._log_t0 = time.monotonic()
-        self._last_row_count_print = 0
+        self._maint_interval_s = float(os.getenv("CTX_SQL_MAINT_INTERVAL_S", "30"))
+        self._checkpoint_mode = os.getenv("CTX_SQL_CHECKPOINT_MODE", "PASSIVE").upper()  # PASSIVE|NONE
         if self._async:
             self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name="SQLiteWriter")
             self._writer_thread.start()
 
+    # --------------- schema ----------------
     def _init_schema(self) -> None:
         c = self.conn.cursor()
         c.execute("""
@@ -810,46 +837,54 @@ class SQLiteContextRepository:
         c.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON contexts(last_accessed)")
         self.conn.commit()
 
-    def save_sync(self, ctx: ContextObject) -> None:
+    # --------------- public helpers ----------------
+    def save_sync(self, ctx: "ContextObject") -> None:
         self._save_many_tx([ctx])
 
     def flush(self, timeout: float = 2.0) -> None:
         if not self._async:
             return
+        import time
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout and not self._q.empty():
             time.sleep(0.01)
-            
+
+    # --------------- writer loop ----------------
     def _writer_loop(self):
-        BATCH_MAX = 500
-        COMMIT_MS = 300
+        import time, queue
+        BATCH_MAX = int(os.getenv("CTX_SQL_BATCH_MAX", "500"))
+        COMMIT_MS = int(os.getenv("CTX_SQL_COMMIT_MS", "300"))
         while True:
-            batch: list[ContextObject] = []
+            batch: list["ContextObject"] = []
             try:
                 item = self._q.get(timeout=0.5)
             except queue.Empty:
                 item = None
 
+            # lightweight maintenance (never TRUNCATE; that causes global locks)
             if item is None:
-                # periodic maintenance
                 now = time.monotonic()
-                if now - self._last_maint > 20:
+                if now - self._last_maint > self._maint_interval_s:
                     try:
-                        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                        self.conn.execute("PRAGMA incremental_vacuum(4000);")
+                        if self._checkpoint_mode != "NONE":
+                            # PASSIVE won't fight with other writers
+                            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                        # keep vacuum optional (off by default)
+                        if os.getenv("CTX_SQL_ENABLE_VACUUM", "0").lower() in ("1","true","yes"):
+                            self.conn.execute("PRAGMA incremental_vacuum(2000);")
                         self.conn.commit()
                     except Exception:
                         pass
                     self._last_maint = now
                 continue
 
+            # coalesce into a batch
             if isinstance(item, list):
                 batch.extend(item)
             else:
                 batch.append(item)
 
             t_start = time.monotonic()
-            # drain quickly to fill batch or until COMMIT_MS elapsed
             while len(batch) < BATCH_MAX and (time.monotonic() - t_start) * 1000 < COMMIT_MS:
                 try:
                     nxt = self._q.get_nowait()
@@ -865,69 +900,135 @@ class SQLiteContextRepository:
             if batch:
                 self._save_many_tx(batch)
 
-    def _save_many_tx(self, ctxs: list[ContextObject]) -> None:
+    # --------------- txn with retry ----------------
+    def _ipc_write_lock(self):
+        """Context manager for optional cross-process lock (POSIX only)."""
+        import contextlib, os
+        @contextlib.contextmanager
+        def _noop():
+            yield
+        if not self._ipc_lock_enabled or os.name == "nt" or self._lockfile_fd is None:
+            return _noop()
+        import fcntl  # POSIX
+        @contextlib.contextmanager
+        def _flock():
+            try:
+                fcntl.flock(self._lockfile_fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(self._lockfile_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+        return _flock()
+
+    def _save_many_tx(self, ctxs: list["ContextObject"]) -> None:
+        import time, random, sqlite3, logging
+        if not ctxs:
+            return
+
+        # Prepare rows first, outside the critical section
         rows = []
         now = _fmt_ts(default_clock())
         for c in ctxs:
             rows.append((c.context_id, c.timestamp, now, c.to_json()))
             c.dirty = False
-        try:
-            with self._lock:
-                self.conn.executemany(
-                    """
-                    INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
-                    VALUES(?,?,?,?)
-                    ON CONFLICT(context_id) DO UPDATE SET
-                      json_blob     = excluded.json_blob,
-                      last_accessed = excluded.last_accessed
-                    """,
-                    rows
-                )
-                self.conn.commit()
-        except sqlite3.Error as e:
-            logging.error("SQLite batch save failed: %s", e)
 
-        # throttled row count print (optional; keeps your log calm)
+        max_retries = int(os.getenv("CTX_SQL_MAX_RETRIES", "12"))
+        base_sleep = float(os.getenv("CTX_SQL_RETRY_BASE_MS", "20")) / 1000.0
+        max_sleep  = float(os.getenv("CTX_SQL_RETRY_MAX_MS", "1500")) / 1000.0
+
+        attempt = 0
+        while True:
+            try:
+                with self._lock:
+                    with self._ipc_write_lock():
+                        cur = self.conn.cursor()
+                        # Acquire write lock early
+                        cur.execute("BEGIN IMMEDIATE;")
+                        cur.executemany(
+                            """
+                            INSERT INTO contexts(context_id,timestamp,last_accessed,json_blob)
+                            VALUES(?,?,?,?)
+                            ON CONFLICT(context_id) DO UPDATE SET
+                              json_blob     = excluded.json_blob,
+                              last_accessed = excluded.last_accessed
+                            """,
+                            rows
+                        )
+                        cur.execute("COMMIT;")
+                # success
+                break
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                # Roll back the txn if opened
+                try:
+                    self.conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                if "locked" in msg or "busy" in msg:
+                    if attempt < max_retries:
+                        # exponential backoff with jitter
+                        sleep_s = min(max_sleep, base_sleep * (1.7 ** attempt)) + random.random() * 0.05
+                        time.sleep(sleep_s)
+                        attempt += 1
+                        continue
+                    else:
+                        logging.warning(
+                            "SQLite save retried %d× due to 'database is locked/busy'; giving up on batch of %d rows",
+                            attempt, len(rows)
+                        )
+                        break
+                else:
+                    logging.error("SQLite batch save failed: %s", e)
+                    break
+            except Exception as e:
+                try:
+                    self.conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                logging.error("SQLite batch save failed: %s", e)
+                break
+
+        # Optional: print throttled row count (quiet)
         try:
             nowt = time.monotonic()
-            if nowt - self._log_t0 > 2.0:
+            if nowt - getattr(self, "_log_t0", 0.0) > 2.0:
                 self._log_t0 = nowt
-                # cheap count (no lock storm)
                 cur = self.conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM contexts")
                 rc = cur.fetchone()[0]
-                if abs(rc - self._last_row_count_print) >= 50:
-                    print(f"[HybridRepo] SQLite rows: {self._last_row_count_print} → {rc} (+{rc - self._last_row_count_print})")
+                if abs(rc - getattr(self, "_last_row_count_print", 0)) >= 50:
+                    # keep as print to match your previous behavior but much less often
+                    print(f"[HybridRepo] SQLite rows ≈ {rc}")
                     self._last_row_count_print = rc
         except Exception:
             pass
 
-    # Public API
-    def save(self, ctx: ContextObject) -> None:
+    # --------------- public API ----------------
+    def save(self, ctx: "ContextObject") -> None:
         if self._async:
             try:
                 self._q.put_nowait(ctx)
-            except queue.Full:
-                # emergency: fallback to sync
+            except Exception:
+                # queue full → fallback to sync (best effort)
                 self._save_many_tx([ctx])
         else:
             self._save_many_tx([ctx])
-
         ctx.dirty = False
 
-    def enqueue_many(self, ctxs: list[ContextObject]) -> None:
-        """Push many items to the writer queue (used by archiver)."""
+    def enqueue_many(self, ctxs: list["ContextObject"]) -> None:
         if not ctxs:
             return
         if self._async:
             try:
                 self._q.put_nowait(ctxs)
-            except queue.Full:
+            except Exception:
                 self._save_many_tx(ctxs)
         else:
             self._save_many_tx(ctxs)
 
-    def get(self, cid: str) -> ContextObject:
+    def get(self, cid: str) -> "ContextObject":
         cur = self.conn.cursor()
         cur.execute("SELECT json_blob FROM contexts WHERE context_id=?", (cid,))
         row = cur.fetchone()
@@ -940,8 +1041,8 @@ class SQLiteContextRepository:
             self.conn.execute("DELETE FROM contexts WHERE context_id=?", (cid,))
             self.conn.commit()
 
-    def query(self, filter_fn: Callable[[ContextObject], bool]) -> List[ContextObject]:
-        out: List[ContextObject] = []
+    def query(self, filter_fn: Callable[["ContextObject"], bool]) -> List["ContextObject"]:
+        out: List["ContextObject"] = []
         for (blob,) in self.conn.execute("SELECT json_blob FROM contexts"):
             obj = ContextObject.from_json(blob)
             if filter_fn(obj):
@@ -952,6 +1053,7 @@ class SQLiteContextRepository:
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM contexts")
         return cur.fetchone()[0]
+
 
 
 class HybridContextRepository:
@@ -1221,13 +1323,13 @@ class HybridContextRepository:
 
         # 🔇 Remove the per-save COUNT(*) print — it races with async writes and spams logs.
         # If you want visibility, throttle it and don't expect a delta after async enqueue.
-        if self._verbose:
+        if os.getenv("CTX_VERBOSE_ROWCOUNT", "0") in ("1","true","yes"):
             now = time.monotonic()
-            if now - getattr(self, "_last_count_log_ts", 0.0) > 2.0:
+            if now - getattr(self, "_last_count_log_ts", 0.0) > 10.0:  # once every 10s max
                 setattr(self, "_last_count_log_ts", now)
                 rc = self._safe_count()
                 if rc is not None:
-                    print(f"[HybridRepo] SQLite rows ≈ {rc}")
+                    logging.info("[HybridRepo] SQLite rows ≈ %d", rc)
 
         # 3) archive JSONL by size
         self._archive_by_size()
@@ -1540,12 +1642,15 @@ class MemoryManager:
 
         # Candidate pool: in-scope only
         filt = self._scope_filter(allowed_user, allowed_conv)
+        # Keep only the most recent N to cap work; tune N to your scale
+        MAX_CANDS = int(os.getenv("CTX_VECTOR_MAX_CANDS", "1200"))
         cands = self.repo.query(filt)
+        cands = sorted(cands, key=lambda c: (c.last_accessed or c.timestamp))[-MAX_CANDS:]
 
         now = default_clock()
 
         def _get_unit_embed(c: ContextObject) -> np.ndarray | None:
-            # prefer persisted
+            # Use persisted if present; otherwise compute in-memory only for ranking
             if not reembed and c.embedding:
                 v = np.asarray(c.embedding, dtype=np.float32).reshape(-1)
             else:
@@ -1553,12 +1658,30 @@ class MemoryManager:
                 if not txt:
                     return None
                 v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
-                # persist for future use
-                c.embedding = v.tolist()
-                c.touch()
-                self.repo.save(c)
+                # DO NOT persist here; we’ll batch-persist for selected results only
             n = float(np.linalg.norm(v) + 1e-9)
-            return v / n
+            return v / n      
+              
+        # Persist embeddings only for the final selected set (batch)
+        to_persist: list[ContextObject] = []
+        for c, _score in selected:
+            if not c.embedding:
+                try:
+                    txt = (c.summary or "").strip()
+                    if txt:
+                        emb = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
+                        c.embedding = emb.tolist()
+                        c.touch()
+                        to_persist.append(c)
+                except Exception:
+                    pass
+        if to_persist:
+            # Use SQLite async batch if available; fallback to repo.save in a loop.
+            try:
+                self.repo.sql_repo.enqueue_many(to_persist)  # fast path
+            except Exception:
+                for c in to_persist:
+                    self.repo.save(c)
 
         rows = []
         for c in cands:
