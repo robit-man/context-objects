@@ -552,47 +552,110 @@ class ContextObject:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# JSONL maintenance
+# JSONL maintenance (robust to non-UTF-8 and truncated lines)
 # ──────────────────────────────────────────────────────────────────────────────
 def sanitize_jsonl(path: str) -> None:
     """
-    Reads 'path' under shared lock, drops any corrupted JSON lines,
-    logs them into 'path.corrupt', and—only if invalid lines are found—
-    atomically rewrites with the remaining valid ones.
+    Robust JSONL sanitizer:
+      • Reads file in **binary** to avoid global UTF-8 decode failures.
+      • Decodes each line as UTF-8 (strict). Undecodable lines are logged & dropped.
+      • Drops lines that decode but are not valid JSON.
+      • Writes back only the valid lines (UTF-8), atomically.
+      • Appends all dropped lines (with reasons) to '<path>.corrupt'.
+
+    No-op if file does not exist.
     """
     if not os.path.exists(path):
         return
 
     corrupt_path = path + ".corrupt"
-    good_lines: List[str] = []
-    bad_entries: List[tuple[int, str]] = []
+    good_text_lines: List[str] = []
+    bad_records: List[str] = []
 
-    # 1) Read & classify under shared lock
-    with open(path, "r+", encoding="utf-8") as f, _locked(f, exclusive=False):
-        for idx, line in enumerate(f, start=1):
+    # Read & classify under shared lock, but in BINARY mode to survive bad bytes
+    with open(path, "rb") as f, _locked(f, exclusive=False):
+        lineno = 0
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
+            lineno += 1
+
+            # Trim a single trailing newline/carriage-return for decode/parse; we will re-add '\n' on write
+            raw_stripped = raw.rstrip(b"\r\n")
+
+            # 1) UTF-8 decode (strict). If it fails, log & skip.
             try:
-                json.loads(line)
-                good_lines.append(line)
+                text = raw_stripped.decode("utf-8")
+            except UnicodeDecodeError as e:
+                # keep a short hex preview to avoid dumping megabytes
+                preview = raw[:64].hex()
+                bad_records.append(
+                    f"{datetime.utcnow().isoformat()}Z LINE {lineno}: <NON-UTF8> "
+                    f"{e}; first64hex={preview}"
+                )
+                continue
+
+            # 2) Remove BOM if present on first line
+            if lineno == 1 and text.startswith("\ufeff"):
+                text = text.lstrip("\ufeff")
+
+            # 3) Validate JSON
+            try:
+                json.loads(text)
+                good_text_lines.append(text + "\n")  # normalize newline
             except JSONDecodeError as e:
-                logging.warning("sanitize_jsonl: dropping invalid JSON at line %d in %s: %s", idx, path, e)
-                bad_entries.append((idx, line.rstrip("\n")))
+                # Include a compact preview of the offending text
+                preview = (text[:120] + "…") if len(text) > 120 else text
+                bad_records.append(
+                    f"{datetime.utcnow().isoformat()}Z LINE {lineno}: <BAD-JSON> {e}; preview={preview!r}"
+                )
+                continue
 
-        # 2) If no bad entries, leave file as-is
-        if not bad_entries:
-            return
+    # If nothing was bad, do nothing
+    if not bad_records:
+        return
 
-        # 3) Log all bad lines
+    # Append all bad records to .corrupt (text, UTF-8)
+    try:
         with open(corrupt_path, "a", encoding="utf-8") as cf:
-            now = datetime.utcnow().isoformat()
-            for idx, text in bad_entries:
-                cf.write(f"{now} LINE {idx}: {text}\n")
+            for rec in bad_records:
+                cf.write(rec + "\n")
+    except Exception:
+        # best-effort only
+        pass
 
-        # 4) Rewrite only when there were bad lines
-        f.seek(0)
-        f.truncate()
-        f.writelines(good_lines)
-        f.flush()
-        os.fsync(f.fileno())
+    # Atomically rewrite the JSONL with only the valid lines
+    dirpath = os.path.dirname(path) or "."
+    tmp_path = os.path.join(dirpath, f".{os.path.basename(path)}.tmp")
+
+    # Use exclusive lock during rewrite to avoid readers seeing mid-write content
+    with open(path, "rb+") as f, _locked(f, exclusive=True):
+        try:
+            with open(tmp_path, "wb") as tf:
+                for line in good_text_lines:
+                    tf.write(line.encode("utf-8"))
+                tf.flush()
+                os.fsync(tf.fileno())
+            # Move over original
+            os.replace(tmp_path, path)
+            # fsync directory for durability on some filesystems
+            try:
+                dir_fd = os.open(dirpath, os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
+        finally:
+            # If something failed mid-way, clean up temp file
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Repositories  (FAST: async batched SQLite + hysteresis bulk archiver)
