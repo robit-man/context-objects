@@ -4000,91 +4000,8 @@ class Assembler:
                     
 
     # ─────────────────────────────────────────────────────────────────────────────
-    #  Decision & utility callbacks  +  I/O helpers  +  Orchestrator
-    #    (dynamic system prompts + lean context assembly across stages)
+    #  Decision & utility callbacks
     # ─────────────────────────────────────────────────────────────────────────────
-
-    def _dynamic_banner(self, state: dict, *, heads_n: int, purpose_default: str) -> str:
-        """
-        Shared dynamic system banner:
-        • Current time banner (from bootstrap)
-        • Purpose / episode goal
-        • Compact 'context heads' from state['merged'] (recent → older)
-        """
-        import re
-        time_line = (state.get("system_time_prompt") or "").strip()
-        purpose = (
-            state.get("episode_purpose")
-            or state.get("purpose")
-            or purpose_default
-        )
-
-        merged = list(state.get("merged") or [])
-        # use most recent heads_n items
-        tail = merged[-heads_n:] if heads_n > 0 else []
-        lines = []
-        for c in reversed(tail):  # recent → older
-            label = f"{getattr(c,'domain','?')}/{getattr(c,'component','?')}/{getattr(c,'semantic_label','?')}"
-            summ  = str(getattr(c, "summary", "") or "")
-            summ  = re.sub(r"\s+", " ", summ).strip()
-            if len(summ) > 140:
-                summ = summ[:140] + "…"
-            lines.append(f"• {label}: {summ}")
-
-        out = []
-        if time_line:
-            out.append(time_line)
-        out.append(f"Role: {purpose}")
-        if lines:
-            out.append("Context heads (recent → older):")
-            out.extend(lines)
-        return "\n".join(out)
-
-
-    def _cap_merged_in_state(self, state: dict) -> None:
-        """
-        Keep pinned + most recent non-pinned; cap with CTX_MAX_MERGED (default 40).
-        Updates state['merged'] and state['merged_ids'] in-place.
-        """
-        MAX_MERGED = int(os.getenv("CTX_MAX_MERGED", "40"))
-        merged = list(state.get("merged") or [])
-        if not merged:
-            state["merged_ids"] = []
-            return
-        pinned = [c for c in merged if getattr(c, "pinned", False)]
-        rest   = [c for c in merged if not getattr(c, "pinned", False)]
-        rest.sort(key=lambda c: (getattr(c, "last_accessed", None) or getattr(c, "timestamp", "")), reverse=True)
-        trimmed = (pinned + rest)[:MAX_MERGED]
-        state["merged"] = trimmed
-        state["merged_ids"] = [getattr(c, "context_id", None) for c in trimmed if getattr(c, "context_id", None)]
-
-
-    def _planner_seed_ids(self, state: dict, *, include_clar_know: bool = True) -> list[str]:
-        """
-        Build a lean list of context IDs for the planner:
-        • last CTX_PLANNER_MERGED_N merged IDs (default 20)
-        • optional clar_ctx & know_ctx when present
-        • includes time_ctx if present in merged
-        """
-        N = int(os.getenv("CTX_PLANNER_MERGED_N", "20"))
-        ids = []
-        merged_ids = list(state.get("merged_ids") or [])
-        ids.extend(merged_ids[-N:])
-        if include_clar_know:
-            for k in ("clar_ctx", "know_ctx"):
-                obj = state.get(k)
-                if obj and getattr(obj, "context_id", None):
-                    ids.append(obj.context_id)
-        # dedupe preserving order
-        seen = set()
-        out = []
-        for cid in ids:
-            if not cid or cid in seen:
-                continue
-            seen.add(cid)
-            out.append(cid)
-        return out
-
 
     def decision_callback(
         self,
@@ -4098,16 +4015,21 @@ class Assembler:
     ) -> str:
         """
         Ask `self.decision_model` to choose exactly one item from `options`.
-        Dynamic system banner + compact narrative/turns.
-        Retries up to 3× with strict option parsing.
+        Returns the model's full response: a one-sentence justification and,
+        on a new line, exactly one option token.
+
+        Upgrades:
+        • Strict options parsing with up to 3 attempts (guard against drift).
+        • Optional policy_manager "priors" to bias decisions (if available).
+        • Context includes a compact narrative + recent turns.
         """
-        import re, json
+        import re
         from context import ContextObject
 
         options = [str(o).strip() for o in options if str(o).strip()]
         assert options, "decision_callback: options required"
 
-        # 0) Optional priors
+        # 0) Optional priors from a policy manager
         priors = {}
         pm = getattr(self, "policy_manager", None)
         if pm and hasattr(pm, "decision_priors"):
@@ -4116,113 +4038,94 @@ class Assembler:
             except Exception:
                 priors = {}
 
-        # 1) Mapping & ruleset
+        # 1) Build mapping & primary system prompt
         mapping    = {vn: opt for vn, opt in zip(var_names, options)}
-        ruleset    = system_template.format(**mapping)
+        system_msg = system_template.format(**mapping)
 
-        # 2) Narrative (most recent of requested context_type)
+        # 2) Load narrative
         narr_ctx  = self._load_arbitrary_context(semantic_label=context_type)
-        narrative = (getattr(narr_ctx, "summary", None) or "(no narrative yet)").strip()
+        narrative = narr_ctx.summary or "(no narrative yet)"
 
-        # 3) Recent turns (scoped if possible)
-        cid = getattr(self, "_active_conversation_id", None)
-        def _scoped_filter(c):
-            if not (c.domain == "segment" and c.semantic_label in ("user_input","assistant")):
-                return False
-            if not cid:
-                return True
-            try:
-                md = getattr(c, "metadata", {}) or {}
-                rcid = md.get("conversation_id") or md.get("conversationid")
-                return (rcid == cid) or (rcid is None)  # lenient for missing
-            except Exception:
-                return True
-
-        segs = sorted([c for c in self.repo.query(_scoped_filter)], key=lambda c: c.timestamp)[-history_size:]
+        # 3) Recent turns
+        segs = sorted(
+            [c for c in self.repo.query(
+                lambda c: c.domain=="segment" and c.semantic_label in ("user_input","assistant")
+            )],
+            key=lambda c:c.timestamp
+        )[-history_size:]
         snippet = "\n".join(
-            f"{'User' if c.semantic_label=='user_input' else 'Assistant'}: {(c.summary or '').strip()}"
+            f"{'User' if c.semantic_label=='user_input' else 'Assistant'}: {c.summary}"
             for c in segs
         )
 
-        # 4) Dynamic banner (small heads)
-        # Build a temporary 'merged' view for the banner from recent turns + narrative
-        try:
-            tmp_state = dict(getattr(self, "_last_state", {}) or {})
-            tmp_state.setdefault("system_time_prompt", getattr(self, "_last_state", {}).get("system_time_prompt", ""))
-            merged_for_heads = []
-            if narr_ctx:
-                merged_for_heads.append(narr_ctx)
-            merged_for_heads.extend(segs)
-            tmp_state["merged"] = merged_for_heads
-            banner = self._dynamic_banner(tmp_state, heads_n=int(os.getenv("CTX_DECISION_HEADS", "6")),
-                                        purpose_default="Choose one option exactly; justify briefly.")
-        except Exception:
-            banner = "Decide with a short justification, then output exactly one allowed option token on a new line."
+        if snippet:
+            context_block = (
+                "### Narrative So Far ###\n" f"{narrative}\n\n"
+                "### Recent Turns ###\n"   f"{snippet}"
+            )
+        else:
+            context_block = "### Narrative So Far ###\n" f"{narrative}"
 
-        # 5) Second system prompt with priors
+        # 4) Second system prompt with justification instruction + priors
         priors_txt = ""
         if priors:
-            try:
-                pairs = ", ".join(f"{k}:{priors.get(k):.2f}" for k in options if k in priors)
-                priors_txt = f"\nUse these option priors as a soft bias: {pairs}"
-            except Exception:
-                pass
+            pairs = ", ".join(f"{k}:{priors.get(k):.2f}" for k in options if k in priors)
+            priors_txt = f"\nUse these option priors as a *soft* bias: {pairs}"
 
         system_msg_2 = (
-            "When you answer: FIRST write a one-sentence justification. "
-            "THEN, on a NEW LINE, write exactly one of: " + ", ".join(options) +
-            "\n\nRuleset:\n" + ruleset + priors_txt
+            "Now, based on the above, obey the ruleset below.\n"
+            "When you answer, **first** write a **one-sentence justification**, "
+            "**then** on a **new line** write exactly one of: "
+            + ", ".join(options)
+            + "\n\nRuleset: "
+            + system_template.format(**mapping)
+            + priors_txt
         )
 
-        # 6) Debug dump
+        # 5) Debug dump
         self._print_stage_context("decision_callback", {
             "narrative":      narrative,
             "recent_turns":   snippet or "(none)",
             "options":        ", ".join(options),
+            "system_prompt":  system_msg,
             "ruleset_prompt": system_msg_2,
             "user_text":      user_text,
             "priors":         priors or {},
         })
 
-        # 7) Build messages & invoke (up to 3 attempts)
-        context_block = (
-            "### Narrative So Far ###\n" f"{narrative}\n\n"
-            "### Recent Turns ###\n"   f"{snippet or '(none)'}"
-        )
+        # 6) Build user message
         user_msg = f"{context_block}\n\nNEW MESSAGE:\n{user_text}"
 
+        # 7) Invoke model up to 3 attempts until we see a standalone option token
         attempt = 0
         prompt_user = user_msg
-        last_full_resp = ""
         while attempt < 3:
-            full_resp = (self._stream_and_capture(
+            full_resp = self._stream_and_capture(
                 model=self.decision_model,
                 messages=[
-                    {"role":"system","content":banner},
+                    {"role":"system","content":system_msg},
                     {"role":"user",  "content":prompt_user},
                     {"role":"system","content":system_msg_2},
                 ],
                 tag="[Decision]"
-            ) or "").strip()
+            ).strip()
 
             # record Q&A if desired
             if record:
-                try:
-                    q_name = "decision_question" if attempt==0 else "decision_feedback_question"
-                    q_ctx = ContextObject.make_stage(q_name, [getattr(narr_ctx, "context_id", "")], {
-                        "prompt_system": banner,
-                        "prompt_user":   prompt_user
-                    })
-                    q_ctx.component="decision"; q_ctx.semantic_label="question"; q_ctx.tags.append("decision")
-                    q_ctx.touch(); self.repo.save(q_ctx)
+                q_name = "decision_question" if attempt==0 else "decision_feedback_question"
+                q_ctx = ContextObject.make_stage(q_name, [narr_ctx.context_id], {
+                    "prompt_system": system_msg,
+                    "prompt_user":   prompt_user
+                })
+                q_ctx.component="decision"; q_ctx.semantic_label="question"; q_ctx.tags.append("decision")
+                q_ctx.touch(); self.repo.save(q_ctx)
 
-                    a_name = "decision_answer" if attempt==0 else "decision_feedback_answer"
-                    a_ctx = ContextObject.make_stage(a_name, [q_ctx.context_id], {"answer": full_resp})
-                    a_ctx.component="decision"; a_ctx.semantic_label="answer"; a_ctx.tags.append("decision")
-                    a_ctx.touch(); self.repo.save(a_ctx)
-                except Exception:
-                    pass
+                a_name = "decision_answer" if attempt==0 else "decision_feedback_answer"
+                a_ctx = ContextObject.make_stage(a_name, [q_ctx.context_id], {"answer": full_resp})
+                a_ctx.component="decision"; a_ctx.semantic_label="answer"; a_ctx.tags.append("decision")
+                a_ctx.touch(); self.repo.save(a_ctx)
 
+            # strict standalone token match (begin/end or newline boundaries)
             m = re.search(rf"(?:^|\n)\s*({'|'.join(map(re.escape, options))})\s*(?:$|\n)", full_resp, re.I)
             if m:
                 return full_resp
@@ -4233,14 +4136,13 @@ class Assembler:
                 "Please answer with exactly one of, on a new line: "
                 + ", ".join(options)
             )
-            last_full_resp = full_resp
             attempt += 1
 
         # Last resort: extract any option occurrence
-        m2 = re.search(rf"\b({'|'.join(map(re.escape, options))})\b", last_full_resp, re.I)
+        m2 = re.search(rf"\b({'|'.join(map(re.escape, options))})\b", full_resp, re.I)
         if m2:
-            return last_full_resp + f"\n{m2.group(1)}"
-        return last_full_resp
+            return full_resp + f"\n{m2.group(1)}"
+        return full_resp
 
 
     def filter_callback(self, user_text: str) -> tuple[bool,str]:
@@ -4358,7 +4260,7 @@ class Assembler:
         for the full retrieval stack. Uses integrator quick-contract and preserves
         mandatory state keys.
         """
-        import uuid, asyncio
+        import uuid
         from context import ContextObject
 
         boot_state: dict[str, Any] = {
@@ -4368,7 +4270,7 @@ class Assembler:
             "images":        [],
             "fixed_calls":   [],
             "provisional_sent": False,
-            "user_text":     (user_text or "").strip(),
+            "user_text":     user_text.strip(),
             "conversation_id": getattr(self, "_active_conversation_id", uuid.uuid4().hex),
             "user_id": getattr(self, "current_user_id", "anon"),
         }
@@ -4378,7 +4280,7 @@ class Assembler:
             boot_state["user_ctx"] = await asyncio.to_thread(self._stage1_record_input, user_text, boot_state)
         except Exception as e:
             boot_state["errors"].append(("record_input", str(e)))
-            dummy = ContextObject.make_stage("record_input_failed", [], {"summary": (user_text or "")[:120]})
+            dummy = ContextObject.make_stage("record_input_failed", [], {"summary": user_text[:120]})
             dummy.touch(); self.repo.save(dummy)
             boot_state["user_ctx"] = dummy
 
@@ -4387,11 +4289,9 @@ class Assembler:
             await asyncio.to_thread(self.integrator.ingest, [boot_state["user_ctx"]])
             quick = await asyncio.to_thread(self.integrator.contract, keep_ids=[boot_state["user_ctx"].context_id])
             boot_state["merged"] = quick
-            boot_state["merged_ids"] = [c.context_id for c in quick if getattr(c, "context_id", None)]
         except Exception as e:
             boot_state["errors"].append(("integrator_quick", str(e)))
             boot_state["merged"] = [boot_state["user_ctx"]]
-            boot_state["merged_ids"] = [boot_state["user_ctx"].context_id]
 
         return boot_state
 
@@ -4439,8 +4339,13 @@ class Assembler:
         2) Planner     – full pipeline:
                         5b(KG) → 7(planner) → 7b(validate) → 8(chain)
                         → 9(DAG exec) → 9b(reflect/replan) → 10/10b(finalize) → 11(memory)
+
+        When direct_plan=True:
+        • Skip Quick-Take and clarifier
+        • Seed planner directly with raw user_text (state['planner_seed_text'])
+        • Attempt explicit Stage-7 calls if available; else hint _stage8_orchestrate via state flags
         """
-        import json, traceback, uuid, textwrap, inspect, time, os
+        import json, traceback, uuid, textwrap, inspect, time
         from datetime import datetime, timezone
         import numpy as np
 
@@ -4465,7 +4370,8 @@ class Assembler:
         ) -> tuple[list[str], list[str]]:
             """
             Use Tools.context_query to fetch recent user_input segments and final_inference stages,
-            interleave into U→A pairs, then rank by cosine(sim(user_text, pair)) + recency boost.
+            interleave them into U→A pairs, then rank by cosine(sim(user_text, pair)) with a small
+            recency boost. Returns (display_lines, flattened_pair_ids).
             """
             # resolve Tools class
             _Tools = None
@@ -4743,8 +4649,6 @@ class Assembler:
                 state["stages_run"].append("stage3_retrieve_and_merge_context")
                 state.setdefault("merged", state.get("merged", []))
                 state.setdefault("merged_ids", state.get("merged_ids", [c.context_id for c in state["merged"] if hasattr(c, "context_id")]))
-                # Trim merged aggressively here to avoid prompt bloat
-                self._cap_merged_in_state(state)
                 status_cb("context_merged", {"merged": len(state.get("merged_ids", [])), "now": state["now_local_human"]})
             except Exception as e:
                 state.setdefault("merged", [])
@@ -4780,11 +4684,8 @@ class Assembler:
                     "No disclaimers, hotlines, or explanations."
                 )
                 qt_ctx = "\n".join(pairs) if pairs else "(no prior context)"
-                # Dynamic heads for QT (tiny)
-                qt_banner = self._dynamic_banner(state, heads_n=int(os.getenv("CTX_QT_HEADS","6")),
-                                                purpose_default="Give a one-line, high-signal preview.")
                 msgs = [
-                    {"role": "system", "content": qt_banner},
+                    {"role": "system", "content": state["system_time_prompt"]},
                     {"role": "system", "content": qt_sys},
                     {"role": "system", "content": qt_guard},
                     {"role": "system", "content": "Ranked prior U↔A pairs:\n" + qt_ctx},
@@ -4810,8 +4711,6 @@ class Assembler:
                         prov.touch(); self.repo.save(prov)
                         state.setdefault("merged", []).append(prov)
                         state.setdefault("merged_ids", []).append(prov.context_id)
-                        # keep merged lean after adding quick take
-                        self._cap_merged_in_state(state)
                     except Exception:
                         pass
                     status_cb("quick_take_done", {"preview": quick[:220]})
@@ -4828,15 +4727,6 @@ class Assembler:
                     on_token=None,  # never stream clarifier (prevents TTS on JSON)
                 )
                 state["clar_ctx"] = clar_ctx
-                # derive episode purpose from clarifier if present
-                try:
-                    purpose = (clar_ctx.metadata.get("purpose")
-                            or clar_ctx.metadata.get("task_title")
-                            or (clar_ctx.summary or "").splitlines()[0])
-                    if purpose:
-                        state["episode_purpose"] = purpose[:180]
-                except Exception:
-                    pass
                 state["stages_run"].append("stage4_intent_clarification")
                 status_cb("clarified", {"topic": (getattr(clar_ctx, "summary", "") or "")[:140], "now": state["now_local_human"]})
             except Exception as e:
@@ -4993,10 +4883,9 @@ class Assembler:
             if time_ctx and time_ctx.context_id not in state["planner_context_ids"]:
                 state["planner_context_ids"].append(time_ctx.context_id)
 
-            # provide compact pack
             state["planner_context_pack"] = {
                 "seed_text": user_text,
-                "merged_ids": state.get("merged_ids", [])[-int(os.getenv("CTX_PLANNER_MERGED_N","20")):],
+                "merged_ids": state.get("merged_ids", []),
                 "tools_list": state.get("tools_list", []),
                 "conversation_id": state.get("conversation_id"),
                 "system_time_prompt": state["system_time_prompt"],
@@ -5052,8 +4941,6 @@ class Assembler:
         else:
             # ── Normal Planner+Executor pipeline via Stage 8 orchestrator ─────
             try:
-                # Keep planner inputs lean: only a capped slice of merged + clar/know
-                state["planner_context_ids"] = self._planner_seed_ids(state, include_clar_know=True)
                 status_cb("planner_begin", {"now": state["now_local_human"]})
                 final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
                 state["tool_ctxs"] = tool_ctxs
