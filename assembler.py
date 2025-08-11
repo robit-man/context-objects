@@ -3846,6 +3846,7 @@ class Assembler:
 
     # ─────────────────────────────────────────────────────────────────────────────
     #  Orchestrator (Quick-Take + Planner) — modern context assembly + no dup emits
+    #  + Integrated TaskScheduler (post-clarifier, with pre-clarifier fast-path)
     # ─────────────────────────────────────────────────────────────────────────────
     async def run_with_meta_context(
         self,
@@ -3866,6 +3867,8 @@ class Assembler:
         • Retrieval & heads scoped to active conversation when possible.
         • No duplicate status_cb emissions for planner/tool lifecycle
             (Stage 8 driver owns those).
+        • Integrated TaskScheduler: tries fast scheduling early; re-attempts after clarification;
+          early-returns with an ACK when a reminder is scheduled.
         """
         import json, traceback, uuid, textwrap, inspect, time, os
         from datetime import datetime, timezone
@@ -4170,6 +4173,51 @@ class Assembler:
         except Exception:
             time_ctx = None  # non-fatal
 
+        # ─────────────────────── TASK SCHEDULER: bootstrap ──────────────────────
+        # We create a tiny Telegram sender here to avoid import cycles; scheduler uses it.
+        try:
+            if not hasattr(self, "_task_send_func") or self._task_send_func is None:
+                async def _task_send_func(chat_id: int | str, text: str):
+                    # Sends a message via python-telegram-bot directly using BOT_TOKEN
+                    import os
+                    from dotenv import load_dotenv
+                    from telegram import Bot
+                    load_dotenv()
+                    token = os.getenv("BOT_TOKEN")
+                    if not token:
+                        # If missing, just swallow; the scheduler will log
+                        return
+                    bot = Bot(token=token)
+                    await bot.send_message(chat_id=chat_id, text=text)
+                self._task_send_func = _task_send_func
+        except Exception:
+            # If we can’t wire a sender, scheduling still works; delivery will simply noop-log.
+            self._task_send_func = None
+
+        try:
+            from task import TaskScheduler  # ← your new module
+            if not hasattr(self, "scheduler") or (getattr(self, "scheduler", None) is None):
+                self.scheduler = TaskScheduler(
+                    repo=self.repo,
+                    logger=getattr(self, "logger", None),
+                    send_func=self._task_send_func,
+                    node_id=getattr(self, "node_id", "local"),
+                )
+            # make chat IDs visible to the scheduler if telegram_input set them on the assembler
+            try:
+                state["_chat_contexts"] = getattr(self, "_chat_contexts", set())
+            except Exception:
+                pass
+            # start the daemon (idempotent)
+            try:
+                self.scheduler.ensure_running()
+                _emit("task_scheduler_ready", {"ok": True})
+            except Exception as e:
+                _emit("task_scheduler_error", {"error": f"{type(e).__name__}: {e}"})
+        except Exception as e:
+            # task.py not present or other import problem; continue without scheduling
+            _emit("task_scheduler_error", {"error": f"{type(e).__name__}: {e}"})
+
         # ── Stage 1: record input ──────────────────────────────────────────────
         try:
             user_ctx = self._stage1_record_input(user_text, state)
@@ -4177,7 +4225,27 @@ class Assembler:
             state["user_text"] = user_text
             _emit("input_recorded", {"ctx_id": getattr(user_ctx, "context_id", None), "now": state["now_local_human"]})
         except Exception as e:
+            user_ctx = None
             _emit("error_stage1", {"error": f"{type(e).__name__}: {e}"})
+
+        # ───── TASK SCHEDULER: pre-clarifier fast attempt (non-blocking) ──────
+        # This catches obvious “in 10m” or “at 7pm” requests and returns immediately.
+        try:
+            if getattr(self, "scheduler", None):
+                # Minimal state for the scheduler
+                state_min = {
+                    "conversation_id": state.get("conversation_id"),
+                    "user_id": state.get("user_id"),
+                    "user_text": user_text,
+                    "cfg": getattr(self, "cfg", {}),
+                    "_chat_contexts": getattr(self, "_chat_contexts", set()),
+                }
+                scheduled_fast, ack_fast = self.scheduler.maybe_schedule(user_text, state_min, user_ctx)
+                if scheduled_fast:
+                    _emit("task_scheduled_preclar", {"ack": ack_fast[:120]})
+                    return ack_fast
+        except Exception as e:
+            _emit("task_scheduler_warn", {"phase": "preclar", "error": f"{type(e).__name__}: {e}"})
 
         # ── Stage 2: system prompts (policies, etc.) + time injection ──────────
         try:
@@ -4196,12 +4264,13 @@ class Assembler:
 
         state["extra_system_messages"] = [state["system_time_prompt"]]
 
-        # Optional: task cues (best-effort)
-        try:
-            self._task_inject_countdown_context(state)
-            self._stage_task_detect_and_schedule(user_text=user_text, state=state)
-        except Exception:
-            pass
+        # (LEGACY) Optional: legacy task cues — disabled by default to avoid duplication
+        if os.getenv("LEGACY_TASK_DETECT", "0") == "1":
+            try:
+                self._task_inject_countdown_context(state)
+                self._stage_task_detect_and_schedule(user_text=user_text, state=state)
+            except Exception:
+                pass
 
         do_quick = (not skip_quick_phases) and (not direct_plan)
 
@@ -4278,7 +4347,7 @@ class Assembler:
                         from context import ContextObject
                         prov = ContextObject.make_stage(
                             "quick_take",
-                            [state["user_ctx"].context_id],
+                            [state["user_ctx"].context_id] if state.get("user_ctx") else [],
                             {"text": quick, "pairs": pairs, "now": state["now_local_human"]}
                         )
                         prov.stage_id = "quick_take"; prov.summary = quick[:250]
@@ -4319,16 +4388,25 @@ class Assembler:
                 clar_ctx = None
                 _emit("error_stage4", {"error": f"{type(e).__name__}: {e}"})
 
-            # Re-attempt scheduling with better structure if we have it
+            # ───── TASK SCHEDULER: post-clarifier attempt (preferred) ──────────
             try:
-                if clar_ctx:
-                    self._stage_task_detect_and_schedule(
-                        user_text=(clar_ctx.metadata.get("notes") or user_text),
-                        state=state,
-                        allow_update=True,
-                    )
-            except Exception:
-                pass
+                if getattr(self, "scheduler", None) and clar_ctx:
+                    clarified_text = (getattr(clar_ctx, "metadata", {}) or {}).get("notes") \
+                                     or (clar_ctx.summary or "") \
+                                     or user_text
+                    state_min = {
+                        "conversation_id": state.get("conversation_id"),
+                        "user_id": state.get("user_id"),
+                        "user_text": clarified_text,
+                        "cfg": getattr(self, "cfg", {}),
+                        "_chat_contexts": getattr(self, "_chat_contexts", set()),
+                    }
+                    scheduled_post, ack_post = self.scheduler.maybe_schedule(clarified_text, state_min, state.get("user_ctx"))
+                    if scheduled_post:
+                        _emit("task_scheduled_postclar", {"ack": ack_post[:120]})
+                        return ack_post
+            except Exception as e:
+                _emit("task_scheduler_warn", {"phase": "postclar", "error": f"{type(e).__name__}: {e}"})
 
         # ── Stage 5: external knowledge (skip on direct_plan) ───────────────────
         know_ctx = None
@@ -4597,4 +4675,5 @@ class Assembler:
         except Exception:
             pass
 
-        return state.get("final", "")
+        # Always return a string (prevents len(None) crash in telegram_input)
+        return str(state.get("final") or "")
