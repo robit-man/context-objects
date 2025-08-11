@@ -2201,7 +2201,6 @@ class Assembler:
             sec1 = f"[User query]\n{user_text.strip()}\n"
 
             # (Optional) Section 1.5 — compressed context window to guide reasoning
-            # Keep it small & readable; this *supplements* but does not replace tools.
             lines = []
             if window["history"]:
                 lines.append("• History: " + " | ".join(window["history"][:3]))
@@ -2222,12 +2221,15 @@ class Assembler:
                 user_payload += "\n[Context window]\n" + ctx_window_text + "\n"
             user_payload += "\n" + sec2
 
-            # Stream final answer
+            # Allow streaming via callback stored on state or a transient slot set by caller
+            on_cb = state.get("on_token") or getattr(self, "_current_on_token", None)
+
             out = self._stream_and_capture(
                 self.primary_model,
                 [{"role": "system", "content": sysmsg},
                 {"role": "user",   "content": user_payload}],
-                tag="[FinalOverride]"
+                tag="[FinalOverride]",
+                on_token=on_cb
             ).strip()
 
             # Stash for upstream callers that read state
@@ -2252,6 +2254,7 @@ class Assembler:
                 {"role": "user",   "content": payload}],
                 tag="[FinalFallback]"
             ).strip()
+
 
     # ————————————————————————————————————————————————————————————
     # Gemma-3 prompt builder
@@ -2677,14 +2680,21 @@ class Assembler:
         Returns True if it rescheduled, False otherwise.
         """
         try:
+            from dateutil.rrule import rrulestr  # pip install python-dateutil
+            from datetime import datetime, timezone
+
             rrule_str = (task_ctx.metadata or {}).get("rrule")
             if not rrule_str:
                 return False
 
-            from dateutil.rrule import rrulestr  # pip install python-dateutil
             # Base the rule on the last due_at; fall back to now if missing
             last_due = (task_ctx.metadata or {}).get("due_at") or self._task__fmt_due(self._task__now_utc())
-            dtstart = datetime.fromisoformat(str(last_due).replace("Z", ""))
+
+            # Repo format is %Y%m%dT%H%M%SZ (no separators). Build aware UTC dtstart.
+            ts = str(last_due)
+            if ts.endswith("Z"):
+                ts = ts[:-1]
+            dtstart = datetime.strptime(ts, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
 
             rule = rrulestr(rrule_str, dtstart=dtstart)
             nxt = rule.after(self._task__now_utc(), inc=False)
@@ -2702,6 +2712,46 @@ class Assembler:
             return True
         except Exception:
             return False
+
+    def _task__notify_user_result(self, *, task_ctx, text: str):
+        """
+        Post the task result to any bound chat(s) for the same conversation_id.
+        Sends text; if a TTS voice file is ready, also sends voice (best-effort).
+        """
+        bot = getattr(self, "_telegram_bot", None)
+        if not bot:
+            return
+        conv_id = (task_ctx.metadata or {}).get("conversation_id")
+        if not conv_id:
+            return
+
+        # Find chats bound to this conversation
+        chat_ids = []
+        for cid, rec in getattr(self, "_chat_index", {}).items():
+            if rec.get("conversation_id") == conv_id:
+                chat_ids.append(cid)
+        if not chat_ids:
+            return
+
+        title = (task_ctx.metadata or {}).get("title", "Scheduled task")
+        header = f"⏰ Task complete: {title}"
+        body = (text or "").strip() or "(no output)"
+        msg = f"{header}\n\n{body}"
+
+        for chat_id in chat_ids:
+            try:
+                bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                continue
+            # Try to send the latest generated voice (optional)
+            try:
+                if getattr(self, "tts", None):
+                    ogg = self.tts.wait_for_latest_ogg(timeout=2.0)
+                    if ogg:
+                        with open(ogg, "rb") as vf:
+                            bot.send_voice(chat_id=chat_id, voice=vf)
+            except Exception:
+                pass
 
 
     # ─── Task scheduling & countdown (repo-native, no extra files) ───────────────
@@ -2918,7 +2968,7 @@ class Assembler:
                 out.append(t)
         return out
 
-    def _launch_scheduled(self, task_ctx: ContextObject):
+    def _launch_scheduled(self, task_ctx):
         """
         Launch a new repo-assembler session seeded with the task's payload.
 
@@ -2932,6 +2982,7 @@ class Assembler:
         - Increments runs_count / failures_count
         - Calls _task__reschedule_from_rrule on success for recurring tasks
         - Calls _task__kick() after (re)scheduling to self-start soon-due items
+        - Streams tokens to TTS while generating, and posts final result to user
         """
         async def _go():
             # Re-fetch the latest copy to avoid stale metadata
@@ -2955,6 +3006,12 @@ class Assembler:
             # Prepare payload
             payload = meta.get("payload_text") or t.summary or ""
 
+            # Bind conversation to scope retrieval/telemetry
+            try:
+                self._active_conversation_id = (meta.get("conversation_id") or self._active_conversation_id)
+            except Exception:
+                pass
+
             # Open episode (best-effort)
             try:
                 self.memman.start_episode(
@@ -2969,11 +3026,37 @@ class Assembler:
             except Exception:
                 pass
 
+            # Wire streaming to TTS bridge if present
+            tok_cb = None
+            if getattr(self, "tts_bridge", None):
+                tok_cb = getattr(self.tts_bridge, "on_token", None)
+            elif getattr(self, "tts", None):
+                tok_cb = getattr(self.tts, "on_token", None)
+
+            # Expose callback for downstream stages without changing their signatures
+            prev_cb = getattr(self, "_current_on_token", None)
+            self._current_on_token = tok_cb
+
             try:
-                # Run the task workload
-                await self.run_with_meta_context(
-                    payload, skip_quick_phases=True, direct_plan=True, images=None
+                # Run the task workload (direct plan path; no Quick-Take/clarifier)
+                final_text = await self.run_with_meta_context(
+                    payload,
+                    skip_quick_phases=True,
+                    direct_plan=True,
+                    images=None,
+                    on_token=tok_cb,
                 )
+
+                # Speak and notify the user (final text)
+                try:
+                    if final_text and getattr(self, "tts", None):
+                        self.tts.enqueue(final_text)
+                except Exception:
+                    pass
+                try:
+                    self._task__notify_user_result(task_ctx=t, text=final_text or "")
+                except Exception:
+                    pass
 
                 # Success path
                 try:
@@ -2983,7 +3066,7 @@ class Assembler:
                 fmeta = fresh.metadata or {}
                 fmeta["last_completed_at"] = self._task__fmt_due(self._task__now_utc())
 
-                # If recurring, try to roll forward; else mark completed
+                # If recurring, roll forward; else mark completed
                 if fmeta.get("rrule"):
                     ok = False
                     try:
@@ -3020,6 +3103,11 @@ class Assembler:
                 fresh.summary = f"[failed] {fmeta.get('title','task')}"
                 fresh.touch(); self.repo.save(fresh)
             finally:
+                # Restore token callback slot and close episode
+                try:
+                    self._current_on_token = prev_cb
+                except Exception:
+                    pass
                 try:
                     self.memman.end_episode()
                 except Exception:
@@ -4320,7 +4408,7 @@ class Assembler:
 
 
     # ─────────────────────────────────────────────────────────────────────────────
-    #  Orchestrator (Quick-Take + Planner) — with direct-plan bypass
+    #  Orchestrator (Quick-Take + Planner) — modern context assembly + no dup emits
     # ─────────────────────────────────────────────────────────────────────────────
     async def run_with_meta_context(
         self,
@@ -4333,25 +4421,32 @@ class Assembler:
         direct_plan: bool = False,  # bypasses QT/clarifier/etc. and feeds user_text into Stage 7
     ) -> str:
         """
-        Two-phase orchestrator (non-destructive). Supports a direct Stage-7 bypass:
+        Two-phase orchestrator (non-destructive). Supports a direct Stage-7 bypass.
 
-        1) Quick-Take  – fast one-liner with ranked prior U↔A pairs (disabled when direct_plan=True)
-        2) Planner     – full pipeline:
-                        5b(KG) → 7(planner) → 7b(validate) → 8(chain)
-                        → 9(DAG exec) → 9b(reflect/replan) → 10/10b(finalize) → 11(memory)
-
-        When direct_plan=True:
-        • Skip Quick-Take and clarifier
-        • Seed planner directly with raw user_text (state['planner_seed_text'])
-        • Attempt explicit Stage-7 calls if available; else hint _stage8_orchestrate via state flags
+        Design upgrades:
+        • Dynamic time/episode banner injected where needed.
+        • Context capped & pinned across stages to avoid prompt/DB bloat.
+        • Retrieval & heads scoped to active conversation when possible.
+        • No duplicate status_cb emissions for planner/tool lifecycle
+            (Stage 8 driver owns those).
         """
-        import json, traceback, uuid, textwrap, inspect, time
+        import json, traceback, uuid, textwrap, inspect, time, os
         from datetime import datetime, timezone
         import numpy as np
 
-        # ── status callback ───────────────────────────────────────────────
+        # ── status callback (no duplicates) ────────────────────────────────────
         if status_cb is None:
             status_cb = lambda *_a, **_k: None
+        _emitted_once: set[str] = set()
+        def _emit(event: str, payload: Any):
+            # Allow repeats for streaming-ish signals if you later add them; for now, dedupe all.
+            if event in _emitted_once:
+                return
+            _emitted_once.add(event)
+            try:
+                status_cb(event, payload)
+            except Exception:
+                pass
 
         # Attach high-observability pieces if present (no-op if already set)
         try:
@@ -4359,6 +4454,57 @@ class Assembler:
                 self._ensure_orchestrator_attached()
         except Exception:
             pass
+
+        # ── tiny helpers (local to keep this drop-in self-contained) ───────────
+        def _cap_merged_in_state(state: dict):
+            """Keep pinned + most recent; cap with CTX_MAX_MERGED (default 40)."""
+            MAX_MERGED = int(os.getenv("CTX_MAX_MERGED", "40"))
+            merged = list(state.get("merged") or [])
+            pinned = [c for c in merged if getattr(c, "pinned", False)]
+            rest   = [c for c in merged if not getattr(c, "pinned", False)]
+            rest.sort(key=lambda c: (getattr(c, "last_accessed", None) or getattr(c, "timestamp", "")), reverse=True)
+            trimmed = (pinned + rest)[:MAX_MERGED]
+            state["merged"] = trimmed
+            state["merged_ids"] = [getattr(c, "context_id", None) for c in trimmed if getattr(c, "context_id", None)]
+
+        def _planner_seed_ids(state: dict, include_clar_know: bool = True) -> list[str]:
+            """Lean list: last CTX_PLANNER_MERGED_N merged IDs (+ clar/know)."""
+            N = int(os.getenv("CTX_PLANNER_MERGED_N", "20"))
+            ids = list((state.get("merged_ids") or [])[-N:])
+            if include_clar_know:
+                for k in ("clar_ctx", "know_ctx"):
+                    obj = state.get(k)
+                    if obj and getattr(obj, "context_id", None):
+                        ids.append(obj.context_id)
+            # dedupe preserving order
+            out, seen = [], set()
+            for cid in ids:
+                if cid and cid not in seen:
+                    seen.add(cid); out.append(cid)
+            return out
+
+        def _dynamic_banner(state: dict, *, heads_n: int, purpose_default: str) -> str:
+            """Time banner + episode purpose + compact 'context heads' (recent→older)."""
+            import re
+            time_line = (state.get("system_time_prompt") or "").strip()
+            purpose = (state.get("episode_purpose") or state.get("purpose") or purpose_default).strip()
+            merged = list(state.get("merged") or [])
+            tail = merged[-heads_n:] if heads_n > 0 else []
+            lines = []
+            for c in reversed(tail):  # recent → older
+                label = f"{getattr(c,'domain','?')}/{getattr(c,'component','?')}/{getattr(c,'semantic_label','?')}"
+                summ  = str(getattr(c, "summary", "") or "")
+                summ  = re.sub(r"\s+", " ", summ).strip()
+                if len(summ) > 160:
+                    summ = summ[:160] + "…"
+                lines.append(f"• {label}: {summ}")
+            out = []
+            if time_line: out.append(time_line)
+            out.append(f"Role: {purpose}")
+            if lines:
+                out.append("Context heads (recent → older):")
+                out.extend(lines)
+            return "\n".join(out)
 
         # ---------- helper: ranked interleaved context via Tools.context_query ----------
         def _ranked_pairs_via_tools(
@@ -4369,9 +4515,8 @@ class Assembler:
             window: str | None = None,   # e.g. "72 hours"
         ) -> tuple[list[str], list[str]]:
             """
-            Use Tools.context_query to fetch recent user_input segments and final_inference stages,
-            interleave them into U→A pairs, then rank by cosine(sim(user_text, pair)) with a small
-            recency boost. Returns (display_lines, flattened_pair_ids).
+            Fetch recent user_input & final_inference, interleave into U→A pairs,
+            rank by cosine(sim(user_text, pair)) + small recency boost.
             """
             # resolve Tools class
             _Tools = None
@@ -4383,7 +4528,7 @@ class Assembler:
                 except Exception:
                     _Tools = None
             if _Tools is None:
-                status_cb("quick_take_info", {"note": "Tools.context_query unavailable"})
+                _emit("quick_take_info", {"note": "Tools.context_query unavailable"})
                 return [], []
 
             def _to_dt(ts):
@@ -4392,7 +4537,6 @@ class Assembler:
                 except Exception:
                     return datetime.min.replace(tzinfo=timezone.utc)
 
-            # knobs
             window = window or self.cfg.get("quick_take_window", "72 hours")
             top_k_each = max(pool * 2, top_pairs * 8)
 
@@ -4433,11 +4577,8 @@ class Assembler:
                     data = []
                 if not data:
                     return []
-
-                # If no cid, just return as-is
                 if not cid:
                     return data
-
                 out = []
                 for r in data:
                     try:
@@ -4445,12 +4586,10 @@ class Assembler:
                         md = (getattr(co, "metadata", None) or {})
                         rcid = md.get("conversation_id") or md.get("conversationid")
                         if not rcid:
-                            # allow if result is extremely recent & relevant even without cid
-                            out.append(r)
+                            out.append(r)  # lenient if missing, keep recent+relevant
                         elif rcid == cid:
                             out.append(r)
                     except Exception:
-                        # if we can't load, keep it (don't over-filter)
                         out.append(r)
                 return out
 
@@ -4464,7 +4603,7 @@ class Assembler:
             except Exception:
                 j_infers, j_users = [], []
 
-            # absolute fallback: if still empty, pull by pure recency (no sim) and filter locally
+            # absolute fallback: pure recency
             if not j_infers or not j_users:
                 try:
                     j_infers = _filter_by_conv(_q(window=window, domain=["stage"], component=["stage"],
@@ -4475,14 +4614,13 @@ class Assembler:
                     j_infers, j_users = [], []
 
             if not j_infers or not j_users:
-                status_cb("quick_take_info", {"note": "No recent U/A history found for pairing"})
+                _emit("quick_take_info", {"note": "No recent U/A history found for pairing"})
                 return [], []
 
             users_sorted  = sorted(j_users,  key=lambda r: _to_dt(r.get("timestamp")))
             infers_sorted = sorted(j_infers, key=lambda r: _to_dt(r.get("timestamp")))
 
-            # pair: for each User, pick the next FinalInference at/after the user timestamp,
-            # else fall back to the nearest prior inference.
+            # pair user → next/nearest assistant final_inference
             pairs = []
             j = 0
             for u in users_sorted[-(pool * 3):]:
@@ -4501,7 +4639,6 @@ class Assembler:
                     uts, _to_dt(a.get("timestamp")),
                     u.get("context_id"), a.get("context_id")
                 ))
-
             if not pairs:
                 return [], []
 
@@ -4515,7 +4652,6 @@ class Assembler:
 
             uvec = _embed(state.get("user_text") or "")
             now = datetime.now(timezone.utc)
-
             def _recency_boost(ts):
                 age_days = max((now - ts).total_seconds() / 86400.0, 0.0)
                 return 0.5 ** (age_days / 3.0)
@@ -4531,17 +4667,15 @@ class Assembler:
                     cos = float(np.dot(uvec, pvec) / den)
                 rec = _recency_boost(max(uts, ats))
                 score = 0.72 * cos + 0.28 * rec
-
                 u_short = textwrap.shorten(u_txt.replace("\n", " "), width=180, placeholder="…")
                 a_short = textwrap.shorten(a_txt.replace("\n", " "), width=180, placeholder="…")
                 scored.append((score, f"U: {u_short} || A: {a_short}", (ucid, acid)))
-
             scored.sort(key=lambda t: t[0], reverse=True)
             lines = [s for _, s, _ in scored[:top_pairs]]
             pair_ids = [i for _, _, ids in scored[:top_pairs] for i in ids if i]
             return lines, pair_ids
 
-        # ── shared state bootstrap (WITH TIME CONTEXT) ───────────────────────
+        # ── shared state bootstrap (WITH TIME CONTEXT) ─────────────────────────
         state = getattr(self, "_last_state", {}) or {}
         state["start_ts"] = state.get("start_ts") or datetime.now(timezone.utc).timestamp()
         state.setdefault("stages_run", [])
@@ -4552,15 +4686,13 @@ class Assembler:
         # Build time context (human + machine) and inject everywhere
         local_now = datetime.now().astimezone()
         utc_now   = datetime.now(timezone.utc)
-
         human_local = local_now.strftime("%A, %B %d, %Y %I:%M %p %Z (UTC%z)")
         human_utc   = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
         time_banner = (
             f"To aid in making chronologically informed decisions, the current time is {human_local}. "
             f"UTC now: {human_utc}. Always compute time deltas relative to this moment."
         )
-
-        # Stash rich time fields in state for every stage to consume
+        # Stash rich time fields
         state["system_time_prompt"]   = time_banner
         state["now_local_human"]      = human_local
         state["now_utc_human"]        = human_utc
@@ -4601,16 +4733,16 @@ class Assembler:
         except Exception:
             time_ctx = None  # non-fatal
 
-        # ── Stage 1: record input ────────────────────────────────────────────
+        # ── Stage 1: record input ──────────────────────────────────────────────
         try:
             user_ctx = self._stage1_record_input(user_text, state)
             state["user_ctx"] = user_ctx
             state["user_text"] = user_text
-            status_cb("input_recorded", {"ctx_id": getattr(user_ctx, "context_id", None), "now": state["now_local_human"]})
+            _emit("input_recorded", {"ctx_id": getattr(user_ctx, "context_id", None), "now": state["now_local_human"]})
         except Exception as e:
-            status_cb("error_stage1", {"error": f"{type(e).__name__}: {e}"})
+            _emit("error_stage1", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 2: system prompts (policies, etc.) + time injection ────────
+        # ── Stage 2: system prompts (policies, etc.) + time injection ──────────
         try:
             sys_ctxs = self._stage2_load_system_prompts()
             if time_ctx:
@@ -4623,10 +4755,11 @@ class Assembler:
             state["stages_run"].append("stage2_load_system_prompts")
         except Exception as e:
             sys_ctxs = []
-            status_cb("error_stage2", {"error": f"{type(e).__name__}: {e}"})
+            _emit("error_stage2", {"error": f"{type(e).__name__}: {e}"})
 
         state["extra_system_messages"] = [state["system_time_prompt"]]
 
+        # Optional: task cues (best-effort)
         try:
             self._task_inject_countdown_context(state)
             self._stage_task_detect_and_schedule(user_text=user_text, state=state)
@@ -4635,7 +4768,7 @@ class Assembler:
 
         do_quick = (not skip_quick_phases) and (not direct_plan)
 
-        # ── Stage 3: retrieve & merge context (skip on direct_plan) ──────────
+        # ── Stage 3: retrieve & merge context (skip on direct_plan) ────────────
         if not direct_plan:
             try:
                 merged_out = self._stage3_retrieve_and_merge_context(
@@ -4649,11 +4782,13 @@ class Assembler:
                 state["stages_run"].append("stage3_retrieve_and_merge_context")
                 state.setdefault("merged", state.get("merged", []))
                 state.setdefault("merged_ids", state.get("merged_ids", [c.context_id for c in state["merged"] if hasattr(c, "context_id")]))
-                status_cb("context_merged", {"merged": len(state.get("merged_ids", [])), "now": state["now_local_human"]})
+                # Trim merged aggressively here to avoid prompt bloat
+                _cap_merged_in_state(state)
+                _emit("context_merged", {"merged": len(state.get("merged_ids", [])), "now": state["now_local_human"]})
             except Exception as e:
                 state.setdefault("merged", [])
                 state.setdefault("merged_ids", [])
-                status_cb("error_stage3", {"error": f"{type(e).__name__}: {e}"})
+                _emit("error_stage3", {"error": f"{type(e).__name__}: {e}"})
         else:
             state.setdefault("merged", [])
             state.setdefault("merged_ids", [])
@@ -4664,10 +4799,10 @@ class Assembler:
                 except Exception:
                     pass
 
-        # ── Quick-Take (optional) — never when direct_plan=True ─────────────
+        # ── Quick-Take (optional) — never when direct_plan=True ────────────────
         if do_quick:
             try:
-                status_cb("quick_take_begin", {"now": state["now_local_human"]})
+                _emit("quick_take_begin", {"now": state["now_local_human"]})
                 pairs, pair_ids = _ranked_pairs_via_tools(
                     state,
                     top_pairs=6,
@@ -4684,8 +4819,11 @@ class Assembler:
                     "No disclaimers, hotlines, or explanations."
                 )
                 qt_ctx = "\n".join(pairs) if pairs else "(no prior context)"
+                # Dynamic heads for QT (tiny, episode-aware)
+                qt_banner = _dynamic_banner(state, heads_n=int(os.getenv("CTX_QT_HEADS","6")),
+                                            purpose_default="Give a one-line, high-signal preview.")
                 msgs = [
-                    {"role": "system", "content": state["system_time_prompt"]},
+                    {"role": "system", "content": qt_banner},
                     {"role": "system", "content": qt_sys},
                     {"role": "system", "content": qt_guard},
                     {"role": "system", "content": "Ranked prior U↔A pairs:\n" + qt_ctx},
@@ -4711,13 +4849,15 @@ class Assembler:
                         prov.touch(); self.repo.save(prov)
                         state.setdefault("merged", []).append(prov)
                         state.setdefault("merged_ids", []).append(prov.context_id)
+                        # keep merged lean after adding quick take
+                        _cap_merged_in_state(state)
                     except Exception:
                         pass
-                    status_cb("quick_take_done", {"preview": quick[:220]})
+                    _emit("quick_take_done", {"preview": quick[:220]})
             except Exception as e:
-                status_cb("quick_take_error", {"error": f"{type(e).__name__}: {e}"})
+                _emit("quick_take_error", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 4: intent clarification (skip on direct_plan) ──────────────
+        # ── Stage 4: intent clarification (skip on direct_plan) ─────────────────
         clar_ctx = None
         if not direct_plan:
             try:
@@ -4727,11 +4867,20 @@ class Assembler:
                     on_token=None,  # never stream clarifier (prevents TTS on JSON)
                 )
                 state["clar_ctx"] = clar_ctx
+                # derive episode purpose from clarifier if present
+                try:
+                    purpose = (clar_ctx.metadata.get("purpose")
+                            or clar_ctx.metadata.get("task_title")
+                            or (clar_ctx.summary or "").splitlines()[0])
+                    if purpose:
+                        state["episode_purpose"] = str(purpose)[:180]
+                except Exception:
+                    pass
                 state["stages_run"].append("stage4_intent_clarification")
-                status_cb("clarified", {"topic": (getattr(clar_ctx, "summary", "") or "")[:140], "now": state["now_local_human"]})
+                _emit("clarified", {"topic": (getattr(clar_ctx, "summary", "") or "")[:140], "now": state["now_local_human"]})
             except Exception as e:
                 clar_ctx = None
-                status_cb("error_stage4", {"error": f"{type(e).__name__}: {e}"})
+                _emit("error_stage4", {"error": f"{type(e).__name__}: {e}"})
 
             # Re-attempt scheduling with better structure if we have it
             try:
@@ -4744,19 +4893,19 @@ class Assembler:
             except Exception:
                 pass
 
-        # ── Stage 5: external knowledge (skip on direct_plan) ────────────────
+        # ── Stage 5: external knowledge (skip on direct_plan) ───────────────────
         know_ctx = None
         if not direct_plan:
             try:
                 know_ctx = self._stage5_external_knowledge(clar_ctx, state)
                 state["know_ctx"] = know_ctx
                 state["stages_run"].append("stage5_external_knowledge")
-                status_cb("knowledge_built", {"snippets": len(state.get("knowledge_snippets", [])), "now": state["now_local_human"]})
+                _emit("knowledge_built", {"snippets": len(state.get("knowledge_snippets", [])), "now": state["now_local_human"]})
             except Exception as e:
                 know_ctx = None
-                status_cb("error_stage5", {"error": f"{type(e).__name__}: {e}"})
+                _emit("error_stage5", {"error": f"{type(e).__name__}: {e}"})
 
-        # ── Stage 5b: planning KG (tool/arg catalog) ─────────────────────────
+        # ── Stage 5b: planning KG (tool/arg catalog) ────────────────────────────
         try:
             tools_list = self._stage6_prepare_tools()
             state["tools_list"] = tools_list
@@ -4770,9 +4919,8 @@ class Assembler:
 
             def _tool_features_map(tool_names: list[str]) -> dict[str, list[float]]:
                 """
-                Build LinUCB features:
-                [affinity, success_rate, 1-arg_err, 1-norm_latency, 1.0]
-                from recent repo observations + cheap text affinity to the clarifier notes.
+                LinUCB features: [affinity, success_rate, 1-arg_err, 1-norm_latency, 1.0]
+                from repo observations + cheap text affinity to clarifier notes.
                 """
                 names = list(tool_names)
                 feats: dict[str, list[float]] = {}
@@ -4862,7 +5010,7 @@ class Assembler:
             )
             state["stages_run"].append("stage5b_build_planning_kg")
         except Exception as e:
-            status_cb("error_stage5b", {"error": f"{type(e).__name__}: {e}"})
+            _emit("error_stage5b", {"error": f"{type(e).__name__}: {e}"})
 
         # === Bandit knobs (planner/executor) — choose once per run ===
         if hasattr(self, "bandit"):
@@ -4873,7 +5021,7 @@ class Assembler:
             state["selected_knobs"]["planner_temperature"] = (idx_t, temp)
             state["selected_knobs"]["executor_retries"]     = (idx_r, retries)
 
-        # ── DIRECT PLAN BYPASS INTO STAGE 7 ───────────────────────────────────
+        # ── DIRECT PLAN BYPASS INTO STAGE 7 ─────────────────────────────────────
         if direct_plan:
             state["planner_mode"] = "direct_from_user"
             state["planner_seed_text"] = user_text
@@ -4885,7 +5033,7 @@ class Assembler:
 
             state["planner_context_pack"] = {
                 "seed_text": user_text,
-                "merged_ids": state.get("merged_ids", []),
+                "merged_ids": (state.get("merged_ids", [])[-int(os.getenv("CTX_PLANNER_MERGED_N","20")):]),
                 "tools_list": state.get("tools_list", []),
                 "conversation_id": state.get("conversation_id"),
                 "system_time_prompt": state["system_time_prompt"],
@@ -4895,8 +5043,7 @@ class Assembler:
             }
 
             try:
-                status_cb("planner_direct_begin", {"mode": "direct_from_user", "now": state["now_local_human"]})
-
+                # No planner_* emits here; Stage 8 owns planner lifecycle telemetry.
                 if hasattr(self, "_stage7_planning_summary"):
                     plan_ctx = self._stage7_planning_summary(
                         user_text=user_text,
@@ -4920,7 +5067,6 @@ class Assembler:
                         "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                         "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                     ])
-                    status_cb("planner_direct_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
                 else:
                     state["bypass_to_stage7"] = True
                     final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
@@ -4932,16 +5078,17 @@ class Assembler:
                         "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                         "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                     ])
-                    status_cb("planner_direct_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
 
             except Exception as e:
-                status_cb("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
+                _emit("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
                 state["final"] = (state.get("draft") or user_text or "").strip()
 
         else:
-            # ── Normal Planner+Executor pipeline via Stage 8 orchestrator ─────
+            # ── Normal Planner+Executor pipeline via Stage 8 orchestrator ───────
             try:
-                status_cb("planner_begin", {"now": state["now_local_human"]})
+                # Keep planner inputs lean: only a capped slice of merged + clar/know
+                state["planner_context_ids"] = _planner_seed_ids(state, include_clar_know=True)
+                # No 'planner_begin' emit; Stage 8 owns lifecycle events.
                 final, tool_ctxs = self._stage8_orchestrate(user_text=user_text, state=state)
                 state["tool_ctxs"] = tool_ctxs
                 state["final"] = final
@@ -4951,12 +5098,12 @@ class Assembler:
                     "stage9b_reflection_and_replan", "stage10_assemble_and_infer",
                     "stage10b_response_critique_and_safety", "stage11_memory_writeback"
                 ])
-                status_cb("planner_done", {"tools": len(tool_ctxs), "now": state["now_local_human"]})
+                # No 'planner_done' emit; Stage 8 owns lifecycle events.
             except Exception as e:
-                status_cb("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
+                _emit("error_pipeline", {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()})
                 state["final"] = (state.get("draft") or user_text or "").strip()
 
-        # ── Optional: Stage 12 performance rating ────────────────────────────
+        # ── Optional: Stage 12 performance rating ───────────────────────────────
         try:
             self._stage12_performance_rating(state)
         except Exception:
@@ -4968,7 +5115,7 @@ class Assembler:
         except Exception:
             pass
 
-        # -------- RL: register turn & persist --------
+        # -------- RL: register turn & persist ----------------------------------
         try:
             # latency
             try:
