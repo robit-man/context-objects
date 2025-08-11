@@ -280,10 +280,13 @@ class TaskScheduler:
             pass
 
         return True, ack
-
+    
     async def _scheduler_loop(self):
-        """Single background worker; never dies (catches and logs)."""
+        """Single background worker; never dies (catches and logs).
+        Guarantees one notification per (task, due_epoch) via a fire-token.
+        """
         event = self._sched_event or asyncio.Event()
+
         while True:
             try:
                 now_epoch = _now_epoch()
@@ -293,6 +296,7 @@ class TaskScheduler:
                     try:
                         if getattr(c, "stage_id", None) == "task" or getattr(c, "semantic_label", "") in ("task","reminder","scheduled_task"):
                             md = c.metadata or {}
+                            # Only tasks explicitly scheduled are considered here
                             return md.get("status") == "scheduled"
                     except Exception:
                         return False
@@ -316,9 +320,34 @@ class TaskScheduler:
                             md["due_utc_iso"] = datetime.fromtimestamp(due_epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
                             self._safe_save(t)
 
-                    if isinstance(due_epoch, (int, float)) and due_epoch <= now_epoch:
-                        due_now.append(t)
-                    elif isinstance(due_epoch, (int, float)):
+                    # skip if not a number
+                    if not isinstance(due_epoch, (int, float)):
+                        continue
+
+                    # idempotency token for this firing window
+                    fire_token = f"{md.get('task_key') or t.context_id}:{int(due_epoch)}"
+
+                    # If we've already fired for this window, roll it forward (RRULE) or mark done.
+                    if md.get("last_fire_token") == fire_token:
+                        if rrule:
+                            nxt = _next_epoch_from_rrule(rrule, now_epoch, tz_offset)
+                            if nxt:
+                                md["status"] = "scheduled"
+                                md["due_epoch"] = int(nxt)
+                                md["due_utc_iso"] = datetime.fromtimestamp(nxt, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+                                self._safe_save(t)
+                                next_epoch = nxt if next_epoch is None else min(next_epoch, nxt)
+                        else:
+                            md["status"] = "done"
+                            md.pop("due_epoch", None)
+                            md.pop("due_utc_iso", None)
+                            self._safe_save(t)
+                        continue
+
+                    if due_epoch <= now_epoch:
+                        # Only consider due-now if not already fired for this due window
+                        due_now.append((t, fire_token))
+                    else:
                         next_epoch = due_epoch if next_epoch is None else min(next_epoch, due_epoch)
 
                 # 2) sleep until next due (or a wakeup)
@@ -329,22 +358,23 @@ class TaskScheduler:
                     event.clear()
                     try:
                         await asyncio.wait_for(event.wait(), timeout=timeout)
-                        # woke up; re-scan immediately
                         continue
                     except asyncio.TimeoutError:
-                        # time to re-check
-                        pass
+                        pass  # time to re-check
 
-                # 3) fire each due task
-                for t in due_now:
+                # 3) fire each due task (idempotent)
+                for t, fire_token in due_now:
                     md = t.metadata or {}
+                    # Re-check status; bail if someone else moved it
                     if md.get("status") != "scheduled":
-                        continue  # someone else claimed
+                        continue
 
                     # best-effort claim
                     md["status"] = "firing"
                     md["lease_owner"] = self.node_id
                     md["lease_epoch"] = _now_epoch()
+                    # Stash the current window token we're attempting to fire
+                    md["pending_fire_token"] = fire_token
                     self._safe_save(t)
 
                     title = md.get("title") or (getattr(t, "summary", "") or "Reminder")
@@ -359,15 +389,16 @@ class TaskScheduler:
                                 await res
                             delivered = True
                         else:
-                            # no sender: log instead
                             self.logger.info("TaskScheduler: deliver (noop) chat=%s text=%s", chat_id, text)
                             delivered = True
                     except Exception as e:
                         self.logger.warning("TaskScheduler: delivery failed: %s", e)
 
                     if delivered:
-                        md["status"] = "sent"
+                        # Mark this due window as completed exactly once
+                        md["last_fire_token"] = fire_token
                         md["sent_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                        md.pop("pending_fire_token", None)
 
                         # recurrence?
                         rrule = md.get("rrule")
@@ -377,16 +408,30 @@ class TaskScheduler:
                                 md["status"] = "scheduled"
                                 md["due_epoch"] = int(nxt)
                                 md["due_utc_iso"] = datetime.fromtimestamp(nxt, tz=timezone.utc).isoformat().replace("+00:00","Z")
+                            else:
+                                # no next occurrence → finalize
+                                md["status"] = "done"
+                                md.pop("due_epoch", None)
+                                md.pop("due_utc_iso", None)
+                        else:
+                            # one-shot → finalize so it never re-fires
+                            md["status"] = "done"
+                            md.pop("due_epoch", None)
+                            md.pop("due_utc_iso", None)
                     else:
-                        # put back with small backoff
+                        # put back with small backoff; do NOT set last_fire_token so we can retry later
+                        backoff = int(md.get("retry_backoff_sec", 30))
+                        backoff = min(max(backoff, 15), 300)
                         md["status"] = "scheduled"
-                        md["due_epoch"] = _now_epoch() + 30
+                        md["due_epoch"] = _now_epoch() + backoff
+                        md["due_utc_iso"] = datetime.fromtimestamp(md["due_epoch"], tz=timezone.utc).isoformat().replace("+00:00","Z")
+                        md["retry_backoff_sec"] = min(backoff * 2, 900)  # exponential cap 15m
+                        md.pop("pending_fire_token", None)
 
                     self._safe_save(t)
 
             except asyncio.CancelledError:
-                # shutting down
-                break
+                break  # shutting down
             except Exception:
                 try:
                     self.logger.exception("TaskScheduler: loop crashed:\n%s", traceback.format_exc())
