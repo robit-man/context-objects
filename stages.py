@@ -499,135 +499,96 @@ def _stage4_intent_clarification(
     on_token: Callable[[str], None] | None = None,
 ) -> "ContextObject":
     """
-    Clarifier prompt now:
-      • Uses post-tool block when available; else last 8 turns
-      • Includes (up to) last 3 tool outputs (truncated)
-      • Adds short semantic / associative / tool reference snippets
-      • Enforces STRICT JSON with robust extraction
-      • Produces keys: {keywords, notes, debug_notes, intents?, constraints?, red_flags?}
+    Constrained Clarifier — user-first, low-noise.
+
+    Design:
+      • Weigh the current user_text almost entirely.
+      • Include at most the single immediately-previous assistant message (if any).
+      • Do NOT inject semantic/associative/tool snippets into the clarifier prompt.
+      • Enforce STRICT JSON with stable keys required elsewhere:
+          {keywords(list), notes(str), debug_notes(list, optional),
+           intents(list, optional), constraints(list, optional), red_flags(list, optional)}
+      • Tight token budget and deterministic shaping; summary=notes (trimmed).
     """
-    import json, textwrap, re, hashlib
+    import json, re, hashlib, textwrap
     from context import ContextObject
 
-    # ---------- 0) Guards ----------
-    state          = state or {}
-    merged         = state.get("merged", [])
-    tool_ctxs      = state.get("tools", []) or state.get("tool_ctxs", [])
-    semantic_ctxs  = state.get("semantic", [])
-    assoc_ctxs     = state.get("assoc", [])
-    tool_refs      = state.get("tools", [])
+    state = state or {}
+    merged = list(state.get("merged") or [])
 
-    # keep dialog ContextObjects in chronological order
-    hist = [c for c in merged if c.semantic_label in ("user_input", "assistant")]
-    hist.sort(key=lambda c: c.timestamp)
+    # ---- 1) Extract only the minimal dialogue context ----------------
+    # Find the last assistant message *before* the latest user turn.
+    last_assistant = ""
+    last_user = user_text.strip()
 
-    # ---------- 1) Build “recent dialogue” ----------
-    last_tool_ts = max((c.timestamp for c in tool_ctxs), default=None)
-    dialogue: list[str] = []
-    for c in hist:
-        if last_tool_ts and c.timestamp <= last_tool_ts:
-            continue
-        role  = "User" if c.semantic_label == "user_input" else "Assistant"
-        text  = c.summary or (c.metadata.get("text", "") if isinstance(c.metadata, dict) else "")
-        dialogue.append(f"{role}: {text}")
+    # merged is chronological in your Stage 3; take the last assistant before current user_ctx
+    try:
+        user_ctx = state.get("user_ctx")
+        user_ts = getattr(user_ctx, "timestamp", None)
+        # scan in reverse to find assistant older than current user
+        for c in reversed(merged):
+            if getattr(c, "semantic_label", "") == "assistant":
+                # if assistant is strictly before the latest user turn (when timestamps are comparable)
+                if not user_ts or getattr(c, "timestamp", None) <= user_ts:
+                    last_assistant = (c.summary or "").strip()
+                    break
+    except Exception:
+        pass
 
-    if not dialogue:
-        for c in hist[-8:]:
-            role = "User" if c.semantic_label == "user_input" else "Assistant"
-            dialogue.append(f"{role}: {c.summary or (c.metadata.get('text', '') if isinstance(c.metadata, dict) else '')}")
+    # Keep the assistant context very short if present
+    if last_assistant:
+        last_assistant = textwrap.shorten(re.sub(r"\s+", " ", last_assistant), width=320, placeholder="…")
 
-    dialog_block = "\n".join(dialogue)[-1500:] or "(none)"
+    # ---- 2) Build the minimal prompt --------------------------------
+    clar_sys = (
+        (getattr(self, "clarifier_prompt", "") or "").strip()
+        or "You are a precise intent clarifier."
+    )
 
-    # ---------- 2) Previous block (last 8 before current) ----------
-    prev_lines: list[str] = []
-    if len(hist) >= 2:
-        for c in hist[-9:-1]:
-            role = "User" if c.semantic_label == "user_input" else "Assistant"
-            prev_lines.append(f"{role}: {c.summary or (c.metadata.get('text','') if isinstance(c.metadata, dict) else '')}")
-    prev_block = "\n".join(prev_lines) if prev_lines else "(none)"
+    # Hard cap and explicit rules: prefer the literal user query; avoid invention.
+    rules = (
+        "Return ONLY JSON with keys: keywords(list), notes(str), "
+        "debug_notes(list, optional), intents(list, optional), constraints(list, optional), red_flags(list, optional).\n"
+        "Prioritize the CURRENT USER QUERY. Do NOT rely on prior context unless it is explicitly quoted by the user.\n"
+        "keywords: extract short terms directly from the user text (no synonyms you invent; 3–8 max).\n"
+        "notes: a one-sentence paraphrase of what the user wants, using their words where possible—no extra context.\n"
+        "intents: OPTIONAL high-level verbs from {answer, search, summarize, transform, create, analyze, plan, code, execute} if obvious.\n"
+        "constraints: OPTIONAL explicit limits the user stated (numbers, dates, files, lengths, formats).\n"
+        "red_flags: OPTIONAL safety/compliance concerns if any.\n"
+        "If unsure, keep fields minimal rather than guessing."
+    )
 
-    # ---------- 3) Last 3 tool outputs ----------
-    def _tool_preview(tc):
-        payload = (tc.metadata.get("output") if isinstance(tc.metadata, dict) else None) or \
-                  (tc.metadata.get("exception") if isinstance(tc.metadata, dict) else "") or ""
-        try:
-            blob = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-        except Exception:
-            blob = repr(payload)
-        return (blob[:950] + " …") if len(blob) > 950 else blob
+    # Minimal context block
+    blocks = [f"### Current User Query ###\n{last_user}"]
+    if last_assistant:
+        blocks.append(f"### Previous Assistant (for disambiguation only; ignore if not needed) ###\n{last_assistant}")
+    full_ctx = "\n\n".join(blocks)
+    if len(full_ctx) > 1200:
+        full_ctx = full_ctx[-1200:]
 
-    tools_block = "\n".join(f"[{tc.stage_id}] {_tool_preview(tc)}" for tc in sorted(tool_ctxs, key=lambda c: c.timestamp)[-3:]) or "(none)"
-
-    # ---------- 4) Short context snippets ----------
-    def _first_n(ctxs, n=3):
-        out = []
-        for c in ctxs[:n]:
-            short = (c.summary or "")[:120].replace("\n", " ")
-            out.append(f"• {short}  (id={c.context_id[:8]})")
-        return out
-
-    semantic_block = "\n".join(_first_n(semantic_ctxs)) or "(none)"
-    assoc_block    = "\n".join(_first_n(assoc_ctxs))    or "(none)"
-    tools_block2   = "\n".join(_first_n(tool_refs))      or "(none)"
-
-    # ---------- 5) System/context ----------
-    clar_sys = self.clarifier_prompt
-    full_ctx = textwrap.dedent(f"""
-        ### Recent Dialogue ###
-        {dialog_block}
-
-        ### Previous User / Assistant Turns ###
-        {prev_block}
-
-        ### Recent Tool Outputs ###
-        {tools_block}
-
-        ### Retrieved Semantic Context ###
-        {semantic_block}
-
-        ### Retrieved Associative Context ###
-        {assoc_block}
-
-        ### Tool Reference Context ###
-        {tools_block2}
-
-        ### Current User Query ###
-        {user_text}
-    """).strip()
-
-    MAX_PROMPT_CHARS = 4096
-    if len(full_ctx) > MAX_PROMPT_CHARS:
-        full_ctx = full_ctx[-MAX_PROMPT_CHARS:]
-
-    # ---------- 6) Call Clarifier (STRICT JSON) ----------
     msgs = [
         {"role": "system", "content": clar_sys},
-        {"role": "system", "content": (
-            "Return ONLY JSON with keys: keywords(list), notes(str), debug_notes(list, optional), "
-            "intents(list, optional), constraints(list, optional), red_flags(list, optional)."
-        )},
+        {"role": "system", "content": rules},
+        # Provide only the constrained context and the raw user text (again) to overweight it
         {"role": "system", "content": full_ctx},
-        {"role": "user",   "content": user_text},
+        {"role": "user",   "content": last_user},
     ]
+
     out = self._stream_and_capture(
         self.primary_model,
         msgs,
-        tag="[Clarifier]",
+        tag="[ClarifierConstrained]",
         images=state.get("images"),
         on_token=None,
     ).strip()
 
-    # ---------- 7) Parse / repair JSON ----------
+    # ---- 3) Robust JSON extraction -----------------------------------
     def _extract_json_blob(s: str) -> str | None:
-        # try fenced
         m = re.search(r"```json\s*(\{.*?\})\s*```", s, flags=re.S)
         if m:
             return m.group(1)
-        # try first {...} block
         m = re.search(r"(\{.*\})", s, flags=re.S)
-        if m:
-            return m.group(1)
-        return None
+        return m.group(1) if m else None
 
     blob = _extract_json_blob(out) or out
     try:
@@ -635,17 +596,28 @@ def _stage4_intent_clarification(
         if not isinstance(clar, dict):
             raise ValueError("not a dict")
     except Exception:
-        clar = {"keywords": [], "notes": out, "debug_notes": dialogue[-8:]}
+        # Minimal, non-hallucinatory fallback: reflect the user verbatim
+        clar = {
+            "keywords": [],
+            "notes": last_user[:280],
+            "debug_notes": [last_user[:280]],
+        }
 
-    # enforce required keys & types
+    # Enforce contract + light normalization
     clar.setdefault("keywords", [])
     clar.setdefault("notes", "")
-    clar.setdefault("debug_notes", dialogue[-8:])
+    if not isinstance(clar.get("debug_notes"), list):
+        clar["debug_notes"] = [str(clar.get("debug_notes", ""))] if clar.get("debug_notes") else []
     for k in ("intents", "constraints", "red_flags"):
         if k in clar and not isinstance(clar[k], list):
             clar[k] = [clar[k]]
 
-    # ---------- 8) Persist Clarifier Context ----------
+    # Truncate overly long fields defensively
+    clar["notes"] = clar.get("notes", "")[:512]
+    if isinstance(clar.get("keywords"), list):
+        clar["keywords"] = [str(k)[:40] for k in clar["keywords"][:8]]
+
+    # ---- 4) Persist ContextObject (same tagging/stamping as before) --
     input_refs = [state["user_ctx"].context_id] if state.get("user_ctx") else []
     clar_ctx = ContextObject.make_stage(
         "intent_clarification",
@@ -653,38 +625,43 @@ def _stage4_intent_clarification(
         output=clar,
     )
     clar_ctx.metadata.update(clar)
-    clar_ctx.stage_id       = "intent_clarification"
+    clar_ctx.stage_id = "intent_clarification"
     clar_ctx.semantic_label = "intent_clarification"
     clar_ctx.tags.append("clarifier")
 
-    # propagate conversation/user ids if available
-    if state.get("user_ctx"):
-        try:
+    # Propagate IDs if available
+    try:
+        if state.get("user_ctx"):
             clar_ctx.metadata.update(
                 {
                     "conversation_id": state["user_ctx"].metadata["conversation_id"],
                     "user_id": state["user_ctx"].metadata["user_id"],
                 }
             )
-        except Exception:
-            pass
-
-    # topic fingerprint (useful for grouping downstream)
-    try:
-        clar_ctx.metadata["topic_id"] = hashlib.md5((clar_ctx.metadata.get("notes","")[:512]).encode("utf-8")).hexdigest()[:10]
     except Exception:
         pass
 
+    # Topic fingerprint for grouping (as in your original)
+    try:
+        clar_ctx.metadata["topic_id"] = hashlib.md5(
+            (clar_ctx.metadata.get("notes", "")[:512]).encode("utf-8")
+        ).hexdigest()[:10]
+    except Exception:
+        pass
+
+    # Summary = the concise notes line
     clar_ctx.summary = (clar.get("notes") or "")[:250]
     clar_ctx.touch()
     self.repo.save(clar_ctx)
 
-    # Optional: register relationships
+    # Optional: register relationships (kept for parity)
     try:
         self.memman.register_relationships(clar_ctx, self.embed_text)
     except Exception:
         pass
 
+    # Expose for downstream stages (if caller relies on state mutation)
+    state["clar_ctx"] = clar_ctx
     return clar_ctx
 
 
