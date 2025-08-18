@@ -3505,137 +3505,204 @@ class Tools:
         images: list[bytes] | None = None
     ) -> str:
         """
-        Call an LLM in a fire-and-forget fashion with very loose repetition guards:
-          • identical token >20× (ignoring punctuation tokens)
-          • any single non-border line ≥20×
-          • any substring (20–120 chars) ≥20×
-          • abort & retry up to 3× on timeout (>5m) or guard trip
+        Call an LLM in a fire-and-forget fashion with robust repetition guards.
+    
+        Changes vs. previous version:
+          • Ignore empty/whitespace deltas and border-only chunks (prevents false positives)
+          • Only count *short* identical deltas (<= 8 chars) toward the token-repeat guard
+          • Don’t activate guards until some real content is produced (>= 120 chars)
+          • Adaptive retries: add frequency/presence penalties, optional tier fallback
+          • Handle finish_reason from the streamer if present
         """
-        import re, json, requests, time, collections
-
-        # choose model
+        import re, json, requests, time, collections, random
+    
+        # ── model selection ────────────────────────────────────────────────
         tier_map = {
             "primary":   config["primary_model"],
             "secondary": config.get("secondary_model", config["primary_model"]),
-            "decision":  config.get(
-                "decision_model",
-                config.get("secondary_model", config["primary_model"])
-            )
+            "decision":  config.get("decision_model",  config.get("secondary_model", config["primary_model"])),
         }
-        model_selected = tier_map.get((model_tier or "primary").lower(),
-                                      config["primary_model"])
-
-        # assemble messages
+        selected_tier = (model_tier or "primary").lower()
+        model_selected = tier_map.get(selected_tier, config["primary_model"])
+    
+        # ── assemble messages ─────────────────────────────────────────────
         messages = []
         if system is not None:
-            messages.append({"role":"system","content":system})
+            messages.append({"role": "system", "content": system})
         if context is not None:
             messages.append({
-                "role":"system",
-                "content":(
-                    f"### Narrative Context (last {retrieval_count} snippets) ###\n"
-                    f"{context}"
-                )
+                "role": "system",
+                "content": f"### Narrative Context (last {retrieval_count} snippets) ###\n{context}"
             })
-        messages.append({"role":"user","content":prompt})
-
-        # embed images
+        messages.append({"role": "user", "content": prompt})
+    
+        # ── image embedding (best-effort) ─────────────────────────────────
         images_data = images or []
         if not images_data:
             img_patt = r"((?:https?://\S+?\.(?:jpg|jpeg|png|bmp|gif))|(?:/\S+?\.(?:jpg|jpeg|png|bmp|gif)))"
             for loc in re.findall(img_patt, prompt, flags=re.I):
                 try:
-                    if loc.lower().startswith(("http://","https://")):
-                        r = requests.get(loc,timeout=5); r.raise_for_status()
+                    if loc.lower().startswith(("http://", "https://")):
+                        r = requests.get(loc, timeout=5); r.raise_for_status()
                         images_data.append(r.content)
                     else:
-                        with open(loc,"rb") as f: images_data.append(f.read())
-                except:
+                        with open(loc, "rb") as f:
+                            images_data.append(f.read())
+                except Exception:
                     pass
         if images_data:
+            # assume your chat() supports images on the last user message
             messages[-1]["images"] = images_data
-
-        # helpers & loosened thresholds
-        _punct_re   = re.compile(r'^[\W_]+$')
-        _border_re  = re.compile(r'^[\s\-\=\+\|\:\.\`~]{3,}$')
-        TOKEN_LIMIT = 20
-        LINE_LIMIT  = 20
-        SUBSTR_LIMIT= 20
-        TIMEOUT_SEC = 5*60
-        MAX_TRIES   = 3
-
+    
+        # ── guards & constants ────────────────────────────────────────────
+        _punct_re    = re.compile(r'^[\W_]+$')               # punctuation-only
+        _border_re   = re.compile(r'^[\s\-\=\+\|\:\.\`~]{3,}$')
+        _whitespace  = re.compile(r'^\s*$')
+    
+        # thresholds
+        TOKEN_LIMIT        = 20   # identical short delta seen > TOKEN_LIMIT times
+        LINE_LIMIT         = 20   # exact same non-border line repeated ≥ LINE_LIMIT
+        SUBSTR_LIMIT       = 20   # tail substr repeat threshold
+        SUBSTR_MIN         = 30   # only check substrings >= this length
+        GUARDS_START_AT    = 120  # don't trigger guards until we have this many chars
+        SHORT_DELTA_MAXLEN = 8    # only count identical deltas up to this length
+        TIMEOUT_SEC        = 5 * 60
+        MAX_TRIES          = 3
+    
         def _log(msg, lvl="INFO"):
+            # assumes your project provides log_message(level)
             log_message(f"auxiliary_inference: {msg}", lvl)
-
+    
         def _substr_count(txt, sub):
             return txt.count(sub)
-
-        for attempt in range(1, MAX_TRIES+1):
-            _log(f"starting attempt #{attempt} (model={model_selected}, temp={temperature})","PROCESS")
+    
+        def _retry_options(base_opts: dict, attempt: int) -> dict:
+            """Adaptive sampling knobs for retries."""
+            opts = dict(base_opts)
+            if attempt == 2:
+                # add repetition pressure
+                opts.update({
+                    "frequency_penalty": 0.6,
+                    "presence_penalty": 0.3,
+                })
+            elif attempt >= 3:
+                # stronger guard; slightly cooler sampling
+                opts.update({
+                    "temperature": max(0.2, float(opts.get("temperature", 0.7)) * 0.75),
+                    "frequency_penalty": 0.8,
+                    "presence_penalty": 0.4,
+                })
+            return opts
+    
+        def _retry_model(curr_model: str, attempt: int) -> str:
+            """Optionally fall back to a different tier on late attempts."""
+            if attempt == 3:
+                # try decision or secondary for a different sampling profile
+                if selected_tier != "decision" and "decision_model" in config:
+                    return tier_map["decision"]
+                if selected_tier != "secondary" and "secondary_model" in config:
+                    return tier_map["secondary"]
+            return curr_model
+    
+        base_options = {"temperature": temperature}
+    
+        content = ""  # defined outside loop so we can return something even on give-up
+        for attempt in range(1, MAX_TRIES + 1):
+            # adapt options/model per attempt
+            options = _retry_options(base_options, attempt)
+            model_to_use = _retry_model(model_selected, attempt)
+    
+            _log(f"starting attempt #{attempt} (model={model_to_use}, opts={options})", "PROCESS")
             content = ""
             prev_tok = None
             tok_rep  = 0
             line_ctr = collections.Counter()
             start_ts = time.time()
-
+    
             try:
-                print("⟳ Auxiliary-LLM stream:",end="",flush=True)
-                for part in chat(model=model_selected,
+                print("⟳ Auxiliary-LLM stream:", end="", flush=True)
+    
+                # NOTE: your streamer is assumed to yield dicts with at least message.content,
+                # and optionally a 'finish_reason' at the end.
+                for part in chat(model=model_to_use,
                                  messages=messages,
                                  stream=True,
-                                 options={"temperature": temperature}):
-                    tok = part["message"]["content"]
+                                 options=options):
+    
+                    # Extract delta safely
+                    msg = part.get("message", {}) if isinstance(part, dict) else {}
+                    tok = msg.get("content", "")
+    
+                    # If the streamer signals the end explicitly, stop cleanly
+                    finish_reason = part.get("finish_reason") if isinstance(part, dict) else None
+                    if finish_reason in ("stop", "eos_token"):
+                        break
+    
                     now = time.time()
-
-                    # timeout
                     if now - start_ts > TIMEOUT_SEC:
                         raise TimeoutError("exceeded 5-minute limit")
-
-                    # identical-token guard
-                    if tok == prev_tok:
-                        tok_rep += 1
-                        if tok_rep > TOKEN_LIMIT and not _punct_re.match(tok):
-                            raise RuntimeError("repeated token spam")
-                    else:
-                        tok_rep = 0
-                    prev_tok = tok
-
+    
+                    # Ignore empty/whitespace/border-only deltas entirely
+                    if not tok or _whitespace.match(tok) or _border_re.match(tok):
+                        continue
+    
+                    # append and echo
                     content += tok
                     print(tok, end="", flush=True)
-
-                    # line-based guard
+    
+                    # Only start anti-repeat guards after we have some real text
+                    if len(content) < GUARDS_START_AT:
+                        prev_tok = tok
+                        tok_rep = 0
+                        continue
+    
+                    # identical short-delta guard (skip long chunks & punctuation-only)
+                    if len(tok) <= SHORT_DELTA_MAXLEN and not _punct_re.match(tok):
+                        if tok == prev_tok:
+                            tok_rep += 1
+                            if tok_rep > TOKEN_LIMIT:
+                                raise RuntimeError("repeated token spam (short delta)")
+                        else:
+                            tok_rep = 0
+                    prev_tok = tok
+    
+                    # line-based guard (only substantive lines)
                     if "\n" in tok:
                         for ln in tok.splitlines():
                             ln = ln.strip()
-                            if ln and not _border_re.match(ln):
+                            if ln and not _border_re.match(ln) and len(ln) >= 4:
                                 line_ctr[ln] += 1
                                 if line_ctr[ln] >= LINE_LIMIT:
                                     raise RuntimeError("repeated line spam")
-
-                    # substring guard
-                    if len(content) > 240:
-                        tail = content[-120:]
-                        for L in range(20, 121, 10):
+    
+                    # substring guard (tail windows, only substantive substrings)
+                    if len(content) > 2 * SUBSTR_MIN:
+                        tail = content[-max(240, SUBSTR_MIN*4):]
+                        for L in range(SUBSTR_MIN, min(120, len(tail))+1, 10):
                             sub = tail[-L:].strip()
-                            if len(sub) >= 5 and _substr_count(content, sub) >= SUBSTR_LIMIT:
-                                raise RuntimeError("repeated substring spam")
-
+                            if len(sub) >= SUBSTR_MIN and not _whitespace.match(sub):
+                                if _substr_count(content, sub) >= SUBSTR_LIMIT:
+                                    raise RuntimeError("repeated substring spam")
+    
                 print()
-                _log("complete.","SUCCESS")
+                _log("complete.", "SUCCESS")
                 return content
-
+    
             except (TimeoutError, RuntimeError) as e:
-                _log(f"{e}; retrying","WARNING")
-                time.sleep(1.0)
+                # brief jittered backoff; on last attempt we’ll fall through and return what we have
+                _log(f"{e}; retrying", "WARNING")
+                time.sleep(0.5 + random.random() * 0.5)
                 continue
-
+    
             except Exception as e:
-                _log(f"fatal error: {e}","ERROR")
-                return json.dumps({"error": str(e)})
-
-        # after MAX_TRIES
-        _log(f"giving up after {MAX_TRIES} attempts","ERROR")
+                _log(f"fatal error: {e}", "ERROR")
+                # Return structured error (preserve prior content if any)
+                return json.dumps({"error": str(e), "partial": content or None})
+    
+        # after MAX_TRIES, return whatever we captured (may be empty)
+        _log(f"giving up after {MAX_TRIES} attempts", "ERROR")
         return content
+
 
 
 
