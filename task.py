@@ -1,7 +1,8 @@
 """
 task.py
 
-A self-contained, idempotent task/reminder scheduler with robust de-dupe:
+A self-contained, idempotent task/reminder scheduler with robust de-dupe
+and JSONL write throttling:
 
 • Natural-language detection (“remind me…”, “in 15m”, “tomorrow 7am”, “every weekday at 9”)
 • ContextObject(stage="task") lifecycle:
@@ -9,16 +10,17 @@ A self-contained, idempotent task/reminder scheduler with robust de-dupe:
 • Single background asyncio daemon; wakes on demand, sleeps otherwise
 • Delivery via provided async/sync send_func(chat_id, text)
 
-De-dup layers:
+De-dup & stability layers:
 1) Stable task_key at schedule time
-2) Per-task delivery guard fields:
+2) Per-task delivery guard fields in metadata:
    - attempt_delivery_key / attempt_epoch  (written BEFORE send)
    - last_delivery_key                      (written AFTER successful send)
-3) Claim+lease with verify, so only one worker sends
+3) Claim+lease with verification, so only one worker sends
 4) In-process TTL cache to mute bursts even if the repo hiccups
 5) Stale-lease repair returns 'firing' to 'scheduled' safely
-
-Drop-in replacement.
+6) Write throttling + change fingerprinting to stop JSONL churn
+7) due_utc_iso/epoch normalization to avoid 1s epoch drift storms
+8) Auto-finalize overdue one-shots (no re-send) to quiet “zombie” tasks
 """
 
 from __future__ import annotations
@@ -39,6 +41,11 @@ SLEEP_DEFAULT_SEC     = 60.0         # max sleep if nothing due
 QUERY_BATCH_MAX       = 2000         # soft cap; repo.query still decides
 CLAIM_BACKOFF_SEC     = 5            # backoff if claim verification fails
 RETRY_SKEW_SEC        = 10           # small skew on rescheduling after guard conflict
+
+# JSONL protection
+WRITE_THROTTLE_SEC    = 8            # minimum seconds between identical saves per context
+DUE_EPOCH_WIGGLE_SEC  = 2            # tolerate tiny epoch drift when comparing
+OVERDUE_GRACE_SEC     = 5            # how long past due before we auto-finalize one-shots
 
 
 class TaskScheduler:
@@ -71,6 +78,10 @@ class TaskScheduler:
 
         # in-process delivery guard: delivery_key -> last_epoch
         self._recent_deliveries: Dict[str, int] = {}
+
+        # write-throttle caches
+        self._fp_cache: Dict[str, str] = {}
+        self._fp_time: Dict[str, int] = {}
 
     # ─────────────────────────── Public API ────────────────────────────
 
@@ -167,18 +178,104 @@ class TaskScheduler:
         except Exception:
             return None
 
-    def _safe_save(self, co: Any) -> bool:
-        """Save with tiny retries to smooth over SQLite hiccups. Returns success."""
+    # ─── JSONL-protecting save helpers ─────────────────────────────────
+
+    def _meaningful_fingerprint(self, co: Any) -> str:
+        """Hash only fields that actually matter; bucket due_epoch to avoid 1s churn."""
+        import json
+        ctx_id = getattr(co, "context_id", None)
+        md = (getattr(co, "metadata", None) or {}).copy()
+        # bucket due_epoch to 5s to avoid write storms from 1s drift
+        due_epoch = md.get("due_epoch")
+        if isinstance(due_epoch, (int, float)):
+            md["due_epoch_bucket"] = int(due_epoch) // 5
+        # keep only meaningful keys
+        keep = {
+            "status","due_epoch_bucket","due_utc_iso","rrule",
+            "lease_owner","lease_epoch","send_token",
+            "attempt_delivery_key","attempt_epoch","last_delivery_key",
+            "task_key","telegram_chat_id","title","tz_offset_minutes"
+        }
+        md_trim = {k: md.get(k) for k in sorted(keep)}
+        base = {
+            "context_id": ctx_id,
+            "stage_id": getattr(co, "stage_id", None),
+            "summary": getattr(co, "summary", None),
+            "metadata": md_trim,
+        }
+        s = repr(base).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+
+    def _normalize_due_fields(self, co: Any) -> bool:
+        """Fix due_epoch if it disagrees with due_utc_iso (>2s). Returns True if changed."""
+        md = co.metadata or {}
+        iso = md.get("due_utc_iso")
+        ep  = md.get("due_epoch")
+        if not iso or not isinstance(ep, (int, float)):
+            return False
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            good = int(dt.astimezone(timezone.utc).timestamp())
+        except Exception:
+            return False
+        if abs(int(ep) - good) > DUE_EPOCH_WIGGLE_SEC:
+            md["due_epoch"] = good
+            return True
+        return False
+
+    def _finalize_stuck_overdue(self, co: Any, now_epoch: int) -> bool:
+        """
+        Non-RRULE, scheduled, due in the past → mark sent (no new message).
+        Returns True if it changed the object.
+        """
+        md = co.metadata or {}
+        if md.get("status") != "scheduled": return False
+        if md.get("rrule"): return False
+        due = md.get("due_epoch")
+        if not isinstance(due, (int, float)): return False
+        if int(due) <= (now_epoch - OVERDUE_GRACE_SEC):
+            md["status"] = "sent"
+            md["sent_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+            # make the delivery key deterministic so future scans see it as finalized
+            title = md.get("title") or ""
+            chat_id = md.get("telegram_chat_id")
+            task_key = md.get("task_key") or _mk_task_key(title, int(due), str(chat_id) if chat_id is not None else None)
+            md["last_delivery_key"] = _mk_delivery_key(task_key, int(due))
+            return True
+        return False
+
+    def _safe_save(self, co: Any, *, allow_churn: bool = False) -> bool:
+        """
+        Save with retries, but skip if nothing meaningful changed recently.
+        Set allow_churn=True only for truly new objects (e.g., initial creation).
+        """
+        ctx_id = getattr(co, "context_id", None)
+        now = _now_epoch()
+        fp = self._meaningful_fingerprint(co)
+
+        # throttle identical writes
+        if not allow_churn:
+            last_fp = self._fp_cache.get(ctx_id)
+            last_t  = self._fp_time.get(ctx_id, 0)
+            if fp == last_fp and (now - last_t) < WRITE_THROTTLE_SEC:
+                return True  # treat as success; nothing to persist
+
+        # perform the actual save with small retries
         last_err = None
         for _ in range(self._sqlite_retry_tries):
             try:
                 self.repo.save(co)
+                # cache on success
+                self._fp_cache[ctx_id] = fp
+                self._fp_time[ctx_id] = now
                 return True
             except Exception as e:
                 last_err = e
                 time.sleep(self._sqlite_retry_ms / 1000.0)
         self.logger.error("TaskScheduler: repo.save failed after retries: %s", last_err)
         return False
+
+    # ─── scheduling ───────────────────────────────────────────────────
 
     def _schedule_task_from_parse(self, parse: dict, state: dict, user_ctx: Any | None) -> Tuple[bool, str]:
         from context import ContextObject  # local import to avoid cycles
@@ -270,7 +367,7 @@ class TaskScheduler:
             "tz_offset_minutes": tz_off_min,
             "source": "task_scheduler",
             "send_token": 0,  # monotonic bump on claim
-            # delivery guards:
+            # delivery guards (populated later):
             # "attempt_delivery_key": str
             # "attempt_epoch": int
             # "last_delivery_key": str
@@ -279,7 +376,7 @@ class TaskScheduler:
             md["due_local_iso"] = due_local.isoformat()
 
         task.touch()
-        self._safe_save(task)
+        self._safe_save(task, allow_churn=True)
 
         # human ACK
         if rrule and not due_local:
@@ -348,11 +445,23 @@ class TaskScheduler:
                 if len(tasks) > QUERY_BATCH_MAX:
                     tasks = tasks[:QUERY_BATCH_MAX]
 
+                # 1a) normalize due fields + finalize ancient one-shots; save only if changed
+                for t in tasks:
+                    changed = False
+                    changed |= self._normalize_due_fields(t)
+                    changed |= self._finalize_stuck_overdue(t, now_epoch)
+                    if changed:
+                        self._safe_save(t)
+
+                # 1b) compute due_now / next_epoch
                 next_epoch = None
                 due_now = []
 
                 for t in tasks:
                     md = t.metadata or {}
+                    if md.get("status") != "scheduled":
+                        continue
+
                     due_epoch = md.get("due_epoch")
                     rrule = md.get("rrule")
                     tz_offset = int(md.get("tz_offset_minutes", 0))
@@ -846,6 +955,7 @@ def _next_epoch_from_rrule(rrule: str, after_epoch: int, tz_offset_minutes: int 
         day_map = {"MO":0,"TU":1,"WE":2,"TH":3,"FR":4,"SA":5,"SU":6}
         targets = [day_map[d] for d in byday_str.split(",") if d in day_map] or list(day_map.values())
         start = after_local
+        # search up to interval * 2 weeks ahead
         for _ in range(14):
             for d in sorted(targets):
                 cand = start + timedelta(days=(d - start.weekday()) % 7)
