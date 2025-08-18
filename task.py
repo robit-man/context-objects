@@ -1,33 +1,44 @@
 """
 task.py
 
-A self-contained, idempotent task/reminder scheduler:
+A self-contained, idempotent task/reminder scheduler with robust de-dupe:
 
 • Natural-language detection (“remind me…”, “in 15m”, “tomorrow 7am”, “every weekday at 9”)
-• Creates ContextObject(stage="task") with status transitions:
-    scheduled -> firing -> sent  (and back to scheduled for RRULE recurrences)
-• Single background asyncio daemon that wakes on demand, sleeps otherwise
-• Telegram delivery via a provided async/sync send_func(chat_id, text)
-• Robust de-dupe using a stable task_key and small time window guard
-• Safe, tiny-retry writes to your repo (reduces SQLite hiccups)
+• ContextObject(stage="task") lifecycle:
+    scheduled -> firing(leased) -> sent  (and back to scheduled for RRULE recurrences)
+• Single background asyncio daemon; wakes on demand, sleeps otherwise
+• Delivery via provided async/sync send_func(chat_id, text)
 
-Usage:
-    scheduler = TaskScheduler(repo=self.repo, logger=self.logger, send_func=self._send_telegram)
-    scheduler.ensure_running()
-    scheduled, ack = scheduler.maybe_schedule(user_text, state, user_ctx)
-    if scheduled: return ack
+De-dup layers:
+1) Stable task_key at schedule time
+2) Per-task delivery guard fields:
+   - attempt_delivery_key / attempt_epoch  (written BEFORE send)
+   - last_delivery_key                      (written AFTER successful send)
+3) Claim+lease with verify, so only one worker sends
+4) In-process TTL cache to mute bursts even if the repo hiccups
+5) Stale-lease repair returns 'firing' to 'scheduled' safely
+
+Drop-in replacement.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 import re
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Dict
+
+# ─────────────────────────── Tunables ────────────────────────────
+LEASE_TTL_SEC         = 300          # how long a "firing" lease is valid before we repair
+DELIVERY_DEDUPE_TTL   = 300          # suppress re-send for same delivery_key within this window
+SEND_BACKOFF_ON_FAIL  = 30           # seconds before retrying a failed send
+SLEEP_DEFAULT_SEC     = 60.0         # max sleep if nothing due
+QUERY_BATCH_MAX       = 2000         # soft cap; repo.query still decides
+CLAIM_BACKOFF_SEC     = 5            # backoff if claim verification fails
+RETRY_SKEW_SEC        = 10           # small skew on rescheduling after guard conflict
 
 
 class TaskScheduler:
@@ -49,7 +60,7 @@ class TaskScheduler:
         """
         self.repo = repo
         self.logger = logger or _NullLogger()
-        self.send_func = send_func  # may be None (then we just log)
+        self.send_func = send_func
         self.node_id = node_id
 
         self._sched_event: Optional[asyncio.Event] = None
@@ -57,6 +68,9 @@ class TaskScheduler:
 
         self._sqlite_retry_ms = int(sqlite_retry_ms)
         self._sqlite_retry_tries = int(sqlite_retry_tries)
+
+        # in-process delivery guard: delivery_key -> last_epoch
+        self._recent_deliveries: Dict[str, int] = {}
 
     # ─────────────────────────── Public API ────────────────────────────
 
@@ -88,7 +102,7 @@ class TaskScheduler:
         Detect & schedule a reminder from free text.
         Returns (scheduled?, ack_string). Idempotent (won’t create dups).
 
-        state must contain at least:
+        state must contain:
           - conversation_id
           - user_id
           - user_text (best-effort)
@@ -153,17 +167,18 @@ class TaskScheduler:
         except Exception:
             return None
 
-    def _safe_save(self, co: Any) -> None:
-        """Save with tiny retries to smooth over SQLite 'another row available' hiccups."""
+    def _safe_save(self, co: Any) -> bool:
+        """Save with tiny retries to smooth over SQLite hiccups. Returns success."""
         last_err = None
-        for i in range(self._sqlite_retry_tries):
+        for _ in range(self._sqlite_retry_tries):
             try:
                 self.repo.save(co)
-                return
+                return True
             except Exception as e:
                 last_err = e
                 time.sleep(self._sqlite_retry_ms / 1000.0)
         self.logger.error("TaskScheduler: repo.save failed after retries: %s", last_err)
+        return False
 
     def _schedule_task_from_parse(self, parse: dict, state: dict, user_ctx: Any | None) -> Tuple[bool, str]:
         from context import ContextObject  # local import to avoid cycles
@@ -254,6 +269,11 @@ class TaskScheduler:
             "tz_name": now_local.tzname() or "Local",
             "tz_offset_minutes": tz_off_min,
             "source": "task_scheduler",
+            "send_token": 0,  # monotonic bump on claim
+            # delivery guards:
+            # "attempt_delivery_key": str
+            # "attempt_epoch": int
+            # "last_delivery_key": str
         })
         if due_local:
             md["due_local_iso"] = due_local.isoformat()
@@ -272,7 +292,6 @@ class TaskScheduler:
             else:
                 ack = f"All set — **{title}** at {local_str} ({rel}). I’ll message you here when it’s time."
 
-        # telemetry
         try:
             self.logger.info("TaskScheduler: scheduled title=%s chat=%s due_epoch=%s rrule=%s",
                              title, chat_id, due_epoch, rrule)
@@ -280,29 +299,55 @@ class TaskScheduler:
             pass
 
         return True, ack
-    
+
     async def _scheduler_loop(self):
-        """Single background worker; never dies (catches and logs).
-        Guarantees one notification per (task, due_epoch) via a fire-token.
-        """
-        event = self._sched_event or asyncio.Event()
+        """Single background worker; never dies (catches and logs)."""
+        if self._sched_event is None:
+            self._sched_event = asyncio.Event()
+        event = self._sched_event
 
         while True:
             try:
                 now_epoch = _now_epoch()
+                self._prune_inproc_dedupe(now_epoch)
+
+                # 0) repair: reclaim stale 'firing' leases
+                try:
+                    def _is_stale_firing(c):
+                        try:
+                            if getattr(c, "stage_id", None) == "task":
+                                md = c.metadata or {}
+                                if md.get("status") == "firing":
+                                    lease_epoch = int(md.get("lease_epoch", 0) or 0)
+                                    return (now_epoch - lease_epoch) > LEASE_TTL_SEC
+                        except Exception:
+                            return False
+                        return False
+
+                    stale = list(self.repo.query(_is_stale_firing))
+                    for t in stale:
+                        md = t.metadata or {}
+                        md["status"] = "scheduled"
+                        md["due_epoch"] = now_epoch + max(5, SEND_BACKOFF_ON_FAIL // 2)
+                        md["repaired_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                        self._safe_save(t)
+                except Exception as e:
+                    self.logger.warning("TaskScheduler: stale-lease repair failed: %s", e)
 
                 # 1) gather scheduled
                 def _is_sched(c):
                     try:
                         if getattr(c, "stage_id", None) == "task" or getattr(c, "semantic_label", "") in ("task","reminder","scheduled_task"):
                             md = c.metadata or {}
-                            # Only tasks explicitly scheduled are considered here
                             return md.get("status") == "scheduled"
                     except Exception:
                         return False
                     return False
 
                 tasks = list(self.repo.query(_is_sched))
+                if len(tasks) > QUERY_BATCH_MAX:
+                    tasks = tasks[:QUERY_BATCH_MAX]
+
                 next_epoch = None
                 due_now = []
 
@@ -320,39 +365,14 @@ class TaskScheduler:
                             md["due_utc_iso"] = datetime.fromtimestamp(due_epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
                             self._safe_save(t)
 
-                    # skip if not a number
-                    if not isinstance(due_epoch, (int, float)):
-                        continue
-
-                    # idempotency token for this firing window
-                    fire_token = f"{md.get('task_key') or t.context_id}:{int(due_epoch)}"
-
-                    # If we've already fired for this window, roll it forward (RRULE) or mark done.
-                    if md.get("last_fire_token") == fire_token:
-                        if rrule:
-                            nxt = _next_epoch_from_rrule(rrule, now_epoch, tz_offset)
-                            if nxt:
-                                md["status"] = "scheduled"
-                                md["due_epoch"] = int(nxt)
-                                md["due_utc_iso"] = datetime.fromtimestamp(nxt, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-                                self._safe_save(t)
-                                next_epoch = nxt if next_epoch is None else min(next_epoch, nxt)
-                        else:
-                            md["status"] = "done"
-                            md.pop("due_epoch", None)
-                            md.pop("due_utc_iso", None)
-                            self._safe_save(t)
-                        continue
-
-                    if due_epoch <= now_epoch:
-                        # Only consider due-now if not already fired for this due window
-                        due_now.append((t, fire_token))
-                    else:
+                    if isinstance(due_epoch, (int, float)) and due_epoch <= now_epoch:
+                        due_now.append(t)
+                    elif isinstance(due_epoch, (int, float)):
                         next_epoch = due_epoch if next_epoch is None else min(next_epoch, due_epoch)
 
                 # 2) sleep until next due (or a wakeup)
                 if not due_now:
-                    timeout = 60.0
+                    timeout = SLEEP_DEFAULT_SEC
                     if next_epoch is not None:
                         timeout = max(0.0, float(next_epoch - now_epoch))
                     event.clear()
@@ -360,27 +380,70 @@ class TaskScheduler:
                         await asyncio.wait_for(event.wait(), timeout=timeout)
                         continue
                     except asyncio.TimeoutError:
-                        pass  # time to re-check
+                        pass
 
-                # 3) fire each due task (idempotent)
-                for t, fire_token in due_now:
+                # 3) fire each due task
+                for t in due_now:
                     md = t.metadata or {}
-                    # Re-check status; bail if someone else moved it
                     if md.get("status") != "scheduled":
-                        continue
-
-                    # best-effort claim
-                    md["status"] = "firing"
-                    md["lease_owner"] = self.node_id
-                    md["lease_epoch"] = _now_epoch()
-                    # Stash the current window token we're attempting to fire
-                    md["pending_fire_token"] = fire_token
-                    self._safe_save(t)
+                        continue  # someone else claimed
 
                     title = md.get("title") or (getattr(t, "summary", "") or "Reminder")
                     chat_id = md.get("telegram_chat_id")
-                    text = f"⏰ Reminder: {title}"
+                    due_epoch = int(md.get("due_epoch") or now_epoch)
+                    task_key = md.get("task_key") or _mk_task_key(title, due_epoch, str(chat_id) if chat_id is not None else None)
+                    delivery_key = _mk_delivery_key(task_key, due_epoch)
 
+                    # If we ever sent (or finalized) this exact due, don't send again.
+                    if md.get("last_delivery_key") == delivery_key:
+                        self._mark_sent_or_reschedule(t, delivered=True)
+                        continue
+
+                    # If there was an attempt for this exact due within TTL, avoid a rapid duplicate.
+                    attempt_key = md.get("attempt_delivery_key")
+                    attempt_epoch = int(md.get("attempt_epoch") or 0)
+                    if attempt_key == delivery_key and (now_epoch - attempt_epoch) < DELIVERY_DEDUPE_TTL:
+                        # push a tiny backoff to re-evaluate later (don’t spam)
+                        md["due_epoch"] = now_epoch + RETRY_SKEW_SEC
+                        self._safe_save(t)
+                        continue
+
+                    # in-process TTL guard (belt & suspenders)
+                    if self._inproc_guard_hit(delivery_key, now_epoch):
+                        md["due_epoch"] = now_epoch + RETRY_SKEW_SEC
+                        self._safe_save(t)
+                        continue
+
+                    # claim with lease + token
+                    send_token_new = int(md.get("send_token", 0) or 0) + 1
+                    md["status"] = "firing"
+                    md["lease_owner"] = self.node_id
+                    md["lease_epoch"] = now_epoch
+                    md["send_token"] = send_token_new
+
+                    if not self._safe_save(t):
+                        self.logger.warning("TaskScheduler: claim save failed; skipping send for %s", getattr(t, "context_id", "?"))
+                        continue
+
+                    if not self._verify_claim(t, send_token_new):
+                        # couldn't verify claim; return to scheduled soon
+                        md["status"] = "scheduled"
+                        md["due_epoch"] = now_epoch + CLAIM_BACKOFF_SEC
+                        self._safe_save(t)
+                        continue
+
+                    # Guard the attempt BEFORE sending
+                    md["attempt_delivery_key"] = delivery_key
+                    md["attempt_epoch"] = now_epoch
+                    if not self._safe_save(t):
+                        # can't persist attempt → do not send (prevents infinite dup storms)
+                        md["status"] = "scheduled"
+                        md["due_epoch"] = now_epoch + CLAIM_BACKOFF_SEC
+                        self._safe_save(t)
+                        continue
+
+                    # Send the reminder
+                    text = f"⏰ Reminder: {title}"
                     delivered = False
                     try:
                         if self.send_func and chat_id is not None:
@@ -393,51 +456,99 @@ class TaskScheduler:
                             delivered = True
                     except Exception as e:
                         self.logger.warning("TaskScheduler: delivery failed: %s", e)
+                        delivered = False
 
                     if delivered:
-                        # Mark this due window as completed exactly once
-                        md["last_fire_token"] = fire_token
-                        md["sent_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-                        md.pop("pending_fire_token", None)
-
-                        # recurrence?
-                        rrule = md.get("rrule")
-                        if rrule:
-                            nxt = _next_epoch_from_rrule(rrule, _now_epoch(), int(md.get("tz_offset_minutes", 0)))
-                            if nxt:
-                                md["status"] = "scheduled"
-                                md["due_epoch"] = int(nxt)
-                                md["due_utc_iso"] = datetime.fromtimestamp(nxt, tz=timezone.utc).isoformat().replace("+00:00","Z")
-                            else:
-                                # no next occurrence → finalize
-                                md["status"] = "done"
-                                md.pop("due_epoch", None)
-                                md.pop("due_utc_iso", None)
-                        else:
-                            # one-shot → finalize so it never re-fires
-                            md["status"] = "done"
-                            md.pop("due_epoch", None)
-                            md.pop("due_utc_iso", None)
+                        self._set_inproc_guard(delivery_key, now_epoch)
+                        # mark as sent & stamp last_delivery_key
+                        md["last_delivery_key"] = delivery_key
+                        self._mark_sent_or_reschedule(t, delivered=True)
                     else:
-                        # put back with small backoff; do NOT set last_fire_token so we can retry later
-                        backoff = int(md.get("retry_backoff_sec", 30))
-                        backoff = min(max(backoff, 15), 300)
+                        # put back with small backoff
                         md["status"] = "scheduled"
-                        md["due_epoch"] = _now_epoch() + backoff
-                        md["due_utc_iso"] = datetime.fromtimestamp(md["due_epoch"], tz=timezone.utc).isoformat().replace("+00:00","Z")
-                        md["retry_backoff_sec"] = min(backoff * 2, 900)  # exponential cap 15m
-                        md.pop("pending_fire_token", None)
-
-                    self._safe_save(t)
+                        md["due_epoch"] = _now_epoch() + SEND_BACKOFF_ON_FAIL
+                        self._safe_save(t)
 
             except asyncio.CancelledError:
-                break  # shutting down
+                break
             except Exception:
                 try:
                     self.logger.exception("TaskScheduler: loop crashed:\n%s", traceback.format_exc())
                 except Exception:
                     pass
                 await asyncio.sleep(0.5)
+
+    # ─────────────────────────── Claim / Guard helpers ─────────────────────────
+
+    def _verify_claim(self, task_obj: Any, expected_token: int) -> bool:
+        """
+        Best-effort verify that our claim persisted, by refetching the same context_id.
+        If your repo doesn't support ID lookup, this uses a tiny query filter.
+        """
+        ctx_id = getattr(task_obj, "context_id", None)
+
+        def _by_id_and_firing(c):
+            try:
+                if getattr(c, "stage_id", None) != "task":
+                    return False
+                if ctx_id is not None and getattr(c, "context_id", None) != ctx_id:
+                    return False
+                md = c.metadata or {}
+                return (
+                    md.get("status") == "firing"
+                    and md.get("lease_owner") == self.node_id
+                    and int(md.get("send_token", 0) or 0) == expected_token
+                )
+            except Exception:
+                return False
+
+        try:
+            matches = list(self.repo.query(_by_id_and_firing))
+            return len(matches) == 1
+        except Exception:
+            return False
+
+    def _mark_sent_or_reschedule(self, task_obj: Any, *, delivered: bool) -> None:
+        """Mark as sent, or compute next if RRULE. Best-effort save."""
+        md = task_obj.metadata or {}
+        md["sent_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+        rrule = md.get("rrule")
+
+        if delivered:
+            md["status"] = "sent"
+
+        if rrule:
+            nxt = _next_epoch_from_rrule(rrule, _now_epoch(), int(md.get("tz_offset_minutes", 0)))
+            if nxt:
+                md["status"] = "scheduled"
+                md["due_epoch"] = int(nxt)
+                md["due_utc_iso"] = datetime.fromtimestamp(nxt, tz=timezone.utc).isoformat().replace("+00:00","Z")
+                # clear attempt guard for next cycle
+                md.pop("attempt_delivery_key", None)
+                md.pop("attempt_epoch", None)
+        else:
+            # non-recurring: clear due to avoid any future 'due' math
+            md["due_epoch"] = None
+            md.pop("attempt_delivery_key", None)
+            md.pop("attempt_epoch", None)
+
+        self._safe_save(task_obj)
+
+    def _inproc_guard_hit(self, delivery_key: str, now_epoch: int) -> bool:
+        last = self._recent_deliveries.get(delivery_key)
+        if last is None:
+            return False
+        return (now_epoch - last) < DELIVERY_DEDUPE_TTL
+
+    def _set_inproc_guard(self, delivery_key: str, now_epoch: int) -> None:
+        self._recent_deliveries[delivery_key] = now_epoch
+
+    def _prune_inproc_dedupe(self, now_epoch: int) -> None:
+        if not self._recent_deliveries:
+            return
+        stale = [k for k, v in self._recent_deliveries.items() if (now_epoch - v) >= DELIVERY_DEDUPE_TTL]
+        for k in stale:
+            self._recent_deliveries.pop(k, None)
 
 
 # ─────────────────────────── Helpers (module-level) ───────────────────────────
@@ -453,6 +564,10 @@ def _now_epoch() -> int:
 
 def _mk_task_key(title: str, due_epoch: int | None, chat_id: str | None) -> str:
     base = f"{(title or '').strip().lower()}|{due_epoch or 0}|{chat_id or ''}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+def _mk_delivery_key(task_key: str, due_epoch: int) -> str:
+    base = f"{task_key}|{int(due_epoch)}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _fmt_local(dt: Optional[datetime]) -> str:
@@ -588,7 +703,6 @@ def _parse_time_bits(text: str, now_local: datetime) -> dict:
             if freq:
                 rrule = f"FREQ={freq};INTERVAL={n}"
                 conf = max(conf, 0.95)
-                # Keep any prior matched span for extraction; not essential
 
     # every weekday / daily
     if rrule is None:
@@ -707,8 +821,8 @@ def _next_epoch_from_rrule(rrule: str, after_epoch: int, tz_offset_minutes: int 
     after_local  = after_dt_utc + timedelta(minutes=tz_offset_minutes)
 
     def _local_to_utc_epoch(dt_local: datetime) -> int:
-        dt_utc = (dt_local - timedelta(minutes=tz_offset_minutes)).astimezone(timezone.utc)
-        return int(dt_utc.timestamp())
+        dt_utc = (dt_local - timedelta(minutes=tz_offset_minutes))
+        return int(dt_utc.replace(tzinfo=timezone.utc).timestamp())
 
     if freq == "SECONDLY":
         return _local_to_utc_epoch(after_local.replace(microsecond=0) + timedelta(seconds=interval))
@@ -732,7 +846,6 @@ def _next_epoch_from_rrule(rrule: str, after_epoch: int, tz_offset_minutes: int 
         day_map = {"MO":0,"TU":1,"WE":2,"TH":3,"FR":4,"SA":5,"SU":6}
         targets = [day_map[d] for d in byday_str.split(",") if d in day_map] or list(day_map.values())
         start = after_local
-        # search up to interval * 2 weeks ahead
         for _ in range(14):
             for d in sorted(targets):
                 cand = start + timedelta(days=(d - start.weekday()) % 7)
