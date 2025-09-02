@@ -1478,7 +1478,6 @@ class HybridContextRepository:
         return cls._singleton
 
 
-
 # ╔══════════════════════════════════════════════════════════════╗
 # ║            H O L O G R A P H I C   M E M O R Y               ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -1491,45 +1490,127 @@ _HMR_DECAY_SECS   = 60 * 60 * 24   # temporal proximity half-life (seconds)
 
 ContextRepository = HybridContextRepository
 
+import os
+import io
+import time
+import math
+import sqlite3
+import threading
+import collections
+from typing import Any, Dict, List, Optional, Callable, Tuple
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+
 # ─ MemoryManager / Service Layer ──────────────────────────────────────────────
 class MemoryManager:
     """
     High-level service for associative recall, reinforcement, pruning,
     spreading-activation (“thought chains”) and consolidation.
+
+    This implementation persists:
+      • Embeddings       → table embeddings(context_id, dim, vec BLOB)
+      • Graph edges      → table edges(src, dst, w, updated_at)
+      • Light node cache → table nodes(context_id, user_id, conversation_id,
+                                       summary, last_accessed, timestamp)
+
+    Notes:
+      • Uses WAL + useful PRAGMAs for speed/safety.
+      • Vector search computes dot products in NumPy over a capped candidate set.
+      • Graph decay executes in-SQL (update + delete).
     """
 
+    # ── legacy attrs (kept for compatibility; no longer used) ─────────────
     _graph: Dict[str, Dict[str, float]] = {}
     _graph_path: str = "context_repos/holo_graph.json"
 
     def __init__(self, repo: ContextRepository):
-        import json, os, threading
         self.repo = repo
-        self._graph_lock = threading.Lock()
-        # lazy-load persisted graph once
-        if not MemoryManager._graph and os.path.exists(self._graph_path):
-            try:
-                with open(self._graph_path, "r", encoding="utf-8") as f:
-                    MemoryManager._graph = json.load(f)
-            except Exception:
-                MemoryManager._graph = {}
+        self._graph_lock = threading.Lock()   # kept for API compatibility
+        self._db_lock = threading.Lock()
+        self._registered_ctxs: set[str] = set()
+        self._embed_cache: Dict[str, tuple[np.ndarray, float]] = {}
+
+        # choose DB path close to the repo
+        base_dir = "context_repos"
+        try:
+            # HybridContextRepository exposes sqlite_path/jsonl_path
+            if getattr(repo, "sqlite_path", None):
+                base_dir = os.path.dirname(os.path.abspath(repo.sqlite_path))
+            elif getattr(repo, "jsonl_path", None):
+                base_dir = os.path.dirname(os.path.abspath(repo.jsonl_path))
+        except Exception:
+            pass
+
+        os.makedirs(base_dir, exist_ok=True)
+        # one holo DB per repo (best-effort name)
+        db_name = "holo_graph"
+        try:
+            # bake in a short repo-id for isolation
+            rid = os.path.basename(getattr(repo, "sqlite_path", "global")).split(".")[0]
+            if rid:
+                db_name = f"holo_{rid}"
+        except Exception:
+            pass
+        self._db_path = os.path.join(base_dir, f"{db_name}.db")
+
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5.0)
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA temp_store=MEMORY;")
+        self._conn.execute("PRAGMA mmap_size=268435456;")  # 256MB
+        self._ensure_schema()
 
     # ──────────────────────────────────────────────────────────────
-    # Helpers
+    # DB schema & helpers
     # ──────────────────────────────────────────────────────────────
+    def _ensure_schema(self) -> None:
+        with self._conn:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    context_id TEXT PRIMARY KEY,
+                    dim        INTEGER NOT NULL,
+                    vec        BLOB NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS edges (
+                    src        TEXT NOT NULL,
+                    dst        TEXT NOT NULL,
+                    w          REAL NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (src, dst)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
+                CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+
+                CREATE TABLE IF NOT EXISTS nodes (
+                    context_id      TEXT PRIMARY KEY,
+                    user_id         TEXT,
+                    conversation_id TEXT,
+                    summary         TEXT,
+                    last_accessed   TEXT,
+                    timestamp       TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_nodes_conv_time
+                    ON nodes(conversation_id, last_accessed);
+                CREATE INDEX IF NOT EXISTS idx_nodes_user_time
+                    ON nodes(user_id, last_accessed);
+                """
+            )
+
     @staticmethod
     def _half_life_factor(delta_seconds: float, half_life_seconds: float) -> float:
-        """Return multiplicative decay factor using true half-life math."""
         if half_life_seconds <= 0:
             return 0.0
-        # 0.5 ** (dt / half_life)
         return 0.5 ** (max(delta_seconds, 0.0) / float(half_life_seconds))
 
     @staticmethod
     def _parse_ts(ts: str) -> datetime:
+        # Stored format: "%Y%m%dT%H%M%SZ"
         return datetime.strptime(ts, "%Y%m%dT%H%M%SZ")
 
     def _scope_filter(self, allowed_user: str | None, allowed_conv: str | None):
-        """Restrict repo scans to a user and/or conversation when provided."""
         def _f(c: ContextObject) -> bool:
             uid = (c.metadata or {}).get("user_id")
             cid = (c.metadata or {}).get("conversation_id")
@@ -1538,64 +1619,159 @@ class MemoryManager:
             return ok_user and ok_conv
         return _f
 
+    # nodes table mirrors essential metadata for fast selection
+    def _upsert_node(self, ctx: 'ContextObject') -> None:
+        try:
+            uid = (ctx.metadata or {}).get("user_id")
+            cid = (ctx.metadata or {}).get("conversation_id")
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO nodes(context_id, user_id, conversation_id,
+                                         summary, last_accessed, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(context_id) DO UPDATE SET
+                         user_id=excluded.user_id,
+                         conversation_id=excluded.conversation_id,
+                         summary=excluded.summary,
+                         last_accessed=excluded.last_accessed,
+                         timestamp=excluded.timestamp
+                    """,
+                    (
+                        ctx.context_id, uid, cid,
+                        (ctx.summary or ""),
+                        ctx.last_accessed,
+                        ctx.timestamp,
+                    )
+                )
+        except Exception:
+            pass
+
+    def _get_recent_candidates(self, user: str | None, conv: str | None, limit: int) -> List[str]:
+        where = []
+        args: List[Any] = []
+        if user is not None:
+            where.append("user_id = ?")
+            args.append(user)
+        if conv is not None:
+            where.append("conversation_id = ?")
+            args.append(conv)
+        wh = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT context_id
+            FROM nodes
+            {wh}
+            ORDER BY COALESCE(last_accessed, timestamp) ASC
+        """
+        # pull last N
+        ids: List[str] = []
+        try:
+            cur = self._conn.execute(sql, args)
+            rows = cur.fetchall()
+            if rows:
+                ids = [r[0] for r in rows[-limit:]]
+        except Exception:
+            pass
+        return ids
+
+    def _get_embeddings(self, ids: List[str]) -> Dict[str, np.ndarray]:
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        out: Dict[str, np.ndarray] = {}
+        try:
+            cur = self._conn.execute(
+                f"SELECT context_id, dim, vec FROM embeddings WHERE context_id IN ({placeholders})",
+                ids
+            )
+            for cid, dim, blob in cur.fetchall():
+                # vec stored as raw float32 bytes
+                v = np.frombuffer(blob, dtype=np.float32, count=dim)
+                out[cid] = v
+        except Exception:
+            pass
+        return out
+
+    def _persist_embedding(self, ctx_id: str, vec: np.ndarray) -> None:
+        vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+        blob = vec.tobytes(order="C")
+        dim = int(vec.shape[0])
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO embeddings(context_id, dim, vec)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(context_id) DO UPDATE SET
+                     dim=excluded.dim, vec=excluded.vec
+                """,
+                (ctx_id, dim, blob)
+            )
+
+    def _sum_assoc_strength(self, ids: List[str]) -> Dict[str, float]:
+        """Return total incident edge weight for each id (degree strength)."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        out: Dict[str, float] = {i: 0.0 for i in ids}
+        try:
+            # outgoing
+            cur = self._conn.execute(
+                f"SELECT src, SUM(w) FROM edges WHERE src IN ({placeholders}) GROUP BY src", ids
+            )
+            for src, s in cur.fetchall():
+                out[src] = out.get(src, 0.0) + float(s or 0.0)
+            # incoming
+            cur = self._conn.execute(
+                f"SELECT dst, SUM(w) FROM edges WHERE dst IN ({placeholders}) GROUP BY dst", ids
+            )
+            for dst, s in cur.fetchall():
+                out[dst] = out.get(dst, 0.0) + float(s or 0.0)
+        except Exception:
+            pass
+        return out
+
     # ──────────────────────────────────────────────────────────────
-    # Graph maintenance
+    # Graph maintenance (SQLite)
     # ──────────────────────────────────────────────────────────────
     def decay_graph_edges(self, half_life_secs: float = 86_400.0, min_w: float = 1e-6) -> None:
-        """Exponential decay on holographic edges; drop tiny weights."""
-        import time
         now = time.time()
-        # cache last decay time
         if not hasattr(self, "_last_graph_decay_ts"):
             self._last_graph_decay_ts = now
             return
         dt = max(now - self._last_graph_decay_ts, 0.0)
-        if dt < 60.0:   # throttle
+        if dt < 60.0:
             return
         factor = self._half_life_factor(dt, half_life_secs)
-        with self._graph_lock:
-            for u, nbrs in list(self._graph.items()):
-                for v, w in list(nbrs.items()):
-                    w2 = w * factor
-                    if w2 <= min_w:
-                        del nbrs[v]
-                    else:
-                        nbrs[v] = w2
-                if not nbrs:
-                    del self._graph[u]
+        with self._conn:
+            try:
+                self._conn.execute("UPDATE edges SET w = w * ?", (factor,))
+                self._conn.execute("DELETE FROM edges WHERE w <= ?", (min_w,))
+            except Exception:
+                pass
         self._last_graph_decay_ts = now
-        self._save_graph()
 
-    def start_episode(self, title: str, meta: Dict[str, Any] | None = None) -> ContextObject:
+    def start_episode(self, title: str, meta: Dict[str, Any] | None = None) -> 'ContextObject':
         from context import ContextObject
-        epi = ContextObject(
-            domain="stage",
-            component="episode",
-            semantic_label="episode",
-        )
+        epi = ContextObject(domain="stage", component="episode", semantic_label="episode")
         epi.summary = title
         epi.tags = ["episode"]
         epi.metadata.update(meta or {})
         self.repo.save(epi)
-        # remember current open episode id
         self._current_episode_id = epi.context_id
+        # cache in nodes
+        self._upsert_node(epi)
         return epi
 
-    def add_to_episode(self, ctx: ContextObject) -> None:
-        """Link a ctx into the open episode (if any) with strong edges."""
-        epi_id = getattr(self, "_current_episode_id", None)
-        if not epi_id:
+    def add_to_episode(self, ctx: 'ContextObject') -> None:
+        eid = getattr(self, "_current_episode_id", None)
+        if not eid:
             return
-        self._add_edge(epi_id, ctx.context_id, 1.5)
-        self._add_edge(ctx.context_id, epi_id, 1.0)
-        self._save_graph()
+        self._add_edge(eid, ctx.context_id, 1.5)
+        self._add_edge(ctx.context_id, eid, 1.0)
 
     def end_episode(self) -> None:
         if hasattr(self, "_current_episode_id"):
             delattr(self, "_current_episode_id")
 
     def consolidate_stm_to_ltm(self, promote_threshold: int = 3) -> None:
-        """Promote frequently-recalled items to LTM tier (and pin them)."""
         for ctx in self.repo.query(lambda c: True):
             cnt = (ctx.recall_stats or {}).get("count", 0)
             if cnt >= promote_threshold and ctx.memory_tier != "LTM":
@@ -1603,20 +1779,16 @@ class MemoryManager:
                 ctx.pinned = True
                 ctx.touch()
                 self.repo.save(ctx)
+                # keep nodes up-to-date
+                self._upsert_node(ctx)
 
+    # JSON graph saver is a no-op now (kept for API compatibility)
     def _save_graph(self) -> None:
-        """Persist holographic graph to disk (best-effort)."""
-        import json, os, tempfile, shutil
-        with self._graph_lock:
-            try:
-                os.makedirs(os.path.dirname(self._graph_path), exist_ok=True)
-                tmp = self._graph_path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self._graph, f)
-                shutil.move(tmp, self._graph_path)
-            except Exception:
-                pass
+        pass
 
+    # ──────────────────────────────────────────────────────────────
+    # Vector search (SQLite-backed embeddings)
+    # ──────────────────────────────────────────────────────────────
     def vector_search(
         self,
         cue_text: str,
@@ -1627,135 +1799,135 @@ class MemoryManager:
         embed_fn: Callable[[str], np.ndarray],
         reembed: bool = False,
         use_hybrid_rank: bool = True,
-    ) -> list[ContextObject]:
-        """
-        Pure vector search (optionally hybridized with recency + assoc).
-        - Persists embeddings lazily on each ContextObject.
-        - Scopes to user/conv if provided.
-        """
+    ) -> list['ContextObject']:
         if not cue_text:
             return []
 
-        # Build query vector (unit)
+        # query vector (unit)
         q = np.asarray(embed_fn(cue_text), dtype=np.float32).reshape(-1)
         q /= (np.linalg.norm(q) + 1e-9)
 
-        # Candidate pool: in-scope only
-        filt = self._scope_filter(allowed_user, allowed_conv)
-        # Keep only the most recent N to cap work; tune N to your scale
-        MAX_CANDS = int(os.getenv("CTX_VECTOR_MAX_CANDS", "1200"))
-        cands = self.repo.query(filt)
-        cands = sorted(cands, key=lambda c: (c.last_accessed or c.timestamp))[-MAX_CANDS:]
+        # candidate pool: most-recent in scope (from nodes table)
+        MAX_CANDS = int(os.getenv("CTX_VECTOR_MAX_CANDS", "2000"))
+        cand_ids = self._get_recent_candidates(allowed_user, allowed_conv, MAX_CANDS)
 
-        now = default_clock()
+        # ensure nodes table has content for fresh rows (best-effort)
+        if not cand_ids:
+            # fallback: scan repo (cap)
+            filt = self._scope_filter(allowed_user, allowed_conv)
+            recents = sorted(
+                self.repo.query(filt),
+                key=lambda c: (c.last_accessed or c.timestamp)
+            )[-MAX_CANDS:]
+            cand_ids = [c.context_id for c in recents]
+            for c in recents:
+                self._upsert_node(c)
 
-        def _get_unit_embed(c: ContextObject) -> np.ndarray | None:
-            # Use persisted if present; otherwise compute in-memory only for ranking
-            if not reembed and c.embedding:
-                v = np.asarray(c.embedding, dtype=np.float32).reshape(-1)
-            else:
-                txt = (c.summary or "").strip()
-                if not txt:
-                    return None
-                v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
-                # DO NOT persist here; we’ll batch-persist for selected results only
-            n = float(np.linalg.norm(v) + 1e-9)
-            return v / n      
-              
-        # Persist embeddings only for the final selected set (batch)
-        to_persist: list[ContextObject] = []
-        for c, _score in selected:
-            if not c.embedding:
+        # fetch embeddings for candidates; compute & persist missing if reembed or absent
+        emb_map = self._get_embeddings(cand_ids)
+        missing = [cid for cid in cand_ids if (cid not in emb_map) or reembed]
+
+        if missing:
+            # compute embeddings for the missing in one pass using repo
+            id_to_ctx: Dict[str, 'ContextObject'] = {}
+            for cid in missing:
                 try:
-                    txt = (c.summary or "").strip()
-                    if txt:
-                        emb = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
-                        c.embedding = emb.tolist()
-                        c.touch()
-                        to_persist.append(c)
-                except Exception:
-                    pass
-        if to_persist:
-            # Use SQLite async batch if available; fallback to repo.save in a loop.
-            try:
-                self.repo.sql_repo.enqueue_many(to_persist)  # fast path
-            except Exception:
-                for c in to_persist:
-                    self.repo.save(c)
+                    id_to_ctx[cid] = self.repo.get(cid)
+                except KeyError:
+                    continue
+            for cid, ctx in id_to_ctx.items():
+                txt = (ctx.summary or "").strip()
+                if not txt:
+                    continue
+                v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
+                self._persist_embedding(cid, v)
+                emb_map[cid] = v
 
-        rows = []
-        for c in cands:
-            u = _get_unit_embed(c)
-            if u is None:
-                continue
-            sim = float(np.dot(q, u))  # cosine (unit vectors)
-            # Optional hybrid re-rank
+        # build matrix for fast cosine = dot on unit vectors
+        rows: List[Tuple[str, float, float]] = []  # (id, hybrid_score, pure_sim)
+        if not emb_map:
+            return []
+
+        # align vectors
+        ids = [cid for cid in cand_ids if cid in emb_map]
+        V = np.stack([emb_map[cid] for cid in ids], axis=0).astype(np.float32)
+        norms = np.linalg.norm(V, axis=1, keepdims=True) + 1e-9
+        U = V / norms
+        sims = (U @ q).astype(np.float32)  # cosine
+
+        # optional hybrid terms
+        rec_map: Dict[str, float] = {}
+        assoc_map: Dict[str, float] = {}
+        if use_hybrid_rank:
+            # fetch node times for recency
+            placeholders = ",".join("?" for _ in ids)
+            try:
+                cur = self._conn.execute(
+                    f"SELECT context_id, COALESCE(last_accessed, timestamp) FROM nodes WHERE context_id IN ({placeholders})",
+                    ids
+                )
+                now = default_clock()
+                for cid, ts in cur.fetchall():
+                    try:
+                        last = self._parse_ts(ts)
+                        age = (now - last).total_seconds()
+                        rec_map[cid] = 1.0 / (1.0 + age)
+                    except Exception:
+                        rec_map[cid] = 0.0
+            except Exception:
+                pass
+            assoc_map = self._sum_assoc_strength(ids)
+
+        for i, cid in enumerate(ids):
+            sim = float(sims[i])
             if use_hybrid_rank:
-                # Recency term
-                last = _parse_ts(c.last_accessed or c.timestamp)
-                age = (now - last).total_seconds()
-                rec = 1.0 / (1.0 + age)
-                # Assoc prior: how connected is this node (degree/strength)
-                assoc = sum((c.association_strengths or {}).values())
-                # Normalize assoc lightly
-                assoc = np.log1p(assoc)
+                rec = rec_map.get(cid, 0.0)
+                assoc = math.log1p(assoc_map.get(cid, 0.0))
                 score = 0.55 * sim + 0.25 * rec + 0.20 * assoc
             else:
                 score = sim
-            rows.append((c, score, sim))
+            rows.append((cid, score, sim))
 
-        # rank
         rows.sort(key=lambda t: t[1], reverse=True)
         pool = rows[: max(top_k * 4, top_k)]
 
-        # MMR (reuse your alpha)
+        # MMR for diversity
         alpha = 0.75
-        selected: list[tuple[ContextObject, float]] = []
-        vec_cache: dict[str, np.ndarray] = {}
-
-        def _vec(c: ContextObject) -> np.ndarray | None:
-            v = vec_cache.get(c.context_id)
-            if v is not None:
-                return v
-            emb = np.asarray(c.embedding, dtype=np.float32).reshape(-1) if c.embedding else None
-            if emb is None or emb.size == 0:
-                return None
-            u = emb / (np.linalg.norm(emb) + 1e-9)
-            vec_cache[c.context_id] = u
-            return u
+        selected: List[Tuple[str, float]] = []
+        vec_cache: Dict[str, np.ndarray] = {cid: (U[ids.index(cid)]) for cid, _, _ in pool}
 
         cands = pool[:]
         while cands and len(selected) < top_k:
             best = None
             best_score = -1e9
-            for c, score, sim in cands:
+            for cid, score, _sim in cands:
                 if not selected:
                     mmr = score
                 else:
-                    v = _vec(c)
-                    if v is None:
-                        novelty = 1.0
-                    else:
-                        sims = []
-                        for cs, _s in selected:
-                            sv = _vec(cs)
-                            if sv is not None:
-                                sims.append(float(np.dot(v, sv)))
-                        novelty = 1.0 - max(sims) if sims else 1.0
+                    v = vec_cache.get(cid)
+                    sims2 = []
+                    for scid, _ in selected:
+                        sv = vec_cache.get(scid)
+                        if sv is not None and v is not None:
+                            sims2.append(float(np.dot(v, sv)))
+                    novelty = 1.0 - (max(sims2) if sims2 else 0.0)
                     mmr = alpha * score + (1.0 - alpha) * novelty
                 if mmr > best_score:
                     best_score = mmr
-                    best = (c, score)
+                    best = (cid, score)
             selected.append(best)
-            cands = [(c, s, sim) for (c, s, sim) in cands if c.context_id != best[0].context_id]
+            cands = [(cid, s, sim) for (cid, s, sim) in cands if cid != best[0]]
 
-        # finalize
-        out: list[ContextObject] = []
-        for c, score in selected:
-            c.retrieval_score = float(score)
-            out.append(c)
+        # materialize
+        out: List['ContextObject'] = []
+        for cid, score in selected:
+            try:
+                obj = self.repo.get(cid)
+                obj.retrieval_score = float(score)
+                out.append(obj)
+            except KeyError:
+                continue
         return out
-
 
     # ──────────────────────────────────────────────────────────────
     # Lightweight recall (one hop via association_strengths)
@@ -1765,14 +1937,13 @@ class MemoryManager:
         seed_ids: List[str],
         k: int = 5,
         weights: Optional[Dict[str, float]] = None
-    ) -> List[ContextObject]:
+    ) -> List['ContextObject']:
         weights = weights or {"assoc": 1.0, "recency": 1.0}
         now = default_clock()
-
         if not seed_ids:
             return []
 
-        # infer scope from the first seed (best-effort)
+        # infer scope
         owner_user = owner_conv = None
         try:
             first = self.repo.get(seed_ids[0])
@@ -1790,7 +1961,6 @@ class MemoryManager:
             except Exception:
                 return False
 
-        # 1) one-hop candidate scoring (scoped)
         scores: Dict[str, float] = {}
         for sid in seed_ids:
             try:
@@ -1810,9 +1980,8 @@ class MemoryManager:
                 base += weights["recency"] / (1.0 + age)
                 scores[oid] = scores.get(oid, 0.0) + base
 
-        # 2) top-k, stamp, record
         top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
-        results: List[ContextObject] = []
+        results: List['ContextObject'] = []
         for cid, score in top:
             try:
                 ctx = self.repo.get(cid)
@@ -1822,11 +1991,12 @@ class MemoryManager:
             ctx.retrieval_metadata = {"seed_ids": seed_ids}
             ctx.record_recall(stage_id="recall", coactivated_with=seed_ids, retrieval_score=score)
             self.repo.save(ctx)
+            self._upsert_node(ctx)
             results.append(ctx)
         return results
 
     # ──────────────────────────────────────────────────────────────
-    # Multi-hop activation over association_strengths
+    # Multi-hop activation over persisted edges (SQLite)
     # ──────────────────────────────────────────────────────────────
     def spread_activation(
         self,
@@ -1836,54 +2006,59 @@ class MemoryManager:
         assoc_weight: float = 1.0,
         recency_weight: float = 1.0,
     ) -> Dict[str, float]:
-        """
-        Perform spreading-activation from seed_ids over N hops.
-
-        - hops: max graph distance
-        - decay: per-hop multiplier (0 < decay ≤ 1)
-        - assoc_weight: scales edge strengths
-        - recency_weight: bonus per node based on recency
-        Returns a map {context_id: activation_score}.
-        """
         now = default_clock()
+        if not seed_ids:
+            return {}
         activation: Dict[str, float] = {cid: 1.0 for cid in seed_ids}
 
+        # one hop at a time (pull neighbors from SQL)
+        frontier = dict(activation)
         for hop in range(1, hops + 1):
-            new_act: Dict[str, float] = {}
-            for cid, act in list(activation.items()):
-                try:
-                    ctx = self.repo.get(cid)
-                except KeyError:
-                    continue
-                for neigh, strength in ctx.association_strengths.items():
-                    inc = act * strength * assoc_weight * (decay ** (hop - 1))
-                    new_act[neigh] = new_act.get(neigh, 0.0) + inc
-            # Merge new activations
-            for cid2, inc in new_act.items():
-                activation[cid2] = activation.get(cid2, 0.0) + inc
-
-        # Recency bonus
-        for cid in list(activation.keys()):
+            new_frontier: Dict[str, float] = {}
+            ids = list(frontier.keys())
+            if not ids:
+                break
+            placeholders = ",".join("?" for _ in ids)
             try:
-                ctx = self.repo.get(cid)
-                last = self._parse_ts(ctx.last_accessed)
-                age = (now - last).total_seconds()
-                activation[cid] += recency_weight / (1.0 + age)
+                cur = self._conn.execute(
+                    f"SELECT src, dst, w FROM edges WHERE src IN ({placeholders})",
+                    ids
+                )
+                for src, dst, w in cur.fetchall():
+                    act = frontier.get(src, 0.0)
+                    inc = act * float(w) * assoc_weight * (decay ** (hop - 1))
+                    new_frontier[dst] = new_frontier.get(dst, 0.0) + inc
             except Exception:
-                continue
+                pass
+            for k, v in new_frontier.items():
+                activation[k] = activation.get(k, 0.0) + v
+            frontier = new_frontier
+
+        # recency bonus (from nodes)
+        if activation:
+            placeholders = ",".join("?" for _ in activation.keys())
+            try:
+                cur = self._conn.execute(
+                    f"SELECT context_id, COALESCE(last_accessed, timestamp) FROM nodes WHERE context_id IN ({placeholders})",
+                    list(activation.keys())
+                )
+                for cid, ts in cur.fetchall():
+                    try:
+                        last = self._parse_ts(ts)
+                        age = (now - last).total_seconds()
+                        activation[cid] += recency_weight / (1.0 + age)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         return activation
 
-    # ──────────────────────────────────────────────────────────────
-    # Decay association strengths in objects + promotion to LTM
-    # ──────────────────────────────────────────────────────────────
     def decay_and_promote(
         self,
-        half_life: float = 86_400.0,     # seconds in a day
+        half_life: float = 86_400.0,
         promote_threshold: int = 3
     ) -> None:
-        import math
-
         now = default_clock()
         for row in list(self.repo.query(lambda c: True)):
             try:
@@ -1895,7 +2070,7 @@ class MemoryManager:
             delta = (now - last_ts).total_seconds()
 
             new_strengths: Dict[str, float] = {}
-            for oid, strength in ctx.association_strengths.items():
+            for oid, strength in (ctx.association_strengths or {}).items():
                 try:
                     self.repo.get(oid)
                 except KeyError:
@@ -1904,21 +2079,18 @@ class MemoryManager:
                 if decayed > 1e-6:
                     new_strengths[oid] = decayed
 
-            should_promote = ctx.recall_stats.get("count", 0) >= promote_threshold
-            if new_strengths != ctx.association_strengths or (should_promote and ctx.memory_tier != "LTM"):
+            should_promote = (ctx.recall_stats or {}).get("count", 0) >= promote_threshold
+            if new_strengths != (ctx.association_strengths or {}) or (should_promote and ctx.memory_tier != "LTM"):
                 ctx.association_strengths = new_strengths
                 if should_promote:
                     ctx.memory_tier = "LTM"
                 ctx.touch()
                 self.repo.save(ctx)
+                self._upsert_node(ctx)
 
-    # ──────────────────────────────────────────────────────────────
-    # Reinforcement (clique strengthening among coactivated)
-    # ──────────────────────────────────────────────────────────────
     def reinforce(self, context_id: str, coactivated: List[str]) -> None:
-        """Strengthen symmetric edges among all coactivated items + context_id."""
         try:
-            base = self.repo.get(context_id)
+            self.repo.get(context_id)
         except KeyError:
             return
 
@@ -1933,58 +2105,72 @@ class MemoryManager:
             return
 
         all_ids = [context_id] + valid
-        # clique reinforcement
         for i in range(len(all_ids)):
             for j in range(i + 1, len(all_ids)):
                 a, b = all_ids[i], all_ids[j]
                 self._add_edge(a, b, 0.5)
                 self._add_edge(b, a, 0.5)
 
-        base.record_recall(stage_id="reinforce", coactivated_with=valid)
-        self.repo.save(base)
-        self._save_graph()
+        try:
+            base = self.repo.get(context_id)
+            base.record_recall(stage_id="reinforce", coactivated_with=valid)
+            self.repo.save(base)
+            self._upsert_node(base)
+        except Exception:
+            pass
 
-    # ──────────────────────────────────────────────────────────────
-    # Prune stale, unpinned contexts
-    # ──────────────────────────────────────────────────────────────
     def prune(self, ttl_hours: int) -> None:
         cutoff = default_clock() - timedelta(hours=ttl_hours)
-        def stale(c: ContextObject) -> bool:
+        def stale(c: 'ContextObject') -> bool:
             la = self._parse_ts(c.last_accessed)
             return la < cutoff and not c.pinned
         for ctx in self.repo.query(stale):
             self.repo.delete(ctx.context_id)
+            # clean up persisted state
+            try:
+                with self._conn:
+                    self._conn.execute("DELETE FROM nodes WHERE context_id=?", (ctx.context_id,))
+                    self._conn.execute("DELETE FROM embeddings WHERE context_id=?", (ctx.context_id,))
+                    self._conn.execute("DELETE FROM edges WHERE src=? OR dst=?", (ctx.context_id, ctx.context_id))
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────
-    # Edge ops (thread-safe)
+    # Edge ops (persisted in SQLite)
     # ──────────────────────────────────────────────────────────────
     def _add_edge(self, src: str, dst: str, w: float) -> None:
         if src == dst or w == 0.0:
             return
-        with self._graph_lock:
-            self._graph.setdefault(src, {})
-            self._graph[src][dst] = self._graph[src].get(dst, 0.0) + w
+        now = int(time.time())
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO edges(src, dst, w, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(src, dst) DO UPDATE SET
+                     w = edges.w + excluded.w,
+                     updated_at = excluded.updated_at
+                """,
+                (src, dst, float(w), now)
+            )
 
     # ------------- 1️⃣  register_relationships ----------------------
     def register_relationships(
         self,
-        ctx: ContextObject,
+        ctx: 'ContextObject',
         embed_fn: Callable[[str], np.ndarray],
     ) -> None:
         """
         Call once after saving a new/updated ContextObject.
         • Skips re-registering relationships for the same ctx.
-        • Uses an in-memory cache for embeddings.
-        • Limits similarity scans to the last N items (scoped).
+        • Maintains node cache + persisted edges + embeddings.
         """
-        import math
-        # Keep track of which contexts we've already processed
-        if not hasattr(self, "_registered_ctxs"):
-            self._registered_ctxs: set[str] = set()
         cid = ctx.context_id
         if cid in self._registered_ctxs:
             return
         self._registered_ctxs.add(cid)
+
+        # keep node row fresh
+        self._upsert_node(ctx)
 
         # ---------- explicit references ----------
         for rid in ctx.references:
@@ -1993,59 +2179,40 @@ class MemoryManager:
 
         # ---------- shared tags ----------
         MAX_TAG_NEIGHBORS = 200
-        for tag in ctx.tags:
+        for tag in (ctx.tags or []):
             tag_node = f"tag::{tag}"
             self._add_edge(cid, tag_node, _HMR_TAG_W)
             self._add_edge(tag_node, cid, _HMR_TAG_W)
-            # trim oversized tag neighborhoods
-            with self._graph_lock:
-                nbrs = self._graph.get(tag_node, {})
-                if len(nbrs) > MAX_TAG_NEIGHBORS:
-                    keep = dict(sorted(nbrs.items(), key=lambda kv: kv[1], reverse=True)[:MAX_TAG_NEIGHBORS])
-                    self._graph[tag_node] = keep
+            # nothing else to trim here — edges table handles it
 
-        # ---------- semantic similarity ----------
-        # initialize embedding cache if missing
-        if not hasattr(self, "_embed_cache"):
-            # cache stores (unit_vector, original_norm)
-            self._embed_cache: Dict[str, tuple[np.ndarray, float]] = {}
-
-        def _unit(text: str) -> np.ndarray:
-            if text in self._embed_cache:
-                u, _ = self._embed_cache[text]
-                return u
-            raw = embed_fn(text)
-            v = np.asarray(raw, dtype=np.float32).reshape(-1)
-            n = float(np.linalg.norm(v) + 1e-9)
-            u = v / n
-            self._embed_cache[text] = (u, n)
-            return u
-
+        # ---------- semantic similarity (last 200 in scope) ----------
         try:
             base_text = (ctx.summary or "").strip()
             if base_text:
-                v1 = _unit(base_text)
-                # restrict recents to same user/conversation when available
+                # persist this embedding now (so future queries are fast)
+                v1 = np.asarray(embed_fn(base_text), dtype=np.float32).reshape(-1)
+                self._persist_embedding(cid, v1)
+
                 allowed_user = (ctx.metadata or {}).get("user_id")
                 allowed_conv = (ctx.metadata or {}).get("conversation_id")
-                # Stable recency ordering (by last_accessed then timestamp)
-                recents_all = self.repo.query(self._scope_filter(allowed_user, allowed_conv))
-                recents_sorted = sorted(
-                    recents_all,
-                    key=lambda c: (c.last_accessed or c.timestamp),
-                )[-200:]
-                for other in recents_sorted:
-                    if other.context_id == cid:
+
+                recent_ids = self._get_recent_candidates(allowed_user, allowed_conv, 200)
+                # include this ctx in nodes if not already
+                if cid not in recent_ids:
+                    recent_ids.append(cid)
+
+                emb_map = self._get_embeddings(recent_ids)
+                # compute similarities
+                u1 = v1 / (np.linalg.norm(v1) + 1e-9)
+                for oid, v2 in emb_map.items():
+                    if oid == cid:
                         continue
-                    txt = (other.summary or "").strip()
-                    if not txt:
-                        continue
-                    v2 = _unit(txt)
-                    sim = float(np.dot(v1, v2))  # already unit vectors
+                    u2 = v2 / (np.linalg.norm(v2) + 1e-9)
+                    sim = float(np.dot(u1, u2))
                     if sim >= _HMR_SIM_THRESH:
                         w = _HMR_SIM_W * sim
-                        self._add_edge(cid, other.context_id, w)
-                        self._add_edge(other.context_id, cid, w)
+                        self._add_edge(cid, oid, w)
+                        self._add_edge(oid, cid, w)
         except Exception:
             pass
 
@@ -2054,18 +2221,21 @@ class MemoryManager:
         window = 600  # seconds
         allowed_user = (ctx.metadata or {}).get("user_id")
         allowed_conv = (ctx.metadata or {}).get("conversation_id")
-        candidates = [
-            c for c in self.repo.query(self._scope_filter(allowed_user, allowed_conv))
-            if abs(now_sec - c._ts_seconds()) <= window and c.context_id != cid
-        ]
-        for other in candidates:
-            age = abs(now_sec - other._ts_seconds())
-            w = self._half_life_factor(age, _HMR_DECAY_SECS)
-            self._add_edge(cid, other.context_id, w)
-            self._add_edge(other.context_id, cid, w)
 
-        # Persist graph after all mutations
-        self._save_graph()
+        # fetch candidates within ~window using nodes cache
+        ids = self._get_recent_candidates(allowed_user, allowed_conv, 500)
+        for oid in ids:
+            if oid == cid:
+                continue
+            try:
+                other = self.repo.get(oid)
+            except KeyError:
+                continue
+            age = abs(now_sec - other._ts_seconds())
+            if age <= window:
+                w = self._half_life_factor(age, _HMR_DECAY_SECS)
+                self._add_edge(cid, oid, w)
+                self._add_edge(oid, cid, w)
 
     # ------------- 2️⃣  holographic_recall --------------------------
     def holographic_recall(
@@ -2075,10 +2245,10 @@ class MemoryManager:
         hops: int = 2,
         top_n: int = 10,
         embed_fn: Callable[[str], np.ndarray] | None = None
-    ) -> List[ContextObject]:
+    ) -> List['ContextObject']:
         """
         Fuse cue_ids &/or cue_text into a single excitation vector,
-        run multi-hop spreading activation over _graph, return top_n ContextObjects.
+        run multi-hop spreading activation over persisted edges, return top_n.
         """
         self.decay_graph_edges()
         self.consolidate_stm_to_ltm()
@@ -2086,9 +2256,8 @@ class MemoryManager:
         cue_ids = cue_ids or []
         activation: Dict[str, float] = collections.Counter({cid: 1.0 for cid in cue_ids})
 
-        # infer scope from the first cue (if available)
-        owner_user = None
-        owner_conv = None
+        # infer scope from first cue
+        owner_user = owner_conv = None
         if cue_ids:
             try:
                 first = self.repo.get(cue_ids[0])
@@ -2097,22 +2266,19 @@ class MemoryManager:
             except Exception:
                 pass
 
-        # text cue → similarity edges once, scoped to user/conv
+        # text cue → immediate sim activation
         if cue_text and embed_fn:
-            def _unit(text: str) -> np.ndarray:
-                v = np.asarray(embed_fn(text), dtype=np.float32).reshape(-1)
-                n = float(np.linalg.norm(v) + 1e-9)
-                return v / n
-            qv = _unit(cue_text)
-            for c in self.repo.query(self._scope_filter(owner_user, owner_conv)):
-                if not c.summary:
-                    continue
-                vv = _unit(c.summary)
-                sim = float(np.dot(qv, vv))  # unit vectors
+            q = np.asarray(embed_fn(cue_text), dtype=np.float32).reshape(-1)
+            q /= (np.linalg.norm(q) + 1e-9)
+            # candidates = last N nodes in scope
+            ids = self._get_recent_candidates(owner_user, owner_conv, 2000)
+            emb_map = self._get_embeddings(ids)
+            for cid, v in emb_map.items():
+                u = v / (np.linalg.norm(v) + 1e-9)
+                sim = float(np.dot(q, u))
                 if sim >= _HMR_SIM_THRESH:
-                    activation[c.context_id] += _HMR_SIM_W * sim
+                    activation[cid] += _HMR_SIM_W * sim
 
-        # hop propagation (optionally scoped to user/conv)
         def _in_scope(cid: str) -> bool:
             if owner_user is None and owner_conv is None:
                 return True
@@ -2122,18 +2288,25 @@ class MemoryManager:
             except Exception:
                 return False
 
-        # Snapshot graph under lock to avoid concurrent modification during traversal
-        with self._graph_lock:
-            graph_snapshot = {k: dict(v) for k, v in self._graph.items()}
-
+        # spread over edges
         frontier = dict(activation)
         for _ in range(hops):
-            new_frontier = collections.Counter()
-            for nid, act in frontier.items():
-                for nbr, w in graph_snapshot.get(nid, {}).items():
-                    if not _in_scope(nbr):
+            new_frontier: Dict[str, float] = collections.Counter()
+            if not frontier:
+                break
+            ids = list(frontier.keys())
+            placeholders = ",".join("?" for _ in ids)
+            try:
+                cur = self._conn.execute(
+                    f"SELECT src, dst, w FROM edges WHERE src IN ({placeholders})",
+                    ids
+                )
+                for src, dst, w in cur.fetchall():
+                    if not _in_scope(dst):
                         continue
-                    new_frontier[nbr] += act * w
+                    new_frontier[dst] += frontier.get(src, 0.0) * float(w)
+            except Exception:
+                pass
             for k, v in new_frontier.items():
                 activation[k] = activation.get(k, 0.0) + v
             frontier = new_frontier
@@ -2142,33 +2315,33 @@ class MemoryManager:
         if owner_user is not None or owner_conv is not None:
             activation = {k: v for k, v in activation.items() if _in_scope(k)}
 
-        # candidate pool for MMR (oversample for diversity)
+        # candidate pool
         cands = sorted(activation.items(), key=lambda kv: kv[1], reverse=True)[: max(top_n * 4, top_n)]
-        selected: list[tuple[str, float]] = []
-        alpha = 0.75  # relevance vs novelty
 
-        # unit-vector helper for MMR; safe when embed_fn is None
-        def _unit_from_cid(cid: str):
-            if not embed_fn:
-                return None
-            try:
-                obj = self.repo.get(cid)
-                txt = (obj.summary or "").strip()
-                if not txt:
-                    return None
-                v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
-                n = float(np.linalg.norm(v) + 1e-9)
-                return v / n
-            except Exception:
-                return None
+        # MMR (use embeddings if available)
+        vecs: Dict[str, Optional[np.ndarray]] = {}
+        if embed_fn and cands:
+            emb_map = self._get_embeddings([cid for cid, _ in cands])
+            for cid, _ in cands:
+                v = emb_map.get(cid)
+                if v is None:
+                    try:
+                        obj = self.repo.get(cid)
+                        txt = (obj.summary or "").strip()
+                        if txt:
+                            v = np.asarray(embed_fn(txt), dtype=np.float32).reshape(-1)
+                            self._persist_embedding(cid, v)
+                    except Exception:
+                        v = None
+                vecs[cid] = None if v is None else (v / (np.linalg.norm(v) + 1e-9))
 
-        vecs = {cid: _unit_from_cid(cid) for cid, _ in cands}
-
-        # MMR selection (single pass)
-        while cands and len(selected) < top_n:
+        alpha = 0.75
+        selected: List[Tuple[str, float]] = []
+        cand_list = cands[:]
+        while cand_list and len(selected) < top_n:
             best = None
             best_score = -1e9
-            for cid, rel in cands:
+            for cid, rel in cand_list:
                 v = vecs.get(cid)
                 if not selected or v is None:
                     novelty = 1.0
@@ -2176,20 +2349,17 @@ class MemoryManager:
                     sims = []
                     for scid, _ in selected:
                         sv = vecs.get(scid)
-                        if sv is None or v is None:
-                            continue
-                        sims.append(float(np.dot(v, sv)))  # unit vectors
-                    max_sim = max(sims) if sims else 0.0
-                    novelty = 1.0 - max(0.0, max_sim)
+                        if sv is not None:
+                            sims.append(float(np.dot(v, sv)))
+                    novelty = 1.0 - (max(sims) if sims else 0.0)
                 mmr = alpha * float(rel) + (1.0 - alpha) * novelty
                 if mmr > best_score:
                     best_score = mmr
-                    best = (cid, rel)
+                    best = (cid, float(rel))
             selected.append(best)
-            cands = [(cid, r) for (cid, r) in cands if cid != best[0]]
+            cand_list = [(cid, r) for (cid, r) in cand_list if cid != best[0]]
 
-        # materialize selected set
-        out = []
+        out: List['ContextObject'] = []
         for cid, score in selected:
             try:
                 obj = self.repo.get(cid)
@@ -2198,6 +2368,7 @@ class MemoryManager:
             except KeyError:
                 continue
         return out
+
 
 
 # ─ Graph Interface Layer ───────────────────────────────────────────────────────

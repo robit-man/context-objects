@@ -3634,6 +3634,279 @@ def _await_if_needed(obj):
     return obj
 
 
+def _stage10_assemble_and_infer(
+    self,
+    user_text: str,
+    state: Dict[str, Any],
+    *,
+    on_token: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Final assembly & inference with interlaced system-context.
+
+    Key changes:
+      • Always place instructions + contextual elements in SYSTEM messages.
+      • Interleave retrieval/tool metadata as SYSTEM messages chronologically with dialogue.
+      • Ensure the final user ask is the last USER message.
+      • Forward on_token to the streamer to support true streaming.
+    """
+    import json, re, textwrap
+    from datetime import datetime, timezone
+
+    # --------------------------- helpers ----------------------------
+    def _utc_iso() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _to_dt(ts) -> float:
+        """Return unix seconds; robust to str/None."""
+        try:
+            if isinstance(ts, datetime):
+                return ts.timestamp()
+            if isinstance(ts, str):
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+        return 0.0
+
+    def _safe_txt(c) -> str:
+        t = (getattr(c, "summary", None) or (getattr(c, "metadata", {}) or {}).get("text") or "").strip()
+        # strip accidental "User:"/"Assistant:" prefixes from Stage 3
+        return re.sub(r"^(User|Assistant):\s*", "", t).strip()
+
+    def _short(s: str, n: int = 420) -> str:
+        s = (s or "").replace("\n", " ").strip()
+        return s if len(s) <= n else (s[: n - 1] + "…")
+
+    def _score(c) -> float:
+        m = getattr(c, "metadata", {}) or {}
+        val = getattr(c, "retrieval_score", None) or m.get("retrieval_score")
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
+    def _ctx_id(c) -> str:
+        return getattr(c, "context_id", "")[:8]
+
+    def _maybe(val, default="(none)"):
+        return val if (val or val == 0) else default
+
+    # -------------------------- gather ------------------------------
+    turn = _ensure_turn_state(state)
+
+    # Primary components collected earlier in the pipeline
+    clar_ctx = state.get("clar_ctx")
+    know_ctx = state.get("know_ctx")
+    history  = list(state.get("history", []))   # chronological
+    semantic = list(state.get("semantic", []))
+    assoc    = list(state.get("assoc", []))
+    tools    = list(state.get("tools", []))     # recent tool outputs contexts
+    wm_ids   = state.get("wm_ids", [])
+
+    # Avoid duplicating the most recent user turn: we'll append user_text last.
+    try:
+        latest_user_id = state.get("user_ctx").context_id
+    except Exception:
+        latest_user_id = None
+    if latest_user_id:
+        history = [h for h in history if getattr(h, "context_id", None) != latest_user_id]
+
+    # Optional knowledge snippets (strings)
+    kn_snips = list(state.get("knowledge_snippets", []) or [])
+    kn_snips = [s for s in kn_snips if isinstance(s, str)]
+
+    # -------------------- build unified event stream -----------------
+    # Each item: (ts, kind, role, text, meta_dict)
+    events = []
+
+    # Dialogue turns
+    for c in history:
+        role = "assistant" if getattr(c, "semantic_label", "") == "assistant" else "user"
+        events.append((
+            _to_dt(getattr(c, "timestamp", None)),
+            "turn",
+            role,
+            _safe_txt(c),
+            {"ctx": c},
+        ))
+
+    # Retrieval: semantic / assoc
+    for c in semantic:
+        events.append((
+            _to_dt(getattr(c, "timestamp", None)),
+            "meta_semantic",
+            "system",
+            f"[SEM id={_ctx_id(c)} score={_score(c):.3f}] {_short(_safe_txt(c), 300)}",
+            {"ctx": c, "kind": "semantic"},
+        ))
+    for c in assoc:
+        events.append((
+            _to_dt(getattr(c, "timestamp", None)),
+            "meta_assoc",
+            "system",
+            f"[ASSOC id={_ctx_id(c)}] {_short(_safe_txt(c), 300)}",
+            {"ctx": c, "kind": "assoc"},
+        ))
+
+    # Tool outputs (short)
+    for c in tools:
+        meta = getattr(c, "metadata", {}) or {}
+        frag = meta.get("output_short") or meta.get("output") or _safe_txt(c) or ""
+        if isinstance(frag, (dict, list)):
+            try:
+                frag = json.dumps(frag, ensure_ascii=False)
+            except Exception:
+                frag = str(frag)
+        events.append((
+            _to_dt(getattr(c, "timestamp", None)),
+            "meta_tool",
+            "system",
+            f"[TOOL {getattr(c,'stage_id','tool_output')} id={_ctx_id(c)}] {_short(str(frag), 300)}",
+            {"ctx": c, "kind": "tool"},
+        ))
+
+    # Knowledge snippets (no timestamp → append near the end)
+    for s in kn_snips[:12]:
+        events.append((
+            _to_dt(getattr(history[-1], "timestamp", None)) + 1.0,  # after last dialog
+            "meta_knowledge",
+            "system",
+            f"[KNOW] {_short(s, 320)}",
+            {"kind": "knowledge"},
+        ))
+
+    # Sort by timestamp, and by kind to interleave meta close to turns
+    kind_order = {
+        "meta_semantic": 0, "meta_assoc": 1, "meta_tool": 2, "meta_knowledge": 3, "turn": 4
+    }
+    events.sort(key=lambda e: (e[0], kind_order.get(e[1], 9)))
+
+    # Trim very long histories while preserving variety
+    MAX_EVENTS = int(getattr(self, "max_history_items", 20)) + 20  # allow some metas
+    if len(events) > MAX_EVENTS:
+        # Keep last N while preserving the newest metas
+        events = events[-MAX_EVENTS:]
+
+    # -------------------- build SYSTEM directives --------------------
+    clar_notes  = (getattr(clar_ctx, "metadata", {}) or {}).get("notes") if clar_ctx else None
+    clar_intents = (getattr(clar_ctx, "metadata", {}) or {}).get("intents") or []
+    clar_constraints = (getattr(clar_ctx, "metadata", {}) or {}).get("constraints") or []
+
+    sys_lines = []
+    sys_lines.append("You are a focused assistant. Follow ALL directives in this message.")
+    sys_lines.append("")
+    sys_lines.append("## Objective")
+    sys_lines.append(_maybe(clar_notes, default=user_text))
+    if clar_intents:
+        sys_lines.append("")
+        sys_lines.append("## Intents")
+        for it in clar_intents[:6]:
+            sys_lines.append(f"- {it}")
+    if clar_constraints:
+        sys_lines.append("")
+        sys_lines.append("## Constraints")
+        for c in clar_constraints[:8]:
+            sys_lines.append(f"- {c}")
+
+    # Minimal guardrails
+    sys_lines.append("")
+    sys_lines.append("## Rules")
+    sys_lines.append("- Be correct and concise. If something is unknown from context, say so plainly.")
+    sys_lines.append("- Never invent tool results; if a tool failed, explain briefly.")
+    sys_lines.append("- Use the user's *latest* question as the primary target.")
+
+    # Provenance (cheap metadata the model can leverage)
+    sys_lines.append("")
+    sys_lines.append("## Context IDs")
+    sys_lines.append(f"- conversation_id: {_maybe(state.get('conversation_id'))}")
+    sys_lines.append(f"- user_id: {_maybe(state.get('user_id'))}")
+    sys_lines.append(f"- turn_id: {_maybe(getattr(turn,'turn_id',''))}")
+    if wm_ids:
+        sys_lines.append(f"- working_memory_ids: {', '.join(wm_ids[:8])}")
+
+    system_intro = "\n".join(sys_lines).strip()
+
+    # -------------------- assemble chat messages ---------------------
+    msgs: List[Dict[str, str]] = []
+    # 1) Top-level directives & context
+    msgs.append({"role": "system", "content": system_intro})
+
+    # 2) Interlaced metadata and dialogue (chronological)
+    for _, kind, role, text, meta in events:
+        if not text:
+            continue
+        if role == "system":  # retrieval/tool/knowledge
+            msgs.append({"role": "system", "content": text})
+        elif role in ("user", "assistant"):
+            msgs.append({"role": role, "content": text})
+
+    # 3) Final user ask (always last)
+    msgs.append({"role": "user", "content": user_text})
+
+    # -------------------- call model & capture -----------------------
+    # (This uses your existing streaming wrapper; Ollama will consume
+    #  all 'system' messages above as steering context.)
+    out = self._stream_and_capture(
+        self.primary_model,
+        msgs,
+        tag="[Final]",
+        images=state.get("images"),
+        on_token=on_token,
+    ).strip()
+
+    reply = out
+
+    # -------------------- persist inference context ------------------
+    try:
+        # Keep a compact preview of the messages we actually sent
+        preview = []
+        for m in msgs[:]:
+            role = m.get("role")
+            txt  = _short(m.get("content",""), 300)
+            preview.append(f"{role.upper()}: {txt}")
+
+        meta = {
+            "messages_preview": preview[-24:],  # last 24 lines
+            "conversation_id": state.get("conversation_id"),
+            "user_id": state.get("user_id"),
+            "turn_id": getattr(turn, "turn_id", ""),
+            "wm_ids": wm_ids,
+            "ts": _utc_iso(),
+        }
+
+        fi = ContextObject.make_stage("final_inference", [], meta)
+        fi.stage_id = "final_inference"
+        fi.summary  = _short(reply, 1000)
+        # Simple relevance proxy for Stage 12
+        try:
+            from difflib import SequenceMatcher
+            fi.metadata["relevance_score"] = float(SequenceMatcher(None, user_text, reply).ratio())
+        except Exception:
+            fi.metadata["relevance_score"] = 0.0
+        self.repo.save(fi)
+
+        # expose for downstream debug panes
+        state["final_ctx"] = fi
+        state["final"] = reply
+        state.setdefault("stages_run", []).append("final_inference")
+        # optional pretty dump if you keep this helper
+        try:
+            state.update({
+                "tc_ctx": state.get("tc_ctx"),
+                "wm_ids": wm_ids,
+                "recent_ids": [getattr(h, "context_id", "") for h in history[-6:]],
+                "plan_output": state.get("plan_output"),
+                "tool_ctxs": state.get("tool_ctxs", []),
+            })
+            _dump_ai_state(state)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return reply
+
+
 def _stage10b_response_critique_and_safety(
     self,
     draft: str,

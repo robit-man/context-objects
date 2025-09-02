@@ -2671,6 +2671,146 @@ class Assembler:
         print(f"[Run-away guard] giving up after {MAX_ATTEMPTS} attempts.")
         return ""
 
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Resolve & invoke configured stages
+    # ─────────────────────────────────────────────────────────────────────────────
+    def _resolve_stage_fn(self, name: str):
+        """
+        Find a bound method for the stage name.
+        Tries:  _stage_<name>  then numbered:  _stage\d+_<name>  (highest number wins)
+        """
+        bare = f"_stage_{name}"
+        if hasattr(self, bare):
+            return getattr(self, bare)
+
+        # fall back to numbered variants
+        candidates = []
+        for mname, fn in inspect.getmembers(self, inspect.ismethod):
+            if mname.startswith("_stage") and mname.endswith(f"_{name}"):
+                # pull numeric prefix if present for stable preference
+                num = 0
+                try:
+                    num = int(mname.split("_", 1)[0].replace("_stage", "") or "0")
+                except Exception:
+                    num = 0
+                candidates.append((num, fn))
+        if candidates:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            return candidates[0][1]
+        return None
+
+
+    async def _maybe_await(self, fn, *args, **kwargs):
+        """Run sync or async functions uniformly."""
+        if inspect.iscoroutinefunction(fn):
+            return await fn(*args, **kwargs)
+        # if it’s a plain function, hop to thread to avoid blocking loop
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+    def _normalize_stage_output(self, stage_name: str, out: Any) -> Dict[str, Any]:
+        """
+        Accepts:
+        • ContextObject
+        • list[ContextObject]
+        • dict (merged into state)
+        • str / other → stored under state["notes"][stage]
+        Also auto-persists any ContextObject(s) and records relationships.
+        """
+        from context import ContextObject
+
+        updates: Dict[str, Any] = {}
+        ctxs: List[ContextObject] = []
+
+        if out is None:
+            return updates
+
+        if isinstance(out, ContextObject):
+            ctxs = [out]
+            updates[stage_name] = out
+        elif isinstance(out, list) and out and isinstance(out[0], ContextObject):
+            ctxs = out
+            updates[stage_name] = out
+        elif isinstance(out, dict):
+            updates.update(out)
+            # persist any ctx(s) tucked inside common keys
+            for k in ("ctx", "ctxs", "context", "contexts", "output_ctx", "outputs"):
+                v = out.get(k)
+                if isinstance(v, ContextObject):
+                    ctxs.append(v)
+                elif isinstance(v, list) and v and isinstance(v[0], ContextObject):
+                    ctxs.extend(v)
+        else:
+            # store as a small note for debugging
+            updates.setdefault("notes", {}).setdefault(stage_name, str(out))
+
+        if ctxs:
+            self._persist_and_index(ctxs)
+            # keep a flat bag for later windows if helpful
+            bag = updates.setdefault("stage_ctxs", [])
+            bag.extend(ctxs)
+
+        return updates
+
+
+    async def _run_configured_stages(
+        self,
+        user_text: str,
+        state: Dict[str, Any],
+        status_cb: Optional[Callable[[str, Any], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Drives self.STAGES → calls bound _stage_* in order.
+        Each stage may declare any subset of (user_text, state, status_cb).
+        Returns the mutated state (also stored back into `state`).
+        """
+        status_cb = status_cb or (lambda *_: None)
+
+        for name in self.STAGES:
+            fn = self._resolve_stage_fn(name)
+            if not fn:
+                # soft skip if stage not implemented
+                status_cb("stage_skip", {"stage": name, "reason": "missing"})
+                continue
+
+            # allow RL to disable optional stages (if configured)
+            if hasattr(self, "_optional_stages") and name in getattr(self, "_optional_stages", []):
+                try:
+                    if hasattr(self, "rl") and not self.rl.should_run(name, state.get("rf", 0.0)):
+                        status_cb("stage_skip", {"stage": name, "reason": "rl_disabled"})
+                        continue
+                except Exception:
+                    pass
+
+            # build kwargs that the stage actually accepts
+            sig = inspect.signature(fn)
+            call_kwargs = {}
+            if "user_text" in sig.parameters:
+                call_kwargs["user_text"] = user_text
+            if "state" in sig.parameters:
+                call_kwargs["state"] = state
+            if "status_cb" in sig.parameters:
+                call_kwargs["status_cb"] = status_cb
+
+            # announce start
+            status_cb("stage_start", {"stage": name})
+
+            try:
+                out = await self._maybe_await(fn, **call_kwargs)
+                updates = self._normalize_stage_output(name, out)
+                state.update(updates)
+                state.setdefault("stages_run", []).append(name)
+                status_cb("stage_end", {"stage": name, "ok": True})
+            except Exception as e:
+                # record but keep going (non-destructive pipeline)
+                state.setdefault("errors", []).append((name, f"{type(e).__name__}: {e}"))
+                status_cb("stage_error", {"stage": name, "error": f"{type(e).__name__}: {e}"})
+
+        return state
+    # ─────────────────────────────────────────────────────────────────────────────
+
+
     # ─── Task scheduling & countdown (repo-native, no extra files) ───────────────
 
     def _task__reschedule_from_rrule(self, task_ctx) -> bool:
@@ -4362,6 +4502,17 @@ class Assembler:
                     _emit("quick_take_done", {"preview": quick[:220]})
             except Exception as e:
                 _emit("quick_take_error", {"error": f"{type(e).__name__}: {e}"})
+
+
+        try:
+            await _run_configured_stages(self, user_text, state, status_cb)
+            # keep a compact bag of tool outputs if your stages produced any
+            if "stage_ctxs" in state:
+                state.setdefault("tool_ctxs", []).extend(
+                    [c for c in state["stage_ctxs"] if getattr(c, "component", "") == "tool_output"]
+                )
+        except Exception as e:
+            state.setdefault("errors", []).append(("stages_driver", f"{type(e).__name__}: {e}"))
 
         # ── Stage 4: intent clarification (skip on direct_plan) ─────────────────
         clar_ctx = None
